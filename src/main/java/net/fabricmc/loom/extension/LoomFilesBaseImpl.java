@@ -29,6 +29,7 @@ import java.io.File;
 import org.gradle.api.Project;
 
 import net.fabricmc.loom.LoomGradleExtension;
+import net.fabricmc.loom.util.Constants;
 
 public abstract class LoomFilesBaseImpl implements LoomFiles {
 	protected abstract File getGradleUserHomeDir();
@@ -107,5 +108,9 @@ public abstract class LoomFilesBaseImpl implements LoomFiles {
 	@Override
 	public File getForgeDependencyRepo() {
 		return new File(getUserCache(), "forge/transformed-dependencies-v1");
+	}
+
+	public File getCacheLocks() {
+		return createFile(getUserCache(), Constants.Cache.LOCKS_DIR);
 	}
 }

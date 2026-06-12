@@ -52,6 +52,7 @@ import net.fabricmc.loom.configuration.providers.mappings.extras.unpick.UnpickLa
 import net.fabricmc.loom.configuration.providers.mappings.unpick.UnpickMetadata;
 import net.fabricmc.loom.configuration.providers.mappings.utils.AddConstructorMappingVisitor;
 import net.fabricmc.loom.util.ZipUtils;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.mappingio.adapter.MappingDstNsReorder;
 import net.fabricmc.mappingio.adapter.MappingSourceNsSwitch;
 import net.fabricmc.mappingio.format.tiny.Tiny2FileWriter;
@@ -70,19 +71,43 @@ public record LayeredMappingsFactory(LayeredMappingSpec spec) {
 		for (LayeredMappingsFactory layeredMappingFactory : configContext.extension().getLayeredMappingFactories()) {
 			try {
 				layeredMappingFactory.evaluate(configContext);
-			} catch (IOException e) {
-				throw new UncheckedIOException("Failed to setup layered mappings: %s".formatted(layeredMappingFactory.mavenNotation()), e);
+			} catch (Exception e) {
+				throw new UncheckedIOException("Failed to setup layered mappings: %s".formatted(layeredMappingFactory.mavenNotation()), new IOException(e));
 			}
 		}
 	}
 
-	private void evaluate(ConfigContext configContext) throws IOException {
+	private void evaluate(ConfigContext configContext) throws Exception {
 		LOGGER.info("Evaluating layer mapping: {}", mavenNotation());
 
 		final Path mavenRepoDir = configContext.extension().getFiles().getGlobalMinecraftRepo().toPath();
 		final LocalMavenHelper maven = new LocalMavenHelper(GROUP, MODULE, spec().getVersion(), null, mavenRepoDir);
-		final Path jar = resolve(configContext.project());
-		maven.copyToMaven(jar, null);
+		final boolean refresh = configContext.extension().refreshDeps();
+
+		// 无锁快路径（关键）：全局仓库已存在该 layered mapping 产物且未要求刷新时，直接返回——
+		// 既不取跨进程锁，也不重写全局产物。
+		// layered mapping 产物按内容寻址（版本号含 hash），一旦存在即不会变化；
+		// 这是暖缓存下多 daemon 并发构建同一版本时「明明只是读取，却互相抢 layered-mappings 锁、
+		// 且不断把 mappings jar 重写进全局仓库、导致另一 daemon 的依赖解析冲突」的根因，必须在锁外短路。
+		if (!refresh && maven.exists(null)) {
+			return;
+		}
+
+		final LoomCacheService cacheService = LoomCacheService.get(configContext.project()).get();
+		final Path lockRoot = configContext.extension().getFiles().getCacheLocks().toPath();
+
+		// 冷/刷新路径：写 GLOBAL 仓库（跨 daemon 共享），用跨进程 per-key 锁串行化首次产出，
+		// 避免多个 daemon 同时首次产出同一 layered mapping spec 时互相踩踏。
+		cacheService.runExclusive(lockRoot, "layered-mappings:" + spec().getVersion(), LoomCacheService.defaultTimeout(), () -> {
+			// 锁内二次确认：等锁期间可能已被其它进程产出，避免重复写
+			if (!refresh && maven.exists(null)) {
+				return null;
+			}
+
+			final Path jar = resolve(configContext.project());
+			maven.copyToMaven(jar, null);
+			return null;
+		});
 	}
 
 	public Path resolve(Project project) throws IOException {

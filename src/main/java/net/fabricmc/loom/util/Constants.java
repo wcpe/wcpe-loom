@@ -199,6 +199,17 @@ public class Constants {
 		public static final String IGNORE_DEPENDENCY_LOOM_VERSION_VALIDATION = "loom.ignoreDependencyLoomVersionValidation";
 	}
 
+	/**
+	 * 共享缓存相关常量.
+	 */
+	public static final class Cache {
+		private Cache() {
+		}
+
+		// 跨进程锁文件所在子目录
+		public static final String LOCKS_DIR = ".locks";
+	}
+
 	public static final class Manifest {
 		public static final String PATH = "META-INF/MANIFEST.MF";
 
