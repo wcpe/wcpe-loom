@@ -48,6 +48,7 @@ import org.slf4j.LoggerFactory;
 import net.fabricmc.loom.api.mappings.intermediate.IntermediateMappingsProvider;
 import net.fabricmc.loom.extension.LoomGradleExtensionApiImpl;
 import net.fabricmc.loom.util.Checksum;
+import net.fabricmc.loom.util.cache.AtomicFiles;
 
 @ApiStatus.Internal
 public abstract class IntermediaryMappingsProvider extends IntermediateMappingsProviderInternal {
@@ -89,13 +90,11 @@ public abstract class IntermediaryMappingsProvider extends IntermediateMappingsP
 					intermediaryJarPath,
 					StandardCopyOption.REPLACE_EXISTING
 			);
-			Files.deleteIfExists(tinyMappings);
 		} else {
 			final String url = urlRaw.formatted(encodedMcVersion);
 
 			LOGGER.info("Downloading intermediary from {}", url);
 
-			Files.deleteIfExists(tinyMappings);
 			Files.deleteIfExists(intermediaryJarPath);
 
 			getDownloader().get().apply(url)
@@ -103,7 +102,10 @@ public abstract class IntermediaryMappingsProvider extends IntermediateMappingsP
 					.downloadPath(intermediaryJarPath);
 		}
 
-		MappingConfiguration.extractMappings(intermediaryJarPath, tinyMappings);
+		// 原子发布共享的 intermediary.tiny：tinyMappings 位于 <userCache>/<version>/，跨 daemon 共享。
+		// 该方法可能被不同的锁 key（mappings: 与 layered-mappings:）在冷缓存下并发触发，
+		// 故必须原子写入（写临时 + move），保证「文件存在 ⟺ 内容完整」，并发写同一文件也安全（内容寻址、幂等）。
+		AtomicFiles.publish(tinyMappings, tmp -> MappingConfiguration.extractMappings(intermediaryJarPath, tmp));
 	}
 
 	@Override

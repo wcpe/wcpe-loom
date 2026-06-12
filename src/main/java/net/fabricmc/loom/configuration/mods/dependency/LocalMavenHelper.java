@@ -28,6 +28,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -46,7 +47,30 @@ public record LocalMavenHelper(String group, String name, String version, @Nulla
 
 		Files.createDirectories(getDirectory());
 		savePom();
-		return Files.copy(artifact, getOutputFile(classifier), StandardCopyOption.REPLACE_EXISTING);
+
+		final Path target = getOutputFile(classifier);
+		// 原子发布：先写「唯一」临时文件再原子 move。唯一名避免两个进程/线程并发写同一目标时
+		// 共享 .tmp 互相踩踏；原子 move 保证读方要么看到旧文件要么看到完整新文件（内容寻址下二者等价）。
+		final Path tmp = Files.createTempFile(target.getParent(), target.getFileName().toString(), ".tmp");
+
+		try {
+			Files.copy(artifact, tmp, StandardCopyOption.REPLACE_EXISTING);
+			atomicMove(tmp, target);
+		} finally {
+			// 原子 move 成功后 tmp 已不存在；失败时清理残留，避免遗留垃圾临时文件
+			Files.deleteIfExists(tmp);
+		}
+
+		return target;
+	}
+
+	// 原子 move：优先 ATOMIC_MOVE，个别平台不支持时退化为普通 move
+	private static void atomicMove(Path source, Path target) throws IOException {
+		try {
+			Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+		} catch (AtomicMoveNotSupportedException e) {
+			Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+		}
 	}
 
 	public boolean exists(String classifier) {
@@ -74,7 +98,16 @@ public record LocalMavenHelper(String group, String name, String version, @Nulla
 					.replace("%NAME%", name)
 					.replace("%VERSION%", version);
 
-			Files.writeString(getPomPath(), pomTemplate, StandardCharsets.UTF_8);
+			// 原子发布：先写「唯一」临时文件再原子 move，避免跨进程读到半写的 pom，且唯一名避免并发写同一 pom 时 tmp 踩踏
+			final Path pom = getPomPath();
+			final Path tmp = Files.createTempFile(pom.getParent(), pom.getFileName().toString(), ".tmp");
+
+			try {
+				Files.writeString(tmp, pomTemplate, StandardCharsets.UTF_8);
+				atomicMove(tmp, pom);
+			} finally {
+				Files.deleteIfExists(tmp);
+			}
 		} catch (IOException e) {
 			throw new UncheckedIOException("Failed to write mod pom", e);
 		}

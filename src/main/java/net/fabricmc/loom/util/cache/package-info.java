@@ -1,7 +1,7 @@
 /*
  * This file is part of fabric-loom, licensed under the MIT License (MIT).
  *
- * Copyright (c) 2021 FabricMC
+ * Copyright (c) 2025 FabricMC
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,34 +22,7 @@
  * SOFTWARE.
  */
 
-package net.fabricmc.loom.extension;
+@NullMarked
+package net.fabricmc.loom.util.cache;
 
-import java.io.File;
-
-import org.gradle.api.Project;
-import org.gradle.api.initialization.Settings;
-
-public interface LoomFiles {
-	static LoomFiles create(Project project) {
-		return new LoomFilesProjectImpl(project);
-	}
-
-	static LoomFiles create(Settings settings) {
-		return new LoomFilesSettingsImpl(settings);
-	}
-
-	File getUserCache();
-	File getRootProjectPersistentCache();
-	File getProjectPersistentCache();
-	File getProjectBuildCache();
-	File getRemappedModCache();
-	File getNativesDirectory(Project project);
-	File getDefaultLog4jConfigFile();
-	File getDevLauncherConfig();
-	File getRemapClasspathFile();
-	File getGlobalMinecraftRepo();
-	File getLocalMinecraftRepo();
-	File getDecompileCache(String version);
-	// 共享缓存按 key 锁文件目录（仅写路径在缺失时使用，读路径不涉及）
-	File getCacheLocks();
-}
+import org.jspecify.annotations.NullMarked;

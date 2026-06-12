@@ -32,6 +32,8 @@ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.ConfigContext;
 import net.fabricmc.loom.configuration.providers.BundleMetadata;
 import net.fabricmc.loom.util.TinyRemapperLoggerAdapter;
+import net.fabricmc.loom.util.cache.AtomicFiles;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.tinyremapper.NonClassCopyMode;
 import net.fabricmc.tinyremapper.OutputConsumerPath;
 import net.fabricmc.tinyremapper.TinyRemapper;
@@ -83,35 +85,58 @@ public abstract sealed class SingleJarMinecraftProvider extends MinecraftProvide
 			getProject().getLogger().warn("Using `clientOnlyMinecraftJar()` is not recommended for Minecraft versions 1.3 or newer.");
 		}
 
+		// 无锁快路径：env-only jar 已就绪且未要求刷新时不获取文件锁
 		boolean requiresRefresh = getExtension().refreshDeps() || Files.notExists(minecraftEnvOnlyJar);
 
 		if (!requiresRefresh) {
 			return;
 		}
 
-		final Path inputJar = getInputJar(this);
+		final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
+		final Path lockRoot = getExtension().getFiles().getCacheLocks().toPath();
 
-		TinyRemapper remapper = null;
-
-		try {
-			remapper = TinyRemapper.newRemapper(TinyRemapperLoggerAdapter.INSTANCE).build();
-
-			Files.deleteIfExists(minecraftEnvOnlyJar);
-
-			// Pass through tiny remapper to fix the meta-inf
-			try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(minecraftEnvOnlyJar).build()) {
-				outputConsumer.addNonClassFiles(inputJar, NonClassCopyMode.FIX_META_INF, remapper);
-				remapper.readInputs(inputJar);
-				remapper.apply(outputConsumer);
+		cacheService.runExclusive(lockRoot, cacheKey(), LoomCacheService.defaultTimeout(), () -> {
+			// 锁内二次确认：可能已被他人在等锁期间生产完成
+			if (!getExtension().refreshDeps() && Files.exists(minecraftEnvOnlyJar)) {
+				return null;
 			}
-		} catch (Exception e) {
-			Files.deleteIfExists(minecraftEnvOnlyJar);
-			throw new RuntimeException("Failed to process %s only jar".formatted(type()), e);
-		} finally {
-			if (remapper != null) {
-				remapper.finish();
+
+			final Path inputJar = getInputJar(this);
+
+			TinyRemapper remapper = null;
+
+			try {
+				remapper = TinyRemapper.newRemapper(TinyRemapperLoggerAdapter.INSTANCE).build();
+
+				Files.deleteIfExists(minecraftEnvOnlyJar);
+
+				final TinyRemapper effectiveRemapper = remapper;
+				// 原子发布：remapper 先写到同目录唯一临时 jar，完整后再原子 move 到 minecraftEnvOnlyJar
+				AtomicFiles.publish(minecraftEnvOnlyJar, tmpJar -> {
+					// Pass through tiny remapper to fix the meta-inf
+					try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(tmpJar).build()) {
+						outputConsumer.addNonClassFiles(inputJar, NonClassCopyMode.FIX_META_INF, effectiveRemapper);
+						effectiveRemapper.readInputs(inputJar);
+						effectiveRemapper.apply(outputConsumer);
+					}
+				});
+			} catch (Exception e) {
+				Files.deleteIfExists(minecraftEnvOnlyJar);
+				throw new RuntimeException("Failed to process %s only jar".formatted(type()), e);
+			} finally {
+				if (remapper != null) {
+					remapper.finish();
+				}
 			}
-		}
+
+			return null;
+		});
+	}
+
+	// 区分 server/client env-only jar，避免 legacy-merged 下两个 single jar provider 用同一把锁互相串扰
+	@Override
+	protected String cacheKey() {
+		return "minecraft:" + minecraftVersion() + ":" + type();
 	}
 
 	public Path getMinecraftEnvOnlyJar() {

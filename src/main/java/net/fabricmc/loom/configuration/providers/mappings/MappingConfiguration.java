@@ -28,7 +28,6 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.Reader;
-import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystem;
 import java.nio.file.FileSystems;
@@ -59,6 +58,7 @@ import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.DeletingFileVisitor;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.ZipUtils;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.service.ServiceFactory;
 import net.fabricmc.mappingio.MappingReader;
 import net.fabricmc.mappingio.format.MappingFormat;
@@ -112,9 +112,9 @@ public class MappingConfiguration {
 
 		try {
 			mappingProvider.setup(project, serviceFactory, minecraftProvider, inputJar);
-		} catch (IOException e) {
+		} catch (Exception e) {
 			cleanWorkingDirectory(workingDir);
-			throw new UncheckedIOException("Failed to setup mappings: " + dependency.getDepString(), e);
+			throw new RuntimeException("Failed to setup mappings: " + dependency.getDepString(), e);
 		}
 
 		return mappingProvider;
@@ -128,12 +128,36 @@ public class MappingConfiguration {
 		return serviceFactory.get(getMappingsServiceOptions(project));
 	}
 
-	private void setup(Project project, ServiceFactory serviceFactory, MinecraftProvider minecraftProvider, Path inputJar) throws IOException {
-		if (minecraftProvider.refreshDeps()) {
+	private void setup(Project project, ServiceFactory serviceFactory, MinecraftProvider minecraftProvider, Path inputJar) throws Exception {
+		final boolean refresh = minecraftProvider.refreshDeps();
+
+		// 无锁快路径：mappings 产物均已就绪且未要求刷新时，不获取文件锁，仅在内存中重新提取额外信息（每次必须执行）
+		if (!refresh && Files.exists(tinyMappings) && Files.exists(tinyMappingsJar)) {
+			try (FileSystem fileSystem = FileSystems.newFileSystem(inputJar, (ClassLoader) null)) {
+				extractExtras(fileSystem);
+			}
+
+			return;
+		}
+
+		final LoomCacheService cacheService = LoomCacheService.get(project).get();
+		final Path lockRoot = LoomGradleExtension.get(project).getFiles().getCacheLocks().toPath();
+		final String key = "mappings:" + mappingsIdentifier;
+
+		cacheService.runExclusive(lockRoot, key, LoomCacheService.defaultTimeout(), () -> {
+			produceMappings(project, serviceFactory, minecraftProvider, inputJar, refresh);
+			return null;
+		});
+	}
+
+	// 产 mappings 文件：受 per-key 锁保护。注意 extractExtras 会在内存中填充字段，
+	// 但本方法仅在「冷/刷新」路径执行；暖路径的内存填充已在 setup 的无锁快路径中完成。
+	private void produceMappings(Project project, ServiceFactory serviceFactory, MinecraftProvider minecraftProvider, Path inputJar, boolean refresh) throws IOException {
+		if (refresh) {
 			cleanWorkingDirectory(mappingsWorkingDir);
 		}
 
-		if (Files.notExists(tinyMappings) || minecraftProvider.refreshDeps()) {
+		if (Files.notExists(tinyMappings) || refresh) {
 			storeMappings(project, serviceFactory, minecraftProvider, inputJar);
 		} else {
 			try (FileSystem fileSystem = FileSystems.newFileSystem(inputJar, (ClassLoader) null)) {
@@ -141,7 +165,7 @@ public class MappingConfiguration {
 			}
 		}
 
-		if (Files.notExists(tinyMappingsJar) || minecraftProvider.refreshDeps()) {
+		if (Files.notExists(tinyMappingsJar) || refresh) {
 			Files.deleteIfExists(tinyMappingsJar);
 			ZipUtils.add(tinyMappingsJar, "mappings/mappings.tiny", Files.readAllBytes(tinyMappings));
 		}

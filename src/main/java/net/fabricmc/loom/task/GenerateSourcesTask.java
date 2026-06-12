@@ -90,7 +90,9 @@ import net.fabricmc.loom.util.ExceptionUtil;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.IOStringConsumer;
 import net.fabricmc.loom.util.Platform;
+import net.fabricmc.loom.util.cache.CacheEntryLock;
 import net.fabricmc.loom.util.gradle.GradleUtils;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.gradle.SyncTaskBuildService;
 import net.fabricmc.loom.util.gradle.ThreadedProgressLoggerConsumer;
 import net.fabricmc.loom.util.gradle.ThreadedSimpleProgressLogger;
@@ -104,7 +106,8 @@ import net.fabricmc.mappingio.tree.MemoryMappingTree;
 
 @DisableCachingByDefault
 public abstract class GenerateSourcesTask extends AbstractLoomTask {
-	private static final String CACHE_VERSION = "v1";
+	// v2：引入跨进程缓存锁与原子发布机制后 bump，使旧版本反编译缓存自然失效重建
+	private static final String CACHE_VERSION = "v2";
 	private final DecompilerOptions decompilerOptions;
 
 	/**
@@ -270,27 +273,34 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
 
 			try (var timer = new Timer("Decompiled sources with cache")) {
 				final Path cacheFile = getDecompileCacheFile().getAsFile().get().toPath();
+				// 反编译缓存锁：缓存文件位于 <userCache>/decompile/<version>.zip，锁目录取 <userCache>/.locks。
+				// 跨进程按缓存文件名加锁，避免多个 genSources 任务（不同子项目/不同 daemon）并发读写同一缓存 zip 导致损坏。
+				final Path lockRoot = cacheFile.getParent().getParent().resolve(Constants.Cache.LOCKS_DIR);
+				final String lockKey = "decompile:" + cacheFile.getFileName();
 
-				if (getResetCache().get()) {
-					getLogger().warn("Resetting decompile cache");
-					Files.deleteIfExists(cacheFile);
-				}
-
-				// TODO ensure we have a lock on this file to prevent multiple tasks from running at the same time
-				Files.createDirectories(cacheFile.getParent());
-
-				if (Files.exists(cacheFile)) {
-					try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(cacheFile, true)) {
-						// Success, cache exists and can be read
-					} catch (IOException e) {
-						getLogger().warn("Discarding invalid decompile cache file: {}", cacheFile, e);
-						Files.delete(cacheFile);
+				CacheEntryLock.withLock(lockRoot, lockKey, LoomCacheService.defaultTimeout(), () -> {
+					if (getResetCache().get()) {
+						getLogger().warn("Resetting decompile cache");
+						Files.deleteIfExists(cacheFile);
 					}
-				}
 
-				try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(cacheFile, true)) {
-					runWithCache(serviceFactory, fs.getRoot());
-				}
+					Files.createDirectories(cacheFile.getParent());
+
+					if (Files.exists(cacheFile)) {
+						try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(cacheFile, true)) {
+							// Success, cache exists and can be read
+						} catch (IOException e) {
+							getLogger().warn("Discarding invalid decompile cache file: {}", cacheFile, e);
+							Files.delete(cacheFile);
+						}
+					}
+
+					try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(cacheFile, true)) {
+						runWithCache(serviceFactory, fs.getRoot());
+					}
+
+					return null;
+				});
 			} catch (Exception e) {
 				ExceptionUtil.processException(e, getDaemonUtilsContext().get());
 				throw ExceptionUtil.createDescriptiveWrapper(RuntimeException::new, "Failed to decompile", e);

@@ -77,6 +77,7 @@ import net.fabricmc.loom.util.Checksum;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.ExceptionUtil;
 import net.fabricmc.loom.util.SourceRemapper;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.gradle.SourceSetHelper;
 import net.fabricmc.loom.util.service.ServiceFactory;
 
@@ -216,10 +217,30 @@ public class ModConfigurationRemapper {
 					.toList();
 
 			if (!toRemap.isEmpty()) {
+				// 仅在确有 mod 需要重映射（写 LOCAL 共享 remapped_mods 缓存）时才取跨进程锁；
+				// 暖缓存下 toRemap 为空、根本不会进入这里，故不取锁 → 同一 checkout 的 client/server 并发构建互不阻塞。
+				final Path lockRoot = extension.getFiles().getCacheLocks().toPath();
+				final String lockKey = LoomCacheService.modDepsKey(project.getRootDir(), mappingsSuffix);
+
 				try {
-					new ModProcessor(project, sourceConfig, serviceFactory).processMods(toRemap);
+					LoomCacheService.get(project).get().runExclusive(lockRoot, lockKey, LoomCacheService.defaultTimeout(), () -> {
+						// 锁内重新过滤：等锁期间其它进程可能已重映射部分 mod，避免重复写
+						final List<ModDependency> stillToRemap = refreshDeps
+								? toRemap
+								: toRemap.stream().filter(dependency -> dependency.isCacheInvalid(project, null)).toList();
+
+						if (!stillToRemap.isEmpty()) {
+							new ModProcessor(project, sourceConfig, serviceFactory).processMods(stillToRemap);
+						}
+
+						return null;
+					});
 				} catch (IOException e) {
 					throw new UncheckedIOException("Failed to remap mods", e);
+				} catch (RuntimeException e) {
+					throw e;
+				} catch (Exception e) {
+					throw new RuntimeException("Failed to remap mods", e);
 				}
 			}
 

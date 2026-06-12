@@ -48,6 +48,7 @@ import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.download.DownloadExecutor;
 import net.fabricmc.loom.util.download.GradleDownloadProgressListener;
 import net.fabricmc.loom.util.gradle.GradleUtils;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.gradle.ProgressGroup;
 
 public abstract class MinecraftProvider {
@@ -79,26 +80,92 @@ public abstract class MinecraftProvider {
 	}
 
 	public void provide() throws Exception {
+		// 内存配置：无论缓存冷热都必须执行
 		initFiles();
 
 		verifyJavaVersion();
 
-		boolean didDownload = downloadJars();
+		// 无锁快路径：未要求刷新且所有产物已就绪时，不获取任何文件锁
+		if (jarsRequireProduction()) {
+			// 产文件部分（下载/抽取/校验）用 per-key 锁保护，按 mcVersion 串行、不同版本可并行
+			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
+			final Path lockRoot = getExtension().getFiles().getCacheLocks().toPath();
+
+			cacheService.runExclusive(lockRoot, downloadLockKey(), LoomCacheService.defaultTimeout(), () -> {
+				// 锁内二次确认：等锁期间可能已被其它进程/线程下载完成，避免重复下载/抽取
+				if (!jarsRequireProduction()) {
+					return null;
+				}
+
+				boolean didDownload = downloadJars();
+
+				if (provideServer()) {
+					// 锁内读取 bundle 元数据用于决定是否抽取（extractBundledServerJar 依赖该字段）
+					serverBundleMetadata = BundleMetadata.fromJar(minecraftServerJar.toPath());
+
+					if (serverBundleMetadata != null) {
+						extractBundledServerJar();
+					}
+				}
+
+				if (didDownload) {
+					verifyJars();
+				}
+
+				return null;
+			});
+		}
+
+		// 暖路径补设字段：上面锁内可能整段跳过（缓存就绪时未进入生产），但 server jar 必已就绪，
+		// 故在锁外对已存在的 server jar 再读取一次，保证暖缓存下 serverBundleMetadata 也正确。
+		if (provideServer() && serverBundleMetadata == null) {
+			serverBundleMetadata = BundleMetadata.fromJar(minecraftServerJar.toPath());
+		}
+
+		// 内存配置：libraryProvider 每次都必须执行
+		final MinecraftLibraryProvider libraryProvider = new MinecraftLibraryProvider(this, configContext.project());
+		libraryProvider.provide();
+	}
+
+	// 下载/抽取产物的跨进程锁 key：始终按版本，确保同一 mcVersion 的所有 jar 配置共享同一把下载锁、只下载一次。
+	// 不可用会被子类覆写的 cacheKey()，否则不同 jar 配置（如 server-only/client-only single jar）会用不同 key 并发下载同一批共享 jar。
+	private String downloadLockKey() {
+		return "minecraft:" + minecraftVersion();
+	}
+
+	// 跨进程互斥 key：用于子类自身产物（merge/split/env-only jar）的生产锁，子类可覆写以区分不同产物
+	protected String cacheKey() {
+		return "minecraft:" + minecraftVersion();
+	}
+
+	// 无锁存在性检查：判断下载/抽取产物是否需要生产。返回 false 即所有产物已就绪，可走无锁快路径。
+	private boolean jarsRequireProduction() {
+		if (getExtension().refreshDeps()) {
+			return true;
+		}
+
+		if (provideClient() && !minecraftClientJar.exists()) {
+			return true;
+		}
 
 		if (provideServer()) {
-			serverBundleMetadata = BundleMetadata.fromJar(minecraftServerJar.toPath());
+			if (!minecraftServerJar.exists()) {
+				return true;
+			}
 
-			if (serverBundleMetadata != null) {
-				extractBundledServerJar();
+			// 该版本若使用 bundler，则抽取后的 server jar 也必须存在。
+			// serverBundleMetadata 此时尚未读取，故直接读已下载的 server jar 判断是否为 bundler。
+			try {
+				if (BundleMetadata.fromJar(minecraftServerJar.toPath()) != null && !minecraftExtractedServerJar.exists()) {
+					return true;
+				}
+			} catch (IOException e) {
+				// 读取失败视为需要重新生产
+				return true;
 			}
 		}
 
-		if (didDownload) {
-			verifyJars();
-		}
-
-		final MinecraftLibraryProvider libraryProvider = new MinecraftLibraryProvider(this, configContext.project());
-		libraryProvider.provide();
+		return false;
 	}
 
 	private void verifyJavaVersion() {

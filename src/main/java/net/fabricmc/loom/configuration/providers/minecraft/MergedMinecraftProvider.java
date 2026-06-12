@@ -36,6 +36,8 @@ import org.slf4j.LoggerFactory;
 
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.ConfigContext;
+import net.fabricmc.loom.util.cache.AtomicFiles;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 
 public final class MergedMinecraftProvider extends MinecraftProvider {
 	private static final Logger LOGGER = LoggerFactory.getLogger(MergedMinecraftProvider.class);
@@ -74,17 +76,28 @@ public final class MergedMinecraftProvider extends MinecraftProvider {
 			throw new UnsupportedOperationException("This version does not provide both the client and server jars - please select the client-only or server-only jar configuration!");
 		}
 
+		// 无锁快路径：merged jar 已就绪且未要求刷新时不获取文件锁
 		if (!Files.exists(minecraftMergedJar) || getExtension().refreshDeps()) {
-			try {
-				mergeJars();
-			} catch (Throwable e) {
-				Files.deleteIfExists(getMinecraftClientJar().toPath());
-				Files.deleteIfExists(getMinecraftServerJar().toPath());
-				Files.deleteIfExists(minecraftMergedJar);
+			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
+			final Path lockRoot = getExtension().getFiles().getCacheLocks().toPath();
 
-				getProject().getLogger().error("Could not merge JARs! Deleting source JARs - please re-run the command and move on.", e);
-				throw e;
-			}
+			cacheService.runExclusive(lockRoot, cacheKey(), LoomCacheService.defaultTimeout(), () -> {
+				// 锁内二次确认：可能已被他人在等锁期间合并完成
+				if (!Files.exists(minecraftMergedJar) || getExtension().refreshDeps()) {
+					try {
+						mergeJars();
+					} catch (Throwable e) {
+						Files.deleteIfExists(getMinecraftClientJar().toPath());
+						Files.deleteIfExists(getMinecraftServerJar().toPath());
+						Files.deleteIfExists(minecraftMergedJar);
+
+						getProject().getLogger().error("Could not merge JARs! Deleting source JARs - please re-run the command and move on.", e);
+						throw e;
+					}
+				}
+
+				return null;
+			});
 		}
 	}
 
@@ -96,7 +109,10 @@ public final class MergedMinecraftProvider extends MinecraftProvider {
 			minecraftServerJar = getMinecraftExtractedServerJar();
 		}
 
-		mergeJars(minecraftClientJar, minecraftServerJar, minecraftMergedJar.toFile());
+		final File clientJar = minecraftClientJar;
+		final File serverJar = minecraftServerJar;
+		// 原子发布：合并写到同目录唯一临时 jar，完整后再原子 move 到 minecraftMergedJar
+		AtomicFiles.publish(minecraftMergedJar, tmpJar -> mergeJars(clientJar, serverJar, tmpJar.toFile()));
 	}
 
 	public static void mergeJars(File clientJar, File serverJar, File mergedJar) throws IOException {

@@ -28,24 +28,14 @@ import static net.fabricmc.loom.util.Constants.Configurations;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.nio.channels.FileChannel;
-import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
-import java.time.Duration;
-import java.util.Objects;
 import java.util.function.Consumer;
 
 import javax.inject.Inject;
 
 import org.gradle.api.Action;
-import org.gradle.api.GradleException;
 import org.gradle.api.Project;
 import org.gradle.api.Task;
-import org.gradle.api.logging.Logger;
-import org.gradle.api.logging.Logging;
 import org.gradle.api.plugins.JavaPlugin;
 import org.gradle.api.provider.Provider;
 import org.gradle.api.tasks.AbstractCopyTask;
@@ -85,11 +75,6 @@ import net.fabricmc.loom.util.service.ScopedServiceFactory;
 import net.fabricmc.loom.util.service.ServiceFactory;
 
 public abstract class CompileConfiguration implements Runnable {
-	private static final String LOCK_PROPERTY_KEY = "fabric.loom.internal.global.lock";
-
-	// 共享缓存锁文件名：所有共享同一 loom 缓存目录的项目使用同一把 NIO 文件锁
-	private static final String SHARED_CACHE_LOCK_FILE = ".shared-cache.lock";
-
 	@Inject
 	protected abstract Project getProject();
 
@@ -117,33 +102,14 @@ public abstract class CompileConfiguration implements Runnable {
 			final boolean previousRefreshDeps = extension.refreshDeps();
 
 			try {
-				// 跨 daemon 共享缓存锁：基于 NIO FileChannel.lock() 的 OS 级文件锁。
-				// 保护共享缓存目录中的 minecraft jar 文件（下载/合并/remap 产物），
-				// 防止多个 Gradle daemon 并发操作导致文件损坏。
-				// NIO FileLock 在进程崩溃时由 OS 自动回收，消除 stale lock 问题。
-				final Path cacheLockFile = getCacheLockFile();
-				final FileChannel lockChannel = FileChannel.open(cacheLockFile,
-						StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.READ);
+				// 各 provider 已自带 per-key 跨进程文件锁，此处不再使用旧的全局缓存锁。
+				setupMinecraft(configContext);
 
-				try {
-					final FileLock fileLock = acquireFileLockWithTimeout(lockChannel, getDefaultTimeout());
-
-					try {
-						// 同一 daemon 内的 JVM 级锁：序列化同 JVM 下多个项目的配置阶段
-						synchronized (getGlobalLockObject()) {
-							setupMinecraft(configContext);
-						}
-
-						var dependencyManager = new LoomDependencyManager(getProject(), serviceFactory, extension);
-						dependencyManager.handleDependencies();
-					} finally {
-						if (fileLock != null && fileLock.isValid()) {
-							fileLock.release();
-						}
-					}
-				} finally {
-					lockChannel.close();
-				}
+				var dependencyManager = new LoomDependencyManager(getProject(), serviceFactory, extension);
+				// mod 依赖处理不在此加锁：锁已下沉到真正写共享 remapped_mods 缓存的两处
+				// （ModProcessor.processMods / SourceRemapper.remapAll），它们各自带「无活则不取锁」的判断，
+				// 故暖缓存下（无 mod 需重映射）完全不取锁——同一 checkout 的 client/server 并发构建互不阻塞。
+				dependencyManager.handleDependencies();
 			} catch (Exception e) {
 				ExceptionUtil.processException(e, DaemonUtils.Context.fromProject(getProject()));
 				throw ExceptionUtil.createDescriptiveWrapper(RuntimeException::new, "Failed to setup Minecraft", e);
@@ -177,59 +143,6 @@ public abstract class CompileConfiguration implements Runnable {
 		if (getProject().getPluginManager().hasPlugin("org.jetbrains.kotlin.kapt")) {
 			// If loom is applied after kapt, then kapt will use the AP arguments too early for loom to pass the arguments we need for mixin.
 			throw new IllegalArgumentException("fabric-loom must be applied BEFORE kapt in the plugins { } block.");
-		}
-	}
-
-	// 获取共享缓存锁文件路径：所有共享同一 loom 缓存目录的项目使用同一把锁
-	private Path getCacheLockFile() {
-		final LoomGradleExtension extension = LoomGradleExtension.get(getProject());
-		final Path cacheDirectory = extension.getFiles().getUserCache().toPath();
-
-		if (!Files.exists(cacheDirectory)) {
-			try {
-				Files.createDirectories(cacheDirectory);
-			} catch (IOException e) {
-				throw new UncheckedIOException(e);
-			}
-		}
-
-		return cacheDirectory.resolve(SHARED_CACHE_LOCK_FILE);
-	}
-
-	// 带超时的 NIO 文件锁获取：通过轮询 tryLock() 实现超时等待
-	@SuppressWarnings("BusyWait")
-	private FileLock acquireFileLockWithTimeout(FileChannel channel, Duration timeout) throws IOException {
-		final long timeoutMs = timeout.toMillis();
-		final Logger logger = Logging.getLogger("loom_acquireFileLock");
-		long waitedMs = 0;
-
-		while (true) {
-			final FileLock lock = channel.tryLock();
-
-			if (lock != null) {
-				return lock;
-			}
-
-			if (waitedMs == 0) {
-				logger.lifecycle("Waiting for shared loom cache lock...");
-			}
-
-			try {
-				Thread.sleep(100);
-			} catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-				throw new IOException("Interrupted while waiting for cache lock", e);
-			}
-
-			waitedMs += 100;
-
-			if (waitedMs >= 1000 * 60 && waitedMs % (1000 * 60) == 0L) {
-				logger.lifecycle("Have been waiting for shared loom cache lock for {} minute(s).", waitedMs / 1000 / 60);
-			}
-
-			if (waitedMs >= timeoutMs) {
-				throw new GradleException("Timed out waiting for shared loom cache lock after %s ms.".formatted(timeoutMs));
-			}
 		}
 	}
 
@@ -371,15 +284,6 @@ public abstract class CompileConfiguration implements Runnable {
 		});
 	}
 
-	private static Duration getDefaultTimeout() {
-		if (System.getenv("CI") != null) {
-			// Set a small timeout on CI, as it's unlikely going to unlock.
-			return Duration.ofMinutes(1);
-		}
-
-		return Duration.ofHours(1);
-	}
-
 	private void finalizedBy(String a, String b) {
 		getTasks().named(a).configure(task -> task.finalizedBy(getTasks().named(b)));
 	}
@@ -392,19 +296,5 @@ public abstract class CompileConfiguration implements Runnable {
 				throw new UncheckedIOException(e);
 			}
 		});
-	}
-
-	// This is a nasty piece of work, but seems to work quite nicely.
-	// We need a lock that works across classloaders, a regular synchronized method will not work here.
-	// We can abuse system properties as a shared object store that we know for sure will be on the same classloader regardless of what Gradle does to loom.
-	// This allows us to ensure that all instances of loom regardless of classloader get the same object to lock on.
-	private static Object getGlobalLockObject() {
-		if (!System.getProperties().contains(LOCK_PROPERTY_KEY)) {
-			// The .intern resolves a possible race where two difference value objects (remember not the same classloader) are set.
-			//noinspection StringOperationCanBeSimplified
-			System.getProperties().setProperty(LOCK_PROPERTY_KEY, LOCK_PROPERTY_KEY.intern());
-		}
-
-		return Objects.requireNonNull(System.getProperty(LOCK_PROPERTY_KEY));
 	}
 }

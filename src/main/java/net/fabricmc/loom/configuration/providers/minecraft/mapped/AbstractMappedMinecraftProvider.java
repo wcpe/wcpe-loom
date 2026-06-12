@@ -28,7 +28,6 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -56,6 +55,8 @@ import net.fabricmc.loom.configuration.providers.minecraft.SignatureFixerApplyVi
 import net.fabricmc.loom.extension.LoomFiles;
 import net.fabricmc.loom.util.SidedClassVisitor;
 import net.fabricmc.loom.util.TinyRemapperHelper;
+import net.fabricmc.loom.util.cache.AtomicFiles;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.tinyremapper.OutputConsumerPath;
 import net.fabricmc.tinyremapper.TinyRemapper;
 
@@ -101,15 +102,26 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 			throw new IllegalStateException("No remapped jars provided");
 		}
 
+		// 无锁快路径：shouldRefreshOutputs 仅做存在性检查，缓存就绪时不会进入下面的锁
 		if (shouldRefreshOutputs(context)) {
-			try {
-				remapInputs(remappedJars, context.configContext());
-				createBackupJars(minecraftJars);
-			} catch (Throwable t) {
-				cleanOutputs(remappedJars);
+			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
+			final Path lockRoot = extension.getFiles().getCacheLocks().toPath();
 
-				throw new RuntimeException("Failed to remap minecraft", t);
-			}
+			cacheService.runExclusive(lockRoot, cacheKey(), LoomCacheService.defaultTimeout(), () -> {
+				// 锁内二次确认：可能已被其它进程/线程在我们等锁期间生产完成
+				if (shouldRefreshOutputs(context)) {
+					try {
+						remapInputs(remappedJars, context.configContext());
+						createBackupJars(minecraftJars);
+					} catch (Throwable t) {
+						cleanOutputs(remappedJars);
+
+						throw new RuntimeException("Failed to remap minecraft", t);
+					}
+				}
+
+				return null;
+			});
 		}
 
 		if (context.applyDependencies()) {
@@ -124,6 +136,12 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		}
 
 		return minecraftJars;
+	}
+
+	// 跨进程互斥 key：targetNamespace 区分 provider 实例（intermediary/named），getVersion 含 mcVersion+mappingsIdentifier，二者已唯一标识这批产物。
+	// protected：legacy-merged 等覆写 provide() 的子类需要复用同一把锁保护其 GLOBAL 合并产物
+	protected String cacheKey() {
+		return getTargetNamespace().name() + ":" + getVersion();
 	}
 
 	// Create two copies of the remapped jar, the backup jar is used as the input of genSources
@@ -142,7 +160,8 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		}
 
 		for (MinecraftJar minecraftJar : minecraftJars) {
-			Files.copy(minecraftJar.getPath(), getBackupJarPath(minecraftJar), StandardCopyOption.REPLACE_EXISTING);
+			// backup 是「最后产生」的就绪标志，必须原子落位，避免跨进程读到半写的 backup 误判就绪
+			AtomicFiles.copy(minecraftJar.getPath(), getBackupJarPath(minecraftJar));
 		}
 	}
 
@@ -258,8 +277,8 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 	protected void remapJar(RemappedJars remappedJars, ConfigContext configContext) throws IOException {
 		if (extension.disableObfuscation()) {
 			// TODO debof - can we skip this?
-			Files.createDirectories(remappedJars.outputJarPath().getParent());
-			Files.copy(remappedJars.inputJar(), remappedJars.outputJarPath(), StandardCopyOption.REPLACE_EXISTING);
+			// 原子复制：避免跨进程读到半写的输出 jar 误判就绪
+			AtomicFiles.copy(remappedJars.inputJar(), remappedJars.outputJarPath());
 			getMavenHelper(remappedJars.type()).savePom();
 			return;
 		}
@@ -284,15 +303,20 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 			configureRemapper(remappedJars, builder);
 		});
 
-		try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(remappedJars.outputJarPath()).build()) {
-			outputConsumer.addNonClassFiles(remappedJars.inputJar());
+		// 原子发布：remapper 先写到同目录唯一临时 jar，完整后再原子 move 到 outputJarPath
+		try {
+			AtomicFiles.publish(remappedJars.outputJarPath(), tmpJar -> {
+				try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(tmpJar).build()) {
+					outputConsumer.addNonClassFiles(remappedJars.inputJar());
 
-			for (Path path : remappedJars.remapClasspath()) {
-				remapper.readClassPath(path);
-			}
+					for (Path path : remappedJars.remapClasspath()) {
+						remapper.readClassPath(path);
+					}
 
-			remapper.readInputs(remappedJars.inputJar());
-			remapper.apply(outputConsumer);
+					remapper.readInputs(remappedJars.inputJar());
+					remapper.apply(outputConsumer);
+				}
+			});
 		} catch (Exception e) {
 			throw new RuntimeException("Failed to remap JAR " + remappedJars.inputJar() + " with mappings from " + mappingConfiguration.tinyMappings, e);
 		} finally {

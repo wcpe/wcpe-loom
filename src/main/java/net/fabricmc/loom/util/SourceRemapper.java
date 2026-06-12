@@ -47,6 +47,7 @@ import net.fabricmc.loom.api.RemapConfigurationSettings;
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration;
 import net.fabricmc.loom.task.service.LorenzMappingService;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.service.ServiceFactory;
 
 public class SourceRemapper {
@@ -86,22 +87,39 @@ public class SourceRemapper {
 	}
 
 	public void remapAll() {
+		// 无待办则直接返回：暖缓存下没有任何源码需要重映射（scheduleRemapSources 受 isCacheInvalid 守卫），
+		// 因此根本不会走到下面取锁——同一 checkout 的并发构建在暖缓存下互不阻塞。
 		if (remapTasks.isEmpty()) {
 			return;
 		}
 
-		project.getLogger().lifecycle(":remapping sources");
+		// 写 LOCAL 共享 remapped_mods 源码缓存：用与二进制 mod 重映射相同的 mod-deps 锁串行化，
+		// 避免同一 checkout 的多个并发构建（如同时跑 client/server）踩踏。
+		final LoomGradleExtension extension = LoomGradleExtension.get(project);
+		final Path lockRoot = extension.getFiles().getCacheLocks().toPath();
+		final String lockKey = LoomCacheService.modDepsKey(project.getRootDir(), extension.getMappingConfiguration().mappingsIdentifier());
 
-		ProgressLoggerFactory progressLoggerFactory = ((ProjectInternal) project).getServices().get(ProgressLoggerFactory.class);
-		ProgressLogger progressLogger = progressLoggerFactory.newOperation(SourceRemapper.class.getName());
-		progressLogger.start("Remapping dependency sources", "sources");
+		try {
+			LoomCacheService.get(project).get().runExclusive(lockRoot, lockKey, LoomCacheService.defaultTimeout(), () -> {
+				project.getLogger().lifecycle(":remapping sources");
 
-		remapTasks.forEach(consumer -> consumer.accept(progressLogger));
+				ProgressLoggerFactory progressLoggerFactory = ((ProjectInternal) project).getServices().get(ProgressLoggerFactory.class);
+				ProgressLogger progressLogger = progressLoggerFactory.newOperation(SourceRemapper.class.getName());
+				progressLogger.start("Remapping dependency sources", "sources");
 
-		progressLogger.completed();
+				remapTasks.forEach(consumer -> consumer.accept(progressLogger));
 
-		// TODO: FIXME - WORKAROUND https://github.com/FabricMC/fabric-loom/issues/45
-		System.gc();
+				progressLogger.completed();
+
+				// TODO: FIXME - WORKAROUND https://github.com/FabricMC/fabric-loom/issues/45
+				System.gc();
+				return null;
+			});
+		} catch (RuntimeException e) {
+			throw e;
+		} catch (Exception e) {
+			throw new RuntimeException("Failed to remap dependency sources", e);
+		}
 	}
 
 	private void remapSourcesInner(File source, File destination) throws Exception {

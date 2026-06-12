@@ -29,6 +29,7 @@ import java.io.File;
 import org.gradle.api.Project;
 
 import net.fabricmc.loom.LoomGradleExtension;
+import net.fabricmc.loom.util.Constants;
 
 public abstract class LoomFilesBaseImpl implements LoomFiles {
 	protected abstract File getGradleUserHomeDir();
@@ -109,5 +110,10 @@ public abstract class LoomFilesBaseImpl implements LoomFiles {
 	@Override
 	public File getDecompileCache(String version) {
 		return new File(getUserCache(), "decompile/" + version + ".zip");
+	}
+
+	@Override
+	public File getCacheLocks() {
+		return createFile(getUserCache(), Constants.Cache.LOCKS_DIR);
 	}
 }
