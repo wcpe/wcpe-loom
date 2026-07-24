@@ -34,6 +34,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -47,7 +48,7 @@ import org.gradle.api.file.FileCollection;
 import org.gradle.api.provider.ListProperty;
 import org.gradle.api.provider.MapProperty;
 import org.gradle.api.provider.Property;
-import org.gradle.api.provider.Provider;
+import org.gradle.api.provider.ProviderFactory;
 import org.gradle.api.specs.Spec;
 import org.gradle.api.tasks.Input;
 import org.gradle.api.tasks.InputFiles;
@@ -75,6 +76,9 @@ public abstract class AbstractRunTask extends JavaExec {
 	@Inject
 	protected abstract ExecOperations getExecOperations();
 
+	@Inject
+	protected abstract ProviderFactory getProviders();
+
 	@Input
 	protected abstract Property<String> getInternalRunDir();
 	@Input
@@ -85,6 +89,9 @@ public abstract class AbstractRunTask extends JavaExec {
 	protected abstract Property<Boolean> getUseArgFile();
 	@Input
 	protected abstract Property<String> getProjectDir();
+	@Input
+	// Gradle 用户主目录绝对路径，供 canPathBeASCIIEncoded 在执行期读取（避免执行期访问 Project）
+	protected abstract Property<String> getGradleUserHomeDir();
 	@Input
 	// We use a string here, as it's technically an output, but we don't want to cache runs of this task by default.
 	protected abstract Property<String> getArgFilePath();
@@ -124,18 +131,25 @@ public abstract class AbstractRunTask extends JavaExec {
 		super();
 		setGroup(Constants.TaskGroup.FABRIC);
 
-		final Provider<RunConfig> config = getProject().provider(() -> configProvider.apply(getProject()));
+		// 配置期立即物化 RunConfig，提取纯数据快照，断开对 Project/RunConfigSettings/SourceSet 的延迟引用，
+		// 使本任务可被配置缓存序列化（原实现用 provider 延迟持有 settings→Project，CC 不可序列化）。
+		final RunConfig runConfig = configProvider.apply(getProject());
+		final List<String> programArgsSnapshot = List.copyOf(runConfig.programArgs);
+		final String mainClassSnapshot = runConfig.mainClass;
+		final String runDirSnapshot = runConfig.runDir;
+		final Map<String, Object> envVarsSnapshot = Map.copyOf(runConfig.environmentVariables);
+		final String environmentSnapshot = runConfig.environment;
+		final List<String> excludedLibraryPathsSnapshot = runConfig.getExcludedLibraryPaths(getProject());
+		final String configNameSnapshot = runConfig.configName;
+		final String nameSnapshot = runConfig.name;
 
-		getInternalClasspath().from(config.map(runConfig -> runConfig.sourceSet.getRuntimeClasspath()
-				.filter(new LibraryFilter(
-						config.get().getExcludedLibraryPaths(getProject()),
-						config.get().configName)
-				)));
+		getInternalClasspath().from(runConfig.sourceSet.getRuntimeClasspath()
+				.filter(new LibraryFilter(excludedLibraryPathsSnapshot, configNameSnapshot)));
 
 		getArgumentProviders().add(new CommandLineArgumentProvider() {
 			@Override
 			public Iterable<String> asArguments() {
-				return config.get().programArgs;
+				return programArgsSnapshot;
 			}
 		});
 		getArgumentProviders().add(new CommandLineArgumentProvider() {
@@ -148,21 +162,22 @@ public abstract class AbstractRunTask extends JavaExec {
 				return List.of();
 			}
 		});
-		getMainClass().set(config.map(runConfig -> runConfig.mainClass));
-		getJvmArguments().addAll(getProject().provider(this::getGameJvmArgs));
+		getMainClass().set(mainClassSnapshot);
+		getJvmArguments().addAll(getProviders().provider(this::getGameJvmArgs));
 
-		getInternalRunDir().set(config.map(runConfig -> runConfig.runDir));
-		getInternalEnvironmentVars().set(config.map(runConfig -> runConfig.environmentVariables));
-		getInternalJvmArgs().set(config.map(runConfig -> runConfig.vmArgs));
+		getInternalRunDir().set(runDirSnapshot);
+		getInternalEnvironmentVars().set(envVarsSnapshot);
+		getInternalJvmArgs().set(List.copyOf(runConfig.vmArgs));
 		getUseArgFile().set(getProject().provider(this::canUseArgFile));
 		getProjectDir().set(getProject().getProjectDir().getAbsolutePath());
+		getGradleUserHomeDir().set(getProject().getGradle().getGradleUserHomeDir().getAbsolutePath());
 
 		// Set up useXvfb: convention is CI + Linux + client run config + xvfb exists
 		getUseXvfb().convention(
-				getProject().getProviders().environmentVariable("CI")
+				getProviders().environmentVariable("CI")
 						.map(value -> Platform.CURRENT.getOperatingSystem().isLinux())
-						.zip(config, (enabled, runConfig) -> enabled && runConfig.environment.equals("client"))
-						.flatMap(enabled -> enabled ? XVFBExistsValueSource.exists(getProject()) : getProject().getProviders().provider(() -> false))
+						.map(enabled -> enabled && environmentSnapshot.equals("client"))
+						.flatMap(enabled -> enabled ? XVFBExistsValueSource.exists(getProviders()) : getProviders().provider(() -> false))
 						.orElse(false)
 		);
 
@@ -171,7 +186,7 @@ public abstract class AbstractRunTask extends JavaExec {
 		getArgFilePath().set(argFile.getAbsolutePath());
 
 		getModClassesOptions().set(ForgeModClassesService.createOptions(getProject()));
-		getRunConfigName().set(config.map(runConfig -> runConfig.name));
+		getRunConfigName().set(nameSnapshot);
 	}
 
 	private boolean canUseArgFile() {
@@ -187,8 +202,8 @@ public abstract class AbstractRunTask extends JavaExec {
 	private boolean canPathBeASCIIEncoded() {
 		CharsetEncoder asciiEncoder = StandardCharsets.US_ASCII.newEncoder();
 
-		return asciiEncoder.canEncode(getProject().getProjectDir().getAbsolutePath())
-				&& asciiEncoder.canEncode(getProject().getGradle().getGradleUserHomeDir().getAbsolutePath());
+		return asciiEncoder.canEncode(getProjectDir().get())
+				&& asciiEncoder.canEncode(getGradleUserHomeDir().get());
 	}
 
 	@Override
