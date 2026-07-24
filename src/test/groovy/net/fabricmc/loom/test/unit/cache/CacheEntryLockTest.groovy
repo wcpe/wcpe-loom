@@ -43,7 +43,7 @@ class CacheEntryLockTest extends Specification {
 
 	def "单线程 withLock 能正常返回 action 结果"() {
 		when:
-		def result = CacheEntryLock.withLock(lockRoot, "key", Duration.ofSeconds(5), { -> "ok" })
+		def result = CacheEntryLock.withLock(lockRoot, "key", Duration.ofSeconds(5)) { -> "ok" }
 
 		then:
 		result == "ok"
@@ -61,10 +61,11 @@ class CacheEntryLockTest extends Specification {
 
 		when:
 		def futures = (1..threads).collect {
-			pool.submit({
+			pool.submit {
 				ready.countDown()
 				start.await()
-				CacheEntryLock.withLock(lockRoot, "shared-key", Duration.ofSeconds(30), { ->
+				CacheEntryLock.withLock(lockRoot, "shared-key", Duration.ofSeconds(30)) {
+					->
 					// 进入临界区：若发现已有线程在内则记录冲突
 					if (!inside.compareAndSet(false, true)) {
 						conflicts.incrementAndGet()
@@ -76,8 +77,8 @@ class CacheEntryLockTest extends Specification {
 					counter.set(v + 1)
 					inside.set(false)
 					return null
-				})
-			})
+				}
+			}
 		}
 		ready.await()
 		start.countDown()

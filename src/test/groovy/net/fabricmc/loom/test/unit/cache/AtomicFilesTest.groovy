@@ -69,11 +69,11 @@ class AtomicFilesTest extends Specification {
 		def target = tempDir.resolve("out.jar")
 
 		when:
-		AtomicFiles.publish(target, { tmp ->
+		AtomicFiles.publish(target) { tmp ->
 			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(tmp, true)) {
 				Files.writeString(fs.getRoot().resolve("hello.txt"), "hi", StandardCharsets.UTF_8)
 			}
-		})
+		}
 
 		then:
 		Files.exists(target)
@@ -88,9 +88,9 @@ class AtomicFilesTest extends Specification {
 		def target = tempDir.resolve("out.txt")
 
 		when:
-		AtomicFiles.publish(target, { tmp ->
+		AtomicFiles.publish(target) { tmp ->
 			Files.writeString(tmp, "完整内容", StandardCharsets.UTF_8)
-		})
+		}
 
 		then:
 		Files.exists(target)
@@ -102,9 +102,9 @@ class AtomicFilesTest extends Specification {
 		def target = tempDir.resolve("nested/dir/out.txt")
 
 		when:
-		AtomicFiles.publish(target, { tmp ->
+		AtomicFiles.publish(target) { tmp ->
 			Files.writeString(tmp, "数据", StandardCharsets.UTF_8)
-		})
+		}
 
 		then:
 		Files.readString(target, StandardCharsets.UTF_8) == "数据"
@@ -115,10 +115,10 @@ class AtomicFilesTest extends Specification {
 		def target = tempDir.resolve("out.txt")
 
 		when:
-		AtomicFiles.publish(target, { tmp ->
+		AtomicFiles.publish(target) { tmp ->
 			Files.writeString(tmp, "半成品", StandardCharsets.UTF_8)
 			throw new IOException("模拟写入中途失败")
-		})
+		}
 
 		then:
 		thrown(IOException)
@@ -134,10 +134,10 @@ class AtomicFilesTest extends Specification {
 		Files.writeString(target, "旧内容", StandardCharsets.UTF_8)
 
 		when:
-		AtomicFiles.publish(target, { tmp ->
+		AtomicFiles.publish(target) { tmp ->
 			Files.writeString(tmp, "新的半成品", StandardCharsets.UTF_8)
 			throw new IOException("模拟写入中途失败")
-		})
+		}
 
 		then:
 		thrown(IOException)
@@ -183,9 +183,9 @@ class AtomicFilesTest extends Specification {
 		Files.writeString(target, "旧内容", StandardCharsets.UTF_8)
 
 		when:
-		AtomicFiles.publish(target, { tmp ->
+		AtomicFiles.publish(target) { tmp ->
 			Files.writeString(tmp, "新内容", StandardCharsets.UTF_8)
-		})
+		}
 
 		then:
 		Files.readString(target, StandardCharsets.UTF_8) == "新内容"
