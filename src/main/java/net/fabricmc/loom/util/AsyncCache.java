@@ -29,14 +29,38 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 public class AsyncCache<T> {
-	private static final Executor EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
+	// 使用平台线程池而非虚拟线程池。
+	// 根因：tiny-remapper 的 FileSystemReference.open()/close() 使用 synchronized(openFsMap) 全局锁，
+	// 虚拟线程进入 synchronized 块时会 pin 住 carrier 线程。并行配置下多个子项目同时解析 mod jar，
+	// 大量虚拟线程争抢 openFsMap 锁导致 carrier 线程池耗尽（pinning），后续虚拟线程无法调度，
+	// 配置线程在 CompletableFuture.join() 上永久阻塞，Gradle daemon 失去响应后被客户端杀死（进程消失）。
+	// 平台线程进入 synchronized 块时不会 pin carrier，仅阻塞自身，其他线程仍可正常运行。
+	private static final Executor EXECUTOR = createExecutor();
+
+	private static Executor createExecutor() {
+		final int poolSize = Math.max(4, Runtime.getRuntime().availableProcessors());
+		// 使用有界队列 + CallerRuns 策略：队列满时由调用线程直接执行，提供背压并避免无界提交。
+		return new ThreadPoolExecutor(
+				poolSize, poolSize,
+				60L, TimeUnit.SECONDS,
+				new ArrayBlockingQueue<>(128),
+				r -> {
+					Thread t = new Thread(r, "loom-async-cache");
+					t.setDaemon(true);
+					return t;
+				},
+				new ThreadPoolExecutor.CallerRunsPolicy()
+		);
+	}
 	private final Map<Object, CompletableFuture<T>> cache = new ConcurrentHashMap<>();
 
 	public CompletableFuture<T> get(Object cacheKey, Supplier<T> supplier) {

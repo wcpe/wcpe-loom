@@ -47,6 +47,17 @@ public abstract class LoomFilesBaseImpl implements LoomFiles {
 
 	@Override
 	public File getUserCache() {
+		// 支持通过系统属性 fabric.loom.cache.dir 覆盖默认缓存目录，
+		// 实现多项目隔离：不同项目可指定各自独立的 Loom 缓存路径，
+		// 避免多项目同时构建时共享全局缓存产生锁竞争。
+		// 用法：在 gradle.properties 中设置 systemProp.fabric.loom.cache.dir=/path/to/loom-cache
+		// 默认目录保持 essential-loom，与原版 Essential Loom 共享缓存协议兼容（同目录同锁语义）。
+		String customCacheDir = System.getProperty("fabric.loom.cache.dir");
+		if (customCacheDir != null && !customCacheDir.isEmpty()) {
+			File cacheDir = new File(customCacheDir);
+			cacheDir.mkdirs();
+			return cacheDir;
+		}
 		return createFile(getGradleUserHomeDir(), "caches" + File.separator + "essential-loom");
 	}
 
