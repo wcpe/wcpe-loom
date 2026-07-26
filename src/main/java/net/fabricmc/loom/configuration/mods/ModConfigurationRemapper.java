@@ -281,10 +281,11 @@ public class ModConfigurationRemapper {
 	private record MetadataCacheKey(Path path, ArtifactMetadata.MixinRemapType defaultMixinRemapType) { }
 
 	/**
-	 * 返回附着在根项目上的跨子项目共享 {@link AsyncCache}.
+	 * Returns the cross-subproject shared {@link AsyncCache} attached to the root project.
 	 *
-	 * <p>缓存仅存活于根项目实例生命周期内（每次构建都会创建新的根项目），因此不会跨 daemon
-	 * 构建泄漏；多个子项目解析同一个 mod jar 时可复用同一个 future。
+	 * <p>The cache lives for the lifetime of the root project instance (a new root project is
+	 * created for each build, so it never leaks across daemon builds), letting multiple
+	 * subprojects resolving the same mod jar reuse the same future.
 	 */
 	private static AsyncCache<ArtifactMetadata> getSharedMetaCache(Project project) {
 		final Project root = project.getRootProject();

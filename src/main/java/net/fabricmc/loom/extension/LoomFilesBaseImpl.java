@@ -53,6 +53,7 @@ public abstract class LoomFilesBaseImpl implements LoomFiles {
 		// 用法：在 gradle.properties 中设置 systemProp.fabric.loom.cache.dir=/path/to/loom-cache
 		// 默认目录保持 essential-loom，与原版 Essential Loom 共享缓存协议兼容（同目录同锁语义）。
 		String customCacheDir = System.getProperty("fabric.loom.cache.dir");
+
 		if (customCacheDir != null && !customCacheDir.isEmpty()) {
 			File cacheDir = new File(customCacheDir);
 			cacheDir.mkdirs();
