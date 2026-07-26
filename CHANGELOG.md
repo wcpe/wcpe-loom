@@ -11,6 +11,10 @@
 
 - **LoomFilesBaseImpl 支持自定义缓存目录**：通过 `fabric.loom.cache.dir` 系统属性覆盖默认 `~/.gradle/caches/fabric-loom`，实现多项目隔离，避免多项目同时构建时的锁竞争。
 
+### 修复（CI）
+
+- **Checkstyle 违规**：修复上述改动引入的 7 处 Checkstyle 违规（RegexpMultiline 空行、WhitespaceAround record 空体、JavadocStyle/JavadocParagraph 中文 javadoc 改英文以匹配规则）。
+
 ## 1.16-wcpe-1
 
 基于上游 fabric-loom dev/1.16（v1.16.3）的 WCPE 定制版本。
