@@ -53,11 +53,13 @@ public abstract class LoomFilesBaseImpl implements LoomFiles {
 		// 避免多项目同时构建时共享 ~/.gradle/caches/fabric-loom 产生锁竞争。
 		// 用法：在 gradle.properties 中设置 systemProp.fabric.loom.cache.dir=/path/to/loom-cache
 		String customCacheDir = System.getProperty("fabric.loom.cache.dir");
+
 		if (customCacheDir != null && !customCacheDir.isEmpty()) {
 			File cacheDir = new File(customCacheDir);
 			cacheDir.mkdirs();
 			return cacheDir;
 		}
+
 		return createFile(getGradleUserHomeDir(), "caches" + File.separator + "fabric-loom");
 	}
 

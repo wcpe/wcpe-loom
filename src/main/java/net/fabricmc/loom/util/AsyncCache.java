@@ -61,6 +61,7 @@ public class AsyncCache<T> {
 				new ThreadPoolExecutor.CallerRunsPolicy()
 		);
 	}
+
 	private final Map<Object, CompletableFuture<T>> cache = new ConcurrentHashMap<>();
 
 	public CompletableFuture<T> get(Object cacheKey, Supplier<T> supplier) {
