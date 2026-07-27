@@ -143,10 +143,10 @@ public abstract class CompileConfiguration implements Runnable {
 	}
 
 	private void deferDependencyHandling(LoomGradleExtension extension, boolean previousRefreshDeps) {
-		getProject().getGradle().projectsEvaluated(gradle -> {
+		getProject().getGradle().getTaskGraph().whenReady(graph -> {
 			((ProjectInternal) getProject()).getOwner().applyToMutableState(project -> {
 				try (var serviceFactory = new ScopedServiceFactory()) {
-					// 复合构建的模块替换会在项目评估阶段完成；在此之后解析才能观察到最终依赖图。
+					// 复合构建的模块替换会在任务图建立前完成；在此之后解析才能观察到最终依赖图。
 					new LoomDependencyManager(getProject(), serviceFactory, extension).handleDependencies();
 				} catch (Exception e) {
 					ExceptionUtil.processException(e, DaemonUtils.Context.fromProject(getProject()));
@@ -209,17 +209,13 @@ public abstract class CompileConfiguration implements Runnable {
 	}
 
 	private void provideMappedMinecraftJars(Project project, LoomGradleExtension extension, IntermediaryMinecraftProvider<?> intermediaryMinecraftProvider, NamedMinecraftProvider<?> namedMinecraftProvider, AbstractMappedMinecraftProvider.ProvideContext provideContext) throws Exception {
-		if (!provideContext.refreshOutputs()) {
-			provideMappedMinecraftJars(intermediaryMinecraftProvider, namedMinecraftProvider, provideContext);
-			return;
-		}
-
-		final String key = "minecraft-provision:" + extension.getMinecraftProvider().minecraftVersion() + ":" + extension.getMappingConfiguration().mappingsIdentifier();
+		final String mappingsIdentifier = extension.disableObfuscation() ? "deobf" : extension.getMappingConfiguration().mappingsIdentifier();
+		final String key = "minecraft-provision:" + extension.getMinecraftProvider().minecraftVersion() + ":" + mappingsIdentifier;
 		final LoomCacheService cacheService = LoomCacheService.get(project).get();
 		final var lockRoot = extension.getFiles().getCacheLocks().toPath();
 
 		cacheService.runExclusive(lockRoot, key, LoomCacheService.defaultTimeout(), () -> {
-			// 刷新会强制重建 intermediary；将其与 named 处理作为同一事务，避免其他项目删除正在被读取的中间 jar。
+			// 输出检查与重建必须同属一个事务；否则另一项目会在本项目读取 intermediary 时删除并重建它。
 			provideMappedMinecraftJars(intermediaryMinecraftProvider, namedMinecraftProvider, provideContext);
 			return null;
 		});
