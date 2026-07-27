@@ -117,7 +117,10 @@ public class ModConfigurationRemapper {
 
 				final Configuration target = RemapConfigurations.getOrCreateCollectorConfiguration(project, entry, runtime);
 				// We copy the source with the desired usage type to get only the runtime or api jars, not both.
+				// We copy the source with the desired usage type to get only the runtime or api jars, not both.
+				// 复制时保留全局依赖替换规则，确保复合构建下本地模块替换不回退解析远端坐标。
 				final Configuration sourceCopy = entry.getSourceConfiguration().get().copyRecursive();
+				sourceCopy.getResolutionStrategy().getUseGlobalDependencySubstitutionRules().set(true);
 				final Usage usage = project.getObjects().named(Usage.class, runtime ? Usage.JAVA_RUNTIME : Usage.JAVA_API);
 				sourceCopy.attributes(attributes -> attributes.attribute(Usage.USAGE_ATTRIBUTE, usage));
 				sourceCopy.setCanBeConsumed(false);
