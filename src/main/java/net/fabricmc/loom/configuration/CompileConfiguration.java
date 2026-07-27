@@ -36,6 +36,7 @@ import javax.inject.Inject;
 import org.gradle.api.Action;
 import org.gradle.api.Project;
 import org.gradle.api.Task;
+import org.gradle.api.internal.project.ProjectInternal;
 import org.gradle.api.plugins.JavaPlugin;
 import org.gradle.api.provider.Provider;
 import org.gradle.api.tasks.AbstractCopyTask;
@@ -142,15 +143,17 @@ public abstract class CompileConfiguration implements Runnable {
 
 	private void deferDependencyHandling(LoomGradleExtension extension, boolean previousRefreshDeps) {
 		getProject().getGradle().projectsEvaluated(gradle -> {
-			try (var serviceFactory = new ScopedServiceFactory()) {
-				// 复合构建的模块替换会在项目评估阶段完成；在此之后解析才能观察到最终依赖图。
-				new LoomDependencyManager(getProject(), serviceFactory, extension).handleDependencies();
-			} catch (Exception e) {
-				ExceptionUtil.processException(e, DaemonUtils.Context.fromProject(getProject()));
-				throw ExceptionUtil.createDescriptiveWrapper(RuntimeException::new, "Failed to process mod dependencies", e);
-			} finally {
-				extension.setRefreshDeps(previousRefreshDeps);
-			}
+			((ProjectInternal) getProject()).getOwner().applyToMutableState(project -> {
+				try (var serviceFactory = new ScopedServiceFactory()) {
+					// 复合构建的模块替换会在项目评估阶段完成；在此之后解析才能观察到最终依赖图。
+					new LoomDependencyManager(getProject(), serviceFactory, extension).handleDependencies();
+				} catch (Exception e) {
+					ExceptionUtil.processException(e, DaemonUtils.Context.fromProject(getProject()));
+					throw ExceptionUtil.createDescriptiveWrapper(RuntimeException::new, "Failed to process mod dependencies", e);
+				} finally {
+					extension.setRefreshDeps(previousRefreshDeps);
+				}
+			});
 		});
 	}
 
