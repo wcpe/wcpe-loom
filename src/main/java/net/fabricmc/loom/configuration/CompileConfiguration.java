@@ -69,6 +69,7 @@ import net.fabricmc.loom.configuration.providers.minecraft.mapped.NamedMinecraft
 import net.fabricmc.loom.extension.MixinExtension;
 import net.fabricmc.loom.task.service.ClasspathGroupService;
 import net.fabricmc.loom.util.ExceptionUtil;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.gradle.GradleUtils;
 import net.fabricmc.loom.util.gradle.SourceSetHelper;
 import net.fabricmc.loom.util.gradle.daemon.DaemonUtils;
@@ -201,10 +202,34 @@ public abstract class CompileConfiguration implements Runnable {
 
 		if (intermediaryMinecraftProvider != null) {
 			extension.setIntermediaryMinecraftProvider(intermediaryMinecraftProvider);
-			intermediaryMinecraftProvider.provide(provideContext);
 		}
 
 		extension.setNamedMinecraftProvider(namedMinecraftProvider);
+		provideMappedMinecraftJars(project, extension, intermediaryMinecraftProvider, namedMinecraftProvider, provideContext);
+	}
+
+	private void provideMappedMinecraftJars(Project project, LoomGradleExtension extension, IntermediaryMinecraftProvider<?> intermediaryMinecraftProvider, NamedMinecraftProvider<?> namedMinecraftProvider, AbstractMappedMinecraftProvider.ProvideContext provideContext) throws Exception {
+		if (!provideContext.refreshOutputs()) {
+			provideMappedMinecraftJars(intermediaryMinecraftProvider, namedMinecraftProvider, provideContext);
+			return;
+		}
+
+		final String key = "minecraft-provision:" + extension.getMinecraftProvider().minecraftVersion() + ":" + extension.getMappingConfiguration().mappingsIdentifier();
+		final LoomCacheService cacheService = LoomCacheService.get(project).get();
+		final var lockRoot = extension.getFiles().getCacheLocks().toPath();
+
+		cacheService.runExclusive(lockRoot, key, LoomCacheService.defaultTimeout(), () -> {
+			// 刷新会强制重建 intermediary；将其与 named 处理作为同一事务，避免其他项目删除正在被读取的中间 jar。
+			provideMappedMinecraftJars(intermediaryMinecraftProvider, namedMinecraftProvider, provideContext);
+			return null;
+		});
+	}
+
+	private void provideMappedMinecraftJars(IntermediaryMinecraftProvider<?> intermediaryMinecraftProvider, NamedMinecraftProvider<?> namedMinecraftProvider, AbstractMappedMinecraftProvider.ProvideContext provideContext) throws Exception {
+		if (intermediaryMinecraftProvider != null) {
+			intermediaryMinecraftProvider.provide(provideContext);
+		}
+
 		namedMinecraftProvider.provide(provideContext);
 	}
 
