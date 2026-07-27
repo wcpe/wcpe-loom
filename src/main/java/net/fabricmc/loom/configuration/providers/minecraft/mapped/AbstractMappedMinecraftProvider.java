@@ -123,8 +123,6 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 						remapInputs(remappedJars, context.configContext());
 						createBackupJars(minecraftJars);
 					} catch (Throwable t) {
-						cleanOutputs(remappedJars);
-
 						throw new RuntimeException("Failed to remap minecraft", t);
 					}
 				}
@@ -271,8 +269,6 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 	}
 
 	private void remapInputs(List<RemappedJars> remappedJars, ConfigContext configContext) throws IOException {
-		cleanOutputs(remappedJars);
-
 		for (RemappedJars remappedJar : remappedJars) {
 			remapJar(remappedJar, configContext);
 		}
@@ -290,8 +286,6 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		final MappingConfiguration mappingConfiguration = extension.getMappingConfiguration();
 		final String fromM = remappedJars.sourceNamespace().toString();
 		final String toM = getTargetNamespace().toString();
-
-		Files.deleteIfExists(remappedJars.outputJarPath());
 
 		final Set<String> classNames = extension.isForgeLike() ? InnerClassRemapper.readClassNames(remappedJars.inputJar()) : Set.of();
 		final AnnotationsData remappedAnnotations = AnnotationsData.getRemappedAnnotations(getTargetNamespace(), mappingConfiguration, getProject(), configContext.serviceFactory(), toM);
@@ -359,13 +353,6 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		if (outputJar.includesClient()) {
 			assert !outputJar.includesServer();
 			tinyRemapperBuilder.extraPostApplyVisitor(SidedClassVisitor.CLIENT);
-		}
-	}
-
-	private void cleanOutputs(List<RemappedJars> remappedJars) throws IOException {
-		for (RemappedJars remappedJar : remappedJars) {
-			Files.deleteIfExists(remappedJar.outputJarPath());
-			Files.deleteIfExists(getBackupJarPath(remappedJar.outputJar()));
 		}
 	}
 
