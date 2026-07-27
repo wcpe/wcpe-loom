@@ -120,6 +120,7 @@ public class ModConfigurationRemapper {
 				// We copy the source with the desired usage type to get only the runtime or api jars, not both.
 				Provider<? extends Configuration> sourceCopy = entry.getSourceConfiguration().map(source -> {
 					Configuration copy = source.copyRecursive();
+					copy.getResolutionStrategy().getUseGlobalDependencySubstitutionRules().set(true);
 					Usage usage = project.getObjects().named(Usage.class, runtime ? Usage.JAVA_RUNTIME : Usage.JAVA_API);
 					copy.attributes(attributes -> attributes.attribute(Usage.USAGE_ATTRIBUTE, usage));
 					return copy;
