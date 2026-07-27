@@ -103,15 +103,7 @@ public abstract class CompileConfiguration implements Runnable {
 
 			final boolean previousRefreshDeps = extension.refreshDeps();
 
-			try {
-				// 各 provider 已自带 per-key 跨进程文件锁，此处不再使用旧的全局缓存锁。
-				setupMinecraft(configContext);
-			} catch (Exception e) {
-				ExceptionUtil.processException(e, DaemonUtils.Context.fromProject(getProject()));
-				throw ExceptionUtil.createDescriptiveWrapper(RuntimeException::new, "Failed to setup Minecraft", e);
-			}
-
-			deferDependencyHandling(extension, previousRefreshDeps);
+			deferMinecraftSetupAndDependencyHandling(extension, previousRefreshDeps);
 
 			MixinExtension mixin = LoomGradleExtension.get(getProject()).getMixin();
 
@@ -142,15 +134,29 @@ public abstract class CompileConfiguration implements Runnable {
 		}
 	}
 
-	private void deferDependencyHandling(LoomGradleExtension extension, boolean previousRefreshDeps) {
+	private void deferMinecraftSetupAndDependencyHandling(LoomGradleExtension extension, boolean previousRefreshDeps) {
 		getProject().getGradle().getTaskGraph().whenReady(graph -> {
 			((ProjectInternal) getProject()).getOwner().applyToMutableState(project -> {
 				try (var serviceFactory = new ScopedServiceFactory()) {
+					final ConfigContext configContext = new ConfigContextImpl(getProject(), serviceFactory, extension);
+
+					try {
+						// Minecraft 处理器会解析运行时依赖，必须在复合构建的模块替换完成后运行。
+						setupMinecraft(configContext);
+					} catch (Exception e) {
+						ExceptionUtil.processException(e, DaemonUtils.Context.fromProject(getProject()));
+						throw ExceptionUtil.createDescriptiveWrapper(RuntimeException::new, "Failed to setup Minecraft", e);
+					}
+
 					// 复合构建的模块替换会在任务图建立前完成；在此之后解析才能观察到最终依赖图。
-					new LoomDependencyManager(getProject(), serviceFactory, extension).handleDependencies();
-				} catch (Exception e) {
-					ExceptionUtil.processException(e, DaemonUtils.Context.fromProject(getProject()));
-					throw ExceptionUtil.createDescriptiveWrapper(RuntimeException::new, "Failed to process mod dependencies", e);
+					try {
+						new LoomDependencyManager(getProject(), serviceFactory, extension).handleDependencies();
+					} catch (Exception e) {
+						ExceptionUtil.processException(e, DaemonUtils.Context.fromProject(getProject()));
+						throw ExceptionUtil.createDescriptiveWrapper(RuntimeException::new, "Failed to process mod dependencies", e);
+					}
+				} catch (IOException e) {
+					throw new UncheckedIOException(e);
 				} finally {
 					extension.setRefreshDeps(previousRefreshDeps);
 				}
