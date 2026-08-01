@@ -291,12 +291,12 @@ public abstract class CompileConfiguration implements Runnable {
 
 		cacheService.runExclusive(lockRoot, key, LoomCacheService.defaultTimeout(), () -> {
 			// 输出检查与重建必须同属一个事务；否则另一项目会在本项目读取 intermediary 时删除并重建它。
-			provideMappedMinecraftJars(intermediaryMinecraftProvider, namedMinecraftProvider, provideContext);
+			provideMappedMinecraftJarsLocked(project, extension, intermediaryMinecraftProvider, namedMinecraftProvider, provideContext);
 			return null;
 		});
 	}
 
-	private void provideMappedMinecraftJars(IntermediaryMinecraftProvider<?> intermediaryMinecraftProvider, NamedMinecraftProvider<?> namedMinecraftProvider, AbstractMappedMinecraftProvider.ProvideContext provideContext) throws Exception {
+	private void provideMappedMinecraftJarsLocked(Project project, LoomGradleExtension extension, IntermediaryMinecraftProvider<?> intermediaryMinecraftProvider, NamedMinecraftProvider<?> namedMinecraftProvider, AbstractMappedMinecraftProvider.ProvideContext provideContext) throws Exception {
 		if (intermediaryMinecraftProvider != null) {
 			intermediaryMinecraftProvider.provide(provideContext);
 		}
@@ -304,13 +304,13 @@ public abstract class CompileConfiguration implements Runnable {
 		namedMinecraftProvider.provide(provideContext);
 
 		if (extension.isForge()) {
-			final SrgMinecraftProvider<?> srgMinecraftProvider = jarConfiguration.createSrgMinecraftProvider(project);
+			final SrgMinecraftProvider<?> srgMinecraftProvider = extension.getMinecraftJarConfiguration().get().createSrgMinecraftProvider(project);
 			extension.setSrgMinecraftProvider(srgMinecraftProvider);
 			srgMinecraftProvider.provide(provideContext);
 		}
 
 		if (extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime()) {
-			final MojangMappedMinecraftProvider<?> mojangMappedMinecraftProvider = jarConfiguration.createMojangMappedMinecraftProvider(project);
+			final MojangMappedMinecraftProvider<?> mojangMappedMinecraftProvider = extension.getMinecraftJarConfiguration().get().createMojangMappedMinecraftProvider(project);
 			extension.setMojangMappedMinecraftProvider(mojangMappedMinecraftProvider);
 			mojangMappedMinecraftProvider.provide(provideContext);
 		}

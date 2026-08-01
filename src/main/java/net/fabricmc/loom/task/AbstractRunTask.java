@@ -48,6 +48,7 @@ import org.gradle.api.file.FileCollection;
 import org.gradle.api.provider.ListProperty;
 import org.gradle.api.provider.MapProperty;
 import org.gradle.api.provider.Property;
+import org.gradle.api.provider.Provider;
 import org.gradle.api.provider.ProviderFactory;
 import org.gradle.api.specs.Spec;
 import org.gradle.api.tasks.Input;
@@ -64,6 +65,7 @@ import org.slf4j.LoggerFactory;
 
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.configuration.ide.RunConfig;
+import net.fabricmc.loom.configuration.ide.RuntimeLibraries;
 import net.fabricmc.loom.task.prod.TracyCapture;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.Platform;
@@ -139,12 +141,21 @@ public abstract class AbstractRunTask extends JavaExec {
 		final String runDirSnapshot = runConfig.runDir;
 		final Map<String, Object> envVarsSnapshot = Map.copyOf(runConfig.environmentVariables);
 		final String environmentSnapshot = runConfig.environment;
-		final List<String> excludedLibraryPathsSnapshot = runConfig.getExcludedLibraryPaths(getProject());
 		final String configNameSnapshot = runConfig.configName;
 		final String nameSnapshot = runConfig.name;
 
-		getInternalClasspath().from(runConfig.sourceSet.getRuntimeClasspath()
-				.filter(new LibraryFilter(excludedLibraryPathsSnapshot, configNameSnapshot)));
+		// excludedLibraryPaths 需要解析 minecraftClientRuntimeLibraries 配置，不能在配置期调用
+		// （Gradle 9 的 unsafe-resolution guard 会拦截跨 included-build 锁边界的配置解析）。
+		// 用 Provider 延迟到执行时解析，仅捕获纯数据快照（environmentSnapshot），保持配置缓存兼容。
+		final Provider<List<String>> excludedLibraryPathsProvider = getProviders().provider(() ->
+				RuntimeLibraries.getExcludedLibraryPaths(getProject(), environmentSnapshot));
+
+		getInternalClasspath().from(getProviders().provider(() ->
+				runConfig.sourceSet.getRuntimeClasspath()
+						.filter(new LibraryFilter(
+								excludedLibraryPathsProvider.get(),
+								configNameSnapshot)
+						)));
 
 		getArgumentProviders().add(new CommandLineArgumentProvider() {
 			@Override
