@@ -44,7 +44,24 @@ import net.fabricmc.loom.util.Constants;
 
 public class RuntimeLibraries {
 	public static List<String> getExcludedLibraryPaths(Project project, RunConfiguration runConfiguration) {
-		if (!runConfiguration.getRuntimeEnvironment().get().toLowerCase(Locale.ROOT).equals("server")) {
+		return getExcludedLibraryPaths(project, runConfiguration.getRuntimeEnvironment().get());
+	}
+
+	/**
+	 * 计算需要从 classpath 中排除的客户端独占库路径. 仅在 server 环境下有意义.
+	 *
+	 * <p>服务端不需要客户端独占的本地库（如 LWJGL），把它们从 classpath 中排除以避免加载失败.
+	 * client 环境直接返回空列表.
+	 *
+	 * <p>此方法会解析 {@code minecraftClientRuntimeLibraries} 配置，只能在任务执行期调用，
+	 * 不得在配置期调用（Gradle 9 的 unsafe-resolution guard 会拦截）.
+	 *
+	 * @param project    Gradle 项目
+	 * @param environment 运行环境标识（"client" / "server"）
+	 * @return 需要排除的库文件绝对路径列表
+	 */
+	public static List<String> getExcludedLibraryPaths(Project project, String environment) {
+		if (!environment.toLowerCase(Locale.ROOT).equals("server")) {
 			return Collections.emptyList();
 		}
 

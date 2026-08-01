@@ -48,6 +48,7 @@ import org.gradle.api.file.FileCollection;
 import org.gradle.api.provider.ListProperty;
 import org.gradle.api.provider.MapProperty;
 import org.gradle.api.provider.Property;
+import org.gradle.api.provider.Provider;
 import org.gradle.api.provider.ProviderFactory;
 import org.gradle.api.specs.Spec;
 import org.gradle.api.tasks.Classpath;
@@ -138,14 +139,23 @@ public abstract class AbstractRunTask extends JavaExec {
 		final Map<String, Object> envVarsSnapshot = Map.copyOf(runConfig.getEnvironmentVars().get());
 		final List<String> jvmArgsSnapshot = List.copyOf(runConfig.getJvmArguments().get());
 		final String environmentSnapshot = runConfig.getRuntimeEnvironment().get();
-		final List<String> excludedLibraryPathsSnapshot = RuntimeLibraries.getExcludedLibraryPaths(getProject(), runConfig);
+		final String sourceSetNameSnapshot = runConfig.getSourceSet().get();
 		final String configNameSnapshot = RunConfigUtils.getDisplayName(runConfig, getProject());
 
-		getInternalClasspath().from(SourceSetHelper.getSourceSetByName(runConfig.getSourceSet().get(), getProject()).getRuntimeClasspath()
-				.filter(new LibraryFilter(
-						excludedLibraryPathsSnapshot,
-						configNameSnapshot)
-				));
+		// excludedLibraryPaths 需要解析 minecraftClientRuntimeLibraries 配置，不能在配置期调用
+		// （Gradle 9 的 unsafe-resolution guard 会拦截跨 included-build 锁边界的配置解析）。
+		// 用 Provider 延迟到执行时解析，仅捕获纯数据快照（environmentSnapshot / sourceSetNameSnapshot /
+		// configNameSnapshot），不捕获 Project 或 RunConfiguration，保持配置缓存兼容。
+		final String environmentSnapshotForFilter = environmentSnapshot;
+		final Provider<List<String>> excludedLibraryPathsProvider = getProviders().provider(() ->
+				RuntimeLibraries.getExcludedLibraryPaths(getProject(), environmentSnapshotForFilter));
+
+		getInternalClasspath().from(getProviders().provider(() ->
+				SourceSetHelper.getSourceSetByName(sourceSetNameSnapshot, getProject()).getRuntimeClasspath()
+						.filter(new LibraryFilter(
+								excludedLibraryPathsProvider.get(),
+								configNameSnapshot)
+						)));
 
 		getArgumentProviders().add(new CommandLineArgumentProvider() {
 			@Override
