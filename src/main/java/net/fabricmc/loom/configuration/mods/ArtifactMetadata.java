@@ -103,13 +103,10 @@ public record ArtifactMetadata(boolean isFabricMod, RemapRequirements remapRequi
 			return;
 		}
 
-		final String[] versionParts = version.split("\\.");
-		final String[] currentVersionParts = currentLoomVersion.split("\\.");
-
 		// Check major and minor version
 		for (int i = 0; i < 2; i++) {
-			final int versionPart = Integer.parseInt(versionParts[i]);
-			final int currentVersionPart = Integer.parseInt(currentVersionParts[i]);
+			final int versionPart = parseVersionPart(version, i);
+			final int currentVersionPart = parseVersionPart(currentLoomVersion, i);
 
 			if (versionPart > currentVersionPart) {
 				throw new IllegalStateException("Mod was built with a newer version of Loom (%s), you are using Loom (%s)".formatted(version, currentLoomVersion));
@@ -118,6 +115,17 @@ public record ArtifactMetadata(boolean isFabricMod, RemapRequirements remapRequi
 				break;
 			}
 		}
+	}
+
+	private static int parseVersionPart(String version, int part) {
+		final String normalizedVersion = version.replaceFirst("-wcpe-(?:0|[1-9]\\d*|dev|ci)$", "");
+		final String[] versionParts = normalizedVersion.split("\\.");
+
+		if (versionParts.length <= part || !versionParts[part].matches("\\d+")) {
+			throw new IllegalStateException("Invalid Loom version: " + version);
+		}
+
+		return Integer.parseInt(versionParts[part]);
 	}
 
 	public boolean shouldRemap() {
