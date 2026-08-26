@@ -1,7 +1,7 @@
 name: CI
 
 # 两种触发：
-# 1. 推送到 main → 构建并发布开发预发布版（1.16-wcpe-dev-latest）
+# 1. 推送到 main → 构建并发布开发预发布版（1.17-wcpe-dev-latest）
 # 2. 打 v 开头的 tag → 构建并发布正式版 + 创建 GitHub Release（带 CHANGELOG）
 on:
   push:
@@ -31,7 +31,8 @@ jobs:
           java-version: 25
           distribution: temurin
 
-      - uses: gradle/actions/wrapper-validation@v6
+      - name: 验证 Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v6
 
       - name: 判断构建类型
         id: meta
@@ -44,7 +45,7 @@ jobs:
             echo "is-prerelease=false" >> "$GITHUB_OUTPUT"
           else
             echo "is-release=false" >> "$GITHUB_OUTPUT"
-            echo "release-version=1.16-wcpe-dev-latest" >> "$GITHUB_OUTPUT"
+            echo "release-version=1.17-wcpe-dev-latest" >> "$GITHUB_OUTPUT"
             echo "is-prerelease=true" >> "$GITHUB_OUTPUT"
           fi
 
