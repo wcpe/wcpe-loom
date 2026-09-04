@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.17-wcpe.1
+
+基于上游 fabric-loom dev/1.17（v1.17.20）的 WCPE 定制版本，补丁队列已整体 rebase 到上游最新。
+
+### 增强
+
+- **跨 daemon 共享缓存锁**：NIO FileLock 替换 PID 文件锁，支持多进程/多 daemon 并发构建共享缓存。
+- **共享缓存改用 per-key 锁与原子发布**：锁下沉到真正写共享缓存的位置（per-key），原子替换发布新产物，同一 checkout 的并发构建互不阻塞。
+- **原子协调 Minecraft 映射产物刷新**：映射产物的检查与生成放入同一缓存事务，避免并发刷新破坏读取；刷新时保留旧完整产物并以原子替换发布。
+
+### 修复
+
+- **AbstractRunTask 兼容 Gradle 配置缓存**：配置期立即物化 RunConfig 提取纯数据快照，断开对 Project 的延迟引用；新增 `@Inject` ProviderFactory 和 gradleUserHomeDir Property；canUseArgFile/canPathBeASCIIEncoded 改读 Property 而非执行期 getProject()。
+- **延迟 AbstractRunTask 的 excludedLibraryPaths 解析以兼容 Gradle 9**：类路径过滤中的排除库路径延迟到执行期解析。
+- **AsyncCache 虚拟线程 pinning 导致 daemon 卡死**：tiny-remapper 内部全局锁会 pin 住虚拟线程 carrier，并行配置下多子项目解析 mod jar 时 carrier 池耗尽、配置线程永久阻塞。改为平台线程池（有界队列 + CallerRuns 背压）。
+- **ModConfigurationRemapper 跨子项目重复解析元数据**：改为挂在根项目上的共享 `AsyncCache`，缓存键为 `jar 路径 + mixin remap 类型`，多子项目复用同一 future。
+- **LoomFilesBaseImpl 支持自定义缓存目录**：`fabric.loom.cache.dir` 系统属性覆盖默认缓存目录，实现多项目隔离。
+- **复合构建兼容性**：延后 Loom 依赖处理与 Minecraft 处理器解析、在任务图就绪后处理依赖、恢复可变项目模型访问/复制配置的复合构建替换/Minecraft 模型初始化时序/评估期依赖装配。
+- **兼容 WCPE Loom 版本后缀**：ArtifactMetadata 识别 WCPE 版本后缀。
+- **按游戏版本隔离分层映射缓存**：LayeredMappingsFactory 按游戏版本隔离缓存，避免跨版本缓存污染。
+- **修复 Checkstyle 违规**：上述改动引入的 Checkstyle 违规（RegexpMultiline 空行、WhitespaceAround record 空体、JavadocStyle 中文 javadoc 改英文）。
+
+### CI/CD
+
+- 改造发布流程：push 到 main 发布开发预发布版（1.17-wcpe-dev-latest），打 tag 发布正式版
+- 发布仓库改为 maven.wcpe.top（maven-releases）
+- 正式版同时发布 latest 指针版本（1.17-wcpe-latest）
+- 新增本地发布版本号覆盖入口（-PloomPublishVersion）
+- 新增 CHANGELOG.md，GitHub Release 从对应版本段落提取内容
+
 ## 1.16-wcpe-3
 
 ### 修复
