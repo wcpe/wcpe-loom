@@ -28,12 +28,24 @@ def baseVersion = '1.15'
 def ENV = System.getenv()
 def runNumber = ENV.GITHUB_RUN_NUMBER ?: "9999"
 
-def isSnapshot = ENV.PR_NUM != null
-
-if (!isSnapshot) {
-	version = baseVersion + "." + runNumber
+// WCPE 发布版本号来源优先级：
+// 1. RELEASE_VERSION 环境变量（tag 触发时由 CI 从 tag 名注入，如 v1.15-wcpe.1 → 1.15-wcpe.1；
+//    push main 触发时注入 1.15-wcpe-dev-latest）
+// 2. 本地开发：buildNumber 占位（可用 -PloomPublishVersion 覆盖发布版本）
+if (ENV.RELEASE_VERSION) {
+	version = ENV.RELEASE_VERSION
 } else {
-	version = baseVersion + "-PR." + ENV.PR_NUM + "." + runNumber
+	version = baseVersion + '.' + runNumber + '-wcpe-dev'
+}
+
+// 是否为预发布（push main 触发的开发版），决定 latest 指针版本号
+def isPrerelease = Boolean.parseBoolean(ENV.IS_PRERELEASE ?: 'false')
+def latestVersion = isPrerelease ? baseVersion + '-wcpe-dev-latest' : baseVersion + '-wcpe-latest'
+
+// 本地发布覆盖入口：-PloomPublishVersion=<版本号> 可指定发布版本号，
+// 保证 project.version、实现包 POM、插件 marker 与 version.txt 全部一致
+if (project.hasProperty('loomPublishVersion')) {
+	version = project.property('loomPublishVersion')
 }
 
 logger.lifecycle(":building plugin v${version}")
@@ -325,6 +337,9 @@ tasks.withType(Test).configureEach {
 
 import org.gradle.api.tasks.testing.logging.TestLogEvent
 import org.gradle.util.GradleVersion
+import org.w3c.dom.Document
+import org.w3c.dom.Element
+import org.w3c.dom.Node
 
 publishing {
 	repositories {
@@ -335,6 +350,55 @@ publishing {
 				credentials {
 					username = System.getenv("NEXUS_USER")
 					password = System.getenv("NEXUS_PASSWORD")
+				}
+			}
+		}
+
+		// WCPE Maven 仓库（CI 发布写入 maven-releases）
+		maven {
+			name = 'WCPE'
+			url = project.findProperty('wcpeMavenUrl') ?: 'https://maven.wcpe.top/repository/maven-releases/'
+			credentials {
+				username = project.findProperty('wcpeUsername')?.toString() ?: ''
+				password = project.findProperty('wcpePassword')?.toString() ?: ''
+			}
+		}
+	}
+
+	publications {
+		if (!ENV.EXPERIMENTAL) {
+			// latest 指针版本：始终指向最新的 wcpe 构建，供下游项目以固定版本号引用
+			// 正式版用 1.15-wcpe-latest，开发预发布版用 1.15-wcpe-dev-latest
+			snapshot(MavenPublication) { publication ->
+				groupId = project.group
+				artifactId = project.base.archivesName.get()
+				version = latestVersion
+
+				from components.java
+			}
+
+			def projectGroup = project.group
+			def projectArtifactId = project.base.archivesName.get()
+			def markerDependencyVersion = project.version.toString()
+
+			gradlePlugin.plugins.forEach { plugin ->
+				it.create(plugin.id + "SnapshotMarker", MavenPublication) { publication ->
+					groupId = plugin.id
+					artifactId = plugin.id + '.gradle.plugin'
+					version = latestVersion
+
+					pom.withXml({
+						Element root = asElement()
+						Document document = root.getOwnerDocument()
+						Node dependencies = root.appendChild(document.createElement('dependencies'))
+						Node dependency = dependencies.appendChild(document.createElement('dependency'))
+						Node groupId = dependency.appendChild(document.createElement('groupId'))
+						groupId.setTextContent(projectGroup)
+						Node artifactId = dependency.appendChild(document.createElement('artifactId'))
+						artifactId.setTextContent(projectArtifactId)
+						Node version = dependency.appendChild(document.createElement('version'))
+						version.setTextContent(markerDependencyVersion)
+					})
 				}
 			}
 		}
