@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.15-wcpe.2
+
+### 修复
+
+- **跨 classloader 的 LoomCacheService 隔离**：同一 Gradle root 下按项目路径注册强类型服务，避免多个 Loom 子项目/插件 classloader 共享同名服务实例时发生 `ClassCastException`
+- **跨 classloader 的共享元数据缓存隔离**：按 Loom classloader 区分 `AsyncCache`，同时保留同一 loader 内的跨子项目复用
+- **Gradle 9.5 配置缓存下延迟解析 RunConfig**：避免 Forge run task 在配置阶段解析 detached configuration，修复 unsafe resolution 与配置缓存序列化边界
+- **新增多 Loom 子项目回归测试**：覆盖同一 Gradle root 下两个直接应用 Loom 的子项目及外部 classloader 服务碰撞
+
 ## 1.15-wcpe.1
 
 基于 Essential Loom dev/1.15（713489a9）的 WCPE 定制版本。
@@ -14,7 +23,6 @@ Essential Loom 完整继承 fabric-loom 与 Forge/NeoForge（含老版本 Forge 
 
 ### 修复
 
-- **AbstractRunTask 兼容 Gradle 配置缓存**：配置期立即物化 RunConfig 提取纯数据快照，断开对 Project 的延迟引用；`excludedLibraryPaths` 延迟到执行期解析
 - **RunGameTask 配置缓存兼容**：setStandardInput(System.in) 从构造函数移到 exec() 执行期
 - **XVFBExistsValueSource**：exists 方法改为接受 ProviderFactory 替代 Project
 - **AsyncCache 虚拟线程 pinning 导致 daemon 卡死**：改为平台线程池（有界队列 + CallerRuns 背压）
