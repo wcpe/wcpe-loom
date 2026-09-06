@@ -33,8 +33,12 @@ public abstract class RunGameTask extends AbstractRunTask {
 	@Inject
 	public RunGameTask(RunConfigSettings settings) {
 		super(proj -> RunConfig.runConfig(proj, settings));
+	}
 
-		// Defaults to empty, forwards stdin to mc.
+	@Override
+	public void exec() {
+		// 在执行期设置 stdin 转发，避免配置期持有 System.in 破坏配置缓存序列化
 		setStandardInput(System.in);
+		super.exec();
 	}
 }
