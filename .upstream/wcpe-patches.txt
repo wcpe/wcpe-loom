@@ -1,4 +1,4 @@
-# WCPE 补丁队列清单（基底之上 13 个提交）
+# WCPE 补丁队列清单（基底之上 14 个提交）
 # 与 git log 713489a90aed2e869e5beb95e8d3d0bd825816a3..dev/1.15-wcpe 一一对应
 # 1. feat(cache): 跨 daemon per-key 缓存锁与原子发布
 #    文件: util/cache/*, util/gradle/LoomCacheService.java, extension/LoomFiles*.java,
@@ -32,4 +32,7 @@
 #           configuration/ide/RuntimeLibraries.java, task/launch/GenerateDLIConfigTask.java
 # 13. docs(release): 准备 1.15-wcpe.2 发布元数据
 #     文件: README.md, CHANGELOG.md, .upstream/wcpe-patches.txt
+# 14. fix(run): 保留无混淆 Forge 完整模块图
+#     文件: configuration/ide/RunConfig.java, test/unit/RuntimeLibrariesTest.groovy,
+#           README.md, CHANGELOG.md, .upstream/wcpe-patches.txt
 # 每次压缩变基后更新本清单（BASE 见 essential-base）

@@ -13,7 +13,7 @@
 
 ```
 wcpe/fabric-loom (dev/1.15-wcpe，默认分支)
-├── WCPE 定制补丁（13 个提交）
+├── WCPE 定制补丁（14 个提交）
 │     缓存锁与原子发布 / 配置缓存兼容 / 复合构建修复 / 映射缓存隔离 …
 └── 基底：Essential Loom dev/1.15（713489a9）
       └── 上游继承链：SparkUniverse/architectury-loom
