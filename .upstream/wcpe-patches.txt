@@ -1,4 +1,4 @@
-# WCPE 补丁队列清单（基底之上 14 个提交）
+# WCPE 补丁队列清单（基底之上 16 个提交）
 # 与 git log 713489a90aed2e869e5beb95e8d3d0bd825816a3..dev/1.15-wcpe 一一对应
 # 1. feat(cache): 跨 daemon per-key 缓存锁与原子发布
 #    文件: util/cache/*, util/gradle/LoomCacheService.java, extension/LoomFiles*.java,
@@ -35,4 +35,12 @@
 # 14. fix(run): 保留无混淆 Forge 完整模块图
 #     文件: configuration/ide/RunConfig.java, test/unit/RuntimeLibrariesTest.groovy,
 #           README.md, CHANGELOG.md, .upstream/wcpe-patches.txt
+# 15. fix(cache): 按 classloader 隔离共享缓存服务
+#     文件: util/gradle/LoomCacheService.java, configuration/mods/ModConfigurationRemapper.java,
+#           test/integration/MultiProjectDirectPluginTest.groovy,
+#           test/integration/buildSrc/loomClasspath/TestPlugin.groovy,
+#           test/integration/OfflineModeTest.groovy, test/unit/cache/LoomCacheServiceTest.groovy,
+#           test/util/GradleProjectTestTrait.groovy
+# 16. docs(release): 更新 1.15-wcpe.2 缓存修复说明
+#     文件: README.md, CHANGELOG.md, .upstream/wcpe-patches.txt
 # 每次压缩变基后更新本清单（BASE 见 essential-base）
