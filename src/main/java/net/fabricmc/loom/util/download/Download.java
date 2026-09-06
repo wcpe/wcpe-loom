@@ -311,6 +311,15 @@ public final class Download {
 		final boolean locked = getAndResetLock(output);
 
 		if (forceDownload || !exists(output)) {
+			// 内容寻址下载的快路径：带期望 hash 的文件（如 vanilla jar）内容永不改变，
+			// 本地 hash 匹配 = 重下结果必然一字节不差。即使 --refresh-dependencies 强制刷新，
+			// 也直接复用本地完好文件，避免重复下载几十 MB 的不变产物；
+			// 损坏文件 hash 必不匹配，仍会照常重下，语义安全。
+			if (forceDownload && expectedHash != null && exists(output) && isHashValid(output)) {
+				LOGGER.info("跳过强制重新下载：本地文件 hash 与期望一致（{}）", output);
+				return false;
+			}
+
 			// File does not exist, or we are forced to download again.
 			return true;
 		}

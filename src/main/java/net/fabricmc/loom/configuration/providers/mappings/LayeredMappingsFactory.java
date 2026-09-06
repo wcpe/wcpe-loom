@@ -51,7 +51,9 @@ import net.fabricmc.loom.configuration.providers.mappings.extras.annotations.Ann
 import net.fabricmc.loom.configuration.providers.mappings.extras.unpick.UnpickLayer;
 import net.fabricmc.loom.configuration.providers.mappings.unpick.UnpickMetadata;
 import net.fabricmc.loom.configuration.providers.mappings.utils.AddConstructorMappingVisitor;
+import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.ZipUtils;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.mappingio.adapter.MappingDstNsReorder;
 import net.fabricmc.mappingio.adapter.MappingSourceNsSwitch;
 import net.fabricmc.mappingio.format.tiny.Tiny2FileWriter;
@@ -70,26 +72,52 @@ public record LayeredMappingsFactory(LayeredMappingSpec spec) {
 		for (LayeredMappingsFactory layeredMappingFactory : configContext.extension().getLayeredMappingFactories()) {
 			try {
 				layeredMappingFactory.evaluate(configContext);
-			} catch (IOException e) {
-				throw new UncheckedIOException("Failed to setup layered mappings: %s".formatted(layeredMappingFactory.mavenNotation()), e);
+			} catch (Exception e) {
+				throw new UncheckedIOException("Failed to setup layered mappings: %s".formatted(layeredMappingFactory.mavenNotation(configContext.project())), new IOException(e));
 			}
 		}
 	}
 
-	private void evaluate(ConfigContext configContext) throws IOException {
-		LOGGER.info("Evaluating layer mapping: {}", mavenNotation());
+	private void evaluate(ConfigContext configContext) throws Exception {
+		final String mappingVersion = mappingVersion(configContext.project());
+		LOGGER.info("Evaluating layer mapping: {}", mavenNotation(mappingVersion));
 
 		final Path mavenRepoDir = configContext.extension().getFiles().getGlobalMinecraftRepo().toPath();
-		final LocalMavenHelper maven = new LocalMavenHelper(GROUP, MODULE, spec().getVersion(), null, mavenRepoDir);
-		final Path jar = resolve(configContext.project());
-		maven.copyToMaven(jar, null);
+		final LocalMavenHelper maven = new LocalMavenHelper(GROUP, MODULE, mappingVersion, null, mavenRepoDir);
+		final boolean refresh = configContext.extension().refreshDeps();
+
+		// 无锁快路径（关键）：全局仓库已存在该 layered mapping 产物且未要求刷新时，直接返回——
+		// 既不取跨进程锁，也不重写全局产物。
+		// layered mapping 产物按内容寻址（版本号含 hash），一旦存在即不会变化；
+		// 这是暖缓存下多 daemon 并发构建同一版本时「明明只是读取，却互相抢 layered-mappings 锁、
+		// 且不断把 mappings jar 重写进全局仓库、导致另一 daemon 的依赖解析冲突」的根因，必须在锁外短路。
+		if (!refresh && maven.exists(null)) {
+			return;
+		}
+
+		final LoomCacheService cacheService = LoomCacheService.get(configContext.project()).get();
+		final Path lockRoot = configContext.extension().getFiles().getCacheLocks().toPath();
+
+		// 冷/刷新路径：写 GLOBAL 仓库（跨 daemon 共享），用跨进程 per-key 锁串行化首次产出，
+		// 避免多个 daemon 同时首次产出同一 layered mapping spec 时互相踩踏。
+		cacheService.runExclusive(lockRoot, "layered-mappings:" + mappingVersion, LoomCacheService.defaultTimeout(), () -> {
+			// 锁内二次确认：等锁期间可能已被其它进程产出，避免重复写
+			if (!refresh && maven.exists(null)) {
+				return null;
+			}
+
+			final Path jar = resolve(configContext.project());
+			maven.copyToMaven(jar, null);
+			return null;
+		});
 	}
 
 	public Path resolve(Project project) throws IOException {
 		final LoomGradleExtension extension = LoomGradleExtension.get(project);
-		final MappingContext mappingContext = new GradleMappingContext(project, spec.getVersion().replace("+", "_").replace(".", "_"));
+		final String mappingVersion = mappingVersion(project);
+		final MappingContext mappingContext = new GradleMappingContext(project, mappingVersion.replace("+", "_").replace(".", "_"));
 		final Path mappingsDir = mappingContext.minecraftProvider().dir("layered").toPath();
-		final Path mappingsZip = mappingsDir.resolve(String.format("%s.%s-%s.jar", GROUP, MODULE, spec.getVersion()));
+		final Path mappingsZip = mappingsDir.resolve(String.format("%s.%s-%s.jar", GROUP, MODULE, mappingVersion));
 
 		if (Files.exists(mappingsZip) && !mappingContext.refreshDeps()) {
 			return mappingsZip;
@@ -110,11 +138,41 @@ public record LayeredMappingsFactory(LayeredMappingSpec spec) {
 	}
 
 	public Dependency createDependency(Project project) {
-		return project.getDependencies().create(mavenNotation());
+		return project.getDependencies().create(mavenNotation(project));
 	}
 
 	public String mavenNotation() {
-		return String.format("%s:%s:%s", GROUP, MODULE, spec.getVersion());
+		return mavenNotation(spec.getVersion());
+	}
+
+	private String mavenNotation(Project project) {
+		return mavenNotation(mappingVersion(project));
+	}
+
+	private String mappingVersion(Project project) {
+		final var minecraftDependencies = project.getConfigurations()
+				.getByName(Constants.Configurations.MINECRAFT)
+				.getDependencies();
+
+		if (minecraftDependencies.size() != 1) {
+			throw new IllegalStateException("Expected exactly one minecraft dependency for layered mappings");
+		}
+
+		final String minecraftVersion = minecraftDependencies.iterator().next().getVersion();
+
+		if (minecraftVersion == null || minecraftVersion.isBlank()) {
+			throw new IllegalStateException("The minecraft dependency must declare a version for layered mappings");
+		}
+
+		return mappingVersion(spec.getVersion(), minecraftVersion);
+	}
+
+	static String mappingVersion(String layeredVersion, String minecraftVersion) {
+		return layeredVersion + "-mc." + minecraftVersion;
+	}
+
+	private static String mavenNotation(String version) {
+		return String.format("%s:%s:%s", GROUP, MODULE, version);
 	}
 
 	private void writeMapping(LayeredMappingsProcessor processor, List<MappingLayer> layers, Path mappingsFile, boolean useIntermediateMappings) throws IOException {

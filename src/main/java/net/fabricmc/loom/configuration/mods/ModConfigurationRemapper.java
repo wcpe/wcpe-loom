@@ -76,6 +76,7 @@ import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.ExceptionUtil;
 import net.fabricmc.loom.util.ModPlatform;
 import net.fabricmc.loom.util.SourceRemapper;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.gradle.SourceSetHelper;
 import net.fabricmc.loom.util.service.ServiceFactory;
 
@@ -116,7 +117,10 @@ public class ModConfigurationRemapper {
 
 				final Configuration target = RemapConfigurations.getOrCreateCollectorConfiguration(project, entry, runtime);
 				// We copy the source with the desired usage type to get only the runtime or api jars, not both.
+				// We copy the source with the desired usage type to get only the runtime or api jars, not both.
+				// 复制时保留全局依赖替换规则，确保复合构建下本地模块替换不回退解析远端坐标。
 				final Configuration sourceCopy = entry.getSourceConfiguration().get().copyRecursive();
+				sourceCopy.getResolutionStrategy().getUseGlobalDependencySubstitutionRules().set(true);
 				final Usage usage = project.getObjects().named(Usage.class, runtime ? Usage.JAVA_RUNTIME : Usage.JAVA_API);
 				sourceCopy.attributes(attributes -> attributes.attribute(Usage.USAGE_ATTRIBUTE, usage));
 				sourceCopy.setCanBeConsumed(false);
@@ -157,7 +161,9 @@ public class ModConfigurationRemapper {
 		// the installer data. The installer data has to be added before
 		// any mods are remapped since remapping needs the dependencies provided by that data.
 		final Map<Configuration, List<ModDependency>> dependenciesBySourceConfig = new HashMap<>();
-		AsyncCache<ArtifactMetadata> metaCache = new AsyncCache<>();
+		// 使用跨子项目共享的元数据缓存：多个子项目依赖同一个 mod jar 时，ArtifactMetadata 只解析一次，
+		// 后续子项目 join 命中已完成的 future，避免主线程在 AsyncCache.join 上重复阻塞。
+		AsyncCache<ArtifactMetadata> metaCache = getSharedMetaCache(project);
 		configsToRemap.forEach((sourceConfig, remappedConfig) -> {
 			/*
 			sourceConfig - The source configuration where the intermediary named artifacts come from. i.e "modApi"
@@ -214,10 +220,30 @@ public class ModConfigurationRemapper {
 					.toList();
 
 			if (!toRemap.isEmpty()) {
+				// 仅在确有 mod 需要重映射（写 LOCAL 共享 remapped_mods 缓存）时才取跨进程锁；
+				// 暖缓存下 toRemap 为空、根本不会进入这里，故不取锁 → 同一 checkout 的 client/server 并发构建互不阻塞。
+				final Path lockRoot = extension.getFiles().getCacheLocks().toPath();
+				final String lockKey = LoomCacheService.modDepsKey(project.getRootDir(), mappingsSuffix);
+
 				try {
-					new ModProcessor(project, sourceConfig, serviceFactory).processMods(toRemap);
+					LoomCacheService.get(project).get().runExclusive(lockRoot, lockKey, LoomCacheService.defaultTimeout(), () -> {
+						// 锁内重新过滤：等锁期间其它进程可能已重映射部分 mod，避免重复写
+						final List<ModDependency> stillToRemap = refreshDeps
+								? toRemap
+								: toRemap.stream().filter(dependency -> dependency.isCacheInvalid(project, null)).toList();
+
+						if (!stillToRemap.isEmpty()) {
+							new ModProcessor(project, sourceConfig, serviceFactory).processMods(stillToRemap);
+						}
+
+						return null;
+					});
 				} catch (IOException e) {
 					throw new UncheckedIOException("Failed to remap mods", e);
+				} catch (RuntimeException e) {
+					throw e;
+				} catch (Exception e) {
+					throw new RuntimeException("Failed to remap mods", e);
 				}
 			}
 
@@ -237,7 +263,10 @@ public class ModConfigurationRemapper {
 		var futures = new HashMap<ArtifactRef, CompletableFuture<ArtifactMetadata>>();
 
 		for (ArtifactRef artifact : artifacts) {
-			CompletableFuture<ArtifactMetadata> future = cache.get(artifact, () -> {
+			// 缓存键使用 jar 文件路径 + 默认 mixin remap 类型，确保跨子项目对同一个 jar 命中同一个 future。
+			// （ResolvedArtifact 在不同子项目里可能是不同实例，直接以 ArtifactRef 作键无法跨项目共享。）
+			final MetadataCacheKey cacheKey = new MetadataCacheKey(artifact.path(), defaultMixinRemapType);
+			CompletableFuture<ArtifactMetadata> future = cache.get(cacheKey, () -> {
 				try {
 					return ArtifactMetadata.create(project, artifact, LoomGradlePlugin.LOOM_VERSION, defaultMixinRemapType, platform);
 				} catch (IOException e) {
@@ -249,6 +278,28 @@ public class ModConfigurationRemapper {
 		}
 
 		return AsyncCache.joinMap(futures);
+	}
+
+	// 跨子项目共享的元数据缓存键：jar 路径 + 默认 mixin remap 类型。
+	private record MetadataCacheKey(Path path, ArtifactMetadata.MixinRemapType defaultMixinRemapType) { }
+
+	/**
+	 * 返回附着在根项目上的跨子项目共享 {@link AsyncCache}.
+	 *
+	 * <p>缓存仅存活于根项目实例生命周期内（每次构建都会创建新的根项目），因此不会跨 daemon
+	 * 构建泄漏；多个子项目解析同一个 mod jar 时可复用同一个 future。
+	 */
+	private static AsyncCache<ArtifactMetadata> getSharedMetaCache(Project project) {
+		final Project root = project.getRootProject();
+		final org.gradle.api.plugins.ExtraPropertiesExtension extra = root.getExtensions().getExtraProperties();
+		final String key = "loom_sharedArtifactMetadataCache";
+		synchronized (root) {
+			if (!extra.has(key)) {
+				extra.set(key, new AsyncCache<ArtifactMetadata>());
+			}
+
+			return (AsyncCache<ArtifactMetadata>) extra.get(key);
+		}
 	}
 
 	private static void createConstraints(ArtifactRef artifact, Configuration targetConfig, Configuration sourceConfig, DependencyHandler dependencies) {
