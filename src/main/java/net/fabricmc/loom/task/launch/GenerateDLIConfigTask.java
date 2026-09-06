@@ -407,7 +407,9 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
 					project.file("src/generated/resources").getAbsolutePath(),
 					extension.getForge().getMixinConfigs().get(),
 					extension.getForge().getUseCustomMixin().get(),
-					extension.getMappingConfiguration().srgToNamedSrg.toAbsolutePath().toString()
+					// 无混淆环境（26.x）没有 mappings 配置，也不存在 SRG→named 重映射；
+					// 消费点仅在混淆分支使用该字段
+					extension.disableObfuscation() ? null : extension.getMappingConfiguration().srgToNamedSrg.toAbsolutePath().toString()
 			);
 		}
 	}
