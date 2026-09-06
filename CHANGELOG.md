@@ -8,6 +8,9 @@
 - **跨 classloader 的共享元数据缓存隔离**：按 Loom classloader 区分 `AsyncCache`，同时保留同一 loader 内的跨子项目复用
 - **Gradle 9.5 配置缓存下延迟解析 RunConfig**：避免 Forge run task 在配置阶段解析 detached configuration，修复 unsafe resolution 与配置缓存序列化边界
 - **新增多 Loom 子项目回归测试**：覆盖同一 Gradle root 下两个直接应用 Loom 的子项目及外部 classloader 服务碰撞
+- **Forge 26.x 无混淆运行链兼容**：不再注入会触发错误 SRG 路由的 naming/remapper service，并在无映射配置时跳过 SRG→named 参数
+- **Forge 开发运行时模块图兼容**：避免注入与 terminalconsoleappender 分裂包冲突的 fabric-log4j-util，无混淆环境保留完整客户端运行库，并将 AccessTransformer 升级到 8.2.17
+- **Forge 26.x 预补丁链兼容**：复用 Forge `mcp_config` 的 merge 步骤生成预补丁 JAR，避免缺失 `preProcessJar` 导致输出未生成，并兼容 binarypatcher 产物没有 `MANIFEST.MF` 的情况
 
 ## 1.15-wcpe.1
 
@@ -23,6 +26,7 @@ Essential Loom 完整继承 fabric-loom 与 Forge/NeoForge（含老版本 Forge 
 
 ### 修复
 
+- **AbstractRunTask 兼容 Gradle 配置缓存**：配置期立即物化 RunConfig 提取纯数据快照，断开对 Project 的延迟引用；`excludedLibraryPaths` 延迟到执行期解析
 - **RunGameTask 配置缓存兼容**：setStandardInput(System.in) 从构造函数移到 exec() 执行期
 - **XVFBExistsValueSource**：exists 方法改为接受 ProviderFactory 替代 Project
 - **AsyncCache 虚拟线程 pinning 导致 daemon 卡死**：改为平台线程池（有界队列 + CallerRuns 背压）

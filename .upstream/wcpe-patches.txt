@@ -1,5 +1,5 @@
-# WCPE 补丁队列清单（基底之上 5 个 squash 提交）
-# 与 git log 713489a90aed2e869e5beb95e8d3d0bd825816a3..main 一一对应
+# WCPE 补丁队列清单（基底之上 13 个提交）
+# 与 git log 713489a90aed2e869e5beb95e8d3d0bd825816a3..dev/1.15-wcpe 一一对应
 # 1. feat(cache): 跨 daemon per-key 缓存锁与原子发布
 #    文件: util/cache/*, util/gradle/LoomCacheService.java, extension/LoomFiles*.java,
 #          task/GenerateSourcesTask.java, test/unit/cache/*
@@ -15,4 +15,21 @@
 #          scripts/sync-upstream.sh, .upstream/*
 # 5. ci: 开发版改为唯一可复现版本号
 #    文件: .github/workflows/publish.yml, build.gradle
+# 6. ci: 调整触发规则——文档不构建，代码推送发 latest 测试版
+#    文件: .github/workflows/publish.yml
+# 7. fix(forge): 无混淆 Forge 走 mcp merge 预补丁并兼容无清单产物
+#    文件: configuration/providers/forge/minecraft/MinecraftPatchedProvider.java
+# 8. fix(cache): 修复跨 classloader 缓存服务隔离
+#    文件: util/gradle/LoomCacheService.java, configuration/mods/ModConfigurationRemapper.java
+# 9. fix(config-cache): 延迟解析运行配置兼容 Gradle 9
+#    文件: task/AbstractRunTask.java, task/RunGameTask.java
+# 10. test(integration): 增加多 Loom 子项目回归测试
+#     文件: test/integration/MultiProjectDirectPluginTest.groovy, test/resources/projects/multiProjectDirectLoom/*
+# 11. docs(changelog): 整理 1.15-wcpe.2 待发布内容
+#     文件: CHANGELOG.md
+# 12. fix(forge): 完善 Forge 26.x 无混淆运行链
+#     文件: gradle/runtime.libs.versions.toml, configuration/LoomConfigurations.java,
+#           configuration/ide/RuntimeLibraries.java, task/launch/GenerateDLIConfigTask.java
+# 13. docs(release): 准备 1.15-wcpe.2 发布元数据
+#     文件: README.md, CHANGELOG.md, .upstream/wcpe-patches.txt
 # 每次压缩变基后更新本清单（BASE 见 essential-base）

@@ -1,7 +1,7 @@
 # WCPE Loom
 
 [![CI 发布状态](https://github.com/wcpe/fabric-loom/actions/workflows/publish.yml/badge.svg?branch=dev/1.15-wcpe)](https://github.com/wcpe/fabric-loom/actions/workflows/publish.yml)
-[![最新正式版](https://img.shields.io/badge/正式版-1.15--wcpe.1-blue)](https://github.com/wcpe/fabric-loom/releases/tag/v1.15-wcpe.1)
+[![最新正式版](https://img.shields.io/badge/正式版-1.15--wcpe.2-blue)](https://github.com/wcpe/fabric-loom/releases/tag/v1.15-wcpe.2)
 [![Maven 仓库](https://img.shields.io/badge/Maven-maven.wcpe.top-orange)](https://maven.wcpe.top/repository/maven-releases/gg/essential/architectury-loom/)
 [![License](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
 
@@ -13,7 +13,7 @@
 
 ```
 wcpe/fabric-loom (dev/1.15-wcpe，默认分支)
-├── WCPE 定制补丁（19 个提交）
+├── WCPE 定制补丁（13 个提交）
 │     缓存锁与原子发布 / 配置缓存兼容 / 复合构建修复 / 映射缓存隔离 …
 └── 基底：Essential Loom dev/1.15（713489a9）
       └── 上游继承链：SparkUniverse/architectury-loom
