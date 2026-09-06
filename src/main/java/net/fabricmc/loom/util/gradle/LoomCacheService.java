@@ -107,7 +107,19 @@ public abstract class LoomCacheService implements BuildService<BuildServiceParam
 		return "mod-deps:" + rootDir.getAbsolutePath() + ":" + mappingsIdentifier;
 	}
 
+	/**
+	 * Returns the cache service for one Gradle project.
+	 *
+	 * <p>The service name is project-scoped deliberately. A Gradle root can load Loom
+	 * through more than one plugin classloader (for example, a convention plugin and
+	 * a direct Loom plugin). A single root-wide typed service name can then return a
+	 * generated service implementation from another classloader, which fails with a
+	 * {@code ClassCastException} when the provider is read. The JVM monitor is only an
+	 * optimization; cross-project and cross-daemon correctness remains provided by
+	 * the per-key file lock in {@link CacheEntryLock}.
+	 */
 	public static Provider<LoomCacheService> get(Project project) {
-		return project.getGradle().getSharedServices().registerIfAbsent(NAME, LoomCacheService.class, spec -> { });
+		final String serviceName = NAME + ":" + project.getPath();
+		return project.getGradle().getSharedServices().registerIfAbsent(serviceName, LoomCacheService.class, spec -> { });
 	}
 }
