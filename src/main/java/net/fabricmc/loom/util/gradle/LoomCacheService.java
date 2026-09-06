@@ -36,6 +36,7 @@ import org.gradle.api.provider.Provider;
 import org.gradle.api.services.BuildService;
 import org.gradle.api.services.BuildServiceParameters;
 
+import net.fabricmc.loom.util.AsyncCache;
 import net.fabricmc.loom.util.cache.CacheEntryLock;
 
 /**
@@ -46,9 +47,24 @@ import net.fabricmc.loom.util.cache.CacheEntryLock;
  */
 public abstract class LoomCacheService implements BuildService<BuildServiceParameters.None> {
 	public static final String NAME = "loomSharedCache";
+	private static final String SERVICE_NAME = NAME + ":loader-"
+			+ Integer.toUnsignedString(System.identityHashCode(LoomCacheService.class.getClassLoader()), 16);
 
 	// JVM 内 per-key 监视器，保证同一构建（含 --parallel）内同 key 的生产串行
 	private final ConcurrentHashMap<String, Object> monitors = new ConcurrentHashMap<>();
+	// 同一 Loom classloader 内的子项目共享异步缓存；不同 loader 由服务名隔离，不共享强类型对象。
+	private final ConcurrentHashMap<String, AsyncCache<?>> asyncCaches = new ConcurrentHashMap<>();
+
+	/**
+	 * 返回当前 Loom classloader 作用域内按名称共享的异步缓存.
+	 *
+	 * <p>调用方必须保证同一名称始终使用同一种值类型。服务注册名包含 classloader 身份，
+	 * 因而不会读取另一插件 classloader 创建的强类型缓存实例。
+	 */
+	@SuppressWarnings("unchecked")
+	public <T> AsyncCache<T> getAsyncCache(String cacheName) {
+		return (AsyncCache<T>) asyncCaches.computeIfAbsent(cacheName, key -> new AsyncCache<>());
+	}
 
 	/**
 	 * 在按 key 取得的「JVM 监视器 + 跨进程文件锁」保护下执行一个互斥动作.
@@ -108,18 +124,13 @@ public abstract class LoomCacheService implements BuildService<BuildServiceParam
 	}
 
 	/**
-	 * Returns the cache service for one Gradle project.
+	 * 返回当前 Loom classloader 对应的缓存服务.
 	 *
-	 * <p>The service name is project-scoped deliberately. A Gradle root can load Loom
-	 * through more than one plugin classloader (for example, a convention plugin and
-	 * a direct Loom plugin). A single root-wide typed service name can then return a
-	 * generated service implementation from another classloader, which fails with a
-	 * {@code ClassCastException} when the provider is read. The JVM monitor is only an
-	 * optimization; cross-project and cross-daemon correctness remains provided by
-	 * the per-key file lock in {@link CacheEntryLock}.
+	 * <p>同一 Gradle root 可能通过约定插件和直接插件加载多份 Loom。注册名包含当前
+	 * classloader 身份，避免从另一 loader 取得不可强转的服务实现；同一 loader 的多个
+	 * 子项目仍共享服务和内存缓存。跨 daemon 正确性继续由 {@link CacheEntryLock} 保证。
 	 */
 	public static Provider<LoomCacheService> get(Project project) {
-		final String serviceName = NAME + ":" + project.getPath();
-		return project.getGradle().getSharedServices().registerIfAbsent(serviceName, LoomCacheService.class, spec -> { });
+		return project.getGradle().getSharedServices().registerIfAbsent(SERVICE_NAME, LoomCacheService.class, spec -> { });
 	}
 }

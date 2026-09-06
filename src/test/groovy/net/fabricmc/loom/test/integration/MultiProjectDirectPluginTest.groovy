@@ -29,6 +29,7 @@ import spock.lang.Specification
 import net.fabricmc.loom.test.util.GradleProjectTestTrait
 
 import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
+import static org.gradle.testkit.runner.TaskOutcome.UP_TO_DATE
 
 class MultiProjectDirectPluginTest extends Specification implements GradleProjectTestTrait {
 	def "multiple subprojects can apply Loom directly in one Gradle root"() {
@@ -37,10 +38,25 @@ class MultiProjectDirectPluginTest extends Specification implements GradleProjec
 		gradle.buildSrc("loomClasspath")
 
 		when:
-		def result = gradle.run(tasks: [":one:configureClientLaunch", ":two:configureClientLaunch"])
+		def result = gradle.run(
+				tasks: [":one:configureClientLaunch", ":two:configureClientLaunch"],
+				isloatedProjects: true)
+		// 首次执行会创建运行配置输出，isolated-projects 会因此使下一次重新存储；
+		// 输出稳定后第三次必须真正复用同一配置缓存条目。
+		def warm = gradle.run(
+				tasks: [":one:configureClientLaunch", ":two:configureClientLaunch"],
+				isloatedProjects: true)
+		def reused = gradle.run(
+				tasks: [":one:configureClientLaunch", ":two:configureClientLaunch"],
+				isloatedProjects: true)
 
 		then:
 		result.task(":one:configureClientLaunch").outcome == SUCCESS
 		result.task(":two:configureClientLaunch").outcome == SUCCESS
+		warm.task(":one:configureClientLaunch").outcome in [SUCCESS, UP_TO_DATE]
+		warm.task(":two:configureClientLaunch").outcome in [SUCCESS, UP_TO_DATE]
+		reused.task(":one:configureClientLaunch").outcome in [SUCCESS, UP_TO_DATE]
+		reused.task(":two:configureClientLaunch").outcome in [SUCCESS, UP_TO_DATE]
+		reused.output.contains("Configuration cache entry reused.")
 	}
 }

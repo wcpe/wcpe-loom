@@ -87,6 +87,7 @@ public class ModConfigurationRemapper {
 	public static final String MISSING_GROUP = "unspecified";
 
 	private static final Logger LOGGER = LoggerFactory.getLogger(ModConfigurationRemapper.class);
+	private static final String ARTIFACT_METADATA_CACHE = "artifactMetadata";
 
 	public static void supplyModConfigurations(Project project, ServiceFactory serviceFactory, String mappingsSuffix, LoomGradleExtension extension, SourceRemapper sourceRemapper) {
 		final DependencyHandler dependencies = project.getDependencies();
@@ -283,28 +284,14 @@ public class ModConfigurationRemapper {
 	// 跨子项目共享的元数据缓存键：jar 路径 + 默认 mixin remap 类型。
 	private record MetadataCacheKey(Path path, ArtifactMetadata.MixinRemapType defaultMixinRemapType) { }
 
-	// ExtraProperties 属于 Gradle root，但同一 root 可能同时加载多份 Loom 类。
-	// 以 AsyncCache 的 classloader 区分缓存桶，保留同一 Loom loader 内的跨子项目复用，
-	// 避免把另一 loader 创建的 AsyncCache 强制转换为当前 loader 的类型。
-	private static final String SHARED_META_CACHE_KEY =
-			"loom_sharedArtifactMetadataCache:" + System.identityHashCode(AsyncCache.class.getClassLoader());
-
 	/**
-	 * 返回附着在根项目上的跨子项目共享 {@link AsyncCache}.
+	 * 返回当前 Loom classloader 服务内的跨子项目共享 {@link AsyncCache}.
 	 *
-	 * <p>缓存仅存活于根项目实例生命周期内（每次构建都会创建新的根项目），因此不会跨 daemon
-	 * 构建泄漏；多个子项目解析同一个 mod jar 时可复用同一个 future。
+	 * <p>缓存仅存活于 Gradle build service 生命周期内，不会跨 daemon 构建泄漏；多个子项目
+	 * 解析同一个 mod jar 时可复用同一个 future，同时不会跨 classloader 共享强类型对象。
 	 */
 	private static AsyncCache<ArtifactMetadata> getSharedMetaCache(Project project) {
-		final Project root = project.getRootProject();
-		final org.gradle.api.plugins.ExtraPropertiesExtension extra = root.getExtensions().getExtraProperties();
-		synchronized (root) {
-			if (!extra.has(SHARED_META_CACHE_KEY)) {
-				extra.set(SHARED_META_CACHE_KEY, new AsyncCache<ArtifactMetadata>());
-			}
-
-			return (AsyncCache<ArtifactMetadata>) extra.get(SHARED_META_CACHE_KEY);
-		}
+		return LoomCacheService.get(project).get().getAsyncCache(ARTIFACT_METADATA_CACHE);
 	}
 
 	private static void createConstraints(ArtifactRef artifact, Configuration targetConfig, Configuration sourceConfig, DependencyHandler dependencies) {

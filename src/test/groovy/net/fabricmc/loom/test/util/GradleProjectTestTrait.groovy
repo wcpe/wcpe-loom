@@ -342,11 +342,21 @@ trait GradleProjectTestTrait {
 				dependencies += "implementation files('${file.absolutePath.replace("\\", "\\\\")}')\n"
 			}
 
-			new File(projectDir, "buildSrc/build.gradle") << """
+			def buildSrcGradle = new File(projectDir, "buildSrc/build.gradle")
+			def marker = "// Loom TestKit managed plugin classpath"
+			def current = buildSrcGradle.text
+			def markerIndex = current.indexOf(marker)
+			def prefix = (markerIndex >= 0 ? current.substring(0, markerIndex) : current).stripTrailing()
+			def updated = prefix + "\n\n" + """
+				${marker}
                 dependencies {
                     ${dependencies}
                 }
-            """
+            """.stripIndent().stripLeading()
+
+			if (current != updated) {
+				buildSrcGradle.text = updated
+			}
 		}
 	}
 }
