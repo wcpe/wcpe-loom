@@ -1,14 +1,18 @@
-# WCPE 自有补丁清单（从 wcpe-backup-20260904 提取，squash 后 4 个功能提交）
+# WCPE 补丁队列清单（基底之上 5 个 squash 提交）
+# 与 git log 713489a90aed2e869e5beb95e8d3d0bd825816a3..main 一一对应
 # 1. feat(cache): 跨 daemon per-key 缓存锁与原子发布
 #    文件: util/cache/*, util/gradle/LoomCacheService.java, extension/LoomFiles*.java,
-#          task/GenerateSourcesTask.java
+#          task/GenerateSourcesTask.java, test/unit/cache/*
 # 2. fix(run): AbstractRunTask 配置缓存与 Gradle 9 兼容
 #    文件: task/AbstractRunTask.java, task/RunGameTask.java, util/XVFBExistsValueSource.java,
 #          configuration/ide/RuntimeLibraries.java
-# 3. fix(composite): 复合构建兼容 + AsyncCache pinning 修复
+# 3. fix(build): 复合构建兼容、AsyncCache 修复与映射缓存隔离
 #    文件: configuration/CompileConfiguration.java, configuration/processors/speccontext/*,
-#          configuration/providers/minecraft/*, configuration/mods/ModConfigurationRemapper.java,
-#          util/AsyncCache.java
-# 4. chore(release): WCPE 发布流程 + CHANGELOG（在 S3 只应用一次）
-#    文件: .github/workflows/publish.yml, .github/workflows/test-push.yml, build.gradle,
-#          CHANGELOG.md, .gitignore, codenarc.groovy
+#          configuration/providers/minecraft/*, configuration/providers/mappings/*,
+#          configuration/mods/*, util/AsyncCache.java, util/SourceRemapper.java
+# 4. chore: WCPE 发布体系、文档与维护元数据
+#    文件: .github/workflows/*, build.gradle, README.md, CHANGELOG.md, codenarc.groovy,
+#          scripts/sync-upstream.sh, .upstream/*
+# 5. ci: 开发版改为唯一可复现版本号
+#    文件: .github/workflows/publish.yml, build.gradle
+# 每次压缩变基后更新本清单（BASE 见 essential-base）

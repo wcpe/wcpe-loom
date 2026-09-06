@@ -1,7 +1,7 @@
 name: CI
 
 # 两种触发：
-# 1. 推送到 main → 构建并发布开发版（1.15-wcpe-dev-latest 指针）
+# 1. 推送到 main → 构建唯一可复现开发版（1.15-wcpe.<runNumber>-dev.<sha>，不覆盖发布）
 # 2. 打 v 开头的 tag → 构建并发布正式版 + 创建 GitHub Release（带 CHANGELOG）
 on:
   push:
@@ -44,8 +44,12 @@ jobs:
             echo "release-version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "is-prerelease=false" >> "$GITHUB_OUTPUT"
           else
+            # 开发版使用唯一可复现版本号（基线-构建号-dev），符合 Nexus releases 仓库不可覆盖的策略
+            # 短 SHA 后缀保证同一 runNumber 重跑（re-run）时也产生不同版本
+            SHA=$(git rev-parse --short=7 HEAD)
+            VERSION="1.15-wcpe.${GITHUB_RUN_NUMBER}-dev.${SHA}"
             echo "is-release=false" >> "$GITHUB_OUTPUT"
-            echo "release-version=1.15-wcpe-dev-latest" >> "$GITHUB_OUTPUT"
+            echo "release-version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "is-prerelease=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -55,6 +59,7 @@ jobs:
           CI: true
           RELEASE_VERSION: ${{ steps.meta.outputs.release-version }}
           IS_PRERELEASE: ${{ steps.meta.outputs.is-prerelease }}
+          PUBLISH_LATEST: ${{ steps.meta.outputs.is-prerelease == 'true' && 'dev' || 'stable' }}
           ORG_GRADLE_PROJECT_wcpeUsername: ${{ secrets.WCPE_USERNAME }}
           ORG_GRADLE_PROJECT_wcpePassword: ${{ secrets.WCPE_PASSWORD }}
 

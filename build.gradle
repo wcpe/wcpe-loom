@@ -29,16 +29,17 @@ def ENV = System.getenv()
 def runNumber = ENV.GITHUB_RUN_NUMBER ?: "9999"
 
 // WCPE 发布版本号来源优先级：
-// 1. RELEASE_VERSION 环境变量（tag 触发时由 CI 从 tag 名注入，如 v1.15-wcpe.1 → 1.15-wcpe.1；
-//    push main 触发时注入 1.15-wcpe-dev-latest）
-// 2. 本地开发：buildNumber 占位（可用 -PloomPublishVersion 覆盖发布版本）
+// 1. RELEASE_VERSION 环境变量（CI 注入：tag 触发时为 tag 名如 1.15-wcpe.1；
+//    push main 触发时为唯一可复现版本号 1.15-wcpe.<runNumber>-dev.<sha>）
+// 2. 本地开发：基线-runNumber-wcpe-dev（可用 -PloomPublishVersion 覆盖发布版本）
 if (ENV.RELEASE_VERSION) {
 	version = ENV.RELEASE_VERSION
 } else {
 	version = baseVersion + '.' + runNumber + '-wcpe-dev'
 }
 
-// 是否为预发布（push main 触发的开发版），决定 latest 指针版本号
+// latest 指针版本号：正式版发布后指向最新正式版（1.15-wcpe-latest）；
+// 开发版 latest（1.15-wcpe-dev-latest）由单独的 CI 步骤以指针更新，实现构建本身用唯一版本号
 def isPrerelease = Boolean.parseBoolean(ENV.IS_PRERELEASE ?: 'false')
 def latestVersion = isPrerelease ? baseVersion + '-wcpe-dev-latest' : baseVersion + '-wcpe-latest'
 
