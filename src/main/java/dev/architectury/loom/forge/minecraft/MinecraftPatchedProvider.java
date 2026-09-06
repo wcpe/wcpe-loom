@@ -255,11 +255,16 @@ public class MinecraftPatchedProvider {
 			McpExecutorBuilder builder = createMcpExecutor(tempFiles.directory("loom-mcp"));
 
 			if (getExtension().disableObfuscation()) {
-				// NeoForm 风格 config（NeoForge）才有 preProcessJar 步骤；Forge 的 mcp_config（26.x spec 4）
-				// 没有该步骤，DependencySet 会静默忽略缺失步骤导致 OUTPUT 永不写入而 NPE。
-				// 无混淆 Forge 不需要重命名，预补丁 jar = vanilla 合并 jar，
-				// 直接复用 Forge 自己 mcp_config 的 merge 步骤（mergetool 产物与 binpatches 的基线一致）。
-				builder.enqueue("merge");
+				// NeoForm spec 6 使用 preProcessJar，Forge mcp_config spec 4 使用 merge。
+				// 无混淆环境跳过 rename，但仍必须选择配置中真实存在的合并步骤；否则
+				// DependencySet 会静默忽略缺失步骤，执行器因没有 OUTPUT 而失败。
+				if (builder.hasStep("preProcessJar")) {
+					builder.enqueue("preProcessJar");
+				} else if (builder.hasStep("merge")) {
+					builder.enqueue("merge");
+				} else {
+					throw new IllegalStateException("MCP config is missing a pre-patch merge step");
+				}
 			} else {
 				builder.enqueue("rename");
 			}
