@@ -84,7 +84,6 @@ import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.build.IntermediaryNamespaces;
 import net.fabricmc.loom.configuration.providers.mappings.TinyMappingsService;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
-import net.fabricmc.loom.util.Check;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.LoomVersions;
@@ -256,7 +255,11 @@ public class MinecraftPatchedProvider {
 			McpExecutorBuilder builder = createMcpExecutor(tempFiles.directory("loom-mcp"));
 
 			if (getExtension().disableObfuscation()) {
-				builder.enqueue("preProcessJar");
+				// NeoForm 风格 config（NeoForge）才有 preProcessJar 步骤；Forge 的 mcp_config（26.x spec 4）
+				// 没有该步骤，DependencySet 会静默忽略缺失步骤导致 OUTPUT 永不写入而 NPE。
+				// 无混淆 Forge 不需要重命名，预补丁 jar = vanilla 合并 jar，
+				// 直接复用 Forge 自己 mcp_config 的 merge 步骤（mergetool 产物与 binpatches 的基线一致）。
+				builder.enqueue("merge");
 			} else {
 				builder.enqueue("rename");
 			}
@@ -701,20 +704,27 @@ public class MinecraftPatchedProvider {
 	}
 
 	public void applyLoomPatchVersion(Path target) throws IOException {
-		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(target, false)) {
-			Path manifestPath = delegate.get().getPath("META-INF/MANIFEST.MF");
-
-			Check.require(Files.exists(manifestPath), "META-INF/MANIFEST.MF does not exist in patched srg jar!");
+		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(target, true)) {
+			Path manifestPath = delegate.get().getPath("META-INF", "MANIFEST.MF");
 			Manifest manifest = new Manifest();
 
 			if (Files.exists(manifestPath)) {
 				try (InputStream stream = Files.newInputStream(manifestPath)) {
 					manifest.read(stream);
-					manifest.getMainAttributes().putValue(LOOM_PATCH_VERSION_KEY, CURRENT_LOOM_PATCH_VERSION);
 				}
 			}
 
-			try (OutputStream stream = Files.newOutputStream(manifestPath, StandardOpenOption.CREATE)) {
+			// 无混淆 Forge 的 binarypatcher 产物可能没有清单（NeoForge installertools 产物才有），
+			// 缺失时先建父目录再创建，避免打标失败。
+			manifest.getMainAttributes().putValue(LOOM_PATCH_VERSION_KEY, CURRENT_LOOM_PATCH_VERSION);
+
+			Path parent = manifestPath.getParent();
+
+			if (parent != null) {
+				Files.createDirectories(parent);
+			}
+
+			try (OutputStream stream = Files.newOutputStream(manifestPath, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
 				manifest.write(stream);
 			}
 		}
