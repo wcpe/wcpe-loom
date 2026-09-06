@@ -5,6 +5,8 @@
 !/gradle
 !/src
 !/.github
+!/scripts
+!/.upstream
 
 # Files
 !/.gitattributes

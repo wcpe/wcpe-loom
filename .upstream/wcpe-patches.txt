@@ -1,0 +1,14 @@
+# WCPE 自有补丁清单（从 wcpe-backup-20260904 提取，squash 后 4 个功能提交）
+# 1. feat(cache): 跨 daemon per-key 缓存锁与原子发布
+#    文件: util/cache/*, util/gradle/LoomCacheService.java, extension/LoomFiles*.java,
+#          task/GenerateSourcesTask.java
+# 2. fix(run): AbstractRunTask 配置缓存与 Gradle 9 兼容
+#    文件: task/AbstractRunTask.java, task/RunGameTask.java, util/XVFBExistsValueSource.java,
+#          configuration/ide/RuntimeLibraries.java
+# 3. fix(composite): 复合构建兼容 + AsyncCache pinning 修复
+#    文件: configuration/CompileConfiguration.java, configuration/processors/speccontext/*,
+#          configuration/providers/minecraft/*, configuration/mods/ModConfigurationRemapper.java,
+#          util/AsyncCache.java
+# 4. chore(release): WCPE 发布流程 + CHANGELOG（在 S3 只应用一次）
+#    文件: .github/workflows/publish.yml, .github/workflows/test-push.yml, build.gradle,
+#          CHANGELOG.md, .gitignore, codenarc.groovy
