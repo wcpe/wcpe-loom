@@ -1,6 +1,6 @@
 # WCPE Loom
 
-[![CI 发布状态](https://github.com/wcpe/fabric-loom/actions/workflows/publish.yml/badge.svg?branch=main)](https://github.com/wcpe/fabric-loom/actions/workflows/publish.yml)
+[![CI 发布状态](https://github.com/wcpe/fabric-loom/actions/workflows/publish.yml/badge.svg?branch=dev/1.15-wcpe)](https://github.com/wcpe/fabric-loom/actions/workflows/publish.yml)
 [![最新正式版](https://img.shields.io/badge/正式版-1.15--wcpe.1-blue)](https://github.com/wcpe/fabric-loom/releases/tag/v1.15-wcpe.1)
 [![Maven 仓库](https://img.shields.io/badge/Maven-maven.wcpe.top-orange)](https://maven.wcpe.top/repository/maven-releases/gg/essential/architectury-loom/)
 [![License](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
@@ -12,7 +12,7 @@
 本项目采用 **Debian quilt 式补丁队列**维护：
 
 ```
-wcpe/fabric-loom (main)
+wcpe/fabric-loom (dev/1.15-wcpe，默认分支)
 ├── WCPE 定制补丁（19 个提交）
 │     缓存锁与原子发布 / 配置缓存兼容 / 复合构建修复 / 映射缓存隔离 …
 └── 基底：Essential Loom dev/1.15（713489a9）
@@ -66,7 +66,7 @@ plugins {
 |---|---|---|
 | `1.15-wcpe.1`、`1.15-wcpe.2` … | 正式版（tag `v1.15-wcpe.N` 触发发布） | 不可变，推荐使用 |
 | `1.15-wcpe-latest` | 指向最新正式版的指针版本 | 随发布更新 |
-| `1.15-wcpe-dev-latest` | 指向最新开发版（push main 触发） | 滚动更新，勿锁定 |
+| `1.15-wcpe-dev-latest` | 指向最新开发版（推送代码触发 CI 自动发布，用于测试发布通道） | 滚动更新，勿锁定 |
 
 - 版本号中的 `1.15` 对应基底 Essential Loom 的 `dev/1.15` 分支代系；`-wcpe` 后缀为定制版标识，与官方版本空间完全隔离
 - 上游 Essential Loom 的 `1.15.50` 中的 `50` 是 CI 运行编号（非语义化补丁位）；本项目改用 tag 驱动的语义化版本号

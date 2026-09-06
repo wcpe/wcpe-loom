@@ -1,14 +1,20 @@
 name: CI
 
-# 两种触发：
-# 1. 推送到 main → 构建唯一可复现开发版（1.15-wcpe.<runNumber>-dev.<sha>，不覆盖发布）
-# 2. 打 v 开头的 tag → 构建并发布正式版 + 创建 GitHub Release（带 CHANGELOG）
+# 触发规则：
+# 1. 推送到 dev/1.15-wcpe（仅代码变更）→ 构建 + 发布 latest 测试版（1.15-wcpe-dev-latest 指针）
+# 2. 打 v 开头的 tag → 手动发布的正式版构建 + 创建 GitHub Release（带 CHANGELOG）
+# 3. 纯文档修改（README/CHANGELOG/docs/**）不触发任何构建
 on:
   push:
     branches:
-      - main
+      - dev/1.15-wcpe
     tags:
       - 'v*'
+    paths-ignore:
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'docs/**'
+      - '**.md'
 
 permissions:
   contents: read
@@ -39,17 +45,20 @@ jobs:
         shell: bash
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # 正式版：手动打 tag 发布，版本号取 tag 名（如 v1.15-wcpe.2 → 1.15-wcpe.2）
             VERSION="${GITHUB_REF#refs/tags/v}"
             echo "is-release=true" >> "$GITHUB_OUTPUT"
             echo "release-version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "latest-version=1.15-wcpe-latest" >> "$GITHUB_OUTPUT"
             echo "is-prerelease=false" >> "$GITHUB_OUTPUT"
           else
-            # 开发版使用唯一可复现版本号（基线-构建号-dev），符合 Nexus releases 仓库不可覆盖的策略
-            # 短 SHA 后缀保证同一 runNumber 重跑（re-run）时也产生不同版本
+            # 代码推送：构建唯一可复现测试版（基线-构建号-dev.短SHA，符合 releases 仓库不可覆盖策略），
+            # 并同步发布 1.15-wcpe-dev-latest 指针验证发布通道可用性
             SHA=$(git rev-parse --short=7 HEAD)
             VERSION="1.15-wcpe.${GITHUB_RUN_NUMBER}-dev.${SHA}"
             echo "is-release=false" >> "$GITHUB_OUTPUT"
             echo "release-version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "latest-version=1.15-wcpe-dev-latest" >> "$GITHUB_OUTPUT"
             echo "is-prerelease=true" >> "$GITHUB_OUTPUT"
           fi
 
