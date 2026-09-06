@@ -65,22 +65,15 @@ class AtomicFilesTest extends Specification {
 	def "publish 适用于 zip/jar 生产者（producer 需把临时文件当作新 jar 创建）"() {
 		given:
 		// 复现 merge/split/remap 等真实场景：producer 用 getJarFileSystem(tmp, true) 把 tmp 当作新 zip 创建并写入。
-		// 若 publish 预先创建了空文件，zip 文件系统会因「空文件不是合法 zip」而失败。
+		// 若 publish 预先创建了空文件，zip 文件系统会因空文件不是合法 zip 而失败。
 		def target = tempDir.resolve("out.jar")
 
 		when:
-		AtomicFiles.publish(target, { tmp ->
-			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(tmp, true)) {
-				Files.writeString(fs.getRoot().resolve("hello.txt"), "hi", StandardCharsets.UTF_8)
-			}
-		})
+		AtomicFiles.publish(target, this.&writeHelloJar)
 
 		then:
 		Files.exists(target)
-
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(target, false)) {
-			Files.readString(fs.getRoot().resolve("hello.txt"), StandardCharsets.UTF_8) == "hi"
-		}
+		readHelloJar(target) == "hi"
 	}
 
 	def "publish 后 target 内容完整"() {
@@ -88,9 +81,9 @@ class AtomicFilesTest extends Specification {
 		def target = tempDir.resolve("out.txt")
 
 		when:
-		AtomicFiles.publish(target, { tmp ->
+		AtomicFiles.publish(target) { tmp ->
 			Files.writeString(tmp, "完整内容", StandardCharsets.UTF_8)
-		})
+		}
 
 		then:
 		Files.exists(target)
@@ -102,9 +95,9 @@ class AtomicFilesTest extends Specification {
 		def target = tempDir.resolve("nested/dir/out.txt")
 
 		when:
-		AtomicFiles.publish(target, { tmp ->
+		AtomicFiles.publish(target) { tmp ->
 			Files.writeString(tmp, "数据", StandardCharsets.UTF_8)
-		})
+		}
 
 		then:
 		Files.readString(target, StandardCharsets.UTF_8) == "数据"
@@ -115,10 +108,10 @@ class AtomicFilesTest extends Specification {
 		def target = tempDir.resolve("out.txt")
 
 		when:
-		AtomicFiles.publish(target, { tmp ->
+		AtomicFiles.publish(target) { tmp ->
 			Files.writeString(tmp, "半成品", StandardCharsets.UTF_8)
 			throw new IOException("模拟写入中途失败")
-		})
+		}
 
 		then:
 		thrown(IOException)
@@ -134,10 +127,10 @@ class AtomicFilesTest extends Specification {
 		Files.writeString(target, "旧内容", StandardCharsets.UTF_8)
 
 		when:
-		AtomicFiles.publish(target, { tmp ->
+		AtomicFiles.publish(target) { tmp ->
 			Files.writeString(tmp, "新的半成品", StandardCharsets.UTF_8)
 			throw new IOException("模拟写入中途失败")
-		})
+		}
 
 		then:
 		thrown(IOException)
@@ -183,9 +176,9 @@ class AtomicFilesTest extends Specification {
 		Files.writeString(target, "旧内容", StandardCharsets.UTF_8)
 
 		when:
-		AtomicFiles.publish(target, { tmp ->
+		AtomicFiles.publish(target) { tmp ->
 			Files.writeString(tmp, "新内容", StandardCharsets.UTF_8)
-		})
+		}
 
 		then:
 		Files.readString(target, StandardCharsets.UTF_8) == "新内容"
@@ -196,6 +189,27 @@ class AtomicFilesTest extends Specification {
 	private static List<Path> listDir(Path dir) {
 		Files.list(dir).withCloseable { stream ->
 			return stream.collect(Collectors.toList())
+		}
+	}
+
+	/** 读取 zip 内 hello.txt 内容（简化实现规避 groovy formatter 缺陷） */
+	private static String readHelloJar(Path jar) {
+		def zin = new java.util.zip.ZipInputStream(Files.newInputStream(jar))
+		try {
+			def entry = zin.nextEntry
+			while (entry != null && entry.name != "hello.txt") {
+				entry = zin.nextEntry
+			}
+			return entry == null ? null : new String(zin.readAllBytes(), StandardCharsets.UTF_8)
+		} finally {
+			zin.close()
+		}
+	}
+
+	/** publish 消费者：把临时文件当作新 zip 创建并写入内容（方法引用形式规避 groovy formatter 缺陷） */
+	private static void writeHelloJar(Path tmp) {
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(tmp, true)) {
+			Files.writeString(fs.getRoot().resolve("hello.txt"), "hi", StandardCharsets.UTF_8)
 		}
 	}
 }

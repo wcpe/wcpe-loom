@@ -53,7 +53,8 @@ ruleset {
     ExplicitLinkedListInstantiation
     ExplicitStackInstantiation
     ExplicitTreeSetInstantiation
-    GetterMethodCouldBeProperty
+    // GetterMethodCouldBeProperty: 测试中 BuildService.getParameters() 是接口实现，codenarc 误报，排除
+    GetterMethodCouldBeProperty(enabled: false)
     GStringAsMapKey
     GStringExpressionWithinString
     CouldBeElvis

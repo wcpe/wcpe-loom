@@ -59,6 +59,7 @@ public abstract class LoomFilesBaseImpl implements LoomFiles {
 			cacheDir.mkdirs();
 			return cacheDir;
 		}
+
 		return createFile(getGradleUserHomeDir(), "caches" + File.separator + "essential-loom");
 	}
 

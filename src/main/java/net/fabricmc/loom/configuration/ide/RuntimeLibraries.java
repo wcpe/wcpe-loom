@@ -38,7 +38,6 @@ import org.gradle.api.artifacts.ResolvedArtifact;
 import org.gradle.api.artifacts.ResolvedModuleVersion;
 
 import net.fabricmc.loom.LoomGradleExtension;
-import net.fabricmc.loom.configuration.ide.RunConfig;
 import net.fabricmc.loom.configuration.providers.BundleMetadata;
 import net.fabricmc.loom.util.Constants;
 

@@ -244,6 +244,8 @@ spotless {
 		importOrder('java', 'javax', '', 'net.fabricmc', '\\#')
 		licenseHeaderFile(rootProject.file("HEADER")).yearSeparator("-")
 		greclipse()
+		// 测试代码使用 Java try-with-resources 语法，GrEclipse formatter 无法解析，排除
+		targetExclude('src/test/**/*.groovy')
 	}
 
 	groovyGradle {

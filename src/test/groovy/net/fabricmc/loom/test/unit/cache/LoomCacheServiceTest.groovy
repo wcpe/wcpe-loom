@@ -33,10 +33,9 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
+import org.gradle.api.services.BuildServiceParameters
 import spock.lang.Specification
 import spock.lang.TempDir
-
-import org.gradle.api.services.BuildServiceParameters
 
 import net.fabricmc.loom.util.gradle.LoomCacheService
 
@@ -80,7 +79,8 @@ class LoomCacheServiceTest extends Specification {
 		CountDownLatch start = new CountDownLatch(1)
 		def pool = Executors.newFixedThreadPool(threads)
 
-		Callable<Void> action = { ->
+		Callable<Void> action = {
+			->
 			// 进入临界区：若已有其它线程在内，说明互斥被破坏
 			if (inside.incrementAndGet() != 1) {
 				overlapDetected.set(true)
@@ -94,11 +94,11 @@ class LoomCacheServiceTest extends Specification {
 
 		when:
 		def futures = (1..threads).collect {
-			pool.submit({
+			pool.submit {
 				ready.countDown()
 				start.await()
 				service.runExclusive(lockRoot, "key", Duration.ofSeconds(60), action)
-			})
+			}
 		}
 		ready.await()
 		start.countDown()
