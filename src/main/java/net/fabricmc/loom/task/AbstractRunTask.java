@@ -35,7 +35,6 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import javax.inject.Inject;
@@ -66,6 +65,7 @@ import org.slf4j.LoggerFactory;
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.configuration.ide.RunConfig;
 import net.fabricmc.loom.configuration.ide.RuntimeLibraries;
+import net.fabricmc.loom.configuration.ide.RunConfigSettings;
 import net.fabricmc.loom.task.prod.TracyCapture;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.Platform;
@@ -129,38 +129,29 @@ public abstract class AbstractRunTask extends JavaExec {
 	@Input
 	protected abstract Property<String> getRunConfigName();
 
-	public AbstractRunTask(Function<Project, RunConfig> configProvider) {
+	public AbstractRunTask(String runConfigName) {
 		super();
 		setGroup(Constants.TaskGroup.FABRIC);
 
-		// 配置期立即物化 RunConfig，提取纯数据快照，断开对 Project/RunConfigSettings/SourceSet 的延迟引用，
-		// 使本任务可被配置缓存序列化（原实现用 provider 延迟持有 settings→Project，CC 不可序列化）。
-		final RunConfig runConfig = configProvider.apply(getProject());
-		final List<String> programArgsSnapshot = List.copyOf(runConfig.programArgs);
-		final String mainClassSnapshot = runConfig.mainClass;
-		final String runDirSnapshot = runConfig.runDir;
-		final Map<String, Object> envVarsSnapshot = Map.copyOf(runConfig.environmentVariables);
-		final String environmentSnapshot = runConfig.environment;
-		final String configNameSnapshot = runConfig.configName;
-		final String nameSnapshot = runConfig.name;
+		// 只捕获稳定的 run-config 名称。RunConfig.runConfig 会评估 Forge 模板并解析 detached
+		// configuration；在 Gradle 9.5 的 projectsEvaluated/task creation 阶段解析会触发
+		// unsafe configuration resolution。通过 project-scoped provider 延迟解析，同时不捕获
+		// RunConfigSettings 对象，保持配置缓存可序列化。
+		final Provider<RunConfig> config = getProviders().provider(() -> {
+			RunConfigSettings settings = LoomGradleExtension.get(getProject()).getRuns().getByName(runConfigName);
+			return RunConfig.runConfig(getProject(), settings);
+		});
 
-		// excludedLibraryPaths 需要解析 minecraftClientRuntimeLibraries 配置，不能在配置期调用
-		// （Gradle 9 的 unsafe-resolution guard 会拦截跨 included-build 锁边界的配置解析）。
-		// 用 Provider 延迟到执行时解析，仅捕获纯数据快照（environmentSnapshot），保持配置缓存兼容。
-		final Provider<List<String>> excludedLibraryPathsProvider = getProviders().provider(() ->
-				RuntimeLibraries.getExcludedLibraryPaths(getProject(), environmentSnapshot));
-
-		getInternalClasspath().from(getProviders().provider(() ->
+		getInternalClasspath().from(config.map(runConfig ->
 				runConfig.sourceSet.getRuntimeClasspath()
 						.filter(new LibraryFilter(
-								excludedLibraryPathsProvider.get(),
-								configNameSnapshot)
-						)));
+								runConfig.getExcludedLibraryPaths(getProject()),
+								runConfig.configName))));
 
 		getArgumentProviders().add(new CommandLineArgumentProvider() {
 			@Override
 			public Iterable<String> asArguments() {
-				return programArgsSnapshot;
+				return config.get().programArgs;
 			}
 		});
 		getArgumentProviders().add(new CommandLineArgumentProvider() {
@@ -173,12 +164,12 @@ public abstract class AbstractRunTask extends JavaExec {
 				return List.of();
 			}
 		});
-		getMainClass().set(mainClassSnapshot);
+		getMainClass().set(config.map(runConfig -> runConfig.mainClass));
 		getJvmArguments().addAll(getProviders().provider(this::getGameJvmArgs));
 
-		getInternalRunDir().set(runDirSnapshot);
-		getInternalEnvironmentVars().set(envVarsSnapshot);
-		getInternalJvmArgs().set(List.copyOf(runConfig.vmArgs));
+		getInternalRunDir().set(config.map(runConfig -> runConfig.runDir));
+		getInternalEnvironmentVars().set(config.map(runConfig -> runConfig.environmentVariables));
+		getInternalJvmArgs().set(config.map(runConfig -> runConfig.vmArgs));
 		getUseArgFile().set(getProject().provider(this::canUseArgFile));
 		getProjectDir().set(getProject().getProjectDir().getAbsolutePath());
 		getGradleUserHomeDir().set(getProject().getGradle().getGradleUserHomeDir().getAbsolutePath());
@@ -187,7 +178,7 @@ public abstract class AbstractRunTask extends JavaExec {
 		getUseXvfb().convention(
 				getProviders().environmentVariable("CI")
 						.map(value -> Platform.CURRENT.getOperatingSystem().isLinux())
-						.map(enabled -> enabled && environmentSnapshot.equals("client"))
+						.zip(config, (enabled, runConfig) -> enabled && runConfig.environment.equals("client"))
 						.flatMap(enabled -> enabled ? XVFBExistsValueSource.exists(getProviders()) : getProviders().provider(() -> false))
 						.orElse(false)
 		);
@@ -197,7 +188,7 @@ public abstract class AbstractRunTask extends JavaExec {
 		getArgFilePath().set(argFile.getAbsolutePath());
 
 		getModClassesOptions().set(ForgeModClassesService.createOptions(getProject()));
-		getRunConfigName().set(nameSnapshot);
+		getRunConfigName().set(runConfigName);
 	}
 
 	private boolean canUseArgFile() {
