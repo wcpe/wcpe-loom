@@ -10,7 +10,8 @@
 - **增强多 Loom 子项目回归测试**：覆盖同一 Gradle root 下两个直接应用 Loom 的子项目、外部 classloader 服务碰撞，以及 isolated-projects 配置缓存的存储与复用
 - **Forge 26.x 无混淆运行链兼容**：不再注入会触发错误 SRG 路由的 naming/remapper service，并在无映射配置时跳过 SRG→named 参数
 - **Forge 开发运行时模块图兼容**：避免注入与 terminalconsoleappender 分裂包冲突的 fabric-log4j-util，无混淆环境由 RunConfig 与 IDE 统一保留完整客户端运行库，并将 AccessTransformer 升级到 8.2.17
-- **Forge 26.x 预补丁链兼容**：复用 Forge `mcp_config` 的 merge 步骤生成预补丁 JAR，避免缺失 `preProcessJar` 导致输出未生成，并兼容 binarypatcher 产物没有 `MANIFEST.MF` 的情况
+- **Forge/NeoForge 无混淆预补丁链兼容**：按配置选择 NeoForm spec 6 的 `preProcessJar` 或 Forge mcp_config spec 4 的 `merge`，避免排入不存在的步骤导致输出未生成，并兼容 binarypatcher 产物没有 `MANIFEST.MF` 的情况
+- **Windows 官方映射集成测试兼容**：向临时 Groovy 构建脚本插入映射路径前统一使用正斜杠，避免盘符路径中的反斜杠被当作转义字符
 
 ## 1.15-wcpe.1
 
