@@ -137,7 +137,8 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
 	protected abstract SetProperty<ForgeRunTemplate.Resolved> getRunTemplates();
 
 	/**
-	 * 配置期固化的混淆开关：执行期不得再经 {@code getExtension()} 访问 loom 扩展，
+	 * 配置期固化的混淆开关 (captured at configuration time).
+	 * 执行期不得再经 {@code getExtension()} 访问 loom 扩展，
 	 * 否则配置缓存运行时会因隔离视图缺失 'loom' 扩展而失败。
 	 */
 	@Input
