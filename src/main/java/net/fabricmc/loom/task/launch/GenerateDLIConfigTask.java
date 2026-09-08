@@ -136,6 +136,13 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
 	@Input
 	protected abstract SetProperty<ForgeRunTemplate.Resolved> getRunTemplates();
 
+	/**
+	 * 配置期固化的混淆开关：执行期不得再经 {@code getExtension()} 访问 loom 扩展，
+	 * 否则配置缓存运行时会因隔离视图缺失 'loom' 扩展而失败。
+	 */
+	@Input
+	protected abstract Property<Boolean> getDisableObfuscation();
+
 	public GenerateDLIConfigTask() {
 		getVersionInfoJson().set(LoomGradlePlugin.GSON.toJson(getExtension().getMinecraftProvider().getVersionInfo()));
 		getMinecraftVersion().set(getExtension().getMinecraftProvider().minecraftVersion());
@@ -156,26 +163,27 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
 		getDevLauncherConfig().set(getExtension().getFiles().getDevLauncherConfig());
 		getProductionNamespace().set(getExtension().getProductionNamespaceEnum().map(MappingsNamespace::toString));
 		getDefaultMixinRemapType().set(getExtension().getDefaultMixinRemapTypeEnum().map(remapType -> remapType.toString().toLowerCase(Locale.ROOT)));
+		getDisableObfuscation().value(getExtension().disableObfuscation()).finalizeValue();
 
 		getPlatformMappingFile().set(getProject().getLayout().file(getProject().provider(() ->
 				getExtension().disableObfuscation() ? null : getExtension().getPlatformMappingFile().toFile())));
 		getPlatformMappingFile().finalizeValue();
 
-		if (!getExtension().disableObfuscation()) {
+		if (!getDisableObfuscation().get()) {
 			getMappingJars().from(getProject().getConfigurations().getByName(Constants.Configurations.MAPPINGS_FINAL));
 		}
 
 		if (getExtension().isForgeLike()) {
-			getRunTemplates().addAll(getProject().provider(() -> {
-				final ForgeRunsProvider forgeRunsProvider = getExtension().getForgeRunsProvider();
-				return forgeRunsProvider.getTemplates()
-						.stream()
-						.map(template -> template.resolve(forgeRunsProvider))
-						.toList();
-			}));
+			final ForgeRunsProvider forgeRunsProvider = getExtension().getForgeRunsProvider();
+			// 配置期立即求值运行模板：惰性 provider 会在配置缓存执行期经 getExtension() 访问 project，导致任务失败。
+			getRunTemplates().set(forgeRunsProvider.getTemplates()
+					.stream()
+					.map(template -> template.resolve(forgeRunsProvider))
+					.toList());
 
 			if (getExtension().isForge()) {
-				getForgeInputs().set(getProject().provider(() -> new ForgeInputs(getProject(), getExtension())));
+				// 同上：配置期立即构造 ForgeInputs（record，Serializable），不保留执行期求值的 provider。
+				getForgeInputs().set(new ForgeInputs(getProject(), getExtension()));
 			}
 		} else {
 			getRunTemplates().empty();
@@ -247,7 +255,7 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
 					.property("loader.enable_quilt_mod_json5_in_dev_env", "true");
 		}
 
-		if (platform.isForgeLike() && !getExtension().disableObfuscation()) {
+		if (platform.isForgeLike() && !getDisableObfuscation().get()) {
 			// Find the mapping files for Unprotect to use for figuring out
 			// which classes are from Minecraft.
 			String unprotectMappings = getMappingJars()
