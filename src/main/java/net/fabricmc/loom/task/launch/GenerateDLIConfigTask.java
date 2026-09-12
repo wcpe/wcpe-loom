@@ -148,7 +148,11 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
 		getVersionInfoJson().set(LoomGradlePlugin.GSON.toJson(getExtension().getMinecraftProvider().getVersionInfo()));
 		getMinecraftVersion().set(getExtension().getMinecraftProvider().minecraftVersion());
 		getSplitSourceSets().set(getExtension().areEnvironmentSourceSetsSplit());
-		getANSISupportedIDE().set(ansiSupportedIde(getProject()));
+		// 惰性求值：ansiSupportedIde 会探测 .vscode/.idea/.project 并列出根目录内容；若在配置阶段求值，
+		// 根目录的**目录列表**会成为配置缓存输入 —— 构建过程在根目录新增任何文件（build/、run/、日志等）
+		// 都会令配置缓存条目失效。改为执行期求值，闭包只捕获不可变的 rootDir，不持有 Project，配置缓存安全。
+		final File ideDetectRootDir = getProject().getRootDir();
+		getANSISupportedIDE().set(getProject().provider(() -> ansiSupportedIde(ideDetectRootDir)));
 		getPlainConsole().set(getProject().getGradle().getStartParameter().getConsoleOutput() == ConsoleOutput.Plain);
 		getClasspathGroupOptions().set(ClasspathGroupService.create(getProject()));
 
@@ -354,12 +358,15 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
 		};
 	}
 
-	private static boolean ansiSupportedIde(Project project) {
-		File rootDir = project.getRootDir();
-		return new File(rootDir, ".vscode").exists()
+	private static boolean ansiSupportedIde(File rootDir) {
+		if (new File(rootDir, ".vscode").exists()
 				|| new File(rootDir, ".idea").exists()
-				|| new File(rootDir, ".project").exists()
-				|| (Arrays.stream(rootDir.listFiles()).anyMatch(file -> file.getName().endsWith(".iws")));
+				|| new File(rootDir, ".project").exists()) {
+			return true;
+		}
+
+		final File[] rootFiles = rootDir.listFiles();
+		return rootFiles != null && Arrays.stream(rootFiles).anyMatch(file -> file.getName().endsWith(".iws"));
 	}
 
 	public static class LaunchConfig {

@@ -163,8 +163,26 @@ public final class SourceSetHelper {
 		return classpath;
 	}
 
+	/**
+	 * 判断当前构建是否由 IDE 驱动（IntelliJ 同步 / IDE 内运行）.
+	 *
+	 * <p>用于跳过对 IDE 工程文件的探测：命令行构建不需要 IDE 的编译输出目录（使用 Gradle 自己
+	 * 产出的 classes），而无条件探测会让这些文件成为 Gradle 配置缓存输入。</p>
+	 */
+	@VisibleForTesting
+	public static boolean isIdeDrivenBuild() {
+		return IdeaUtils.isIdeaSync() || Boolean.parseBoolean(System.getProperty("idea.active", "false"));
+	}
+
 	@VisibleForTesting
 	public static List<File> getIdeaClasspath(SourceSetReference reference, Project project) {
+		// 仅在 IDE 驱动构建时注入 IDEA 输出目录。本方法会读取 .idea/misc.xml 的**内容**
+		// （XPath 求 project/output/@url）；若在配置阶段无条件执行，Gradle 会把它登记为配置缓存
+		// 输入 —— IDE 每次改写 misc.xml 都会令配置缓存条目失效，表现为每次构建都重新配置整个工程。
+		if (!isIdeDrivenBuild()) {
+			return Collections.emptyList();
+		}
+
 		final File projectDir = project.getRootDir();
 		final File dotIdea = new File(projectDir, ".idea");
 
