@@ -1,7 +1,7 @@
 # WCPE Loom
 
-[![CI 发布状态](https://github.com/wcpe/fabric-loom/actions/workflows/publish.yml/badge.svg?branch=dev/1.15-wcpe)](https://github.com/wcpe/fabric-loom/actions/workflows/publish.yml)
-[![最新正式版](https://img.shields.io/badge/正式版-1.15--wcpe.2-blue)](https://github.com/wcpe/fabric-loom/releases/tag/v1.15-wcpe.2)
+[![CI 发布状态](https://github.com/wcpe/wcpe-loom/actions/workflows/publish.yml/badge.svg?branch=dev/1.15-wcpe)](https://github.com/wcpe/wcpe-loom/actions/workflows/publish.yml)
+[![最新正式版](https://img.shields.io/github/v/release/wcpe/wcpe-loom?filter=v1.15-wcpe.*&label=正式版)](https://github.com/wcpe/wcpe-loom/releases/latest)
 [![Maven 仓库](https://img.shields.io/badge/Maven-maven.wcpe.top-orange)](https://maven.wcpe.top/repository/maven-releases/gg/essential/architectury-loom/)
 [![License](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
 
@@ -12,8 +12,8 @@
 本项目采用 **Debian quilt 式补丁队列**维护：
 
 ```
-wcpe/fabric-loom (dev/1.15-wcpe，默认分支)
-├── WCPE 定制补丁（19 个提交）
+wcpe/wcpe-loom (dev/1.15-wcpe，默认分支)
+├── WCPE 定制补丁
 │     缓存锁与原子发布 / 配置缓存兼容 / 复合构建修复 / 映射缓存隔离 …
 └── 基底：Essential Loom dev/1.15（713489a9）
       └── 上游继承链：SparkUniverse/architectury-loom
@@ -46,7 +46,7 @@ pluginManagement {
 
 ```groovy
 plugins {
-    id 'gg.essential.loom' version '1.15-wcpe.1'
+    id 'gg.essential.loom' version '1.15-wcpe.5'
 }
 ```
 
@@ -72,14 +72,30 @@ plugins {
 - 上游 Essential Loom 的 `1.15.50` 中的 `50` 是 CI 运行编号（非语义化补丁位）；本项目改用 tag 驱动的语义化版本号
 - 本地调试发布：`./gradlew publishToMavenLocal -PloomPublishVersion=<版本号>`
 
+## 重映射构建缓存
+
+从 `1.15-wcpe.5` 起，下游项目的 `remapJar`、`remapSourcesJar` 及派生重映射任务支持 Gradle build cache。使用 `--build-cache` 或设置 `org.gradle.caching=true` 启用；配置缓存仍通过 `--configuration-cache` 单独启用。
+
+输入不变且输出仍存在时，任务可显示 `UP-TO-DATE`；输出缺失且存在匹配缓存时，任务可显示 `FROM-CACHE`。映射、类路径、源码、Manifest 版本或其他任务输入变化都会重新计算缓存键。若定制任务保留原始文件时间戳或关闭可重现文件顺序，输出缓存保持禁用。
+
 ## 构建与开发
 
 ```bash
-git clone https://github.com/wcpe/fabric-loom.git
-cd fabric-loom
+git clone https://github.com/wcpe/wcpe-loom.git
+cd wcpe-loom
 ./gradlew build -x test     # 完整构建（跳过测试）
 ./gradlew test --tests "net.fabricmc.loom.test.unit.cache.*"   # 缓存并发测试
+./gradlew test --tests "net.fabricmc.loom.test.integration.RemapTaskCacheTest"   # 重映射缓存回归
 ```
+
+正式发布前，在待发布提交上运行现有 `Run Tests` 工作流；确认该运行的 `headSha` 与待打标签提交一致且成功，再推送正式标签。`CI` 工作流还会在开发版和正式版发布前执行重映射缓存回归。GitHub CLI 必须显式指定 WCPE 仓库，避免选择上游仓库：
+
+```bash
+gh workflow run test-push.yml --repo wcpe/wcpe-loom --ref dev/1.15-wcpe -f extended_tests=false
+gh run list --repo wcpe/wcpe-loom --workflow test-push.yml --json databaseId,headSha,status,conclusion
+```
+
+`extended_tests=true` 会额外启用现有 Windows 构建和测试矩阵。发布由 `publish.yml` 的标签流程执行；`publish-exp.yml` 是独立实验发布入口，不用于正式修订版。
 
 上游同步：
 

@@ -46,11 +46,14 @@ import org.gradle.api.provider.ListProperty;
 import org.gradle.api.provider.MapProperty;
 import org.gradle.api.provider.Property;
 import org.gradle.api.provider.Provider;
+import org.gradle.api.tasks.Classpath;
 import org.gradle.api.tasks.Input;
 import org.gradle.api.tasks.InputFile;
 import org.gradle.api.tasks.InputFiles;
 import org.gradle.api.tasks.Nested;
 import org.gradle.api.tasks.Optional;
+import org.gradle.api.tasks.PathSensitive;
+import org.gradle.api.tasks.PathSensitivity;
 import org.gradle.api.tasks.SourceSet;
 import org.gradle.api.tasks.bundling.ZipEntryCompression;
 import org.gradle.jvm.tasks.Jar;
@@ -83,9 +86,10 @@ public abstract class AbstractRemapJarTask extends Jar {
 	 * <p>The input file's manifest will be copied into the remapped jar.
 	 */
 	@InputFile
+	@PathSensitive(PathSensitivity.NONE)
 	public abstract RegularFileProperty getInputFile();
 
-	@InputFiles
+	@Classpath
 	public abstract ConfigurableFileCollection getClasspath();
 
 	@Input
@@ -112,6 +116,7 @@ public abstract class AbstractRemapJarTask extends Jar {
 	 */
 	@ApiStatus.Experimental
 	@InputFiles
+	@PathSensitive(PathSensitivity.NAME_ONLY)
 	@Optional
 	public abstract ConfigurableFileCollection getCustomMappings();
 
@@ -149,6 +154,12 @@ public abstract class AbstractRemapJarTask extends Jar {
 
 		jarManifestServiceProvider = JarManifestService.get(getProject());
 		usesService(jarManifestServiceProvider);
+		// BuildService 的参数不会自动进入任务缓存键，必须登记实际写入 Manifest 的版本值。
+		getInputs().property("loomManifestVersions", jarManifestServiceProvider.map(JarManifestService::getManifestVersions));
+		getOutputs().doNotCacheIf("归档未启用可重现文件顺序或保留了原始时间戳", task -> {
+			AbstractRemapJarTask remapTask = (AbstractRemapJarTask) task;
+			return remapTask.isPreserveFileTimestamps() || !remapTask.isReproducibleFileOrder();
+		});
 
 		getModPlatform().value(LoomGradleExtension.get(getProject()).getPlatform()).finalizeValue();
 	}
@@ -321,6 +332,7 @@ public abstract class AbstractRemapJarTask extends Jar {
 
 	@Deprecated
 	@InputFile
+	@PathSensitive(PathSensitivity.NONE)
 	public RegularFileProperty getInput() {
 		return getInputFile();
 	}

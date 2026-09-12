@@ -25,6 +25,8 @@
 package net.fabricmc.loom.task.service;
 
 import java.io.Serializable;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.jar.Attributes;
@@ -54,6 +56,7 @@ public abstract class JarManifestService implements BuildService<JarManifestServ
 		Property<String> getTinyRemapperVersion();
 		Property<String> getFabricLoaderVersion();
 		Property<MixinVersion> getMixinVersion();
+		Property<Boolean> getReproducibleTest();
 	}
 
 	public static Provider<JarManifestService> get(Project project) {
@@ -69,6 +72,7 @@ public abstract class JarManifestService implements BuildService<JarManifestServ
 				params.getTinyRemapperVersion().set(tinyRemapperVersion.orElse("unknown"));
 				params.getFabricLoaderVersion().set(project.provider(() -> Optional.ofNullable(extension.getInstallerData()).map(InstallerData::version).orElse("unknown")));
 				params.getMixinVersion().set(getMixinVersion(project));
+				params.getReproducibleTest().set(project.getProviders().systemProperty("loom.test.reproducible").map(Boolean::parseBoolean).orElse(false));
 			});
 		});
 	}
@@ -82,25 +86,35 @@ public abstract class JarManifestService implements BuildService<JarManifestServ
 					attributes.putValue(entry.getKey(), entry.getValue());
 				});
 
-		// Don't set version attributes when running the reproducible build tests as it will break them when anything updates
-		if (Boolean.getBoolean("loom.test.reproducible")) {
-			return;
-		}
+		// 保留模组显式指定的 Mixin 版本，缓存键与实际写入共用同一份版本模型。
+		boolean hasMixinVersion = attributes.getValue(Constants.Manifest.MIXIN_VERSION) != null;
+		getManifestVersions().forEach((name, value) -> {
+			if (!hasMixinVersion || !name.equals(Constants.Manifest.MIXIN_VERSION) && !name.equals(Constants.Manifest.MIXIN_GROUP)) {
+				attributes.putValue(name, value);
+			}
+		});
+	}
 
+	/**
+	 * 返回影响归档内容的版本值，供重映射任务登记缓存输入.
+	 */
+	public Map<String, String> getManifestVersions() {
 		Params p = getParameters();
 
-		attributes.putValue(Constants.Manifest.GRADLE_VERSION, p.getGradleVersion().get());
-		attributes.putValue(Constants.Manifest.LOOM_VERSION, p.getLoomVersion().get());
-		attributes.putValue(Constants.Manifest.MIXIN_COMPILE_EXTENSIONS_VERSION, p.getMCEVersion().get());
-		attributes.putValue(Constants.Manifest.MINECRAFT_VERSION, p.getMinecraftVersion().get());
-		attributes.putValue(Constants.Manifest.TINY_REMAPPER_VERSION, p.getTinyRemapperVersion().get());
-		attributes.putValue(Constants.Manifest.FABRIC_LOADER_VERSION, p.getFabricLoaderVersion().get());
-
-		// This can be overridden by mods if required
-		if (!attributes.containsKey(Constants.Manifest.MIXIN_VERSION)) {
-			attributes.putValue(Constants.Manifest.MIXIN_VERSION, p.getMixinVersion().get().version());
-			attributes.putValue(Constants.Manifest.MIXIN_GROUP, p.getMixinVersion().get().group());
+		if (p.getReproducibleTest().get()) {
+			return Map.of();
 		}
+
+		Map<String, String> versions = new LinkedHashMap<>();
+		versions.put(Constants.Manifest.GRADLE_VERSION, p.getGradleVersion().get());
+		versions.put(Constants.Manifest.LOOM_VERSION, p.getLoomVersion().get());
+		versions.put(Constants.Manifest.MIXIN_COMPILE_EXTENSIONS_VERSION, p.getMCEVersion().get());
+		versions.put(Constants.Manifest.MINECRAFT_VERSION, p.getMinecraftVersion().get());
+		versions.put(Constants.Manifest.TINY_REMAPPER_VERSION, p.getTinyRemapperVersion().get());
+		versions.put(Constants.Manifest.FABRIC_LOADER_VERSION, p.getFabricLoaderVersion().get());
+		versions.put(Constants.Manifest.MIXIN_VERSION, p.getMixinVersion().get().version());
+		versions.put(Constants.Manifest.MIXIN_GROUP, p.getMixinVersion().get().group());
+		return Collections.unmodifiableMap(versions);
 	}
 
 	// Must be public for configuration cache

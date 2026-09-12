@@ -485,7 +485,9 @@ tasks.register('exportVersion') {
 	def versionFile = file("${layout.buildDirectory.get()}/version.txt")
 	outputs.file(versionFile)
 
-	def v = project.version
+	def v = project.version.toString()
+	// 发布版本变化必须使导出任务失效，避免复用上一次发布留下的 version.txt。
+	inputs.property('version', v)
 	doLast {
 		versionFile.text = v
 		println("Exported version: ${v}")
