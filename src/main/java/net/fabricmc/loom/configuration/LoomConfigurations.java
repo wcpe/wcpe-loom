@@ -152,7 +152,15 @@ public abstract class LoomConfigurations implements Runnable {
 
 		// Add the dev time dependencies
 		getDependencies().add(Constants.Configurations.LOOM_DEVELOPMENT_DEPENDENCIES, LoomVersions.DEV_LAUNCH_INJECTOR.mavenNotation());
-		getDependencies().add(Constants.Configurations.LOOM_DEVELOPMENT_DEPENDENCIES, LoomVersions.FABRIC_LOG4J_UTIL.mavenNotation());
+
+		// fabric-log4j-util 与 Forge 的 terminalconsoleappender 在 JPMS 下分裂包冲突
+		//（ForgeBootstrap 扫描 classpath 上全部模块化 jar，两者都导出
+		// net.minecrell.terminalconsole.util），仅 Fabric/Quilt 车道注入；
+		// Forge 车道日志由 terminalconsoleappender 自行处理。
+		if (!extension.isForgeLike()) {
+			getDependencies().add(Constants.Configurations.LOOM_DEVELOPMENT_DEPENDENCIES, LoomVersions.FABRIC_LOG4J_UTIL.mavenNotation());
+		}
+
 		// The above fabric-log4j-util doesn't work with beta versions of log4j2 (as used by e.g. Minecraft 1.8), so we
 		// add a somewhat arbitrary minimum log4j-core version to ensure we're not using the beta version.
 		// We don't want to be too up-to-date or people might accidentally use log4j features not available in prod.
@@ -218,8 +226,14 @@ public abstract class LoomConfigurations implements Runnable {
 
 			// Add Forge-only dev-time dependencies
 			if (extension.isForge()) {
-				getDependencies().add(Constants.Configurations.FORGE_EXTRA, LoomVersions.NAMING_SERVICE.mavenNotation());
-				getDependencies().add(Constants.Configurations.FORGE_EXTRA, LoomVersions.MIXIN_REMAPPER_SERVICE.mavenNotation());
+				// architectury-naming-service 注册 mcp→srg 的 INameMappingService，
+				// 无混淆（26.x）没有 srg 命名空间：AT 解析器走 srg 分支会把全部官方名行判 Invalid
+				//（Invalid AccessTransformer config 启动崩溃），故不注入。
+				if (!extension.disableObfuscation()) {
+					getDependencies().add(Constants.Configurations.FORGE_EXTRA, LoomVersions.NAMING_SERVICE.mavenNotation());
+					getDependencies().add(Constants.Configurations.FORGE_EXTRA, LoomVersions.MIXIN_REMAPPER_SERVICE.mavenNotation());
+				}
+
 				getDependencies().add(Constants.Configurations.FORGE_EXTRA, LoomVersions.MCP_ANNOTATIONS.mavenNotation());
 			}
 		}

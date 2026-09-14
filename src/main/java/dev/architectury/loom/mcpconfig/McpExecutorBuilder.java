@@ -171,6 +171,16 @@ public final class McpExecutorBuilder {
 	}
 
 	/**
+	 * 判断当前 MCP 配置是否声明了指定步骤.
+	 *
+	 * @param step 步骤名称
+	 * @return 配置中存在该步骤时为 true
+	 */
+	public boolean hasStep(String step) {
+		return steps.stream().anyMatch(candidate -> candidate.name().equals(step));
+	}
+
+	/**
 	 * Builds options for an executor that runs all queued steps and their dependencies.
 	 *
 	 * @return the options

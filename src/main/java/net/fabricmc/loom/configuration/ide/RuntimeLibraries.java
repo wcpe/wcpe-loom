@@ -64,6 +64,13 @@ public class RuntimeLibraries {
 			return Collections.emptyList();
 		}
 
+		// 无混淆（MC 26.x）dev 服运行 client+server 合并 jar，且经 ForgeBootstrap 做 JPMS 模块解析：
+		// 若按 client-only 排除 lwjgl 等 API jar，natives 模块的 requires 将无法解析
+		//（Module org.lwjgl.vma not found）。此场景不做排除，保证模块图完整。
+		if (LoomGradleExtension.get(project).disableObfuscation()) {
+			return Collections.emptyList();
+		}
+
 		final BundleMetadata bundleMetadata = LoomGradleExtension.get(project).getMinecraftProvider().getServerBundleMetadata();
 
 		if (bundleMetadata == null) {

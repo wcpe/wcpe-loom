@@ -84,7 +84,6 @@ import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.build.IntermediaryNamespaces;
 import net.fabricmc.loom.configuration.providers.mappings.TinyMappingsService;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
-import net.fabricmc.loom.util.Check;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.LoomVersions;
@@ -256,7 +255,16 @@ public class MinecraftPatchedProvider {
 			McpExecutorBuilder builder = createMcpExecutor(tempFiles.directory("loom-mcp"));
 
 			if (getExtension().disableObfuscation()) {
-				builder.enqueue("preProcessJar");
+				// NeoForm spec 6 使用 preProcessJar，Forge mcp_config spec 4 使用 merge。
+				// 无混淆环境跳过 rename，但仍必须选择配置中真实存在的合并步骤；否则
+				// DependencySet 会静默忽略缺失步骤，执行器因没有 OUTPUT 而失败。
+				if (builder.hasStep("preProcessJar")) {
+					builder.enqueue("preProcessJar");
+				} else if (builder.hasStep("merge")) {
+					builder.enqueue("merge");
+				} else {
+					throw new IllegalStateException("MCP config is missing a pre-patch merge step");
+				}
 			} else {
 				builder.enqueue("rename");
 			}
@@ -701,20 +709,27 @@ public class MinecraftPatchedProvider {
 	}
 
 	public void applyLoomPatchVersion(Path target) throws IOException {
-		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(target, false)) {
-			Path manifestPath = delegate.get().getPath("META-INF/MANIFEST.MF");
-
-			Check.require(Files.exists(manifestPath), "META-INF/MANIFEST.MF does not exist in patched srg jar!");
+		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(target, true)) {
+			Path manifestPath = delegate.get().getPath("META-INF", "MANIFEST.MF");
 			Manifest manifest = new Manifest();
 
 			if (Files.exists(manifestPath)) {
 				try (InputStream stream = Files.newInputStream(manifestPath)) {
 					manifest.read(stream);
-					manifest.getMainAttributes().putValue(LOOM_PATCH_VERSION_KEY, CURRENT_LOOM_PATCH_VERSION);
 				}
 			}
 
-			try (OutputStream stream = Files.newOutputStream(manifestPath, StandardOpenOption.CREATE)) {
+			// 无混淆 Forge 的 binarypatcher 产物可能没有清单（NeoForge installertools 产物才有），
+			// 缺失时先建父目录再创建，避免打标失败。
+			manifest.getMainAttributes().putValue(LOOM_PATCH_VERSION_KEY, CURRENT_LOOM_PATCH_VERSION);
+
+			Path parent = manifestPath.getParent();
+
+			if (parent != null) {
+				Files.createDirectories(parent);
+			}
+
+			try (OutputStream stream = Files.newOutputStream(manifestPath, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
 				manifest.write(stream);
 			}
 		}
