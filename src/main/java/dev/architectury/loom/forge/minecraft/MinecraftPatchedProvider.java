@@ -110,10 +110,11 @@ public class MinecraftPatchedProvider {
 	// The version where the bug was fixed.
 	private static final String MAX_NEOFORGE_MANUAL_CLEAN_JAR_CREATION_VERSION = "21.10.64";
 
-	private final Project project;
-	private final Logger logger;
-	private final MinecraftProvider minecraftProvider;
-	private final Type type;
+	// 对子类开放：legacy Forge（1.8-1.16）支持的 MinecraftLegacyPatchedProvider 需要访问这些成员
+	protected final Project project;
+	protected final Logger logger;
+	protected final MinecraftProvider minecraftProvider;
+	protected final Type type;
 
 	// Step 1: Remap Minecraft to intermediate mappings, merge if needed
 	private Path minecraftIntermediateJar;
@@ -793,9 +794,10 @@ public class MinecraftPatchedProvider {
 		SERVER_ONLY("server", "server", (patch, userdev) -> patch.extractServerPatches()),
 		MERGED("merged", "joined", (patch, userdev) -> userdev.getJoinedPatches());
 
-		private final String id;
-		private final String mcpId;
-		private final BiFunction<PatchProvider, ForgeUserdevProvider, Path> patches;
+		// 对子类开放：legacy 实现需要按 type 区分产物命名
+		protected final String id;
+		protected final String mcpId;
+		protected final BiFunction<PatchProvider, ForgeUserdevProvider, Path> patches;
 
 		Type(String id, String mcpId, BiFunction<PatchProvider, ForgeUserdevProvider, Path> patches) {
 			this.id = id;
