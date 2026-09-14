@@ -40,6 +40,7 @@ import org.jspecify.annotations.Nullable;
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.util.AttributeHelper;
 import net.fabricmc.loom.util.FileSystemUtil;
+import net.fabricmc.loom.util.cache.AtomicFiles;
 
 public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String mainClass) {
 	private static final String LIBRARIES_LIST_PATH = "META-INF/libraries.list";
@@ -99,11 +100,15 @@ public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String
 				}
 			}
 
-			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar)) {
-				Files.copy(fs.get().getPath(path()), dest, StandardCopyOption.REPLACE_EXISTING);
-			}
+			// 原子发布：先抽取到同目录唯一临时文件并写入 hash 标记，完整后再原子 move 到 dest。
+			// 避免跨进程的无锁存在性检查在抽取期间看到半写的 server jar 误判就绪。
+			AtomicFiles.publish(dest, tmp -> {
+				try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar)) {
+					Files.copy(fs.get().getPath(path()), tmp, StandardCopyOption.REPLACE_EXISTING);
+				}
 
-			writeHash(dest, sha1);
+				writeHash(tmp, sha1);
+			});
 		}
 
 		private Optional<String> readHash(Path output) {
