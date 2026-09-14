@@ -1,0 +1,186 @@
+# WCPE Loom 维护手册
+
+本目录保存补丁队列的边界、清单与规范。**本文是照着做的操作手册**；
+"什么才算一个合规的补丁"见 [PATCH-QUEUE.md](PATCH-QUEUE.md)。
+
+---
+
+## 一页看懂架构
+
+```
+┌────────────────────────────────────────────┐
+│ 基底  base/essential-1.15-713489a9          │ ← 上游原版，冻住不动
+├────────────────────────────────────────────┤
+│ P1  P2  P3  ...  P12                        │ ← 我们贴的便利贴
+│                                               │   一张只干一件事
+├────────────────────────────────────────────┤ ← patch-queue/1.15
+│ M1  M2                                        │ ← 封面/目录/说明书
+└────────────────────────────────────────────┘   （README/CHANGELOG/CI，不算补丁）
+```
+
+三句话：
+
+- **基底** = 从上游拿来的一本原版书，冻住。换基底 = 换一本新书。
+- **补丁队列** = 我们在书里贴的便利贴。一张只干一件事，将来换书时好揭好贴。
+- **元数据** = 我们的封面、目录、说明书。属于本仓库，不属于补丁。
+
+**为什么要这么做**：上游出新版时，把 12 张便利贴揭下来贴到新书上就行。一张只干一件事，那么"哪张贴不上""哪张上游自己修了可以撕掉"一眼看得出来。这是 Debian 维护几十年的办法。
+
+---
+
+## 目录导航
+
+| 文件 | 作用 | 什么时候动它 |
+|---|---|---|
+| `essential-base` | 基底提交 SHA | 换基底时 |
+| `wcpe-patches.txt` | 补丁清单（顺序 + 溯源 + 重组来源） | 增删补丁后 |
+| `PATCH-QUEUE.md` | 补丁判定规范与溯源标注格式 | 规则变化时 |
+| `README.md` | 本文：日常操作手册 | 流程变化时 |
+
+---
+
+## 日常操作
+
+### 加一个新补丁
+
+```bash
+# 1. 改代码
+# 2. 提交，末尾带两行溯源
+git add -A
+git commit -m "fix(xxx): 做了什么事
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed"
+```
+
+- `Origin`：`vendor, wcpe-loom`（自研，永不上游）/ `upstream, <提交URL>` / `backport, <版本>`
+- `Forwarded`：`not-needed`（本项目专属）/ `no`（该反馈上游但还没）/ `<URL>`（已反馈）
+
+### 改一个已有的补丁 ← 最常遇到
+
+**规则：如果撤掉原补丁后，你这次的修改就没意义了，那它属于原补丁，改写它，不要新建。**
+
+```bash
+# 先找到目标补丁的 sha
+git log --oneline base/essential-1.15-713489a9..patch-queue/1.15
+
+# 1. 改代码
+# 2. 标记"这是给 P1 的修正"
+git add -A
+git commit --fixup=<P1 的 sha>
+
+# 3. 揉进去（GIT_SEQUENCE_EDITOR=: 让它不弹编辑器）
+GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash base/essential-1.15-713489a9
+```
+
+揉完之后，P1 还是那一张便利贴，历史里不会多出"修复我自己"的垃圾提交。
+
+**省事做法**：平时不管，正常提交；发版前集中整理一次。流程不用天天当枷锁。
+
+### 判断表
+
+| 你的修改 | 处理 |
+|---|---|
+| P1 有 bug，加锁范围写错 | 改写 P1 |
+| P1 只覆盖了 A 路径，要扩到 B 路径 | 改写 P1（同一件事没做全） |
+| P1 的日志文案不好看 | 改写 P1 |
+| 给 P1 的功能加一个新的指标上报（新需求） | 新建补丁 |
+| P1 没问题，但另一个模块也要加锁 | 新建补丁 |
+
+### 拆分 / 合并补丁
+
+```bash
+# 合并相邻的两个补丁
+GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash base/essential-1.15-713489a9
+# 在待办列表里把后一个的 pick 改成 squash
+```
+
+拆分需要把改动按文件或按 hunk 分到不同提交，用 `git reset HEAD~1` 退回来后分批 `git add` 再提交。
+
+---
+
+## 已发布的版本能不能改？
+
+**能改，tag 是锚点。**
+
+```
+v1.15-wcpe.5  ──→ 旧的 P1（历史存档，永远取得回来）
+                    │
+v1.15-wcpe.6  ──→ 改好的 P1 ──→ P2 ──→ ...
+```
+
+- 已发布的 tag 不动，谁要 `wcpe.5` 的源码都取得到
+- 改写 P1 只影响**下一个版本**的内容
+- `maven.wcpe.top` 上已发布的制品不受任何影响
+
+**副作用**：改写 P1 会让它后面所有补丁的 sha 变化（rebase 的连锁反应）。如果已经推到远端，需要 `--force-with-lease` 强推。这是正常的。
+
+---
+
+## 发版
+
+```bash
+# 1. 更新 CHANGELOG.md，写清楚这版改了什么
+# 2. 校验队列没走样
+bash scripts/sync-upstream.sh verify
+# 3. 打 tag 并推送（CI 看到 tag 自动构建 + 发布）
+git tag -a v1.15-wcpe.6 -m "发布 1.15-wcpe.6"
+git push origin v1.15-wcpe.6
+```
+
+**版本号连续递增**，不要重置。重构没有改变代码内容，所以 `wcpe.5 → wcpe.6` 是正常演进。
+
+---
+
+## 上游更新了怎么办（换基底）
+
+```bash
+bash scripts/sync-upstream.sh essential-rebase
+```
+
+它会：揭下所有便利贴 → 贴到新基底上 → 输出两份报告：
+
+1. `git cherry` 的结果：标 `-` 的补丁说明**上游自己已经修了**，可以直接删掉
+2. `git range-diff` 的结果：告诉你重放前后哪些补丁内容变了，逐项核对
+
+换完后更新 `essential-base` 和 `wcpe-patches.txt`。
+
+---
+
+## 校验
+
+```bash
+bash scripts/sync-upstream.sh verify        # 默认命令，可直接跑
+```
+
+五项检查：
+
+1. 基底 tag 存在，且是 HEAD 的祖先
+2. 基底到队列末端之间没有 merge 提交
+3. 队列末端之后不含 `src/`、`gradle/` 改动（元数据必须隔离在末端之后）
+4. 每个补丁都带 `Origin` 与 `Forwarded` 字段
+5. 提交类型（`feat`/`fix`/...）合规
+
+---
+
+## 常用速查
+
+```bash
+# 看队列长什么样
+git log --oneline base/essential-1.15-713489a9..patch-queue/1.15
+
+# 看元数据部分
+git log --oneline patch-queue/1.15..HEAD
+
+# 看某个补丁改了什么
+git show <sha>
+
+# 看某个补丁碰了哪些文件
+git show --stat <sha>
+
+# 队列有没有走样
+bash scripts/sync-upstream.sh verify
+
+# 当前基底/队列状态
+bash scripts/sync-upstream.sh status
+```
