@@ -56,6 +56,78 @@ Forwarded: not-needed"
 - `Origin`：`vendor, wcpe-loom`（自研，永不上游）/ `upstream, <提交URL>` / `backport, <版本>`
 - `Forwarded`：`not-needed`（本项目专属）/ `no`（该反馈上游但还没）/ `<URL>`（已反馈）
 
+### 从上游采集一个补丁 ← 想用上游现成的东西时
+
+**场景**：上游已经做了某个功能或修复，你的直接基底（essential）还没跟上。比如要支持 Minecraft 26.2，fabric-loom 早就支持了，essential 没动。
+
+**这跟"换基底"是两回事，别搞混**：
+
+| 你想干什么 | 用什么动作 | 找哪个上游 |
+|---|---|---|
+| 换整本书（基底升到新版本） | rebase 整个队列 | `essential-loom`（直接上游） |
+| 借一个功能（只拿单个提交） | **cherry-pick** | `architectury` / `upstream` |
+
+**为什么不能直接 merge**：merge 会把上游**全部历史**（几千个提交）拉进你的仓库，你那 12 个补丁瞬间被淹没，队列也就废了。cherry-pick 只取**一个提交的改动**，历史保持干净。
+
+#### 四步
+
+```bash
+# 1. 看 —— 上游有什么是我没有的
+bash scripts/sync-upstream.sh candidates
+#    输出分两段：FabricMC 候选、Architectury 候选
+#    只列「你没包含、且与现有补丁不等价」的提交
+
+# 2. 挑 —— 把选中的那一个复制过来
+bash scripts/sync-upstream.sh pick f6682efb
+
+# 3. 标 —— 写清它从哪来（脚本目前不代劳，要手工加）
+git commit --amend
+#    在提交信息末尾加：
+#    Origin: backport, fabric-loom dev/1.16@f6682efb
+#    Forwarded: not-needed
+
+# 4. 查 —— 确认队列没走样
+bash scripts/sync-upstream.sh verify
+```
+
+**别忘了第 4 步之前的这件事**：新补丁必须落在**队列内部**，所以要把它纳入边界标记：
+
+```bash
+git tag -d patch-queue/1.15
+git tag -a patch-queue/1.15 -m "1.15 代系补丁队列末端"
+```
+
+否则 `verify` 第 3 项会报"末端之后仍有 src/ 改动"。
+
+#### 三个 remote 分别是谁
+
+| 脚本里的名字 | 实际仓库 | 什么时候用它 |
+|---|---|---|
+| `upstream` | FabricMC/fabric-loom | 找官方实现（新版本支持通常在这） |
+| `architectury` | architectury/architectury-loom | 找 Forge / NeoForge 相关实现 |
+| `essential-loom` | SparkUniverse/architectury-loom | 换基底时的直接上游 |
+
+#### 怎么从一长串候选里挑
+
+脚本只负责**列出来**，挑哪个是人的判断。三个判断点：
+
+1. **它解决的是不是你的问题** —— 要支持 26.2，就找标题里带 `26.2` 的
+2. **它和你的代码冲不冲突** —— 先干跑一次试试：
+   ```bash
+   git show <sha> --format="" | git apply --check
+   ```
+3. **它是否依赖别的提交** —— 有些改动要前置补丁，一起拿或按顺序拿
+
+#### Origin 写哪种
+
+| 情况 | 写法 |
+|---|---|
+| 同代系原样采集 | `Origin: upstream, <提交URL>` |
+| 从更新的代系往回搬（backport） | `Origin: backport, fabric-loom dev/1.16@<sha>` |
+| 采集后自己又改过 | 用上面的值，并在正文说明改了什么 |
+
+`backport` 意味着"新基底可能已经自带了"——将来换基底时要重点检查这个补丁是否还需要保留。
+
 ### 改一个已有的补丁 ← 最常遇到
 
 **规则：如果撤掉原补丁后，你这次的修改就没意义了，那它属于原补丁，改写它，不要新建。**
@@ -232,6 +304,15 @@ git show <sha>
 
 # 看某个补丁碰了哪些文件
 git show --stat <sha>
+
+# 上游有什么东西还没采集
+bash scripts/sync-upstream.sh candidates
+
+# 采集一个上游提交
+bash scripts/sync-upstream.sh pick <sha>
+
+# 试一下某个上游提交能否干净应用（不改工作区）
+git show <sha> --format="" | git apply --check
 
 # 队列有没有走样
 bash scripts/sync-upstream.sh verify
