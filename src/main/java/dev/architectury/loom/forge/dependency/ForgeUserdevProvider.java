@@ -92,6 +92,7 @@ public class ForgeUserdevProvider extends DependencyProvider {
 			if (isLegacyForge) {
 				json = createManifestFromForgeGradle2(dependency, json);
 			}
+
 			config = UserdevConfig.CODEC.parse(JsonOps.INSTANCE, json)
 					.getOrThrow(false, msg -> getProject().getLogger().error("Couldn't read userdev config, {}", msg));
 		}
@@ -222,7 +223,6 @@ public class ForgeUserdevProvider extends DependencyProvider {
 
 		return isLegacyForge;
 	}
-
 
 	public File getUserdevJar() {
 		return userdevJar;
