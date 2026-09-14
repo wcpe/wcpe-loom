@@ -212,6 +212,23 @@ public interface LoomGradleExtension extends LoomGradleExtensionAPI {
 		return getDependencyProviders().getProvider(ForgeUserdevProvider.class);
 	}
 
+	/**
+	 * 是否为 legacy Forge（1.8-1.16，ForgeGradle 2 时代）.
+	 *
+	 * <p>判定依据是 userdev 配置里有没有 {@code mcp} 段，因此必须在 userdev 解析完成后调用；
+	 * 未解析时 {@link ForgeUserdevProvider#isLegacyForge()} 会抛异常。
+	 */
+	default boolean isLegacyForge() {
+		return isForge() && getForgeUserdevProvider().isLegacyForge();
+	}
+
+	/**
+	 * 是否为 Forge 系（含 NeoForge）中的现代版本，即非 legacy Forge.
+	 */
+	default boolean isModernForgeLike() {
+		return isForgeLike() && !isLegacyForge();
+	}
+
 	default ForgeProvider getForgeProvider() {
 		return getDependencyProviders().getProvider(ForgeProvider.class);
 	}
