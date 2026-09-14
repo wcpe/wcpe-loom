@@ -1,6 +1,6 @@
 # WCPE Loom
 
-[![CI 发布状态](https://github.com/wcpe/wcpe-loom/actions/workflows/publish.yml/badge.svg?branch=dev/1.15-wcpe)](https://github.com/wcpe/wcpe-loom/actions/workflows/publish.yml)
+[![CI 发布状态](https://github.com/wcpe/wcpe-loom/actions/workflows/publish.yml/badge.svg?branch=main)](https://github.com/wcpe/wcpe-loom/actions/workflows/publish.yml)
 [![最新正式版](https://img.shields.io/github/v/release/wcpe/wcpe-loom?filter=v1.15-wcpe.*&label=正式版)](https://github.com/wcpe/wcpe-loom/releases/latest)
 [![Maven 仓库](https://img.shields.io/badge/Maven-maven.wcpe.top-orange)](https://maven.wcpe.top/repository/maven-releases/gg/essential/architectury-loom/)
 [![License](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
@@ -12,7 +12,7 @@
 本项目采用 **Debian quilt 式补丁队列**维护：
 
 ```
-wcpe/wcpe-loom (dev/1.15-wcpe，默认分支)
+wcpe/wcpe-loom (main，唯一主线，仅维护者直接推送)
 ├── WCPE 定制补丁
 │     缓存锁与原子发布 / 配置缓存兼容 / 复合构建修复 / 映射缓存隔离 …
 └── 基底：Essential Loom dev/1.15（713489a9）
@@ -92,7 +92,7 @@ cd wcpe-loom
 正式发布前，在待发布提交上运行现有 `Run Tests` 工作流；确认该运行的 `headSha` 与待打标签提交一致且成功，再推送正式标签。`CI` 工作流还会在开发版和正式版发布前执行重映射缓存回归。GitHub CLI 必须显式指定 WCPE 仓库，避免选择上游仓库：
 
 ```bash
-gh workflow run test-push.yml --repo wcpe/wcpe-loom --ref dev/1.15-wcpe -f extended_tests=false
+gh workflow run test-push.yml --repo wcpe/wcpe-loom --ref main -f extended_tests=false
 gh run list --repo wcpe/wcpe-loom --workflow test-push.yml --json databaseId,headSha,status,conclusion
 ```
 

@@ -1,13 +1,13 @@
 name: CI
 
 # 触发规则：
-# 1. 推送到 dev/1.15-wcpe（仅代码变更）→ 构建 + 发布 latest 测试版（1.15-wcpe-dev-latest 指针）
+# 1. 推送到 main（仅代码变更）→ 构建 + 发布 latest 测试版（1.15-wcpe-dev-latest 指针）
 # 2. 打 v 开头的 tag → 手动发布的正式版构建 + 创建 GitHub Release（带 CHANGELOG）
 # 3. 纯文档修改（README/CHANGELOG/docs/**）不触发任何构建
 on:
   push:
     branches:
-      - dev/1.15-wcpe
+      - main
     tags:
       - 'v*'
     paths-ignore:

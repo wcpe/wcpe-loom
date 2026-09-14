@@ -26,7 +26,7 @@ ARCH_BRANCH="dev/1.17"
 # 补丁队列边界（见 .upstream/PATCH-QUEUE.md）
 BASE_TAG="base/essential-1.15-713489a9"
 QUEUE_TAG="patch-queue/1.15"
-QUEUE_BRANCH="${QUEUE_BRANCH:-dev/1.15-wcpe}"
+QUEUE_BRANCH="${QUEUE_BRANCH:-main}"
 
 die() { echo "错误: $*" >&2; exit 1; }
 
