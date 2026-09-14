@@ -132,6 +132,58 @@ class DownloadFileTest extends DownloadTest {
 		!results[1].didDownload()
 	}
 
+	def "Force: 本地 hash 匹配时跳过强制重下"() {
+		setup:
+		int requestCount = 0
+
+		server.get("/forceSha1Skip.txt") {
+			it.result("Hello World")
+			requestCount ++
+		}
+
+		def output = new File(File.createTempDir(), "file.txt").toPath()
+
+		when:
+		// 第一次正常下载；第二次 forceDownload（模拟 --refresh-dependencies），本地 hash 匹配应直接复用、不发请求
+		def first = Download.create("$PATH/forceSha1Skip.txt")
+				.sha1("0a4d55a8d778e5022fab701977c5d840bbc486d0")
+				.downloadPath(output)
+		def second = Download.create("$PATH/forceSha1Skip.txt")
+				.sha1("0a4d55a8d778e5022fab701977c5d840bbc486d0")
+				.forceDownload()
+				.downloadPath(output)
+
+		then:
+		requestCount == 1
+		first.didDownload()
+		!second.didDownload()
+	}
+
+	def "Force: 本地 hash 不匹配时仍强制重下"() {
+		setup:
+		int requestCount = 0
+
+		server.get("/forceSha1Redownload.txt") {
+			it.result("Hello World")
+			requestCount ++
+		}
+
+		def output = new File(File.createTempDir(), "file.txt").toPath()
+		// 预置一个内容不符（hash 必不匹配）的本地文件，模拟损坏缓存
+		Files.writeString(output, "corrupted content")
+
+		when:
+		def result = Download.create("$PATH/forceSha1Redownload.txt")
+				.sha1("0a4d55a8d778e5022fab701977c5d840bbc486d0")
+				.forceDownload()
+				.downloadPath(output)
+
+		then:
+		requestCount == 1
+		result.didDownload()
+		Files.readString(output) == "Hello World"
+	}
+
 	def "Invalid Sha1"() {
 		setup:
 		server.get("/sha1.invalid") {
