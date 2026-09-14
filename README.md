@@ -1,3 +1,119 @@
+# WCPE Loom
+
+[![CI 发布状态](https://github.com/wcpe/wcpe-loom/actions/workflows/publish.yml/badge.svg?branch=dev/1.15-wcpe)](https://github.com/wcpe/wcpe-loom/actions/workflows/publish.yml)
+[![最新正式版](https://img.shields.io/github/v/release/wcpe/wcpe-loom?filter=v1.15-wcpe.*&label=正式版)](https://github.com/wcpe/wcpe-loom/releases/latest)
+[![Maven 仓库](https://img.shields.io/badge/Maven-maven.wcpe.top-orange)](https://maven.wcpe.top/repository/maven-releases/gg/essential/architectury-loom/)
+[![License](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
+
+**WCPE Loom** 是 [Essential Loom](https://github.com/SparkUniverse/architectury-loom)（dev/1.15 分支）的定制版本，在保留其完整 **Fabric + Forge/NeoForge（含老版本 Forge 1.8-1.16）** 能力的基础上，叠加了 WCPE 的并发缓存、配置缓存兼容与复合构建修复补丁，发布到自建 Maven 仓库供下游使用。
+
+## 仓库关系
+
+本项目采用 **Debian quilt 式补丁队列**维护：
+
+```
+wcpe/wcpe-loom (dev/1.15-wcpe，默认分支)
+├── WCPE 定制补丁
+│     缓存锁与原子发布 / 配置缓存兼容 / 复合构建修复 / 映射缓存隔离 …
+└── 基底：Essential Loom dev/1.15（713489a9）
+      └── 共同祖先：FabricMC/fabric-loom（dev/1.15 代系）
+          ├── architectury/architectury-loom（旁系：仅 1.13/1.14/1.16/1.17，无 1.15 分支）
+          └── SparkUniverse/architectury-loom（旁系：本项目的直接基底）
+```
+
+- **直接基底**：[SparkUniverse/architectury-loom](https://github.com/SparkUniverse/architectury-loom)（Essential Loom，dev/1.15，提交 `713489a9`）
+- **补丁来源**：[FabricMC/fabric-loom](https://github.com/FabricMC/fabric-loom) 与 [architectury/architectury-loom](https://github.com/architectury/architectury-loom)，按需 cherry-pick 采集，**不并入历史**
+- **拓扑**：architectury 未建立 Loom 1.15 代系分支；essential `dev/1.15` 与 architectury 现有分支在 2025-12-23 分叉，二者互为旁系（均非对方祖先）
+- 同步策略：基底更新用 rebase 重放补丁队列（见 `scripts/sync-upstream.sh`）
+
+## 使用方式
+
+在 `settings.gradle` 中添加 WCPE Maven 仓库：
+
+```groovy
+pluginManagement {
+    repositories {
+        maven {
+            name = 'WCPE'
+            url = 'https://maven.wcpe.top/repository/maven-releases/'
+        }
+        gradlePluginPortal()
+        mavenCentral()
+    }
+}
+```
+
+在 `build.gradle` 中应用插件（插件 ID 沿用 `gg.essential.loom` 系列）：
+
+```groovy
+plugins {
+    id 'gg.essential.loom' version '1.15-wcpe.5'
+}
+```
+
+可选的 5 个插件入口：
+
+| 插件 ID | 用途 |
+|---|---|
+| `gg.essential.loom` | 标准插件（Fabric + Forge/NeoForge 全支持） |
+| `gg.essential.loom-no-remap` | 不做重映射的轻量变体（未混淆 Minecraft） |
+| `gg.essential.loom-remap` | 重映射变体 |
+| `gg.essential.loom-companion` | 复合构建伴侣插件 |
+| `gg.essential.loom-repositories` | 仓库配置插件 |
+
+## 版本号说明
+
+| 版本形式 | 含义 | 稳定性 |
+|---|---|---|
+| `1.15-wcpe.1`、`1.15-wcpe.2` … | 正式版（tag `v1.15-wcpe.N` 触发发布） | 不可变，推荐使用 |
+| `1.15-wcpe-latest` | 指向最新正式版的指针版本 | 随发布更新 |
+| `1.15-wcpe-dev-latest` | 指向最新开发版（推送代码触发 CI 自动发布，用于测试发布通道） | 滚动更新，勿锁定 |
+
+- 版本号中的 `1.15` 对应基底 Essential Loom 的 `dev/1.15` 分支代系；`-wcpe` 后缀为定制版标识，与官方版本空间完全隔离
+- 上游 Essential Loom 的 `1.15.50` 中的 `50` 是 CI 运行编号（非语义化补丁位）；本项目改用 tag 驱动的语义化版本号
+- 本地调试发布：`./gradlew publishToMavenLocal -PloomPublishVersion=<版本号>`
+
+## 重映射构建缓存
+
+从 `1.15-wcpe.5` 起，下游项目的 `remapJar`、`remapSourcesJar` 及派生重映射任务支持 Gradle build cache。使用 `--build-cache` 或设置 `org.gradle.caching=true` 启用；配置缓存仍通过 `--configuration-cache` 单独启用。
+
+输入不变且输出仍存在时，任务可显示 `UP-TO-DATE`；输出缺失且存在匹配缓存时，任务可显示 `FROM-CACHE`。映射、类路径、源码、Manifest 版本或其他任务输入变化都会重新计算缓存键。若定制任务保留原始文件时间戳或关闭可重现文件顺序，输出缓存保持禁用。
+
+## 构建与开发
+
+```bash
+git clone https://github.com/wcpe/wcpe-loom.git
+cd wcpe-loom
+./gradlew build -x test     # 完整构建（跳过测试）
+./gradlew test --tests "net.fabricmc.loom.test.unit.cache.*"   # 缓存并发测试
+./gradlew test --tests "net.fabricmc.loom.test.integration.RemapTaskCacheTest"   # 重映射缓存回归
+```
+
+正式发布前，在待发布提交上运行现有 `Run Tests` 工作流；确认该运行的 `headSha` 与待打标签提交一致且成功，再推送正式标签。`CI` 工作流还会在开发版和正式版发布前执行重映射缓存回归。GitHub CLI 必须显式指定 WCPE 仓库，避免选择上游仓库：
+
+```bash
+gh workflow run test-push.yml --repo wcpe/wcpe-loom --ref dev/1.15-wcpe -f extended_tests=false
+gh run list --repo wcpe/wcpe-loom --workflow test-push.yml --json databaseId,headSha,status,conclusion
+```
+
+`extended_tests=true` 会额外启用现有 Windows 构建和测试矩阵。发布由 `publish.yml` 的标签流程执行；`publish-exp.yml` 是独立实验发布入口，不用于正式修订版。
+
+上游同步：
+
+```bash
+./scripts/sync-upstream.sh status        # 查看基底与补丁队列状态
+./scripts/sync-upstream.sh candidates    # 列出上游候选提交
+./scripts/sync-upstream.sh essential-rebase   # Essential 换基底重放补丁队列
+```
+
+---
+
+以下为原 README（上游 Essential Loom / Architectury Loom），保留作参考。
+
+# 原始 README（上游项目）
+
+---
+
 # Essential Loom
 
 A fork of [Architectury Loom](https://github.com/architectury/architectury-loom/), primarily to support legacy forge versions

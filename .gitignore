@@ -5,6 +5,8 @@
 !/gradle
 !/src
 !/.github
+!/scripts
+!/.upstream
 
 # Files
 !/.gitattributes
@@ -17,6 +19,7 @@
 !/HEADER
 !/LICENSE
 !/README.md
+!/CHANGELOG.md
 !/settings.gradle
 !/Jenkinsfile
 !/checkstyle.xml
