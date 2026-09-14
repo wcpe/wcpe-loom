@@ -1,52 +1,78 @@
-# WCPE 补丁队列清单（基底之上 19 个提交）
-# 与 git log 713489a90aed2e869e5beb95e8d3d0bd825816a3..dev/1.15-wcpe 一一对应
-# 1. feat(cache): 跨 daemon per-key 缓存锁与原子发布
-#    文件: util/cache/*, util/gradle/LoomCacheService.java, extension/LoomFiles*.java,
-#          task/GenerateSourcesTask.java, test/unit/cache/*
-# 2. fix(run): AbstractRunTask 配置缓存与 Gradle 9 兼容
-#    文件: task/AbstractRunTask.java, task/RunGameTask.java, util/XVFBExistsValueSource.java,
-#          configuration/ide/RuntimeLibraries.java
-# 3. fix(build): 复合构建兼容、AsyncCache 修复与映射缓存隔离
-#    文件: configuration/CompileConfiguration.java, configuration/processors/speccontext/*,
-#          configuration/providers/minecraft/*, configuration/providers/mappings/*,
-#          configuration/mods/*, util/AsyncCache.java, util/SourceRemapper.java
-# 4. chore: WCPE 发布体系、文档与维护元数据
-#    文件: .github/workflows/*, build.gradle, README.md, CHANGELOG.md, codenarc.groovy,
-#          scripts/sync-upstream.sh, .upstream/*
-# 5. ci: 开发版改为唯一可复现版本号
-#    文件: .github/workflows/publish.yml, build.gradle
-# 6. ci: 调整触发规则——文档不构建，代码推送发 latest 测试版
-#    文件: .github/workflows/publish.yml
-# 7. fix(forge): 无混淆 Forge 走 mcp merge 预补丁并兼容无清单产物
-#    文件: configuration/providers/forge/minecraft/MinecraftPatchedProvider.java
-# 8. fix(cache): 修复跨 classloader 缓存服务隔离
-#    文件: util/gradle/LoomCacheService.java, configuration/mods/ModConfigurationRemapper.java
-# 9. fix(config-cache): 延迟解析运行配置兼容 Gradle 9
-#    文件: task/AbstractRunTask.java, task/RunGameTask.java
-# 10. test(integration): 增加多 Loom 子项目回归测试
-#     文件: test/integration/MultiProjectDirectPluginTest.groovy, test/resources/projects/multiProjectDirectLoom/*
-# 11. docs(changelog): 整理 1.15-wcpe.2 待发布内容
-#     文件: CHANGELOG.md
-# 12. fix(forge): 完善 Forge 26.x 无混淆运行链
-#     文件: gradle/runtime.libs.versions.toml, configuration/LoomConfigurations.java,
-#           configuration/ide/RuntimeLibraries.java, task/launch/GenerateDLIConfigTask.java
-# 13. docs(release): 准备 1.15-wcpe.2 发布元数据
-#     文件: README.md, CHANGELOG.md, .upstream/wcpe-patches.txt
-# 14. fix(run): 保留无混淆 Forge 完整模块图
-#     文件: configuration/ide/RunConfig.java, test/unit/RuntimeLibrariesTest.groovy,
-#           README.md, CHANGELOG.md, .upstream/wcpe-patches.txt
-# 15. fix(cache): 按 classloader 隔离共享缓存服务
-#     文件: util/gradle/LoomCacheService.java, configuration/mods/ModConfigurationRemapper.java,
-#           test/integration/MultiProjectDirectPluginTest.groovy,
-#           test/integration/buildSrc/loomClasspath/TestPlugin.groovy,
-#           test/integration/OfflineModeTest.groovy, test/unit/cache/LoomCacheServiceTest.groovy,
-#           test/util/GradleProjectTestTrait.groovy
-# 16. docs(release): 更新 1.15-wcpe.2 缓存修复说明
-#     文件: README.md, CHANGELOG.md, .upstream/wcpe-patches.txt
-# 17. fix(forge): 按配置选择无混淆预补丁步骤
-#     文件: forge/minecraft/MinecraftPatchedProvider.java, mcpconfig/McpExecutorBuilder.java
-# 18. test(integration): 规范 Windows 映射文件路径
-#     文件: test/integration/SimpleDevOnlyRemapTest.groovy
-# 19. docs(release): 补充 1.15-wcpe.2 预补丁兼容说明
-#     文件: README.md, CHANGELOG.md, .upstream/wcpe-patches.txt
-# 每次压缩变基后更新本清单（BASE 见 essential-base）
+# WCPE Loom 补丁队列清单（1.15 代系）
+#
+# 基底    : base/essential-1.15-713489a9
+# 队列末端: patch-queue/1.15
+# 规范    : .upstream/PATCH-QUEUE.md
+# 校验    : scripts/sync-upstream.sh verify
+#
+# 本清单不记录队列提交自身的 SHA（换基底 rebase 后会变化），
+# 只记录补丁顺序、溯源与重组来源，便于换基底时逐项核对。
+
+# ── 补丁队列：基底 → patch-queue/1.15（12 个补丁）─────────────────
+#
+# P1  feat(cache): 跨 daemon per-key 缓存锁与原子发布
+#     Origin: vendor, wcpe-loom            Forwarded: not-needed
+#     重组自 25052d70
+#
+# P2  fix(config-cache): 运行与 IDE 任务兼容 Gradle 9 配置缓存
+#     Origin: vendor, wcpe-loom            Forwarded: no
+#     重组自 c73e8f10 27f89361 32c3c6a1 db65fa55
+#            （4ed0488b 修改的均为 32c3c6a1 新增行，已压缩）
+#
+# P3  fix(forge): 完善无混淆 Forge 运行链
+#     Origin: vendor, wcpe-loom            Forwarded: no
+#     重组自 72a68efc e4726aca d26c94d0 8655fc3b
+#
+# P4  fix(cache): 扩展跨 daemon 加锁与原子发布到全部缓存产物
+#     Origin: vendor, wcpe-loom            Forwarded: not-needed
+#     重组自 4f50b9c2 拆分①（下载/抽取/合并/映射/源码重映射的锁与原子发布）
+#
+# P5  fix(build): 复合构建保留全局依赖替换规则并共享元数据缓存
+#     Origin: vendor, wcpe-loom            Forwarded: not-needed
+#     重组自 4f50b9c2 拆分②（RemappedProjectView、ModConfigurationRemapper）
+#
+# P6  fix(cache): AsyncCache 改用平台线程池避免虚拟线程 pinning
+#     Origin: vendor, wcpe-loom            Forwarded: no
+#     重组自 4f50b9c2 拆分③（AsyncCache）
+#
+# P7  fix(mods): 版本校验兼容 WCPE 版本后缀
+#     Origin: vendor, wcpe-loom            Forwarded: not-needed
+#     重组自 4f50b9c2 拆分④（ArtifactMetadata 及其测试）
+#
+# P8  fix(download): 内容寻址下载跳过无谓的强制重下
+#     Origin: vendor, wcpe-loom            Forwarded: no
+#     重组自 4f50b9c2 拆分⑤（Download 及其测试）
+#
+# P9  test(integration): 增加多 Loom 子项目与 Windows 路径回归测试
+#     Origin: vendor, wcpe-loom            Forwarded: not-needed
+#     重组自 c7c869af c6247c24
+#     说明：该脚手架是 P10 的前置（P10 修改其中新增的测试文件）
+#
+# P10 fix(cache): 缓存服务按 classloader 隔离
+#     Origin: vendor, wcpe-loom            Forwarded: not-needed
+#     重组自 94a80456 016a1b2c
+#            （016a1b2c 重构 94a80456 的初步方案，两者压缩为同一补丁）
+#
+# P11 fix(loom): 重映射任务支持构建缓存
+#     Origin: vendor, wcpe-loom            Forwarded: not-needed
+#     重组自 e8f2c631 的代码部分
+#
+# P12 fix(service): 展开服务实例化异常的根因
+#     Origin: vendor, wcpe-loom            Forwarded: no
+#     独立补丁
+
+# ── 仓库元数据：patch-queue/1.15 之后，不属于补丁队列 ──────────────
+#
+# M1  chore(repo): WCPE 发布体系、CI 与补丁队列元数据
+#     重组自 389c3a93 e215f328 7f891675 58637356 609c0097
+#            a7285c3d 95238f7b 以及 e8f2c631 的元数据部分
+#     另含 .gitignore 白名单补录：!/CHANGELOG.md
+
+# ── 维护记录 ───────────────────────────────────────────────────
+#
+# 2026-09-14  队列规范化重构：基底之上 23 个提交重组为 12 个补丁 + 1 个元数据提交。
+#             - 压缩迭代提交：4ed0488b→32c3c6a1、016a1b2c←94a80456
+#             - 拆分混合提交：4f50b9c2 原混合 5 个不相关变更，按文件归属拆为 P4-P8
+#             - 剥离元数据：README/CHANGELOG/CI/脚本集中至 M1
+#             - 重构后代码树与重构前完全一致（以树对象哈希校验）
+#             重构前的完整状态保存在 tag backup/pre-patch-queue-refactor。
