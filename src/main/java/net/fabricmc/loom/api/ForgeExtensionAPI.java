@@ -35,6 +35,7 @@ import org.gradle.jvm.tasks.Jar;
 import org.jetbrains.annotations.ApiStatus;
 
 import net.fabricmc.loom.api.aw2at.Aw2AtSettings;
+import net.fabricmc.loom.configuration.providers.forge.fg2.Pack200Provider;
 import net.fabricmc.loom.util.Check;
 
 /**
@@ -175,6 +176,14 @@ public interface ForgeExtensionAPI {
 	@ApiStatus.ScheduledForRemoval(inVersion = "2.0")
 	@Deprecated(forRemoval = true)
 	Property<Boolean> getUseForgeLoggerConfig();
+
+	/**
+	 * pack200 解包器，仅供 legacy Forge（1.8-1.16）使用.
+	 *
+	 * <p>legacy 的 binpatches 以 pack200 压缩，而 JDK 自 14 起不再自带解包实现，
+	 * 需要调用方注入（例如 architectury-pack200）。
+	 */
+	Property<Pack200Provider> getPack200Provider();
 
 	/**
 	 * A list of mod IDs for mods applied for data generation.

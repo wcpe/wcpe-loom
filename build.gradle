@@ -159,6 +159,9 @@ dependencies {
 	implementation libs.datafixerupper
 	implementation libs.at
 
+	// LZMA 解压：legacy Forge 的 binpatches.pack.lzma 需要
+	implementation libs.lzma
+
 	// Forge mods.toml parsing
 	implementation libs.night.config.toml
 
@@ -181,6 +184,8 @@ dependencies {
 	testImplementation testLibs.bcutil
 	testImplementation testLibs.bcpkix
 	testImplementation testLibs.fabric.loader
+	// pack200 解包：legacy Forge 夹具注入的 pack200Provider 在运行时需要
+	runtimeOnly testLibs.pack200
 
 	compileOnly runtimeLibs.jetbrains.annotations
 	testCompileOnly runtimeLibs.jetbrains.annotations

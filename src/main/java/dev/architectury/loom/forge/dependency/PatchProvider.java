@@ -24,16 +24,34 @@
 
 package dev.architectury.loom.forge.dependency;
 
+import static java.nio.file.StandardOpenOption.CREATE;
+import static java.nio.file.StandardOpenOption.TRUNCATE_EXISTING;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.jar.JarEntry;
+import java.util.jar.JarInputStream;
+import java.util.jar.JarOutputStream;
+import java.util.zip.ZipEntry;
 
+import lzma.sdk.lzma.Decoder;
+import lzma.sdk.lzma.Encoder;
+import lzma.streams.LzmaInputStream;
+import lzma.streams.LzmaOutputStream;
 import org.gradle.api.Project;
 import org.jspecify.annotations.Nullable;
 
 import net.fabricmc.loom.configuration.DependencyInfo;
+import net.fabricmc.loom.configuration.providers.forge.fg2.Pack200Provider;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
 
@@ -50,7 +68,16 @@ public class PatchProvider extends DependencyProvider {
 	@Override
 	public void provide(DependencyInfo dependency) throws Exception {
 		init();
-		installerJar = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve Forge installer")).toPath();
+		// legacy Forge（1.8-1.16）没有独立的 installer，补丁位于 universal jar 内
+		installerJar = getExtension().isModernForgeLike()
+				? dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve Forge installer")).toPath()
+				: getExtension().getForgeUniversalProvider().getForge().toPath();
+
+		if (getExtension().isLegacyForge()) {
+			clientPatches = projectCacheFolder.resolve("patches-client.lzma");
+			serverPatches = projectCacheFolder.resolve("patches-server.lzma");
+			extractLegacyPatches(clientPatches, serverPatches);
+		}
 	}
 
 	public Path extractClientPatches() {
@@ -91,6 +118,84 @@ public class PatchProvider extends DependencyProvider {
 			Files.createDirectories(projectCacheFolder);
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);
+		}
+	}
+
+	private void extractLegacyPatches(Path clientPatches, Path serverPatches) throws IOException {
+		if (Files.exists(clientPatches) && Files.exists(serverPatches) && !refreshDeps()) {
+			// No need to extract
+			return;
+		}
+
+		byte[] unpackedBytes;
+
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(installerJar, false)) {
+			unpackedBytes = unpack200Lzma(fs.getPath("binpatches.pack.lzma"));
+		}
+
+		try (JarInputStream in = new JarInputStream(new ByteArrayInputStream(unpackedBytes));
+				OutputStream clientFileOut = Files.newOutputStream(clientPatches, CREATE, TRUNCATE_EXISTING);
+				LzmaOutputStream clientLzmaOut = new LzmaOutputStream(clientFileOut, new Encoder());
+				JarOutputStream clientJarOut = new JarOutputStream(clientLzmaOut);
+				OutputStream serverFileOut = Files.newOutputStream(serverPatches, CREATE, TRUNCATE_EXISTING);
+				LzmaOutputStream serverLzmaOut = new LzmaOutputStream(serverFileOut, new Encoder());
+				JarOutputStream serverJarOut = new JarOutputStream(serverLzmaOut);
+		) {
+			for (JarEntry entry; (entry = in.getNextJarEntry()) != null;) {
+				String name = entry.getName();
+
+				JarOutputStream out;
+
+				if (name.startsWith("binpatch/client/")) {
+					out = clientJarOut;
+				} else if (name.startsWith("binpatch/server/")) {
+					out = serverJarOut;
+				} else {
+					getProject().getLogger().warn("Unexpected file in Forge binpatches archive: " + name);
+					continue;
+				}
+
+				out.putNextEntry(new ZipEntry(name));
+
+				// Converting from legacy format to modern (v1) format
+				DataInputStream dataIn = new DataInputStream(in);
+				DataOutputStream dataOut = new DataOutputStream(out);
+				dataOut.writeByte(1); // version
+				dataIn.readUTF(); // unused patch name (presumably always the same as the obf class name)
+				dataOut.writeUTF(dataIn.readUTF().replace('.', '/')); // obf class name
+				dataOut.writeUTF(dataIn.readUTF().replace('.', '/')); // srg class name
+				in.transferTo(out); // remainder is unchanged
+
+				out.closeEntry();
+			}
+		}
+	}
+
+	private byte[] unpack200(InputStream in) throws IOException {
+		ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+
+		try (JarOutputStream jarOut = new JarOutputStream(bytes)) {
+			Pack200Provider provider = getExtension().getForge().getPack200Provider().getOrNull();
+
+			if (provider == null) {
+				throw new IllegalStateException("No provider for Pack200 has been found. Did you declare a provider?");
+			}
+
+			provider.unpack(in, jarOut);
+		}
+
+		return bytes.toByteArray();
+	}
+
+	private byte[] unpack200Lzma(InputStream in) throws IOException {
+		try (LzmaInputStream lzmaIn = new LzmaInputStream(in, new Decoder())) {
+			return unpack200(lzmaIn);
+		}
+	}
+
+	private byte[] unpack200Lzma(Path path) throws IOException {
+		try (InputStream in = Files.newInputStream(path)) {
+			return unpack200Lzma(in);
 		}
 	}
 
