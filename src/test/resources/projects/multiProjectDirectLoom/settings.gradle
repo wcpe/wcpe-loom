@@ -1,0 +1,4 @@
+rootProject.name = "multi-project-direct-loom"
+
+include "one"
+include "two"

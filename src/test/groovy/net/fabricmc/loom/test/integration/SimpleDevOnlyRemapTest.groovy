@@ -137,12 +137,13 @@ class SimpleDevOnlyRemapTest extends Specification implements GradleProjectTestT
 	def "build with official to named"() {
 		setup:
 		def mappings = Path.of("src/test/resources/mappings/25w46a_unobfuscated-named-minimal.tiny").toAbsolutePath()
+		def mappingsLiteral = mappings.toString().replace('\\', '/')
 		def gradle = gradleProject(project: "minimalBase", version: PRE_RELEASE_GRADLE)
 		gradle.buildGradle << """
 				dependencies {
 					minecraft 'com.mojang:minecraft:25w46a_unobfuscated'
 					mappings loom.layered {
-					    it.mappings file("${mappings}")
+					    it.mappings file("${mappingsLiteral}")
 					}
 					modImplementation "net.fabricmc:fabric-loader:0.18.0"
                 }
