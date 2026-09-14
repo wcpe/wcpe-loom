@@ -168,13 +168,13 @@ public class MinecraftPatchedProvider {
 		minecraftClientExtra = forgeWorkingDir.resolve("client-extra.jar");
 	}
 
-	private void cleanAllCache() throws IOException {
+	protected void cleanAllCache() throws IOException {
 		for (Path path : getGlobalCaches()) {
 			Files.deleteIfExists(path);
 		}
 	}
 
-	private Path[] getGlobalCaches() {
+	protected Path[] getGlobalCaches() {
 		Path[] files = {
 				minecraftIntermediateJar,
 				minecraftPatchedIntermediateJar,
@@ -186,7 +186,7 @@ public class MinecraftPatchedProvider {
 		return files;
 	}
 
-	private void checkCache() throws IOException {
+	protected void checkCache() throws IOException {
 		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(Files::notExists)
 				|| !isPatchedJarUpToDate(minecraftPatchedJar)) {
 			cleanAllCache();
@@ -503,7 +503,7 @@ public class MinecraftPatchedProvider {
 		return getExtension().getForgeUserdevProvider().getUserdevJar();
 	}
 
-	private boolean isPatchedJarUpToDate(Path jar) throws IOException {
+	protected boolean isPatchedJarUpToDate(Path jar) throws IOException {
 		if (Files.notExists(jar)) return false;
 
 		byte[] manifestBytes = ZipUtils.unpackNullable(jar, "META-INF/MANIFEST.MF");
@@ -524,7 +524,7 @@ public class MinecraftPatchedProvider {
 		}
 	}
 
-	private void accessTransformForge() throws IOException {
+	protected void accessTransformForge() throws IOException {
 		Path input = minecraftPatchedIntermediateJar;
 		Path target = minecraftPatchedIntermediateAtJar;
 		Stopwatch stopwatch = Stopwatch.createStarted();
@@ -593,7 +593,7 @@ public class MinecraftPatchedProvider {
 		logger.lifecycle(":patched jars in " + stopwatch.stop());
 	}
 
-	private void patchJars(Path clean, Path output, Path patches) {
+	protected void patchJars(Path clean, Path output, Path patches) throws Exception {
 		ForgeToolValueSource.exec(project, spec -> {
 			UserdevConfig.BinaryPatcherConfig config = getExtension().getForgeUserdevProvider().getConfig().binpatcher();
 			final FileCollection download = DependencyDownloader.download(project, config.dependency());
@@ -676,11 +676,11 @@ public class MinecraftPatchedProvider {
 		}
 	}
 
-	private void walkFileSystems(Path source, Path target, Predicate<Path> filter, FsPathConsumer action) throws IOException {
+	protected void walkFileSystems(Path source, Path target, Predicate<Path> filter, FsPathConsumer action) throws IOException {
 		walkFileSystems(source, target, filter, FileSystem::getRootDirectories, action);
 	}
 
-	private void copyMissingClasses(Path source, Path target) throws IOException {
+	protected void copyMissingClasses(Path source, Path target) throws IOException {
 		walkFileSystems(source, target, it -> it.toString().endsWith(".class"), (sourceFs, targetFs, sourcePath, targetPath) -> {
 			if (Files.exists(targetPath)) return;
 			Path parent = targetPath.getParent();
@@ -702,7 +702,7 @@ public class MinecraftPatchedProvider {
 		walkFileSystems(source, target, filter, this::copyReplacing);
 	}
 
-	private void copyReplacing(FileSystem sourceFs, FileSystem targetFs, Path sourcePath, Path targetPath) throws IOException {
+	protected void copyReplacing(FileSystem sourceFs, FileSystem targetFs, Path sourcePath, Path targetPath) throws IOException {
 		Path parent = targetPath.getParent();
 
 		if (parent != null) {
