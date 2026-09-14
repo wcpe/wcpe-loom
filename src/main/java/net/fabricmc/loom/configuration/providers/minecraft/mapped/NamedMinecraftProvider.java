@@ -24,6 +24,7 @@
 
 package net.fabricmc.loom.configuration.providers.minecraft.mapped;
 
+import java.nio.file.Path;
 import java.util.List;
 
 import org.gradle.api.Project;
@@ -37,6 +38,8 @@ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftSourceSets;
 import net.fabricmc.loom.configuration.providers.minecraft.SingleJarEnvType;
 import net.fabricmc.loom.configuration.providers.minecraft.SingleJarMinecraftProvider;
 import net.fabricmc.loom.configuration.providers.minecraft.SplitMinecraftProvider;
+import net.fabricmc.loom.util.cache.AtomicFiles;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.tinyremapper.TinyRemapper;
 
 public abstract class NamedMinecraftProvider<M extends MinecraftProvider> extends AbstractMappedMinecraftProvider<M> {
@@ -98,14 +101,26 @@ public abstract class NamedMinecraftProvider<M extends MinecraftProvider> extend
 			client.provide(childContext);
 
 			if (refreshOutputs) {
-				// then merge them
-				MergedMinecraftProvider.mergeJars(
-							client.getEnvOnlyJar().toFile(),
-							server.getEnvOnlyJar().toFile(),
-							getMergedJar().toFile()
-				);
+				// 合并产物写 GLOBAL 共享仓库：用与常规 named provider 相同的 per-key 跨进程锁串行化，
+				// 并原子落位，避免多 daemon 并发构建同一 MC<1.3 版本时损坏共享 merged jar。
+				final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
+				final Path lockRoot = extension.getFiles().getCacheLocks().toPath();
 
-				createBackupJars(minecraftJars);
+				cacheService.runExclusive(lockRoot, cacheKey(), LoomCacheService.defaultTimeout(), () -> {
+					// 锁内二次确认：等锁期间可能已被其它进程合并完成
+					if (this.shouldRefreshOutputs(childContext)) {
+						// 原子发布：合并写到唯一临时 jar，完整后再原子 move 到 GLOBAL merged jar
+						AtomicFiles.publish(getMergedJar().getPath(), tmpJar -> MergedMinecraftProvider.mergeJars(
+									client.getEnvOnlyJar().toFile(),
+									server.getEnvOnlyJar().toFile(),
+									tmpJar.toFile()
+						));
+
+						createBackupJars(minecraftJars);
+					}
+
+					return null;
+				});
 			}
 
 			getMavenHelper(MinecraftJar.Type.MERGED).savePom();
