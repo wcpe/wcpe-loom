@@ -57,7 +57,8 @@ class OfflineModeTest extends Specification implements GradleProjectTestTrait {
 
 		def projectHash = result1.output.split("%%")[1]
 
-		// Create a dummy lock file to ensure that the loom cache is rebuilt on the next run
+		// 留下旧版 Loom 使用的项目级锁文件。当前细粒度锁协议不再把“锁文件存在”等同于
+		// “锁仍被占用”，因此离线暖缓存必须可以忽略这个遗留文件并继续构建。
 		def lockFile = new File(gradle.gradleHomeDir, "caches/essential-loom/.${projectHash}.lock")
 		lockFile.text = "12345"
 
@@ -66,8 +67,6 @@ class OfflineModeTest extends Specification implements GradleProjectTestTrait {
 		then:
 		result1.task(":build").outcome == SUCCESS
 		result2.task(":build").outcome == SUCCESS
-
-		result2.output.contains("is currently held by pid '12345'")
-		result2.output.contains("rebuilding loom cache")
+		!result2.output.contains("is currently held by pid '12345'")
 	}
 }

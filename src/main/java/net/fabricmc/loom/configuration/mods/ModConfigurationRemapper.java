@@ -87,6 +87,7 @@ public class ModConfigurationRemapper {
 	public static final String MISSING_GROUP = "unspecified";
 
 	private static final Logger LOGGER = LoggerFactory.getLogger(ModConfigurationRemapper.class);
+	private static final String ARTIFACT_METADATA_CACHE = "artifactMetadata";
 
 	public static void supplyModConfigurations(Project project, ServiceFactory serviceFactory, String mappingsSuffix, LoomGradleExtension extension, SourceRemapper sourceRemapper) {
 		final DependencyHandler dependencies = project.getDependencies();
@@ -284,22 +285,13 @@ public class ModConfigurationRemapper {
 	private record MetadataCacheKey(Path path, ArtifactMetadata.MixinRemapType defaultMixinRemapType) { }
 
 	/**
-	 * 返回附着在根项目上的跨子项目共享 {@link AsyncCache}.
+	 * 返回当前 Loom classloader 服务内的跨子项目共享 {@link AsyncCache}.
 	 *
-	 * <p>缓存仅存活于根项目实例生命周期内（每次构建都会创建新的根项目），因此不会跨 daemon
-	 * 构建泄漏；多个子项目解析同一个 mod jar 时可复用同一个 future。
+	 * <p>缓存仅存活于 Gradle build service 生命周期内，不会跨 daemon 构建泄漏；多个子项目
+	 * 解析同一个 mod jar 时可复用同一个 future，同时不会跨 classloader 共享强类型对象。
 	 */
 	private static AsyncCache<ArtifactMetadata> getSharedMetaCache(Project project) {
-		final Project root = project.getRootProject();
-		final org.gradle.api.plugins.ExtraPropertiesExtension extra = root.getExtensions().getExtraProperties();
-		final String key = "loom_sharedArtifactMetadataCache";
-		synchronized (root) {
-			if (!extra.has(key)) {
-				extra.set(key, new AsyncCache<ArtifactMetadata>());
-			}
-
-			return (AsyncCache<ArtifactMetadata>) extra.get(key);
-		}
+		return LoomCacheService.get(project).get().getAsyncCache(ARTIFACT_METADATA_CACHE);
 	}
 
 	private static void createConstraints(ArtifactRef artifact, Configuration targetConfig, Configuration sourceConfig, DependencyHandler dependencies) {
