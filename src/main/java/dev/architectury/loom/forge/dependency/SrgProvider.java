@@ -25,10 +25,15 @@
 package dev.architectury.loom.forge.dependency;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.Reader;
 import java.io.UncheckedIOException;
+import java.io.Writer;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
@@ -36,6 +41,8 @@ import java.util.Map;
 import dev.architectury.loom.forge.tool.ForgeToolValueSource;
 import dev.architectury.loom.util.DependencyDownloader;
 import dev.architectury.loom.util.Stopwatch;
+import org.cadixdev.lorenz.io.srg.SrgReader;
+import org.cadixdev.lorenz.io.srg.tsrg.TSrgWriter;
 import org.gradle.api.Project;
 import org.jspecify.annotations.Nullable;
 
@@ -75,7 +82,22 @@ public class SrgProvider extends DependencyProvider {
 
 		if (!Files.exists(srg) || refreshDeps()) {
 			Path srgZip = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve srg")).toPath();
-			Files.write(srg, ZipUtils.unpack(srgZip, "config/joined.tsrg"));
+
+			try {
+				Files.write(srg, ZipUtils.unpack(srgZip, "config/joined.tsrg"));
+			} catch (NoSuchFileException e) {
+				try {
+					// FG2-era MCP uses the older SRG format, convert it on the fly
+					byte[] srgBytes = ZipUtils.unpack(srgZip, "joined.srg");
+
+					try (Reader reader = new InputStreamReader(new ByteArrayInputStream(srgBytes)); Writer writer = Files.newBufferedWriter(srg)) {
+						new TSrgWriter(writer).write(new SrgReader(reader).read());
+					}
+				} catch (NoSuchFileException e1) {
+					e.addSuppressed(e1);
+					throw e;
+				}
+			}
 		}
 
 		try (BufferedReader reader = Files.newBufferedReader(srg)) {

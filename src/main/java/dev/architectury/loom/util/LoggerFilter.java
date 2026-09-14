@@ -46,4 +46,31 @@ public class LoggerFilter {
 			// Failed to replace logger filter, just ignore
 		}
 	}
+
+	public static <T extends Throwable> void withSystemOutAndErrSuppressed(CheckedRunnable<T> block) throws T {
+		PrintStream previousOut = System.out;
+		PrintStream previousErr = System.err;
+
+		try {
+			System.setOut(new PrintStream(NullOutputStream.INSTANCE));
+			System.setErr(new PrintStream(NullOutputStream.INSTANCE));
+		} catch (SecurityException ignored) {
+			// Failed to replace logger, just ignore
+		}
+
+		try {
+			block.run();
+		} finally {
+			try {
+				System.setOut(previousOut);
+				System.setErr(previousErr);
+			} catch (SecurityException ignored) {
+				// Failed to replace logger, just ignore
+			}
+		}
+	}
+
+	public interface CheckedRunnable<T extends Throwable> {
+		void run() throws T;
+	}
 }

@@ -37,6 +37,7 @@ import org.gradle.api.invocation.Gradle;
 import org.gradle.api.plugins.ExtensionAware;
 import org.gradle.api.plugins.PluginAware;
 
+import net.fabricmc.loom.configuration.providers.minecraft.library.processors.LWJGL2UpgradeLibraryProcessor;
 import net.fabricmc.loom.extension.LoomFiles;
 import net.fabricmc.loom.util.MirrorUtil;
 
@@ -71,6 +72,7 @@ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
 
 	private void declareRepositories(RepositoryHandler repositories, LoomFiles files, ExtensionAware target) {
 		declareLocalRepositories(repositories, files);
+		LWJGL2UpgradeLibraryProcessor.legacyFabricLWJGL(repositories);
 
 		repositories.maven(repo -> {
 			repo.setName("Architectury");
@@ -94,6 +96,10 @@ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
 				sources.artifact();
 				sources.ignoreGradleMetadataRedirection();
 			});
+
+			// Fallback to maven central for artifacts such as sources or javadocs that are not mirrored on Mojang's repo.
+			// See: https://github.com/FabricMC/fabric-loom/issues/1032
+			repo.artifactUrls(ArtifactRepositoryContainer.MAVEN_CENTRAL_URL);
 		});
 		repositories.maven(repo -> {
 			repo.setName("Forge");
