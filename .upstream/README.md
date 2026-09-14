@@ -99,6 +99,61 @@ GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash base/essential-1.15-713489a9
 
 ---
 
+## 协作：别人的贡献怎么进来
+
+**main 是唯一主线，不接受直接推送。** 其他人在自己的 fork 或分支上开发，提 PR，由维护者审查后并入补丁队列。
+
+### 分支角色
+
+| 分支 | 谁可以写 | 作用 |
+|---|---|---|
+| `main` | 仅维护者 | 唯一主线，补丁队列在这里 |
+| 贡献者的 fork / 分支 | 各自 | 提 PR 用，合完即可删除 |
+| `dev/1.15-wcpe` | **已冻结** | 重构前的旧历史，仅作存档，不要往上提交 |
+
+### 分支保护规则
+
+`main` 已启用保护，非维护者：
+
+- 不能直接 push（必须走 PR）
+- 不能 force push
+- 不能删除 `main`
+- PR 需要 1 个 approval
+
+维护者不受这些限制（`enforce_admins: false`）——因为**改写补丁必须 force push**，这条保护对维护者是放行的，只拦外部。
+
+### 合并 PR 的正确方式
+
+GitHub 的三个按钮里只有一个能用：
+
+| 按钮 | 能用吗 | 原因 |
+|---|---|---|
+| Create a merge commit | ❌ | 会在队列里留下 merge 提交，`verify` 第 2 项直接失败 |
+| Squash and merge | ⚠️ | 队列保持线性，但贡献者的提交被压成一条，溯源信息丢失 |
+| **Rebase and merge** | ✅ | 保留提交与溯源字段，队列保持线性 |
+
+### 对贡献者的要求
+
+提交信息必须按补丁规范书写，否则没法并入队列：
+
+```
+<type>(<scope>): <中文描述>
+
+<为什么改>
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+```
+
+`Origin` 取值见 [PATCH-QUEUE.md](PATCH-QUEUE.md#3-溯源标注)。不符合规范的 PR，维护者需要先整理成合规补丁再并入，或者直接要求对方改写。
+
+### 两个不用担心的地方
+
+- **从外部分支提 PR 不会触发 force push**：只要贡献者的分支基于最新 `main`，rebase 合并不改写 `main` 的已有历史。
+- **PR 合进 main 会触发 CI**：推代码 → 发测试版指针；打 tag → 发正式版。这是预期行为。
+
+---
+
 ## 已发布的版本能不能改？
 
 **能改，tag 是锚点。**
