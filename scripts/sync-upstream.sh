@@ -24,8 +24,9 @@ ESS_BRANCH="dev/1.15"
 ARCH_BRANCH="dev/1.17"
 
 # 补丁队列边界（见 .upstream/PATCH-QUEUE.md）
-BASE_TAG="base/essential-1.15-713489a9"
-QUEUE_TAG="patch-queue/1.15"
+# 三者均可用环境变量覆盖，便于在换基底/换代系时切换队列
+BASE_TAG="${BASE_TAG:-base/essential-1.15-713489a9}"
+QUEUE_TAG="${QUEUE_TAG:-patch-queue/1.15}"
 QUEUE_BRANCH="${QUEUE_BRANCH:-main}"
 
 die() { echo "错误: $*" >&2; exit 1; }
@@ -181,15 +182,86 @@ cmd_candidates() {
 	echo "  2. 审核后采集: scripts/sync-upstream.sh pick <sha>"
 }
 
+# 给最近一个提交追加溯源字段（已存在则跳过）
+inject_traceability() {
+	local origin="$1"
+	local forwarded="$2"
+	local msg
+	msg=$(git log -1 --format='%B')
+
+	if printf '%s' "$msg" | grep -q '^Origin: '; then
+		echo "    溯源字段已存在，跳过注入"
+		return 0
+	fi
+
+	local tmpfile
+	tmpfile=$(mktemp)
+	# 去掉尾部空行后追加溯源块
+	printf '%s\n\nOrigin: %s\nForwarded: %s\n' \
+		"$(printf '%s' "$msg" | sed -e 's/[[:space:]]*$//')" "$origin" "$forwarded" > "$tmpfile"
+	git commit -q --amend -F "$tmpfile"
+	rm -f "$tmpfile"
+	echo "    已注入 Origin: $origin / Forwarded: $forwarded"
+}
+
+# 把队列末端标记前移到 HEAD（新补丁必须落在队列内部）
+advance_queue_tag() {
+	if ! git rev-parse --verify --quiet "$QUEUE_TAG" >/dev/null 2>&1; then
+		echo "    ⚠ 队列末端 tag '$QUEUE_TAG' 不存在，跳过前移"
+		echo "      首次建立队列时请手动创建：git tag -a \"$QUEUE_TAG\" -m '补丁队列末端'"
+		return 0
+	fi
+
+	if [ "$(git rev-parse "$QUEUE_TAG^{commit}")" = "$(git rev-parse HEAD)" ]; then
+		echo "    队列末端标记已在 HEAD"
+		return 0
+	fi
+
+	local old; old=$(git rev-parse --short "$QUEUE_TAG^{commit}")
+	git tag -d "$QUEUE_TAG" >/dev/null
+	git tag -a "$QUEUE_TAG" -m "补丁队列末端"
+	echo "    队列末端标记已前移：$old → $(git rev-parse --short HEAD)"
+}
+
 cmd_pick() {
 	require_clean
-	[ $# -ge 1 ] || die "用法: $0 pick <sha>..."
-	[ "$(git branch --show-current)" != "main" ] && echo "⚠ 当前不在 main（$(git branch --show-current)），正常流程应在 main 或专用采集分支上"
-	for sha in "$@"; do
-		echo ">>> cherry-pick -x $sha"
-		git cherry-pick -x "$sha" || die "采集 $sha 冲突。解决后 git cherry-pick --continue；放弃用 git cherry-pick --abort。冲突改写时请在提交信息中记录前置依赖与适配点"
+
+	local origin="" forwarded="not-needed"
+	local shas=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--origin)    origin="${2:-}";    shift 2 ;;
+			--forwarded) forwarded="${2:-}"; shift 2 ;;
+			--)          shift; shas+=("$@"); break ;;
+			-*)          die "未知选项: $1" ;;
+			*)           shas+=("$1"); shift ;;
+		esac
 	done
-	echo ">>> 采集完成，请运行构建验证: ./gradlew build -x test"
+
+	[ ${#shas[@]} -ge 1 ] || die "用法: $0 pick <sha>... [--origin '<值>'] [--forwarded '<值>']
+  例: $0 pick f6682efb --origin 'backport, fabric-loom dev/1.16@f6682efb'"
+
+	[ "$(git branch --show-current)" != "$QUEUE_BRANCH" ] && \
+		echo "⚠ 当前不在 $QUEUE_BRANCH（$(git branch --show-current)），正常流程应在主线或专用采集分支上"
+
+	for sha in "${shas[@]}"; do
+		echo ">>> cherry-pick -x $sha"
+		git cherry-pick -x "$sha" || die "采集 $sha 冲突。
+  解决后继续：git cherry-pick --continue
+  放弃本次：  git cherry-pick --abort
+  冲突改写时请在提交信息中记录适配点"
+
+		if [ -n "$origin" ]; then
+			inject_traceability "$origin" "$forwarded"
+		fi
+	done
+
+	advance_queue_tag
+
+	echo
+	echo ">>> 采集完成。建议接着运行："
+	echo "    $0 verify"
+	echo "    ./gradlew build -x test"
 }
 
 cmd_essential_rebase() {
