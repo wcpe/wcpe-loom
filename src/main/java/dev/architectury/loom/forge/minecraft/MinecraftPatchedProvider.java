@@ -525,8 +525,17 @@ public class MinecraftPatchedProvider {
 	}
 
 	protected void accessTransformForge() throws IOException {
-		Path input = minecraftPatchedIntermediateJar;
-		Path target = minecraftPatchedIntermediateAtJar;
+		accessTransform(minecraftPatchedIntermediateJar, minecraftPatchedIntermediateAtJar);
+	}
+
+	/**
+	 * 对给定 jar 执行 Forge 的 access transform.
+	 *
+	 * <p>现代 Forge 走 {@link #accessTransformForge()}（中间产物路径）；legacy Forge 的补丁
+	 * 流程在 FG2 自己的工作目录下产出 jar（client/server/merged-patched.jar），必须显式指定
+	 * 输入输出，否则会写错产物，令后续的 walkFileSystems / applyLoomPatchVersion 拿到陈旧文件。
+	 */
+	protected void accessTransform(Path input, Path target) throws IOException {
 		Stopwatch stopwatch = Stopwatch.createStarted();
 		logger.lifecycle(":access transforming minecraft");
 

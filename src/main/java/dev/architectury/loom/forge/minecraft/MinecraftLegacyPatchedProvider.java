@@ -154,7 +154,7 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 			case SERVER_ONLY -> minecraftServerPatchedJar;
 			case MERGED -> minecraftMergedPatchedJar;
 			};
-			accessTransformForge();
+			accessTransform(minecraftPatchedJar, minecraftPatchedAtJar);
 			walkFileSystems(forgeJar, minecraftPatchedAtJar, (path) -> true, this::copyReplacing);
 			applyLoomPatchVersion(minecraftPatchedAtJar);
 		}
