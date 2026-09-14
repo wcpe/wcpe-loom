@@ -34,7 +34,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.Function;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 import javax.inject.Inject;
@@ -48,6 +48,7 @@ import org.gradle.api.provider.ListProperty;
 import org.gradle.api.provider.MapProperty;
 import org.gradle.api.provider.Property;
 import org.gradle.api.provider.Provider;
+import org.gradle.api.provider.ProviderFactory;
 import org.gradle.api.specs.Spec;
 import org.gradle.api.tasks.Input;
 import org.gradle.api.tasks.InputFiles;
@@ -63,6 +64,8 @@ import org.slf4j.LoggerFactory;
 
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.configuration.ide.RunConfig;
+import net.fabricmc.loom.configuration.ide.RuntimeLibraries;
+import net.fabricmc.loom.configuration.ide.RunConfigSettings;
 import net.fabricmc.loom.task.prod.TracyCapture;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.Platform;
@@ -75,6 +78,9 @@ public abstract class AbstractRunTask extends JavaExec {
 	@Inject
 	protected abstract ExecOperations getExecOperations();
 
+	@Inject
+	protected abstract ProviderFactory getProviders();
+
 	@Input
 	protected abstract Property<String> getInternalRunDir();
 	@Input
@@ -85,6 +91,9 @@ public abstract class AbstractRunTask extends JavaExec {
 	protected abstract Property<Boolean> getUseArgFile();
 	@Input
 	protected abstract Property<String> getProjectDir();
+	@Input
+	// Gradle 用户主目录绝对路径，供 canPathBeASCIIEncoded 在执行期读取（避免执行期访问 Project）
+	protected abstract Property<String> getGradleUserHomeDir();
 	@Input
 	// We use a string here, as it's technically an output, but we don't want to cache runs of this task by default.
 	protected abstract Property<String> getArgFilePath();
@@ -120,17 +129,24 @@ public abstract class AbstractRunTask extends JavaExec {
 	@Input
 	protected abstract Property<String> getRunConfigName();
 
-	public AbstractRunTask(Function<Project, RunConfig> configProvider) {
+	public AbstractRunTask(String runConfigName) {
 		super();
 		setGroup(Constants.TaskGroup.FABRIC);
 
-		final Provider<RunConfig> config = getProject().provider(() -> configProvider.apply(getProject()));
+		// 只捕获稳定的 run-config 名称。RunConfig.runConfig 会评估 Forge 模板并解析 detached
+		// configuration；在 Gradle 9.5 的 projectsEvaluated/task creation 阶段解析会触发
+		// unsafe configuration resolution。通过 project-scoped provider 延迟解析，同时不捕获
+		// RunConfigSettings 对象，保持配置缓存可序列化。
+		final Provider<RunConfig> config = getProviders().provider(() -> {
+			RunConfigSettings settings = LoomGradleExtension.get(getProject()).getRuns().getByName(runConfigName);
+			return RunConfig.runConfig(getProject(), settings);
+		});
 
-		getInternalClasspath().from(config.map(runConfig -> runConfig.sourceSet.getRuntimeClasspath()
-				.filter(new LibraryFilter(
-						config.get().getExcludedLibraryPaths(getProject()),
-						config.get().configName)
-				)));
+		getInternalClasspath().from(config.map(runConfig ->
+				runConfig.sourceSet.getRuntimeClasspath()
+						.filter(new LibraryFilter(
+								runConfig.getExcludedLibraryPaths(getProject()),
+								runConfig.configName))));
 
 		getArgumentProviders().add(new CommandLineArgumentProvider() {
 			@Override
@@ -149,20 +165,21 @@ public abstract class AbstractRunTask extends JavaExec {
 			}
 		});
 		getMainClass().set(config.map(runConfig -> runConfig.mainClass));
-		getJvmArguments().addAll(getProject().provider(this::getGameJvmArgs));
+		getJvmArguments().addAll(getProviders().provider(this::getGameJvmArgs));
 
 		getInternalRunDir().set(config.map(runConfig -> runConfig.runDir));
 		getInternalEnvironmentVars().set(config.map(runConfig -> runConfig.environmentVariables));
 		getInternalJvmArgs().set(config.map(runConfig -> runConfig.vmArgs));
 		getUseArgFile().set(getProject().provider(this::canUseArgFile));
 		getProjectDir().set(getProject().getProjectDir().getAbsolutePath());
+		getGradleUserHomeDir().set(getProject().getGradle().getGradleUserHomeDir().getAbsolutePath());
 
 		// Set up useXvfb: convention is CI + Linux + client run config + xvfb exists
 		getUseXvfb().convention(
-				getProject().getProviders().environmentVariable("CI")
+				getProviders().environmentVariable("CI")
 						.map(value -> Platform.CURRENT.getOperatingSystem().isLinux())
 						.zip(config, (enabled, runConfig) -> enabled && runConfig.environment.equals("client"))
-						.flatMap(enabled -> enabled ? XVFBExistsValueSource.exists(getProject()) : getProject().getProviders().provider(() -> false))
+						.flatMap(enabled -> enabled ? XVFBExistsValueSource.exists(getProviders()) : getProviders().provider(() -> false))
 						.orElse(false)
 		);
 
@@ -171,7 +188,7 @@ public abstract class AbstractRunTask extends JavaExec {
 		getArgFilePath().set(argFile.getAbsolutePath());
 
 		getModClassesOptions().set(ForgeModClassesService.createOptions(getProject()));
-		getRunConfigName().set(config.map(runConfig -> runConfig.name));
+		getRunConfigName().set(runConfigName);
 	}
 
 	private boolean canUseArgFile() {
@@ -187,8 +204,8 @@ public abstract class AbstractRunTask extends JavaExec {
 	private boolean canPathBeASCIIEncoded() {
 		CharsetEncoder asciiEncoder = StandardCharsets.US_ASCII.newEncoder();
 
-		return asciiEncoder.canEncode(getProject().getProjectDir().getAbsolutePath())
-				&& asciiEncoder.canEncode(getProject().getGradle().getGradleUserHomeDir().getAbsolutePath());
+		return asciiEncoder.canEncode(getProjectDir().get())
+				&& asciiEncoder.canEncode(getGradleUserHomeDir().get());
 	}
 
 	@Override

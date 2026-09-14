@@ -26,8 +26,8 @@ package net.fabricmc.loom.util;
 
 import javax.inject.Inject;
 
-import org.gradle.api.Project;
 import org.gradle.api.provider.Provider;
+import org.gradle.api.provider.ProviderFactory;
 import org.gradle.api.provider.ValueSource;
 import org.gradle.api.provider.ValueSourceParameters;
 import org.gradle.process.ExecOperations;
@@ -49,7 +49,7 @@ public abstract class XVFBExistsValueSource implements ValueSource<Boolean, Valu
 		return result.getExitValue() == 0;
 	}
 
-	public static Provider<Boolean> exists(Project project) {
-		return project.getProviders().of(XVFBExistsValueSource.class, i -> { });
+	public static Provider<Boolean> exists(ProviderFactory providers) {
+		return providers.of(XVFBExistsValueSource.class, i -> { });
 	}
 }
