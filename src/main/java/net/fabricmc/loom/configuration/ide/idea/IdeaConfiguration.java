@@ -35,6 +35,7 @@ import org.gradle.api.Project;
 
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.task.LoomTasks;
+import net.fabricmc.loom.util.gradle.GradleUtils;
 
 public abstract class IdeaConfiguration implements Runnable {
 	@Inject
@@ -49,6 +50,8 @@ public abstract class IdeaConfiguration implements Runnable {
 			}
 		});
 
+		hookDownloadSources();
+
 		if (!IdeaUtils.isIdeaSync()) {
 			return;
 		}
@@ -60,5 +63,27 @@ public abstract class IdeaConfiguration implements Runnable {
 		startParameter.setTaskNames(List.of("ideaSyncTask"));
 		taskRequests.addAll(startParameter.getTaskRequests());
 		startParameter.setTaskRequests(taskRequests);
+	}
+
+	private void hookDownloadSources() {
+		if (!GradleUtils.isRootProject(getProject())) {
+			return;
+		}
+
+		if (!DownloadSourcesHook.hasInitScript(getProject())) {
+			return;
+		}
+
+		getProject().getTasks().configureEach(task -> {
+			if (task.getName().startsWith(DownloadSourcesHook.INIT_SCRIPT_NAME)) {
+				getProject().allprojects(subProject -> {
+					if (!GradleUtils.isLoomProject(subProject)) {
+						return;
+					}
+
+					new DownloadSourcesHook(subProject, task).tryHook();
+				});
+			}
+		});
 	}
 }
