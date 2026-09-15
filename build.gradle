@@ -34,7 +34,8 @@ if (ENV.RELEASE_VERSION) {
 	// 发布流程可显式指定版本号（如从 tag 推导的 1.17.3），优先于按运行号推导
 	version = ENV.RELEASE_VERSION
 } else if (!isSnapshot) {
-	version = baseVersion + "." + runNumber
+	// 分支构建与正式版分属不同命名空间：正式版为 1.17.<N>（仅 tag 发布），分支构建为 1.17-dev.<运行号>
+	version = baseVersion + "-dev." + runNumber
 } else {
 	version = baseVersion + "-PR." + ENV.PR_NUM + "." + runNumber
 }
@@ -372,41 +373,55 @@ publishing {
 		}
 	}
 
-	publications {
+	publications { pubs ->
 		if (!isSnapshot && !ENV.EXPERIMENTAL) {
-			// Also publish a snapshot so people can use the latest version if they wish
-			snapshot(MavenPublication) { publication ->
-				groupId = project.group
-				artifactId = project.base.archivesName.get()
-				version = baseVersion + '-SNAPSHOT'
+			// 除具体版本外，额外发布一组固定版本（随每次发布覆盖）：
+			//   1.17-SNAPSHOT    —— 始终指向最近一次发布（不论正式版还是分支构建）
+			//   1.17-latest      —— 稳定线指针，仅正式版发布时更新
+			//   1.17-dev-latest  —— 开发线指针，仅分支构建时更新
+			// 使用者写指针版本即可，无需关心单调递增的运行号。
+			def extraVersions = [(baseVersion + '-SNAPSHOT'): 'snapshot']
 
-				from components.java
+			if (ENV.PUBLISH_LATEST == 'stable') {
+				extraVersions[baseVersion + '-latest'] = 'latest'
+			} else if (ENV.PUBLISH_LATEST == 'dev') {
+				extraVersions[baseVersion + '-dev-latest'] = 'devLatest'
 			}
 
 			def projectGroup = project.group
 			def projectArtifactId = project.base.archivesName.get()
 			def markerDependencyVersion = project.version.toString()
 
-			gradlePlugin.plugins.forEach { plugin ->
-				// Manually crate the plugin marker for snapshot versions
-				it.create(plugin.id + "SnapshotMarker", MavenPublication) { publication ->
-					groupId = plugin.id
-					artifactId = plugin.id + '.gradle.plugin'
-					version = baseVersion + '-SNAPSHOT'
+			extraVersions.each { extraVersion, name ->
+				pubs.create(name, MavenPublication) { publication ->
+					groupId = projectGroup
+					artifactId = projectArtifactId
+					version = extraVersion
 
-					pom.withXml({
-						// Based off org.gradle.plugin.devel.plugins.MavenPluginPublishPlugin
-						Element root = asElement()
-						Document document = root.getOwnerDocument()
-						Node dependencies = root.appendChild(document.createElement('dependencies'))
-						Node dependency = dependencies.appendChild(document.createElement('dependency'))
-						Node groupId = dependency.appendChild(document.createElement('groupId'))
-						groupId.setTextContent(projectGroup)
-						Node artifactId = dependency.appendChild(document.createElement('artifactId'))
-						artifactId.setTextContent(projectArtifactId)
-						Node version = dependency.appendChild(document.createElement('version'))
-						version.setTextContent(markerDependencyVersion)
-					})
+					from components.java
+				}
+
+				gradlePlugin.plugins.forEach { plugin ->
+					// Manually crate the plugin marker for the extra versions
+					pubs.create(plugin.id + name.capitalize() + 'Marker', MavenPublication) { publication ->
+						groupId = plugin.id
+						artifactId = plugin.id + '.gradle.plugin'
+						version = extraVersion
+
+						pom.withXml({
+							// Based off org.gradle.plugin.devel.plugins.MavenPluginPublishPlugin
+							Element root = asElement()
+							Document document = root.getOwnerDocument()
+							Node dependencies = root.appendChild(document.createElement('dependencies'))
+							Node dependency = dependencies.appendChild(document.createElement('dependency'))
+							Node groupId = dependency.appendChild(document.createElement('groupId'))
+							groupId.setTextContent(projectGroup)
+							Node artifactId = dependency.appendChild(document.createElement('artifactId'))
+							artifactId.setTextContent(projectArtifactId)
+							Node version = dependency.appendChild(document.createElement('version'))
+							version.setTextContent(markerDependencyVersion)
+						})
+					}
 				}
 			}
 		}
