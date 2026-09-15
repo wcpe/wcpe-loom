@@ -1,9 +1,10 @@
 name: CI
 
 # 触发规则：
-# 1. 推送到 dev/1.17-wcpe（仅代码变更）→ 构建 + 发布补丁版本（版本号 1.17.<运行号>）
-# 2. 打 wcpe-v 开头的 tag → 发布该 tag 指定的正式版（如 wcpe-v1.17.1 → 1.17.1）
-#    并创建 GitHub Release。
+# 1. 推送到 dev/1.17-wcpe（仅代码变更）→ 构建 + 发布开发版（版本号 1.17-dev.<运行号>），
+#    并更新开发线指针 1.17-dev-latest
+# 2. 打 wcpe-v 开头的 tag → 发布该 tag 指定的正式版（如 wcpe-v1.17.1 → 1.17.1），
+#    更新稳定线指针 1.17-latest，并创建 GitHub Release。
 #    说明：这里不用 v* 前缀，因为上游 fabric-loom 已占用大量 v1.17.* 的 release tag，
 #    同名 tag 在本仓库内不可复用。
 # 3. 纯文档修改（README/CHANGELOG/docs/**）不触发任何构建
@@ -52,14 +53,13 @@ jobs:
             VERSION="${GITHUB_REF#refs/tags/wcpe-v}"
             echo "is-release=true" >> "$GITHUB_OUTPUT"
             echo "release-version=$VERSION" >> "$GITHUB_OUTPUT"
-            echo "latest-version=1.17-latest" >> "$GITHUB_OUTPUT"
             echo "is-prerelease=false" >> "$GITHUB_OUTPUT"
           else
-            # 代码推送：发布补丁版本 1.17.<运行号>；运行号单调递增，天然满足产物不可覆盖的要求
-            VERSION="1.17.${GITHUB_RUN_NUMBER}"
+            # 代码推送：发布开发版 1.17-dev.<运行号>，与正式版 1.17.<N> 分属不同命名空间；
+            # 运行号单调递增，天然满足产物不可覆盖的要求
+            VERSION="1.17-dev.${GITHUB_RUN_NUMBER}"
             echo "is-release=false" >> "$GITHUB_OUTPUT"
             echo "release-version=$VERSION" >> "$GITHUB_OUTPUT"
-            echo "latest-version=1.17-dev-latest" >> "$GITHUB_OUTPUT"
             echo "is-prerelease=true" >> "$GITHUB_OUTPUT"
           fi
 
