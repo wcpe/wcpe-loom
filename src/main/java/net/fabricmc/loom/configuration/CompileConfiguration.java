@@ -80,8 +80,10 @@ import net.fabricmc.loom.configuration.processors.JsrAnnotationRemapperProcessor
 import net.fabricmc.loom.configuration.processors.MinecraftJarProcessorManager;
 import net.fabricmc.loom.configuration.processors.ModJavadocProcessor;
 import net.fabricmc.loom.configuration.processors.speccontext.DebofConfiguration;
+import net.fabricmc.loom.configuration.providers.mappings.GeneratedIntermediateMappingsProvider;
 import net.fabricmc.loom.configuration.providers.mappings.LayeredMappingsFactory;
 import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration;
+import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftMetadataProvider;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftSourceSets;
@@ -138,26 +140,15 @@ public abstract class CompileConfiguration implements Runnable {
 				extension.setRefreshDeps(true);
 			}
 
-			// 跨进程缓存锁：getGlobalLockObject 只覆盖 JVM 内（同一 daemon 的多个 classloader），
-			// 多个 daemon 并发构建同一版本时会同时进入 setupMinecraft 生产共享缓存产物并互相踩踏。
-			// 外层叠加 per-key 跨进程文件锁，键按 Minecraft 版本 + 映射标识隔离，不同版本仍可并行。
-			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
-			final var lockRoot = extension.getFiles().getCacheLocks().toPath();
-			final String setupLockKey = "minecraft-setup:" + extension.getMinecraftProvider().minecraftVersion()
-					+ ":" + (extension.disableObfuscation() ? "deobf" : extension.getMappingConfiguration().mappingsIdentifier);
-
 			try {
-				cacheService.runExclusive(lockRoot, setupLockKey, LoomCacheService.defaultTimeout(), () -> {
-					// Setting up loom across Gradle projects is not thread safe, synchronize it here to ensure that multiple projects cannot use it.
-					// There is no easy way around this, as we want to use the same global cache for downloaded or generated files.
-					synchronized (getGlobalLockObject()) {
-						setupMinecraft(configContext);
-					}
+				// Setting up loom across Gradle projects is not thread safe, synchronize it here to ensure that multiple projects cannot use it.
+				// There is no easy way around this, as we want to use the same global cache for downloaded or generated files.
+				synchronized (getGlobalLockObject()) {
+					setupMinecraft(configContext);
+				}
 
-					var dependencyManager = new LoomDependencyManager(getProject(), serviceFactory, extension);
-					dependencyManager.handleDependencies();
-					return null;
-				});
+				var dependencyManager = new LoomDependencyManager(getProject(), serviceFactory, extension);
+				dependencyManager.handleDependencies();
 			} catch (Exception e) {
 				ExceptionUtil.processException(e, DaemonUtils.Context.fromProject(getProject()));
 				disownLock();
@@ -264,6 +255,12 @@ public abstract class CompileConfiguration implements Runnable {
 			// but before MinecraftPatchedProvider.provide.
 			setupDependencyProviders(project, extension);
 
+			if (extension.isLegacyForge()) {
+				extension.setIntermediateMappingsProvider(GeneratedIntermediateMappingsProvider.class, provider -> {
+					provider.minecraftProvider = minecraftProvider;
+				});
+			}
+
 			// Resolve the mapping files from the configuration
 			final DependencyInfo mappingsDep = DependencyInfo.create(getProject(), Configurations.MAPPINGS);
 			final MappingConfiguration mappingConfiguration = MappingConfiguration.create(getProject(), configContext.serviceFactory(), mappingsDep, minecraftProvider);
@@ -303,27 +300,50 @@ public abstract class CompileConfiguration implements Runnable {
 			namedMinecraftProvider = jarConfiguration.createProcessedNamedMinecraftProvider(namedMinecraftProvider, minecraftJarProcessorManager);
 		}
 
-		final var provideContext = new AbstractMappedMinecraftProvider.ProvideContext(true, extension.refreshDeps(), configContext);
+		provideMappedMinecraftJars(extension, project, configContext, jarConfiguration, intermediaryMinecraftProvider, namedMinecraftProvider);
+	}
 
-		if (intermediaryMinecraftProvider != null) {
-			extension.setIntermediaryMinecraftProvider(intermediaryMinecraftProvider);
-			intermediaryMinecraftProvider.provide(provideContext);
-		}
+	/**
+	 * 跨进程供给已映射的 Minecraft jar。
+	 * <p>
+	 * getGlobalLockObject 只覆盖 JVM 内（同一 daemon 的多个 classloader），多个 daemon 并发构建同一版本时
+	 * 仍会同时生产共享缓存产物并互相踩踏；因此按 Minecraft 版本 + 映射标识叠加一把 per-key 跨进程文件锁，
+	 * 不同版本仍可并行。输出检查与重建必须同属一个事务，否则另一进程会在本项目读取 intermediary 时将它删除并重建。
+	 */
+	private void provideMappedMinecraftJars(LoomGradleExtension extension, Project project, ConfigContext configContext,
+			MinecraftJarConfiguration<?, ?, ?> jarConfiguration,
+			IntermediaryMinecraftProvider<?> intermediaryMinecraftProvider,
+			NamedMinecraftProvider<?> namedMinecraftProvider) throws Exception {
+		final var lockRoot = extension.getFiles().getCacheLocks().toPath();
+		final String mappingsIdentifier = extension.disableObfuscation() ? "deobf" : extension.getMappingConfiguration().mappingsIdentifier();
+		final String key = "minecraft-provision:" + extension.getMinecraftProvider().minecraftVersion() + ":" + mappingsIdentifier;
+		final LoomCacheService cacheService = LoomCacheService.get(project).get();
 
-		extension.setNamedMinecraftProvider(namedMinecraftProvider);
-		namedMinecraftProvider.provide(provideContext);
+		cacheService.runExclusive(lockRoot, key, LoomCacheService.defaultTimeout(), () -> {
+			final var provideContext = new AbstractMappedMinecraftProvider.ProvideContext(true, extension.refreshDeps(), configContext);
 
-		if (extension.isForge()) {
-			final SrgMinecraftProvider<?> srgMinecraftProvider = jarConfiguration.createSrgMinecraftProvider(project);
-			extension.setSrgMinecraftProvider(srgMinecraftProvider);
-			srgMinecraftProvider.provide(provideContext);
-		}
+			if (intermediaryMinecraftProvider != null) {
+				extension.setIntermediaryMinecraftProvider(intermediaryMinecraftProvider);
+				intermediaryMinecraftProvider.provide(provideContext);
+			}
 
-		if (extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime() && !extension.isUnobfuscatedForge()) {
-			final MojangMappedMinecraftProvider<?> mojangMappedMinecraftProvider = jarConfiguration.createMojangMappedMinecraftProvider(project);
-			extension.setMojangMappedMinecraftProvider(mojangMappedMinecraftProvider);
-			mojangMappedMinecraftProvider.provide(provideContext);
-		}
+			extension.setNamedMinecraftProvider(namedMinecraftProvider);
+			namedMinecraftProvider.provide(provideContext);
+
+			if (extension.isForge()) {
+				final SrgMinecraftProvider<?> srgMinecraftProvider = jarConfiguration.createSrgMinecraftProvider(project);
+				extension.setSrgMinecraftProvider(srgMinecraftProvider);
+				srgMinecraftProvider.provide(provideContext);
+			}
+
+			if (extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime() && !extension.isUnobfuscatedForge()) {
+				final MojangMappedMinecraftProvider<?> mojangMappedMinecraftProvider = jarConfiguration.createMojangMappedMinecraftProvider(project);
+				extension.setMojangMappedMinecraftProvider(mojangMappedMinecraftProvider);
+				mojangMappedMinecraftProvider.provide(provideContext);
+			}
+
+			return null;
+		});
 	}
 
 	private void registerGameProcessors(ConfigContext configContext) {
@@ -615,9 +635,9 @@ public abstract class CompileConfiguration implements Runnable {
 		}
 
 		if (extension.isForgeLike()) {
+			dependencyProviders.addProvider(new ForgeUniversalProvider(project));
 			dependencyProviders.addProvider(new McpConfigProvider(project));
 			dependencyProviders.addProvider(new PatchProvider(project));
-			dependencyProviders.addProvider(new ForgeUniversalProvider(project));
 		}
 
 		dependencyProviders.handleDependencies(project);
