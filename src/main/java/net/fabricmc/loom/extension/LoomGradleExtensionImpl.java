@@ -139,7 +139,7 @@ public abstract class LoomGradleExtensionImpl extends LoomGradleExtensionApiImpl
 		disableObfuscation = project.getObjects().property(Boolean.class);
 		dontRemap = project.getObjects().property(Boolean.class);
 
-		if (project.getPluginManager().hasPlugin(LoomNoRemapGradlePlugin.NAME)) {
+		if (LoomNoRemapGradlePlugin.isApplied(project)) {
 			disableObfuscation.set(true);
 			disableObfuscation.finalizeValue();
 		} else {

@@ -1,5 +1,6 @@
 plugins {
-	id 'dev.architectury.loom'
+	// 本夹具用新插件 id，其余夹具仍用 dev.architectury.loom 以覆盖别名路径
+	id 'top.wcpe.loom'
 	id 'maven-publish'
 }
 
