@@ -22,10 +22,17 @@
  * SOFTWARE.
  */
 
-package net.fabricmc.loom.test.integration.buildSrc.loomClasspath
+package net.fabricmc.loom.configuration.providers.forge.fg2;
 
-import org.gradle.api.services.BuildService
-import org.gradle.api.services.BuildServiceParameters
+import java.io.InputStream;
+import java.util.jar.JarOutputStream;
 
-abstract class ForeignCacheService implements BuildService<BuildServiceParameters.None> {
+/**
+ * pack200 解包器.
+ *
+ * <p>legacy Forge（1.8-1.16）的 binpatches 以 pack200 压缩，JDK 自 14 起移除了内置实现，
+ * 因此由调用方注入（通常是 architectury-pack200）。
+ */
+public interface Pack200Provider {
+	void unpack(InputStream inputStream, JarOutputStream outputStream);
 }

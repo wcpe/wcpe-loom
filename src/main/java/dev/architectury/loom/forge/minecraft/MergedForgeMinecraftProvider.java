@@ -28,16 +28,16 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
 
+import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.configuration.ConfigContext;
 import net.fabricmc.loom.configuration.providers.minecraft.MergedMinecraftProvider;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftMetadataProvider;
 
 public final class MergedForgeMinecraftProvider extends MergedMinecraftProvider implements ForgeMinecraftProvider {
-	private final MinecraftPatchedProvider patchedProvider;
+	private MinecraftPatchedProvider patchedProvider;
 
 	public MergedForgeMinecraftProvider(MinecraftMetadataProvider metadataProvider, ConfigContext configContext) {
 		super(metadataProvider, configContext);
-		this.patchedProvider = new MinecraftPatchedProvider(configContext.project(), this, MinecraftPatchedProvider.Type.MERGED);
 	}
 
 	@Override
@@ -51,16 +51,27 @@ public final class MergedForgeMinecraftProvider extends MergedMinecraftProvider 
 
 	@Override
 	public Path getMergedJar() {
-		return patchedProvider.getMinecraftPatchedJar();
+		return getPatchedProvider().getMinecraftPatchedJar();
 	}
 
 	@Override
 	public List<Path> getMinecraftJars() {
-		return List.of(patchedProvider.getMinecraftPatchedJar());
+		return List.of(getPatchedProvider().getMinecraftPatchedJar());
 	}
 
 	@Override
 	public MinecraftPatchedProvider getPatchedProvider() {
+		if (this.patchedProvider == null) {
+			// legacy Forge（1.8-1.16）走 FG2 的 patching 流程，需要专门的实现。
+			// 判定依赖已解析的 userdev 配置（ForgeUserdevProvider.isLegacyForge 未解析时会抛异常），
+			// 故延迟到这里而非构造函数。
+			if (LoomGradleExtension.get(getProject()).isModernForgeLike()) {
+				this.patchedProvider = new MinecraftPatchedProvider(getProject(), this, MinecraftPatchedProvider.Type.MERGED);
+			} else {
+				this.patchedProvider = new MinecraftLegacyPatchedProvider(getProject(), this, MinecraftPatchedProvider.Type.MERGED);
+			}
+		}
+
 		return patchedProvider;
 	}
 }

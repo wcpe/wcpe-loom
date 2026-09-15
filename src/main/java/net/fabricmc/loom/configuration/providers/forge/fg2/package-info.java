@@ -22,10 +22,10 @@
  * SOFTWARE.
  */
 
-package net.fabricmc.loom.test.integration.buildSrc.loomClasspath
+/**
+ * ForgeGradle 2（legacy Forge 1.8-1.16）时代的支持代码.
+ */
+@NullMarked
+package net.fabricmc.loom.configuration.providers.forge.fg2;
 
-import org.gradle.api.services.BuildService
-import org.gradle.api.services.BuildServiceParameters
-
-abstract class ForeignCacheService implements BuildService<BuildServiceParameters.None> {
-}
+import org.jspecify.annotations.NullMarked;
