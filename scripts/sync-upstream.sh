@@ -123,10 +123,9 @@ cmd_add_patch_finish() {
 	local branch="${1:-}" queue oldtip cand cands
 	# finish 必须从默认分支执行：add-patch 分支切自队列末端，其上没有 scripts/ 目录
 	if [ -z "${branch}" ]; then
-		cands="$(git for-each-ref --format=%(refname:short) refs/heads/add-patch/*)"
+		cands="$(git for-each-ref --format='%(refname:short)' 'refs/heads/add-patch/*')"
 		[ -n "${cands}" ] || die "没有 add-patch/* 分支；用法: add-patch finish <分支名>"
-		[ "$(printf %s
- "${cands}" | wc -l)" = "1" ] || die "存在多个 add-patch/* 分支，请显式指定：add-patch finish <分支名>"
+		[ "$(printf '%s\n' "${cands}" | wc -l)" = "1" ] || die "存在多个 add-patch/* 分支，请显式指定：add-patch finish <分支名>"
 		branch="${cands}"
 	fi
 	git rev-parse -q --verify "refs/heads/${branch}" >/dev/null || die "分支 ${branch} 不存在"
