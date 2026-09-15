@@ -1,41 +1,126 @@
-name: Publish
+name: CI
+
+# 触发规则：
+# 1. 推送到 dev/1.17-wcpe（仅代码变更）→ 构建 + 发布补丁版本（版本号 1.17.<运行号>）
+# 2. 打 v 开头的 tag → 发布该 tag 指定的正式版（如 v1.17.3 → 1.17.3）并创建 GitHub Release
+# 3. 纯文档修改（README/CHANGELOG/docs/**）不触发任何构建
 on:
   push:
     branches:
-      - 'dev/0.6-forge'
-      - 'dev/0.7-forge'
-      - 'dev/0.8'
-      - 'dev/0.9'
-      - 'dev/0.10.0'
-      - 'dev/0.11.0'
-      - 'dev/0.12.0'
-      - 'dev/1.0'
-      - 'dev/1.1'
-      - 'dev/1.2'
-      - 'dev/1.3'
-      - 'dev/1.4'
-      - 'dev/1.5'
-      - 'dev/1.6'
-      - 'dev/1.7'
-      - 'dev/1.9'
-      - 'dev/1.10'
-      - 'dev/1.11'
-      - 'dev/1.13'
-      - 'dev/1.14'
-      - 'dev/1.17'
+      - dev/1.17-wcpe
+    tags:
+      - 'v*'
+    paths-ignore:
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'docs/**'
+      - '**.md'
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-24.04
+    outputs:
+      is-release: ${{ steps.meta.outputs.is-release }}
+      release-version: ${{ steps.meta.outputs.release-version }}
     steps:
-      - name: setup jdk
-        uses: actions/setup-java@v5
+      - name: 检出代码
+        uses: actions/checkout@v4
         with:
-          java-version: 25
-          distribution: 'temurin'
-      - uses: actions/checkout@v6
-      - uses: gradle/actions/wrapper-validation@v6
-      - name: Upload to Maven
-        run: ./gradlew publish --stacktrace
+          fetch-depth: 0
+
+      - name: 配置 JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: 验证 Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: 判断构建类型
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # 正式版：打 tag 发布，版本号取 tag 名（如 v1.17.3 → 1.17.3）
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            echo "is-release=true" >> "$GITHUB_OUTPUT"
+            echo "release-version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "latest-version=1.17-latest" >> "$GITHUB_OUTPUT"
+            echo "is-prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            # 代码推送：发布补丁版本 1.17.<运行号>；运行号单调递增，天然满足产物不可覆盖的要求
+            VERSION="1.17.${GITHUB_RUN_NUMBER}"
+            echo "is-release=false" >> "$GITHUB_OUTPUT"
+            echo "release-version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "latest-version=1.17-dev-latest" >> "$GITHUB_OUTPUT"
+            echo "is-prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 验证重映射缓存回归
+        run: ./gradlew test --tests net.fabricmc.loom.test.integration.RemapTaskCacheTest --no-daemon --stacktrace --warning-mode fail
         env:
-          MAVEN_PASS: ${{ secrets.MAVEN_PASS }}
+          CI: true
+          RELEASE_VERSION: ${{ steps.meta.outputs.release-version }}
+
+      - name: 上传缓存回归失败报告
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remap-cache-test-results
+          path: |
+            build/reports/tests/test/
+            build/test-results/test/
+
+      - name: 构建并发布
+        run: ./gradlew build publish exportVersion -x test --no-daemon --stacktrace
+        env:
+          CI: true
+          RELEASE_VERSION: ${{ steps.meta.outputs.release-version }}
+          IS_PRERELEASE: ${{ steps.meta.outputs.is-prerelease }}
+          PUBLISH_LATEST: ${{ steps.meta.outputs.is-prerelease == 'true' && 'dev' || 'stable' }}
+          ORG_GRADLE_PROJECT_wcpeUsername: ${{ secrets.WCPE_USERNAME }}
+          ORG_GRADLE_PROJECT_wcpePassword: ${{ secrets.WCPE_PASSWORD }}
+
+  # 正式版发布后创建 GitHub Release（仅 tag 触发）
+  release:
+    needs: build
+    if: needs.build.outputs.is-release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 提取 CHANGELOG
+        id: changelog
+        shell: bash
+        run: |
+          VERSION="${{ needs.build.outputs.release-version }}"
+          BODY=""
+          # 本线暂无 CHANGELOG.md，缺失时回退为占位说明，不让发布失败
+          if [ -f CHANGELOG.md ]; then
+            BODY=$(awk -v ver="$VERSION" '
+              /^## / { if (found) exit; if ($2 == ver) found=1; next }
+              found { print }
+            ' CHANGELOG.md)
+          fi
+          if [ -z "$BODY" ]; then
+            BODY="发布版本 $VERSION"
+          fi
+          echo "body<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$BODY" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: wcpe-loom ${{ github.ref_name }}
+          body: ${{ steps.changelog.outputs.body }}
+          draft: false
+          prerelease: false

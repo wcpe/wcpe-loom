@@ -360,6 +360,18 @@ import org.w3c.dom.Element
 import org.w3c.dom.Node
 
 publishing {
+	repositories {
+		// WCPE Maven 仓库（CI 发布写入 maven-releases）
+		maven {
+			name = 'WCPE'
+			url = project.findProperty('wcpeMavenUrl') ?: 'https://maven.wcpe.top/repository/maven-releases/'
+			credentials {
+				username = project.findProperty('wcpeUsername')?.toString() ?: ''
+				password = project.findProperty('wcpePassword')?.toString() ?: ''
+			}
+		}
+	}
+
 	publications {
 		if (!isSnapshot && !ENV.EXPERIMENTAL) {
 			// Also publish a snapshot so people can use the latest version if they wish
