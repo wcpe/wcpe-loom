@@ -111,7 +111,9 @@ public class RunConfigUtils {
 		File projectDir = project.getRootProject().getProjectDir();
 
 		if (runDir.toPath().startsWith(projectDir.toPath())) {
-			String relativePath = projectDir.toPath().relativize(runDir.toPath()).toString();
+			// Windows 上 Path.toString() 使用反斜杠，而 $PROJECT_DIR$ / ${workspace_loc} 这类 IDE 宏约定用正斜杠
+			// （1.15 由 URI.getPath() 保证恒为正斜杠），不归一化会写出 $PROJECT_DIR$/sub\run 这种混用分隔符的配置。
+			String relativePath = projectDir.toPath().relativize(runDir.toPath()).toString().replace(File.separatorChar, '/');
 			return relativeFormatter.apply(relativePath);
 		} else {
 			return absoluteFormatter.apply(runDir);
