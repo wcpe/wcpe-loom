@@ -2,14 +2,17 @@ name: CI
 
 # 触发规则：
 # 1. 推送到 dev/1.17-wcpe（仅代码变更）→ 构建 + 发布补丁版本（版本号 1.17.<运行号>）
-# 2. 打 v 开头的 tag → 发布该 tag 指定的正式版（如 v1.17.3 → 1.17.3）并创建 GitHub Release
+# 2. 打 wcpe-v 开头的 tag → 发布该 tag 指定的正式版（如 wcpe-v1.17.1 → 1.17.1）
+#    并创建 GitHub Release。
+#    说明：这里不用 v* 前缀，因为上游 fabric-loom 已占用大量 v1.17.* 的 release tag，
+#    同名 tag 在本仓库内不可复用。
 # 3. 纯文档修改（README/CHANGELOG/docs/**）不触发任何构建
 on:
   push:
     branches:
       - dev/1.17-wcpe
     tags:
-      - 'v*'
+      - 'wcpe-v*'
     paths-ignore:
       - 'README.md'
       - 'CHANGELOG.md'
@@ -44,9 +47,9 @@ jobs:
         id: meta
         shell: bash
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            # 正式版：打 tag 发布，版本号取 tag 名（如 v1.17.3 → 1.17.3）
-            VERSION="${GITHUB_REF#refs/tags/v}"
+          if [[ "${GITHUB_REF}" == refs/tags/wcpe-v* ]]; then
+            # 正式版：打 tag 发布，版本号取 tag 名去掉 wcpe-v 前缀（如 wcpe-v1.17.1 → 1.17.1）
+            VERSION="${GITHUB_REF#refs/tags/wcpe-v}"
             echo "is-release=true" >> "$GITHUB_OUTPUT"
             echo "release-version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "latest-version=1.17-latest" >> "$GITHUB_OUTPUT"
