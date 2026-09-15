@@ -86,6 +86,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+      # Forge 自带的 ForgeFlower 反编译器不支持 JDK 25，需为 forge 系列测试准备 JDK 21（放在 25 之前，避免顶掉 JAVA_HOME）
+      - name: setup jdk 21 (Forge tooling)
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: 'temurin'
       - name: setup jdk
         uses: actions/setup-java@v5
         with:
@@ -122,6 +128,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+      # 同 run_tests：forge 系列测试的反编译步骤需要 JDK 21
+      - name: setup jdk 21 (Forge tooling)
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: 'temurin'
       - name: setup jdk
         uses: actions/setup-java@v5
         with:
