@@ -30,7 +30,10 @@ def runNumber = ENV.GITHUB_RUN_NUMBER ?: "9999"
 
 def isSnapshot = ENV.PR_NUM != null
 
-if (!isSnapshot) {
+if (ENV.RELEASE_VERSION) {
+	// 发布流程可显式指定版本号（如从 tag 推导的 1.17.3），优先于按运行号推导
+	version = ENV.RELEASE_VERSION
+} else if (!isSnapshot) {
 	version = baseVersion + "." + runNumber
 } else {
 	version = baseVersion + "-PR." + ENV.PR_NUM + "." + runNumber
