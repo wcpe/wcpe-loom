@@ -156,6 +156,12 @@ public abstract class AbstractRemapJarTask extends Jar {
 
 		jarManifestServiceProvider = JarManifestService.get(getProject());
 		usesService(jarManifestServiceProvider);
+		// BuildService 的参数不会自动进入任务缓存键，必须登记实际写入 Manifest 的版本值。
+		getInputs().property("loomManifestVersions", jarManifestServiceProvider.map(JarManifestService::getManifestVersions));
+		getOutputs().doNotCacheIf("归档未启用可重现文件顺序或保留了原始时间戳", task -> {
+			AbstractRemapJarTask remapTask = (AbstractRemapJarTask) task;
+			return remapTask.isPreserveFileTimestamps() || !remapTask.isReproducibleFileOrder();
+		});
 
 		getModPlatform().value(LoomGradleExtension.get(getProject()).getPlatform()).finalizeValue();
 	}

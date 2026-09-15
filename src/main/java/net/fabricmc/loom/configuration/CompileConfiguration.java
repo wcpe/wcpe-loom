@@ -96,6 +96,7 @@ import net.fabricmc.loom.util.Checksum;
 import net.fabricmc.loom.util.ExceptionUtil;
 import net.fabricmc.loom.util.ProcessUtil;
 import net.fabricmc.loom.util.gradle.GradleUtils;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.gradle.SourceSetHelper;
 import net.fabricmc.loom.util.gradle.daemon.DaemonUtils;
 import net.fabricmc.loom.util.service.ScopedServiceFactory;
@@ -137,15 +138,26 @@ public abstract class CompileConfiguration implements Runnable {
 				extension.setRefreshDeps(true);
 			}
 
-			try {
-				// Setting up loom across Gradle projects is not thread safe, synchronize it here to ensure that multiple projects cannot use it.
-				// There is no easy way around this, as we want to use the same global cache for downloaded or generated files.
-				synchronized (getGlobalLockObject()) {
-					setupMinecraft(configContext);
-				}
+			// 跨进程缓存锁：getGlobalLockObject 只覆盖 JVM 内（同一 daemon 的多个 classloader），
+			// 多个 daemon 并发构建同一版本时会同时进入 setupMinecraft 生产共享缓存产物并互相踩踏。
+			// 外层叠加 per-key 跨进程文件锁，键按 Minecraft 版本 + 映射标识隔离，不同版本仍可并行。
+			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
+			final var lockRoot = extension.getFiles().getCacheLocks().toPath();
+			final String setupLockKey = "minecraft-setup:" + extension.getMinecraftProvider().minecraftVersion()
+					+ ":" + (extension.disableObfuscation() ? "deobf" : extension.getMappingConfiguration().mappingsIdentifier);
 
-				var dependencyManager = new LoomDependencyManager(getProject(), serviceFactory, extension);
-				dependencyManager.handleDependencies();
+			try {
+				cacheService.runExclusive(lockRoot, setupLockKey, LoomCacheService.defaultTimeout(), () -> {
+					// Setting up loom across Gradle projects is not thread safe, synchronize it here to ensure that multiple projects cannot use it.
+					// There is no easy way around this, as we want to use the same global cache for downloaded or generated files.
+					synchronized (getGlobalLockObject()) {
+						setupMinecraft(configContext);
+					}
+
+					var dependencyManager = new LoomDependencyManager(getProject(), serviceFactory, extension);
+					dependencyManager.handleDependencies();
+					return null;
+				});
 			} catch (Exception e) {
 				ExceptionUtil.processException(e, DaemonUtils.Context.fromProject(getProject()));
 				disownLock();
