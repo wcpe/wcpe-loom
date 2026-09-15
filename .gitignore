@@ -25,3 +25,7 @@
 !/bootstrap
 
 /src/**/generated
+
+# 谱系/队列元数据属正式项目文档，需入库（! 行必须在忽略规则之后）
+!.upstream/
+!.upstream/**
