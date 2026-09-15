@@ -31,11 +31,18 @@ import org.gradle.api.Project;
  * A marker plugin to indicate to the main loom plugin not to setup for remapping.
  */
 public class LoomNoRemapGradlePlugin implements Plugin<Project> {
-	public static final String NAME = "dev.architectury.loom-no-remap";
+	public static final String NAME = "top.wcpe.loom-no-remap";
+	/** 上一层分叉（architectury）的插件 id，作为兼容别名保留. */
+	public static final String LEGACY_NAME = "dev.architectury.loom-no-remap";
+
+	/** 本项目是否已应用 no-remap 变体（新旧任一 id）. */
+	public static boolean isApplied(Project project) {
+		return project.getPluginManager().hasPlugin(NAME) || project.getPluginManager().hasPlugin(LEGACY_NAME);
+	}
 
 	@Override
 	public void apply(Project target) {
-		if (target.getPluginManager().hasPlugin(LoomGradlePlugin.NAME)) {
+		if (LoomGradlePlugin.isApplied(target)) {
 			throw new IllegalStateException(NAME + " must be applied before " + LoomGradlePlugin.NAME);
 		}
 

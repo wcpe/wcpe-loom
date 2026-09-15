@@ -56,6 +56,14 @@ import net.fabricmc.loom.util.OneDrive;
 
 public class LoomGradlePlugin implements Plugin<PluginAware> {
 	public static final String NAME = Constants.PLUGIN_ID;
+	/** 上一层分叉（architectury）的插件 id，作为兼容别名保留，使既有项目与测试夹具无需改动. */
+	public static final String LEGACY_NAME = "dev.architectury.loom";
+
+	/** 目标是否已应用 loom（新旧任一 id）. */
+	public static boolean isApplied(PluginAware target) {
+		return target.getPluginManager().hasPlugin(NAME) || target.getPluginManager().hasPlugin(LEGACY_NAME);
+	}
+
 	public static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 	public static final String LOOM_VERSION = Objects.requireNonNullElse(LoomGradlePlugin.class.getPackage().getImplementationVersion(), "0.0.0+unknown");
 

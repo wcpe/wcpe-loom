@@ -269,6 +269,30 @@ codenarc {
 
 gradlePlugin {
 	plugins {
+		// 本 fork 的插件 id
+		wcpeLoom {
+			id = 'top.wcpe.loom'
+			implementationClass = 'net.fabricmc.loom.LoomGradlePlugin'
+		}
+		wcpeLoomNoRemap {
+			id = 'top.wcpe.loom-no-remap'
+			implementationClass = 'net.fabricmc.loom.LoomNoRemapGradlePlugin'
+		}
+		wcpeLoomRemap {
+			id = 'top.wcpe.loom-remap'
+			implementationClass = 'net.fabricmc.loom.LoomRemapGradlePlugin'
+		}
+		wcpeLoomCompanion {
+			id = 'top.wcpe.loom-companion'
+			implementationClass = 'net.fabricmc.loom.LoomCompanionGradlePlugin'
+		}
+		wcpeLoomRepositories {
+			id = 'top.wcpe.loom-repositories'
+			implementationClass = 'net.fabricmc.loom.LoomRepositoryPlugin'
+		}
+
+		// 兼容别名：上一层分叉（architectury）的 id。
+		// 既有下游项目与 src/test/resources 下的测试夹具都使用这些 id，勿删。
 		fabricLoom {
 			id = 'dev.architectury.loom'
 			implementationClass = 'net.fabricmc.loom.LoomGradlePlugin'
