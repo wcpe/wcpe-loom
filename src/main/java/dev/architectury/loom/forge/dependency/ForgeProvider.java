@@ -36,6 +36,22 @@ import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.ModPlatform;
 
 public class ForgeProvider extends DependencyProvider {
+	private static final String USERDEV_CLASSIFIER = "userdev";
+	private static final String USERDEV3_CLASSIFIER = "userdev3";
+
+	/**
+	 * 1.12.2 上 {@code userdev3} 分类器的起始 Forge build 号.
+	 *
+	 * <p>依据是对 maven.minecraftforge.net 制品列表的实测：14.23.5.2847 及以下只发布
+	 * {@code :userdev}，14.23.5.2851 起只发布 {@code :userdev3}（2848-2850、2853 两者皆缺），
+	 * 其余所有 MC 版本一律只有 {@code :userdev}。因此只有 1.12.2 且 build 号不小于该值时
+	 * 才改用 {@code userdev3}。
+	 */
+	private static final int USERDEV3_MIN_FORGE_BUILD = 2851;
+
+	/** userdev3 的 MC 版本，即上述分界规则唯一适用的 Minecraft 版本. */
+	private static final String USERDEV3_MINECRAFT_VERSION = "1.12.2";
+
 	private final ModPlatform platform;
 	private ForgeVersion version = new ForgeVersion(null);
 	private File globalCache;
@@ -48,8 +64,43 @@ public class ForgeProvider extends DependencyProvider {
 	@Override
 	public void provide(DependencyInfo dependency) throws Exception {
 		version = new ForgeVersion(dependency.getResolvedVersion());
-		addDependency(dependency.getDepString() + ":userdev", Constants.Configurations.FORGE_USERDEV);
+		addDependency(dependency.getDepString() + ":" + getForgeUserdevClassifier(), Constants.Configurations.FORGE_USERDEV);
 		addDependency(dependency.getDepString() + ":installer", Constants.Configurations.FORGE_INSTALLER);
+	}
+
+	/**
+	 * {@return 该 Forge 版本对应的 userdev 分类器}.
+	 *
+	 * <p>Forge 在 1.12.2 的 14.23.5.2851 前后更换了 userdev 的发布格式：旧 build 发布 FG2 形态的
+	 * {@code :userdev}，新 build 发布 FG2.3 过渡形态的 {@code :userdev3}（两者不并存，见
+	 * {@link #USERDEV3_MIN_FORGE_BUILD}）。build 号解析失败时保守回退 {@code :userdev}。
+	 */
+	private String getForgeUserdevClassifier() {
+		if (!USERDEV3_MINECRAFT_VERSION.equals(version.getMinecraftVersion())
+				|| parseForgeBuild(version.getForgeVersion()) < USERDEV3_MIN_FORGE_BUILD) {
+			return USERDEV_CLASSIFIER;
+		}
+
+		return USERDEV3_CLASSIFIER;
+	}
+
+	/**
+	 * 解析 Forge 版本末段的 build 号（如 {@code 14.23.5.2860} → 2860）.
+	 *
+	 * @return build 号，无法解析时返回 -1
+	 */
+	private static int parseForgeBuild(String forgeVersion) {
+		final int dotIndex = forgeVersion.lastIndexOf('.');
+
+		if (dotIndex == -1) {
+			return -1;
+		}
+
+		try {
+			return Integer.parseInt(forgeVersion.substring(dotIndex + 1));
+		} catch (NumberFormatException e) {
+			return -1;
+		}
 	}
 
 	public ForgeVersion getVersion() {

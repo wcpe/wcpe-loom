@@ -36,7 +36,9 @@ repositories {
 dependencies {
 	minecraft "com.mojang:minecraft:1.12.2"
 	mappings "de.oceanlabs.mcp:mcp_stable:39-1.12"
-	forge "net.minecraftforge:forge:1.12.2-14.23.5.2847"
+	// 该 build 只发布 userdev3（1.12.2 的 14.23.5.2851 起改用该分类器），
+	// 用于覆盖 ForgeUserdevProvider 的 userdev3 -> FG2 归一分支
+	forge "net.minecraftforge:forge:1.12.2-14.23.5.2860"
 
 	// Example mod dep
 	modLocalRuntime "mezz.jei:jei_1.12.2:4.16.1.302"
