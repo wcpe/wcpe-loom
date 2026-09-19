@@ -58,6 +58,7 @@ import net.fabricmc.loom.configuration.providers.mappings.mojmap.MojangMappingsS
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.LoomVersions;
 import net.fabricmc.loom.util.ZipUtils;
+import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.loom.util.cache.CacheEntryLock;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.mappingio.MappingReader;
@@ -86,64 +87,134 @@ public class SrgProvider extends DependencyProvider {
 	public void provide(DependencyInfo dependency) throws Exception {
 		init(dependency.getDependency().getVersion());
 
-		if (!Files.exists(srg) || refreshDeps()) {
-			Path srgZip = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve srg")).toPath();
-
-			try {
-				Files.write(srg, ZipUtils.unpack(srgZip, "config/joined.tsrg"));
-			} catch (NoSuchFileException e) {
-				try {
-					// FG2-era MCP uses the older SRG format, convert it on the fly
-					byte[] srgBytes = ZipUtils.unpack(srgZip, "joined.srg");
-
-					try (Reader reader = new InputStreamReader(new ByteArrayInputStream(srgBytes)); Writer writer = Files.newBufferedWriter(srg)) {
-						new TSrgWriter(writer).write(new SrgReader(reader).read());
-					}
-				} catch (NoSuchFileException e1) {
-					e.addSuppressed(e1);
-					throw e;
-				}
-			}
+		// srg.tsrg 与 merged mojmap 产物位于跨 daemon 共享的 userCache（不按项目隔离），
+		// 同一 MC 版本的多个并发构建会写同一路径；需要生产时取锁串行化（锁内二次确认）。
+		if (needsSrgProduction()) {
+			produceSrgWithLock(dependency);
 		}
 
 		try (BufferedReader reader = Files.newBufferedReader(srg)) {
 			isTsrgV2 = reader.readLine().startsWith("tsrg2");
 		}
+	}
 
-		if (isTsrgV2) {
-			if (!Files.exists(mergedMojangRaw) || !Files.exists(mergedMojangTrimmed) || refreshDeps()) {
-				Stopwatch stopwatch = Stopwatch.createStarted();
-				getProject().getLogger().lifecycle(":merging mappings (InstallerTools, srg + mojmap)");
+	/**
+	 * {@return 是否需要生产 srg 相关产物}.
+	 *
+	 * <p>无锁快路径：srg.tsrg 缺失或要求刷新时直接判定需要；否则读 srg.tsrg 首行判断形态，
+	 * 仅 tsrgV2（现代 MC）才存在 merged mojmap 产物，legacy 形态下其缺失属正常，无需生产。
+	 */
+	private boolean needsSrgProduction() throws IOException {
+		if (Files.notExists(srg) || refreshDeps()) {
+			return true;
+		}
 
-				Files.deleteIfExists(mergedMojangRaw);
-				Path mojmapTsrg2 = getMojmapTsrg2(getProject(), getExtension());
-				ForgeToolValueSource.exec(getProject(), settings -> {
-					settings.classpath(DependencyDownloader.download(getProject(), LoomVersions.FORGE_INSTALLER_TOOLS.mavenNotation()));
-					settings.getMainClass().set(INSTALLER_TOOLS_MAIN_CLASS);
-					settings.args(
-							"--task",
-							"MERGE_MAPPING",
-							"--left",
-							getSrg().toAbsolutePath().toString(),
-							"--right",
-							mojmapTsrg2.toAbsolutePath().toString(),
-							"--classes",
-							"--output",
-							mergedMojangRaw.toAbsolutePath().toString()
-					);
-				});
-
-				MemoryMappingTree tree = new MemoryMappingTree();
-				MappingVisitor visitor = new ArgDroppingVisitor(new FieldDescWrappingVisitor(tree));
-				MappingReader.read(mergedMojangRaw, visitor);
-
-				try (MappingWriter writer = MappingWriter.create(mergedMojangTrimmed, MappingFormat.TSRG_2_FILE)) {
-					tree.accept(writer);
-				}
-
-				getProject().getLogger().lifecycle(":merged mappings (InstallerTools, srg + mojmap) in " + stopwatch.stop());
+		try (BufferedReader reader = Files.newBufferedReader(srg)) {
+			if (!reader.readLine().startsWith("tsrg2")) {
+				return false;
 			}
 		}
+
+		return Files.notExists(mergedMojangRaw) || Files.notExists(mergedMojangTrimmed);
+	}
+
+	/**
+	 * 在跨进程锁保护下生产 srg.tsrg 与 merged mojmap 产物.
+	 *
+	 * <p>缓存位于 {@code userCache}（不按项目隔离），同一 MC 版本的多个 daemon 会指向同一路径；
+	 * 由首个取得锁的进程写入，其余进程等待后直接复用。锁内二次确认；srg.tsrg 原子落位，
+	 * 保证「文件存在 ⟺ 内容完整」，锁外读方不会看到半截内容。
+	 */
+	private void produceSrgWithLock(DependencyInfo dependency) {
+		final String lockKey = "forge-srg:" + getExtension().getMinecraftProvider().minecraftVersion();
+		final Path lockRoot = srg.getParent().resolve(Constants.Cache.LOCKS_DIR);
+
+		try {
+			CacheEntryLock.withLock(lockRoot, lockKey, LoomCacheService.defaultTimeout(), () -> {
+				// 锁内二次确认：等锁期间可能已被其它进程完成生产
+				produceSrg(dependency);
+				produceMergedMojang(dependency);
+				return null;
+			});
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		} catch (Exception e) {
+			throw new RuntimeException("Could not produce SRG mappings", e);
+		}
+	}
+
+	private void produceSrg(DependencyInfo dependency) throws IOException {
+		if (Files.exists(srg) && !refreshDeps()) {
+			return;
+		}
+
+		Path srgZip = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve srg")).toPath();
+
+		try {
+			final byte[] tsrgBytes = ZipUtils.unpack(srgZip, "config/joined.tsrg");
+			AtomicFiles.publish(srg, tmp -> Files.write(tmp, tsrgBytes));
+		} catch (NoSuchFileException e) {
+			try {
+				// FG2-era MCP uses the older SRG format, convert it on the fly
+				byte[] srgBytes = ZipUtils.unpack(srgZip, "joined.srg");
+
+				AtomicFiles.publish(srg, tmp -> {
+					try (Reader reader = new InputStreamReader(new ByteArrayInputStream(srgBytes)); Writer writer = Files.newBufferedWriter(tmp)) {
+						new TSrgWriter(writer).write(new SrgReader(reader).read());
+					}
+				});
+			} catch (NoSuchFileException e1) {
+				e.addSuppressed(e1);
+				throw e;
+			}
+		}
+	}
+
+	private void produceMergedMojang(DependencyInfo dependency) throws IOException {
+		boolean tsrgV2;
+
+		try (BufferedReader reader = Files.newBufferedReader(srg)) {
+			tsrgV2 = reader.readLine().startsWith("tsrg2");
+		}
+
+		if (!tsrgV2) {
+			return;
+		}
+
+		if (Files.exists(mergedMojangRaw) && Files.exists(mergedMojangTrimmed) && !refreshDeps()) {
+			return;
+		}
+
+		Stopwatch stopwatch = Stopwatch.createStarted();
+		getProject().getLogger().lifecycle(":merging mappings (InstallerTools, srg + mojmap)");
+
+		Files.deleteIfExists(mergedMojangRaw);
+		Path mojmapTsrg2 = getMojmapTsrg2(getProject(), getExtension());
+		ForgeToolValueSource.exec(getProject(), settings -> {
+			settings.classpath(DependencyDownloader.download(getProject(), LoomVersions.FORGE_INSTALLER_TOOLS.mavenNotation()));
+			settings.getMainClass().set(INSTALLER_TOOLS_MAIN_CLASS);
+			settings.args(
+					"--task",
+					"MERGE_MAPPING",
+					"--left",
+					getSrg().toAbsolutePath().toString(),
+					"--right",
+					mojmapTsrg2.toAbsolutePath().toString(),
+					"--classes",
+					"--output",
+					mergedMojangRaw.toAbsolutePath().toString()
+			);
+		});
+
+		MemoryMappingTree tree = new MemoryMappingTree();
+		MappingVisitor visitor = new ArgDroppingVisitor(new FieldDescWrappingVisitor(tree));
+		MappingReader.read(mergedMojangRaw, visitor);
+
+		try (MappingWriter writer = MappingWriter.create(mergedMojangTrimmed, MappingFormat.TSRG_2_FILE)) {
+			tree.accept(writer);
+		}
+
+		getProject().getLogger().lifecycle(":merged mappings (InstallerTools, srg + mojmap) in " + stopwatch.stop());
 	}
 
 	// A visitor that drop all method args from srg

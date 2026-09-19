@@ -89,21 +89,25 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 
 	@Override
 	public void provide() throws Exception {
-		String forgeVersion = getExtension().getForgeProvider().getVersion().getCombined();
-		Path forgeWorkingDir = ForgeProvider.getForgeCache(project);
-		String patchId = "forge-" + forgeVersion + "-";
+		withPatchedLock(() -> {
+			String forgeVersion = getExtension().getForgeProvider().getVersion().getCombined();
+			Path forgeWorkingDir = ForgeProvider.getForgeCache(project);
+			String patchId = "forge-" + forgeVersion + "-";
 
-		minecraftProvider.setJarPrefix(patchId);
+			minecraftProvider.setJarPrefix(patchId);
 
-		minecraftClientPatchedJar = forgeWorkingDir.resolve("client-patched.jar");
-		minecraftServerPatchedJar = forgeWorkingDir.resolve("server-patched.jar");
-		minecraftMergedPatchedJar = forgeWorkingDir.resolve("merged-patched.jar");
-		minecraftPatchedAtJar = forgeWorkingDir.resolve(type.id + "-at-patched.jar");
-		forgeJar = forgeWorkingDir.resolve("forge.jar");
+			minecraftClientPatchedJar = forgeWorkingDir.resolve("client-patched.jar");
+			minecraftServerPatchedJar = forgeWorkingDir.resolve("server-patched.jar");
+			minecraftMergedPatchedJar = forgeWorkingDir.resolve("merged-patched.jar");
+			minecraftPatchedAtJar = forgeWorkingDir.resolve(type.id + "-at-patched.jar");
+			forgeJar = forgeWorkingDir.resolve("forge.jar");
 
-		checkCache();
+			// 锁内判定：等锁期间其它进程可能已完成生产，checkCache 的 notExists 判定即为二次确认
+			checkCache();
 
-		dirty = false;
+			dirty = false;
+			return null;
+		});
 	}
 
 	protected void cleanAllCache() throws IOException {
@@ -131,33 +135,38 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 
 	@Override
 	public void remapJar(ServiceFactory serviceFactory) throws Exception {
-		if (Files.notExists(forgeJar)) {
-			dirty = true;
-			patchForge();
-			applyLoomPatchVersion(forgeJar);
-		}
+		// 锁内判定：等锁期间其它进程可能已完成生产，notExists 判定即为二次确认
+		withPatchedLock(() -> {
+			if (Files.notExists(forgeJar)) {
+				dirty = true;
+				patchForge();
+				applyLoomPatchVersion(forgeJar);
+			}
 
-		if (Files.notExists(minecraftClientPatchedJar) || Files.notExists(minecraftServerPatchedJar)) {
-			dirty = true;
-			patchJars();
-		}
+			if (Files.notExists(minecraftClientPatchedJar) || Files.notExists(minecraftServerPatchedJar)) {
+				dirty = true;
+				patchJars();
+			}
 
-		if (type == Type.MERGED && (dirty || Files.notExists(minecraftMergedPatchedJar))) {
-			dirty = true;
-			mergeJars();
-		}
+			if (type == Type.MERGED && (dirty || Files.notExists(minecraftMergedPatchedJar))) {
+				dirty = true;
+				mergeJars();
+			}
 
-		if (dirty || Files.notExists(minecraftPatchedAtJar)) {
-			dirty = true;
-			Path minecraftPatchedJar = switch (type) {
-			case CLIENT_ONLY -> minecraftClientPatchedJar;
-			case SERVER_ONLY -> minecraftServerPatchedJar;
-			case MERGED -> minecraftMergedPatchedJar;
-			};
-			accessTransform(minecraftPatchedJar, minecraftPatchedAtJar);
-			walkFileSystems(forgeJar, minecraftPatchedAtJar, (path) -> true, this::copyReplacing);
-			applyLoomPatchVersion(minecraftPatchedAtJar);
-		}
+			if (dirty || Files.notExists(minecraftPatchedAtJar)) {
+				dirty = true;
+				Path minecraftPatchedJar = switch (type) {
+				case CLIENT_ONLY -> minecraftClientPatchedJar;
+				case SERVER_ONLY -> minecraftServerPatchedJar;
+				case MERGED -> minecraftMergedPatchedJar;
+				};
+				accessTransform(minecraftPatchedJar, minecraftPatchedAtJar);
+				walkFileSystems(forgeJar, minecraftPatchedAtJar, (path) -> true, this::copyReplacing);
+				applyLoomPatchVersion(minecraftPatchedAtJar);
+			}
+
+			return null;
+		});
 	}
 
 	private void patchForge() throws Exception {
