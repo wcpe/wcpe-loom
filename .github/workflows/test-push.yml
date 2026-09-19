@@ -1,6 +1,15 @@
 name: Run Tests
 on:
   push:
+    branches:
+      - dev/1.17-wcpe
+    # 显式排除所有 tag。本仓库的 patch-queue/<线> 是可移动的队列标记 tag，每次插入补丁
+    # 都会 force-push 前移一次；wcpe-v* 正式版 tag 的发布由 publish.yml 负责。
+    # 上游原版此处为 `on: push`（无过滤），会匹配一切 ref，导致每次前移队列标记都白跑
+    # 一轮完整测试（实测约 40 分钟）。注意此文件随补丁队列一起被重放，tag 推送触发时
+    # GitHub 读取的正是本提交上的版本，故修正必须落在队列内。
+    tags-ignore:
+      - '**'
   pull_request:
   workflow_dispatch:
     inputs:
