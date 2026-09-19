@@ -641,7 +641,7 @@ public class MinecraftPatchedProvider {
 
 		for (File file : files) {
 			if (file.getName().endsWith(".jar")) {
-				try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(file.toPath())) {
+				try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(file.toPath())) {
 					final Path mfPath = fs.getPath("META-INF/MANIFEST.MF");
 
 					if (Files.exists(mfPath)) {

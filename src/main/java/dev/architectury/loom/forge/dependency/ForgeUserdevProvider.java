@@ -414,7 +414,7 @@ public class ForgeUserdevProvider extends DependencyProvider {
 		});
 
 		if (!sourcesMaven.exists(null)) {
-			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(userdevJarPath, false)) {
+			try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(userdevJarPath)) {
 				sourcesMaven.copyToMaven(fs.getPath(LEGACY_SOURCES_FILE), null);
 			}
 		}

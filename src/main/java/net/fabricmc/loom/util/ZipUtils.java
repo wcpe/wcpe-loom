@@ -74,7 +74,7 @@ public class ZipUtils {
 	}
 
 	public static boolean contains(Path zip, String path) {
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(zip, false)) {
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(zip)) {
 			Path fsPath = fs.get().getPath(path);
 
 			return Files.exists(fsPath);
@@ -84,7 +84,7 @@ public class ZipUtils {
 	}
 
 	public static void unpackAll(Path zip, Path output) throws IOException {
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(zip, false);
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(zip);
 				Stream<Path> walk = Files.walk(fs.getRoot())) {
 			Iterator<Path> iterator = walk.iterator();
 
@@ -108,6 +108,8 @@ public class ZipUtils {
 	}
 
 	public static byte[] unpack(Path zip, String path) throws IOException {
+		// 必须保留共享文件系统：写入方（如 MinecraftJarMerger）在 close() 前内容尚未落盘，
+		// 独立文件系统从磁盘读取会看不到这些条目。读取"刚写完未关闭"的 jar 是本方法的既有契约。
 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(zip, false)) {
 			return fs.readAllBytes(path);
 		}

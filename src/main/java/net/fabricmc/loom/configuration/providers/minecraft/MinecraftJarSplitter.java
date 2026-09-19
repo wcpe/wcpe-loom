@@ -79,7 +79,7 @@ public class MinecraftJarSplitter implements AutoCloseable {
 	public static Set<String> getJarEntries(Path input) throws IOException {
 		Set<String> entries = new HashSet<>();
 
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(input);
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(input);
 				Stream<Path> walk = Files.walk(fs.get().getPath("/"))) {
 			Iterator<Path> iterator = walk.iterator();
 
@@ -106,7 +106,7 @@ public class MinecraftJarSplitter implements AutoCloseable {
 	private void copyEntriesToJar(Set<String> entries, Path inputJar, Path outputJar, String env) throws IOException {
 		Files.deleteIfExists(outputJar);
 
-		try (FileSystemUtil.Delegate inputFs = FileSystemUtil.getJarFileSystem(inputJar);
+		try (FileSystemUtil.Delegate inputFs = FileSystemUtil.getReadOnlyJarFileSystem(inputJar);
 				FileSystemUtil.Delegate outputFs = FileSystemUtil.getJarFileSystem(outputJar, true)) {
 			for (String entry : entries) {
 				Path inputPath = inputFs.get().getPath(entry);

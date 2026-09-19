@@ -64,7 +64,7 @@ public record CachedJarProcessor(CachedFileStore<CachedData> fileStore, String b
 		int hits = 0;
 		int misses = 0;
 
-		try (FileSystemUtil.Delegate inputFs = FileSystemUtil.getJarFileSystem(inputJar, false);
+		try (FileSystemUtil.Delegate inputFs = FileSystemUtil.getReadOnlyJarFileSystem(inputJar);
 				FileSystemUtil.Delegate incompleteFs = FileSystemUtil.getJarFileSystem(incompleteJar, true);
 				FileSystemUtil.Delegate existingSourcesFs = FileSystemUtil.getJarFileSystem(existingSourcesJar, true);
 				FileSystemUtil.Delegate existingClassesFs = FileSystemUtil.getJarFileSystem(existingClassesJar, true)) {
@@ -164,7 +164,7 @@ public record CachedJarProcessor(CachedFileStore<CachedData> fileStore, String b
 			// Sources name -> hash
 			Map<String, String> outputNameMap = workToDoJob.outputNameMap();
 
-			try (FileSystemUtil.Delegate outputFs = FileSystemUtil.getJarFileSystem(workToDoJob.output(), false);
+			try (FileSystemUtil.Delegate outputFs = FileSystemUtil.getReadOnlyJarFileSystem(workToDoJob.output());
 					Stream<Path> walk = Files.walk(outputFs.getRoot())) {
 				Iterator<Path> iterator = walk.iterator();
 
@@ -211,8 +211,10 @@ public record CachedJarProcessor(CachedFileStore<CachedData> fileStore, String b
 
 		if (workJob instanceof PartialWorkJob partialWorkJob) {
 			// Copy all the existing items to the output jar
+			// outputFs 在本块内被写入（见下方 Files.copy），必须保留共享文件系统；
+			// existingFs 仅作为读取源，改用独立文件系统以避免全局锁。
 			try (FileSystemUtil.Delegate outputFs = FileSystemUtil.getJarFileSystem(partialWorkJob.output(), false);
-					FileSystemUtil.Delegate existingFs = FileSystemUtil.getJarFileSystem(partialWorkJob.existingSources(), false);
+					FileSystemUtil.Delegate existingFs = FileSystemUtil.getReadOnlyJarFileSystem(partialWorkJob.existingSources());
 					Stream<Path> walk = Files.walk(existingFs.getRoot())) {
 				Iterator<Path> iterator = walk.iterator();
 

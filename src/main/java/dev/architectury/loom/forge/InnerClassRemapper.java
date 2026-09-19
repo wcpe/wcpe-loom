@@ -48,7 +48,7 @@ public class InnerClassRemapper {
 	public static Set<String> readClassNames(Path jar) {
 		Set<String> set = new HashSet<>();
 
-		try (FileSystemUtil.Delegate system = FileSystemUtil.getJarFileSystem(jar, false)) {
+		try (FileSystemUtil.Delegate system = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
 			Iterator<Path> iterator = Files.walk(system.get().getPath("/")).iterator();
 
 			while (iterator.hasNext()) {

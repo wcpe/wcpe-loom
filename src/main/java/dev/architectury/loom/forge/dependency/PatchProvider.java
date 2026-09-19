@@ -104,7 +104,7 @@ public class PatchProvider extends DependencyProvider {
 			return;
 		}
 
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(installerJar, false)) {
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(installerJar)) {
 			Files.copy(fs.getPath("data", name), targetPath, StandardCopyOption.REPLACE_EXISTING);
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);
@@ -129,7 +129,7 @@ public class PatchProvider extends DependencyProvider {
 
 		byte[] unpackedBytes;
 
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(installerJar, false)) {
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(installerJar)) {
 			unpackedBytes = unpack200Lzma(fs.getPath("binpatches.pack.lzma"));
 		}
 

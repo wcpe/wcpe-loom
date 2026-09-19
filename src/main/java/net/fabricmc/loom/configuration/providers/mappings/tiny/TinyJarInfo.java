@@ -43,7 +43,7 @@ public record TinyJarInfo(boolean v2, Optional<String> minecraftVersionId) {
 	private static final String MANIFEST_VERSION_ID_ATTRIBUTE = "Minecraft-Version-Id";
 
 	public static TinyJarInfo get(Path jar) {
-		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(jar)) {
+		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
 			return new TinyJarInfo(doesJarContainV2Mappings(delegate), getMinecraftVersionId(delegate));
 		} catch (IOException e) {
 			throw new UncheckedIOException("Failed to read tiny jar info", e);
