@@ -74,7 +74,7 @@ public class ZipUtils {
 	}
 
 	public static boolean contains(Path zip, String path) {
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(zip, false)) {
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(zip)) {
 			Path fsPath = fs.get().getPath(path);
 
 			return Files.exists(fsPath);
@@ -84,7 +84,7 @@ public class ZipUtils {
 	}
 
 	public static void unpackAll(Path zip, Path output) throws IOException {
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(zip, false);
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(zip);
 				Stream<Path> walk = Files.walk(fs.getRoot())) {
 			Iterator<Path> iterator = walk.iterator();
 
@@ -108,7 +108,7 @@ public class ZipUtils {
 	}
 
 	public static byte[] unpack(Path zip, String path) throws IOException {
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(zip, false)) {
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(zip)) {
 			return fs.readAllBytes(path);
 		}
 	}

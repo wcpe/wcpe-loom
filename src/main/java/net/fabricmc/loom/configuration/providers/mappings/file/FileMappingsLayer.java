@@ -64,7 +64,7 @@ public record FileMappingsLayer(
 		if (!ZipUtils.isZip(path)) {
 			visit(path, mappingVisitor);
 		} else {
-			try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getJarFileSystem(path)) {
+			try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getReadOnlyJarFileSystem(path)) {
 				visit(fileSystem.get().getPath(mappingPath), mappingVisitor);
 			}
 		}
@@ -108,7 +108,7 @@ public record FileMappingsLayer(
 			throw new UnsupportedOperationException("Unpick is only supported for zip file mapping layers.");
 		}
 
-		try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getJarFileSystem(path)) {
+		try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getReadOnlyJarFileSystem(path)) {
 			final Path unpickMetadata = fileSystem.get().getPath(UnpickMetadata.UNPICK_METADATA_PATH);
 			final Path unpickDefinitions = fileSystem.get().getPath(UnpickMetadata.UNPICK_DEFINITIONS_PATH);
 
@@ -140,7 +140,7 @@ public record FileMappingsLayer(
 			throw new UnsupportedOperationException("Annotations data is only supported for zip file mapping layers.");
 		}
 
-		try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getJarFileSystem(path)) {
+		try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getReadOnlyJarFileSystem(path)) {
 			final Path annotations = fileSystem.get().getPath(AnnotationsLayer.ANNOTATIONS_PATH);
 
 			if (!Files.exists(annotations)) {

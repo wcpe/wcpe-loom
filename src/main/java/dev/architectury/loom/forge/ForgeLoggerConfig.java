@@ -43,7 +43,7 @@ public final class ForgeLoggerConfig {
 	}
 
 	public static void copyToPath(Path libraryFile, Path outputFile) {
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(libraryFile, false)) {
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(libraryFile)) {
 			final Path configPath = fs.getPath("log4j2.xml");
 			Files.copy(configPath, outputFile, StandardCopyOption.REPLACE_EXISTING);
 		} catch (IOException e) {

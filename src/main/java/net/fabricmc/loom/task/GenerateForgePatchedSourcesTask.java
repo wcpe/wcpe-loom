@@ -253,7 +253,7 @@ public abstract class GenerateForgePatchedSourcesTask extends AbstractLoomTask {
 			final List<String> sass = getSasOptions().get().getSass().get();
 			final List<Path> sasPaths = new ArrayList<>();
 
-			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(getSasOptions().get().getUserdevJar().get().getAsFile(), false)) {
+			try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(getSasOptions().get().getUserdevJar().get().getAsFile().toPath())) {
 				for (String sasPath : sass) {
 					try {
 						final Path from = fs.getPath(sasPath);

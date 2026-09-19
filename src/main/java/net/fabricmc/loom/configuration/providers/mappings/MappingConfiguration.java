@@ -231,7 +231,7 @@ public class MappingConfiguration {
 		if (Files.notExists(tinyMappings) || refresh) {
 			storeMappings(project, serviceFactory, minecraftProvider, inputJar);
 		} else {
-			try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getJarFileSystem(inputJar, false)) {
+			try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getReadOnlyJarFileSystem(inputJar)) {
 				extractExtras(fileSystem.get());
 			}
 		}
@@ -387,7 +387,7 @@ public class MappingConfiguration {
 			return;
 		}
 
-		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(inputJar)) {
+		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getReadOnlyJarFileSystem(inputJar)) {
 			extractMappings(delegate.fs(), baseTinyMappings);
 			extractExtras(delegate.fs());
 		}
@@ -454,7 +454,7 @@ public class MappingConfiguration {
 	}
 
 	private boolean isMCP(Path path) throws IOException {
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(path, false)) {
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(path)) {
 			return Files.exists(fs.getPath("fields.csv")) && Files.exists(fs.getPath("methods.csv"));
 		}
 	}
@@ -469,7 +469,7 @@ public class MappingConfiguration {
 	}
 
 	public static void extractMappings(Path jar, Path extractTo) throws IOException {
-		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(jar)) {
+		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
 			extractMappings(delegate.fs(), extractTo);
 		}
 	}
