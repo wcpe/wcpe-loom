@@ -98,32 +98,20 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v5
-
-      - name: 提取 CHANGELOG
-        id: changelog
-        shell: bash
-        run: |
-          VERSION="${{ needs.build.outputs.release-version }}"
-          BODY=""
-          # 本线暂无 CHANGELOG.md，缺失时回退为占位说明，不让发布失败
-          if [ -f CHANGELOG.md ]; then
-            BODY=$(awk -v ver="$VERSION" '
-              /^## / { if (found) exit; if ($2 == ver) found=1; next }
-              found { print }
-            ' CHANGELOG.md)
-          fi
-          if [ -z "$BODY" ]; then
-            BODY="发布版本 $VERSION"
-          fi
-          echo "body<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$BODY" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-      - name: 创建 GitHub Release
-        uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: wcpe-loom ${{ github.ref_name }}
-          body: ${{ steps.changelog.outputs.body }}
-          draft: false
-          prerelease: false
+          # 生成 Release Notes 需要完整历史：--generate-notes 要对比上一版 tag，
+          # fetch-depth=1 拿不到上一版 tag 会导致 What's Changed / Contributors 缺失
+          fetch-depth: 0
+
+      - name: 创建 GitHub Release（自动生成贡献者与变更清单）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        # --generate-notes 由 GitHub 按 .github/release.yml 的分组配置自动生成
+        # What's Changed（逐 PR 列出作者与编号）、New Contributors 与 Full Changelog；
+        # 要求该版本的改动经由 PR 合入默认分支（直接 push 的提交不会单独列出）。
+        run: |
+          gh release create "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "wcpe-loom $TAG_NAME" \
+            --generate-notes
