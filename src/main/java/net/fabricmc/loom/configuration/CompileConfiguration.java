@@ -319,31 +319,78 @@ public abstract class CompileConfiguration implements Runnable {
 		final String key = "minecraft-provision:" + extension.getMinecraftProvider().minecraftVersion() + ":" + mappingsIdentifier;
 		final LoomCacheService cacheService = LoomCacheService.get(project).get();
 
+		// 无锁快路径：所有 mapped provider 的产物均已就绪（shouldRefreshOutputs 为纯只读的
+		// 存在性/脏标志检查）时，本次供给不含任何共享缓存写入，内部 provide 各自的快路径
+		// 也不会取锁，故整段事务可无锁执行。
+		final var warmContext = new AbstractMappedMinecraftProvider.ProvideContext(true, extension.refreshDeps(), configContext);
+
+		if (isMappedJarsWarm(extension, project, jarConfiguration, intermediaryMinecraftProvider, namedMinecraftProvider, warmContext)) {
+			provideMappedProviders(extension, project, jarConfiguration, intermediaryMinecraftProvider, namedMinecraftProvider, warmContext);
+			return;
+		}
+
 		cacheService.runExclusive(lockRoot, key, LoomCacheService.defaultTimeout(), () -> {
 			final var provideContext = new AbstractMappedMinecraftProvider.ProvideContext(true, extension.refreshDeps(), configContext);
-
-			if (intermediaryMinecraftProvider != null) {
-				extension.setIntermediaryMinecraftProvider(intermediaryMinecraftProvider);
-				intermediaryMinecraftProvider.provide(provideContext);
-			}
-
-			extension.setNamedMinecraftProvider(namedMinecraftProvider);
-			namedMinecraftProvider.provide(provideContext);
-
-			if (extension.isForge()) {
-				final SrgMinecraftProvider<?> srgMinecraftProvider = jarConfiguration.createSrgMinecraftProvider(project);
-				extension.setSrgMinecraftProvider(srgMinecraftProvider);
-				srgMinecraftProvider.provide(provideContext);
-			}
-
-			if (extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime() && !extension.isUnobfuscatedForge()) {
-				final MojangMappedMinecraftProvider<?> mojangMappedMinecraftProvider = jarConfiguration.createMojangMappedMinecraftProvider(project);
-				extension.setMojangMappedMinecraftProvider(mojangMappedMinecraftProvider);
-				mojangMappedMinecraftProvider.provide(provideContext);
-			}
-
+			provideMappedProviders(extension, project, jarConfiguration, intermediaryMinecraftProvider, namedMinecraftProvider, provideContext);
 			return null;
 		});
+	}
+
+	/**
+	 * {@return 所有 mapped provider 的产物是否已就绪（无需重建）}.
+	 *
+	 * <p>shouldRefreshOutputs 仅做文件存在性与脏标志检查，不写入任何共享缓存，可安全在锁外调用。
+	 */
+	private boolean isMappedJarsWarm(LoomGradleExtension extension, Project project, MinecraftJarConfiguration<?, ?, ?> jarConfiguration,
+			IntermediaryMinecraftProvider<?> intermediaryMinecraftProvider,
+			NamedMinecraftProvider<?> namedMinecraftProvider,
+			AbstractMappedMinecraftProvider.ProvideContext context) {
+		if (intermediaryMinecraftProvider != null && !intermediaryMinecraftProvider.isUpToDate(context)) {
+			return false;
+		}
+
+		if (!namedMinecraftProvider.isUpToDate(context)) {
+			return false;
+		}
+
+		if (extension.isForge()) {
+			if (!jarConfiguration.createSrgMinecraftProvider(project).isUpToDate(context)) {
+				return false;
+			}
+		}
+
+		if (extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime() && !extension.isUnobfuscatedForge()) {
+			if (!jarConfiguration.createMojangMappedMinecraftProvider(project).isUpToDate(context)) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	private void provideMappedProviders(LoomGradleExtension extension, Project project, MinecraftJarConfiguration<?, ?, ?> jarConfiguration,
+			IntermediaryMinecraftProvider<?> intermediaryMinecraftProvider,
+			NamedMinecraftProvider<?> namedMinecraftProvider,
+			AbstractMappedMinecraftProvider.ProvideContext provideContext) throws Exception {
+		if (intermediaryMinecraftProvider != null) {
+			extension.setIntermediaryMinecraftProvider(intermediaryMinecraftProvider);
+			intermediaryMinecraftProvider.provide(provideContext);
+		}
+
+		extension.setNamedMinecraftProvider(namedMinecraftProvider);
+		namedMinecraftProvider.provide(provideContext);
+
+		if (extension.isForge()) {
+			final SrgMinecraftProvider<?> srgMinecraftProvider = jarConfiguration.createSrgMinecraftProvider(project);
+			extension.setSrgMinecraftProvider(srgMinecraftProvider);
+			srgMinecraftProvider.provide(provideContext);
+		}
+
+		if (extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime() && !extension.isUnobfuscatedForge()) {
+			final MojangMappedMinecraftProvider<?> mojangMappedMinecraftProvider = jarConfiguration.createMojangMappedMinecraftProvider(project);
+			extension.setMojangMappedMinecraftProvider(mojangMappedMinecraftProvider);
+			mojangMappedMinecraftProvider.provide(provideContext);
+		}
 	}
 
 	private void registerGameProcessors(ConfigContext configContext) {
