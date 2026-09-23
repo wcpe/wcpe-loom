@@ -41,3 +41,5 @@ changelog:
         - test
         - tests
     - title: 其他变更
+      labels:
+        - '*'
