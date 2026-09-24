@@ -10,6 +10,14 @@ on:
     # GitHub 读取的正是本提交上的版本，故修正必须落在队列内。
     tags-ignore:
       - '**'
+    # 纯文档推送不跑测试：与 publish.yml 的 paths-ignore 对齐，
+    # 避免一行 README 改动就白跑一轮约 30 分钟的完整测试。
+    # 仅作用于 push 触发，PR 仍照常运行，以免分支保护要求的状态检查缺失。
+    paths-ignore:
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'docs/**'
+      - '**.md'
   pull_request:
   workflow_dispatch:
     inputs:
