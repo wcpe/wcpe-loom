@@ -43,7 +43,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
+import java.util.zip.ZipFile;
 
 import dev.architectury.loom.forge.ForgeMigratedMappingConfiguration;
 import dev.architectury.loom.forge.dependency.SrgProvider;
@@ -89,6 +91,24 @@ import net.fabricmc.stitch.commands.CommandProposeFieldNames;
 
 public class MappingConfiguration {
 	private static final Logger LOGGER = LoggerFactory.getLogger(MappingConfiguration.class);
+	private static final String RECORD_SIGNATURES_PATH = "extras/record_signatures.json";
+
+	/**
+	 * 跨项目复用缓存：同构项目（同一套 mappings + 同一 MC 版本 + 同一平台）产出的
+	 * MappingConfiguration 语义等价，且暖路径下只读，无需每个项目都重开一次 mappings jar。
+	 * 键取 mappingsIdentifier —— 它已编码 mappings 坐标、classifier、MC 版本与平台差异。
+	 */
+	private static final Map<String, MappingConfiguration> SHARED_INSTANCES = new ConcurrentHashMap<>();
+
+	/**
+	 * 早缓存索引：键仅由「声明信息」构成（不触发依赖解析），用于在解析 MAPPINGS 之前就命中已产出的实例。
+	 */
+	private static final Map<String, MappingConfiguration> SHARED_EARLY = new ConcurrentHashMap<>();
+
+	private static String earlyKey(LoomGradleExtension extension, DependencyInfo dependency, MinecraftProvider minecraftProvider, String declaredVersion) {
+		return extension.isForgeLike() + "|" + dependency.getDependency().getGroup() + "|"
+				+ dependency.getDependency().getName() + "|" + declaredVersion + "|" + minecraftProvider.minecraftVersion();
+	}
 
 	public final String mappingsIdentifier;
 
@@ -106,6 +126,7 @@ public class MappingConfiguration {
 	private final Path unpickDefinitions;
 
 	private List<AnnotationsData> annotationsData = List.of();
+
 	@Nullable
 	private UnpickMetadata unpickMetadata;
 	private Map<String, String> signatureFixes;
@@ -127,6 +148,21 @@ public class MappingConfiguration {
 	}
 
 	public static MappingConfiguration create(Project project, ServiceFactory serviceFactory, DependencyInfo dependency, MinecraftProvider minecraftProvider) {
+		final LoomGradleExtension extension = LoomGradleExtension.get(project);
+		final boolean refresh = minecraftProvider.refreshDeps();
+
+		// 早缓存：getResolvedVersion() 会触发 MAPPINGS 配置的完整依赖解析（实测单模块 2~9s），
+		// 而同构项目共用同一份 mappings 声明。故先用「不触发解析」的声明信息查一次缓存。
+		final String declaredVersion = dependency.getDependency().getVersion();
+
+		if (!refresh && declaredVersion != null) {
+			final MappingConfiguration earlyHit = SHARED_EARLY.get(earlyKey(extension, dependency, minecraftProvider, declaredVersion));
+
+			if (earlyHit != null && Files.exists(earlyHit.tinyMappings) && Files.exists(earlyHit.tinyMappingsJar)) {
+				return earlyHit;
+			}
+		}
+
 		final String version = dependency.getResolvedVersion();
 		final Path inputJar = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve mappings: " + dependency)).toPath();
 		final String mappingsName = StringUtils.removeSuffix(dependency.getDependency().getGroup() + "." + dependency.getDependency().getName(), "-unmerged");
@@ -138,7 +174,6 @@ public class MappingConfiguration {
 			}
 		});
 
-		final LoomGradleExtension extension = LoomGradleExtension.get(project);
 		String mappingsIdentifier;
 
 		if (extension.isForgeLike()) {
@@ -153,6 +188,16 @@ public class MappingConfiguration {
 
 		final Path workingDir = minecraftProvider.dir(mappingsIdentifier).toPath();
 
+		// 跨项目复用：同构项目命中同一实例即可跳过第二次起的 setup——其成本主要是
+		// 重复打开 mappings jar（zipfs 建索引）。命中后仍校验产物在位，避免缓存到已删文件。
+		if (!refresh) {
+			final MappingConfiguration shared = SHARED_INSTANCES.get(mappingsIdentifier);
+
+			if (shared != null && Files.exists(shared.tinyMappings) && Files.exists(shared.tinyMappingsJar)) {
+				return shared;
+			}
+		}
+
 		MappingConfiguration mappingProvider;
 
 		if (extension.isForgeLike()) {
@@ -166,6 +211,14 @@ public class MappingConfiguration {
 		} catch (Exception e) {
 			cleanWorkingDirectory(workingDir);
 			throw new RuntimeException("Failed to setup mappings: " + dependency.getDepString(), e);
+		}
+
+		if (!refresh) {
+			SHARED_INSTANCES.put(mappingsIdentifier, mappingProvider);
+
+			if (declaredVersion != null) {
+				SHARED_EARLY.put(earlyKey(extension, dependency, minecraftProvider, declaredVersion), mappingProvider);
+			}
 		}
 
 		return mappingProvider;
@@ -204,8 +257,13 @@ public class MappingConfiguration {
 
 		// 无锁快路径：mappings 产物均已就绪且未要求刷新时，不获取文件锁，仅在内存中重新提取额外信息（每次必须执行）
 		if (!refresh && Files.exists(tinyMappings) && Files.exists(tinyMappingsJar)) {
-			try (FileSystem fileSystem = FileSystems.newFileSystem(inputJar, (ClassLoader) null)) {
-				extractExtras(fileSystem);
+			// 轻量预检：先读 zip 中央目录的条目名判断有无 extras，再决定是否打开 zipfs。
+			// 打开 zipfs 会建索引，成本远高于读条目名；而 layered mappings jar 往往只有
+			// 「目录 + mappings/mappings.tiny」两个条目，此时可整段跳过。
+			if (jarContainsExtras(inputJar)) {
+				try (FileSystem fileSystem = FileSystems.newFileSystem(inputJar, (ClassLoader) null)) {
+					extractExtras(fileSystem);
+				}
 			}
 
 			return;
@@ -478,6 +536,25 @@ public class MappingConfiguration {
 		Files.copy(jar.getPath("mappings/mappings.tiny"), extractTo, StandardCopyOption.REPLACE_EXISTING);
 	}
 
+	/**
+	 * 轻量预检：仅凭 zip 中央目录的条目名判断该 jar 是否带 extras，避免为「必然空跑」的
+	 * extractExtras 打开 zipfs（打开会建索引，是暖路径上的主要成本）。
+	 */
+	private static boolean jarContainsExtras(Path inputJar) throws IOException {
+		try (ZipFile zipFile = new ZipFile(inputJar.toFile())) {
+			if (zipFile.getEntry(AnnotationsLayer.ANNOTATIONS_PATH) != null) {
+				return true;
+			}
+
+			if (zipFile.getEntry(RECORD_SIGNATURES_PATH) != null) {
+				return true;
+			}
+
+			return zipFile.getEntry(UnpickMetadata.UNPICK_DEFINITIONS_PATH) != null
+					&& zipFile.getEntry(UnpickMetadata.UNPICK_METADATA_PATH) != null;
+		}
+	}
+
 	private void extractExtras(FileSystem jar) throws IOException {
 		extractAnnotationsData(jar);
 		extractUnpickDefinitions(jar);
@@ -510,7 +587,7 @@ public class MappingConfiguration {
 	}
 
 	private void extractSignatureFixes(FileSystem jar) throws IOException {
-		Path recordSignaturesJsonPath = jar.getPath("extras/record_signatures.json");
+		Path recordSignaturesJsonPath = jar.getPath(RECORD_SIGNATURES_PATH);
 
 		if (!Files.exists(recordSignaturesJsonPath)) {
 			return;
