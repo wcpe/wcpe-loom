@@ -96,12 +96,12 @@ public class MappingConfiguration {
 	/**
 	 * 跨项目复用缓存：同构项目（同一套 mappings + 同一 MC 版本 + 同一平台）产出的
 	 * MappingConfiguration 语义等价，且暖路径下只读，无需每个项目都重开一次 mappings jar。
-	 * 键取 mappingsIdentifier —— 它已编码 mappings 坐标、classifier、MC 版本与平台差异。
+	 * 键取 mappingsIdentifier —— 它已编码 mappings 坐标、classifier、MC 版本与平台差异.
 	 */
 	private static final Map<String, MappingConfiguration> SHARED_INSTANCES = new ConcurrentHashMap<>();
 
 	/**
-	 * 早缓存索引：键仅由「声明信息」构成（不触发依赖解析），用于在解析 MAPPINGS 之前就命中已产出的实例。
+	 * 早缓存索引：键仅由「声明信息」构成（不触发依赖解析），用于在解析 MAPPINGS 之前就命中已产出的实例.
 	 */
 	private static final Map<String, MappingConfiguration> SHARED_EARLY = new ConcurrentHashMap<>();
 
@@ -538,7 +538,7 @@ public class MappingConfiguration {
 
 	/**
 	 * 轻量预检：仅凭 zip 中央目录的条目名判断该 jar 是否带 extras，避免为「必然空跑」的
-	 * extractExtras 打开 zipfs（打开会建索引，是暖路径上的主要成本）。
+	 * extractExtras 打开 zipfs（打开会建索引，是暖路径上的主要成本）.
 	 */
 	private static boolean jarContainsExtras(Path inputJar) throws IOException {
 		try (ZipFile zipFile = new ZipFile(inputJar.toFile())) {

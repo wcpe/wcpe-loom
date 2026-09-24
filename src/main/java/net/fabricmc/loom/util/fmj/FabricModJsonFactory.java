@@ -134,7 +134,7 @@ public final class FabricModJsonFactory {
 
 	/**
 	 * 跨项目缓存：读取 jar 内的 fabric.mod.json 是纯操作，而同构项目（共用同一批 mod jar）
-	 * 会反复解析同一批文件。键取「路径 + 大小 + 修改时间」，足以识别内容变化。
+	 * 会反复解析同一批文件。键取「路径 + 大小 + 修改时间」，足以识别内容变化.
 	 */
 	private static final Map<ZipFmjKey, Optional<FabricModJson>> ZIP_FMJ_CACHE = new ConcurrentHashMap<>();
 
