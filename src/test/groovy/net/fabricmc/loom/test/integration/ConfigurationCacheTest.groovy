@@ -126,6 +126,56 @@ class ConfigurationCacheTest extends Specification implements GradleProjectTestT
 		version << STANDARD_TEST_VERSIONS
 	}
 
+	// 上一次构建被杀（或另一构建持锁）时会在用户缓存里留下锁文件，
+	// 该锁文件的清理不得让后续构建反复失效配置缓存
+	@Unroll
+	def "Leftover cache lock file (#version)"() {
+		setup:
+		def gradle = gradleProject(project: "minimalBase", version: version)
+		gradle.buildGradle << """
+            dependencies {
+                minecraft 'com.mojang:minecraft:1.20.4'
+                mappings 'net.fabricmc:yarn:1.20.4+build.3:v2'
+                modImplementation "${LoomTestVersions.FABRIC_LOADER.mavenNotation()}"
+            }
+
+			import net.fabricmc.loom.util.Checksum
+			println("%%" + Checksum.of(getProject()).sha1().hex() + "%%")
+            """.stripIndent()
+
+		when:
+		def result1 = gradle.run(task: "help")
+		def projectHash = result1.output.split("%%")[1]
+
+		// 模拟上一次构建在配置阶段被杀，留下一个记录着已死进程号的锁文件
+		def lockFile = new File(gradle.gradleHomeDir, "caches/fabric-loom/.${projectHash}.lock")
+		lockFile.text = "12345"
+
+		// 残留锁不得使配置缓存失效，此时配置阶段未被重跑，Loom 也无从清理该文件
+		def result2 = gradle.run(task: "help")
+
+		// 强制重新配置，此时 Loom 才会执行加锁逻辑并识别残留锁
+		gradle.buildGradle << "\n// force reconfiguration\n"
+		def result3 = gradle.run(task: "help")
+		// 锁文件已在上一轮被清理，必须恢复复用
+		def result4 = gradle.run(task: "help")
+
+		then:
+		result1.output.contains("Calculating task graph as no cached configuration is available")
+		// 残留锁文件不得让配置缓存失效：第 2 轮必须直接复用
+		result2.output.contains("Reusing configuration cache")
+		result3.task(":help").outcome != FAILED
+		// 重新配置时识别残留锁并重建 loom 缓存
+		result3.output.contains("rebuilding loom cache")
+		// 后续构建不得再因锁文件被删除或内容变化而失效
+		// （loom 缓存产物被创建导致的失效属于既有行为，不在本用例范围内）
+		!result4.output.contains(".lock' has been removed")
+		!result4.output.contains(".lock' has changed")
+
+		where:
+		version << STANDARD_TEST_VERSIONS
+	}
+
 	static def fmj(String version) {
 		return """
 		{
