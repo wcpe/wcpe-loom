@@ -28,6 +28,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -41,9 +42,11 @@ import dev.architectury.loom.util.ClassVisitorUtil;
 import dev.architectury.loom.util.PropertyUtil;
 import dev.architectury.loom.util.Version;
 import org.gradle.api.Project;
+import org.gradle.api.artifacts.Configuration;
 import org.gradle.api.artifacts.Dependency;
 import org.gradle.api.artifacts.ModuleDependency;
 import org.gradle.api.artifacts.ModuleVersionIdentifier;
+import org.gradle.api.artifacts.ModuleVersionSelector;
 import org.gradle.api.artifacts.ResolvedArtifact;
 import org.gradle.api.artifacts.ResolvedConfiguration;
 import org.jspecify.annotations.Nullable;
@@ -128,9 +131,10 @@ public class ForgeLibrariesProvider {
 		// Resolve all files. We just add the dependencies manually unless it's FML.
 		// We're transforming the files manually instead of using Gradle's mechanism because
 		// we can target the individual files to be transformed instead of creating new copies of all the libraries.
-		final ResolvedConfiguration config = project.getConfigurations()
-				.detachedConfiguration(dependencies.toArray(new Dependency[0]))
-				.getResolvedConfiguration();
+		final Configuration detached = project.getConfigurations()
+				.detachedConfiguration(dependencies.toArray(new Dependency[0]));
+		pinDynamicVersionsToDeclaredVersions(detached, dependencies);
+		final ResolvedConfiguration config = detached.getResolvedConfiguration();
 
 		boolean isFancyModLoader10OrNewer = false;
 
@@ -330,6 +334,74 @@ public class ForgeLibrariesProvider {
 		} catch (IOException e) {
 			throw new IOException("Could not remap object holders in " + outputJar, e);
 		}
+	}
+
+	/**
+	 * 把 Forge 库传递依赖里的动态版本，钉到同一 configuration 中已声明的固定版本.
+	 *
+	 * <p>背景：Forge 自家 POM 用动态版本声明部分传递依赖（如 eventbus:6.0.5 声明
+	 * {@code cpw.mods:modlauncher:10.0.+}、coremods:5.0.1 声明 {@code modlauncher:9.0.+}）。
+	 * Gradle 解析动态版本必须对每个仓库列举版本列表，而本构建的仓库清单常有二十余个，
+	 * 多数不含这些构件，每次都要串行走一遍慢 404；实测单次配置阶段因此多耗 1.5~5.4 秒。
+	 *
+	 * <p>取值的依据是 userdev 自己声明的固定版本，而不是写死版本表：同一条 Forge 依赖清单里
+	 * 已用精确版本声明了这些构件（1.16.5 线 modlauncher 8.1.3、1.18.1 线 9.1.0、
+	 * 1.19.4 线 10.0.8、1.20.1 线 10.0.9），把与之竞争的动态声明钉到该版本，即得
+	 * 「该 Forge 版本发布时自带的版本」——既跳过版本列举，也不会跨代系串版本。
+	 *
+	 * <p>只处理「同一 configuration 里存在同坐标固定声明」的动态版本；没有固定声明与之竞争的
+	 * （如 {@code dev.architectury:mixin-patched:0.8.5.+}）保持动态，因为那类动态版本真实生效。
+	 *
+	 * @param configuration 正在解析的 Forge 库 configuration
+	 * @param dependencies 传入该 configuration 的依赖（含 userdev 声明的固定版本）
+	 */
+	private static void pinDynamicVersionsToDeclaredVersions(Configuration configuration, List<Dependency> dependencies) {
+		final Map<String, String> declaredVersions = new HashMap<>();
+
+		for (Dependency dependency : dependencies) {
+			final String version = dependency.getVersion();
+
+			if (version == null || isDynamicVersion(version)) {
+				continue;
+			}
+
+			declaredVersions.putIfAbsent(dependency.getGroup() + ":" + dependency.getName(), version);
+		}
+
+		if (declaredVersions.isEmpty()) {
+			return;
+		}
+
+		configuration.getResolutionStrategy().eachDependency(details -> {
+			final ModuleVersionSelector requested = details.getRequested();
+			final String version = requested.getVersion();
+
+			// 只处理动态版本；已是固定版本（含 userdev 的精确声明）保持原样，避免多余干预
+			if (version == null || !isDynamicVersion(version)) {
+				return;
+			}
+
+			final String declared = declaredVersions.get(requested.getGroup() + ":" + requested.getName());
+
+			// 没有同坐标的固定声明与之竞争时保持动态：那类动态版本真实生效，钉死会造成功能退化
+			if (declared != null) {
+				details.useVersion(declared);
+			}
+		});
+	}
+
+	/**
+	 * 判断版本声明是否为动态版本（{@code 1.+}、{@code [1.0,2.0)}、{@code ]1.0,2.0]}、{@code latest.release}）.
+	 *
+	 * @param version 版本声明
+	 * @return 动态版本返回 true
+	 */
+	private static boolean isDynamicVersion(String version) {
+		return version.indexOf('+') >= 0
+				|| version.startsWith("[")
+				|| version.startsWith("(")
+				|| version.startsWith("]")
+				|| version.startsWith("latest.");
 	}
 
 	/**
