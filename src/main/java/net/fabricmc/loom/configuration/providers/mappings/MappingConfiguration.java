@@ -95,6 +95,11 @@ public class MappingConfiguration {
 	private static final Logger LOGGER = LoggerFactory.getLogger(MappingConfiguration.class);
 	private static final String RECORD_SIGNATURES_PATH = "extras/record_signatures.json";
 
+	/** 成对就绪标记的内容：两件产物出自同一次生成. */
+	private static final String PAIR_MARKER_READY = "ready";
+	/** 成对就绪标记的失效内容：本轮正在（重新）生成这对产物. */
+	private static final String PAIR_MARKER_INVALID = "invalidated";
+
 	/**
 	 * 跨项目复用缓存：同构项目（同一套 mappings + 同一 MC 版本 + 同一平台）产出的
 	 * MappingConfiguration 语义等价，且暖路径下只读，无需每个项目都重开一次 mappings jar。
@@ -126,6 +131,8 @@ public class MappingConfiguration {
 	public final Path srgToNamedSrg; // FORGE: srg to named in srg file format
 	private final Map<MappingOption, Supplier<Path>> mappingOptions;
 	private final Path unpickDefinitions;
+	// mappings.tiny 与 mappings.jar 的成对就绪标记：与两件产物同处共享工作目录，跨工作树/daemon 共享
+	private final Path mappingsPairMarker;
 
 	private List<AnnotationsData> annotationsData = List.of();
 
@@ -140,6 +147,7 @@ public class MappingConfiguration {
 		this.baseTinyMappings = mappingsWorkingDir.resolve("mappings-base.tiny");
 		this.tinyMappings = mappingsWorkingDir.resolve("mappings.tiny");
 		this.tinyMappingsJar = mappingsWorkingDir.resolve("mappings.jar");
+		this.mappingsPairMarker = mappingsWorkingDir.resolve("mappings-pair.ready");
 		this.unpickDefinitions = mappingsWorkingDir.resolve("mappings.unpick");
 		this.tinyMappingsWithSrg = mappingsWorkingDir.resolve("mappings-srg.tiny");
 		this.tinyMappingsWithMojang = mappingsWorkingDir.resolve("mappings-mojang.tiny");
@@ -160,7 +168,7 @@ public class MappingConfiguration {
 		if (!refresh && declaredVersion != null) {
 			final MappingConfiguration earlyHit = SHARED_EARLY.get(earlyKey(extension, dependency, minecraftProvider, declaredVersion));
 
-			if (earlyHit != null && Files.exists(earlyHit.tinyMappings) && Files.exists(earlyHit.tinyMappingsJar)) {
+			if (earlyHit != null && earlyHit.hasUsableMappingsPair()) {
 				return earlyHit;
 			}
 		}
@@ -191,11 +199,12 @@ public class MappingConfiguration {
 		final Path workingDir = minecraftProvider.dir(mappingsIdentifier).toPath();
 
 		// 跨项目复用：同构项目命中同一实例即可跳过第二次起的 setup——其成本主要是
-		// 重复打开 mappings jar（zipfs 建索引）。命中后仍校验产物在位，避免缓存到已删文件。
+		// 重复打开 mappings jar（zipfs 建索引）。命中后仍校验两件产物成对就绪，
+		// 避免缓存到已删文件，或只落位了一半的一代产物。
 		if (!refresh) {
 			final MappingConfiguration shared = SHARED_INSTANCES.get(mappingsIdentifier);
 
-			if (shared != null && Files.exists(shared.tinyMappings) && Files.exists(shared.tinyMappingsJar)) {
+			if (shared != null && shared.hasUsableMappingsPair()) {
 				return shared;
 			}
 		}
@@ -259,8 +268,9 @@ public class MappingConfiguration {
 	private void setup(Project project, ServiceFactory serviceFactory, MinecraftProvider minecraftProvider, Path inputJar) throws Exception {
 		final boolean refresh = minecraftProvider.refreshDeps();
 
-		// 无锁快路径：mappings 产物均已就绪且未要求刷新时，不获取文件锁，仅在内存中重新提取额外信息（每次必须执行）
-		if (!refresh && Files.exists(tinyMappings) && Files.exists(tinyMappingsJar)) {
+		// 无锁快路径：两件 mappings 产物成对就绪（含成对标记，见 hasUsableMappingsPair）且未要求刷新时，
+		// 不获取文件锁，仅在内存中重新提取额外信息（每次必须执行）
+		if (!refresh && hasUsableMappingsPair()) {
 			// 轻量预检：先读 zip 中央目录的条目名判断有无 extras，再决定是否打开 zipfs。
 			// 打开 zipfs 会建索引，成本远高于读条目名；而 layered mappings jar 往往只有
 			// 「目录 + mappings/mappings.tiny」两个条目，此时可整段跳过。
@@ -317,7 +327,18 @@ public class MappingConfiguration {
 		// 刷新（--refresh-dependencies）不再靠删除共享产物实现：删除会制造「产物不存在」窗口，
 		// 锁外的存在性快路径会误判、并连带删掉其它进程正在读的文件。
 		// 改为「强制重建 + 原子替换」，读方始终看到旧的完整文件或新的完整文件。
-		if (Files.notExists(tinyMappings) || refresh) {
+		final boolean writeTiny = Files.notExists(tinyMappings) || refresh;
+		// mappings.jar 的内容派生自 mappings.tiny（把同一份 tiny 原样打进 zip），故本轮重写了 tiny 就必须
+		// 同轮重写 jar：否则「新的 mappings.tiny + 旧的 mappings.jar」同样会被后面的标记认证为成对就绪。
+		final boolean writeJar = writeTiny || Files.notExists(tinyMappingsJar);
+
+		// 只要本轮会写其中任一件，就先让成对标记失效：两件产物是两次独立发布，
+		// 若两次发布之间标记仍为就绪，读方会命中「新的 mappings.tiny + 旧的 mappings.jar」。
+		if (writeTiny || writeJar) {
+			invalidateMappingsPairMarker();
+		}
+
+		if (writeTiny) {
 			storeMappings(project, serviceFactory, minecraftProvider, inputJar);
 		} else {
 			try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getReadOnlyJarFileSystem(inputJar)) {
@@ -325,10 +346,55 @@ public class MappingConfiguration {
 			}
 		}
 
-		if (Files.notExists(tinyMappingsJar) || refresh) {
+		if (writeJar) {
 			// 原子发布 mappings.jar：先在临时文件上完成全部加工再原子落位，不再「先删后就地写」
 			AtomicFiles.publish(tinyMappingsJar, tmp -> ZipUtils.add(tmp, "mappings/mappings.tiny", Files.readAllBytes(tinyMappings)));
 		}
+
+		// 两件产物都已落位，最后提交成对标记：标记就绪 ⟹ 这对产物出自同一次生成
+		AtomicFiles.publish(mappingsPairMarker, tmp -> Files.writeString(tmp, PAIR_MARKER_READY, StandardCharsets.UTF_8));
+	}
+
+	/**
+	 * 暖路径判据：mappings.tiny 与 mappings.jar 成对就绪.
+	 *
+	 * <p>这两件产物由 {@link #produceMappings} 分两次独立发布，「单件原子」并不等于「成对原子」：
+	 * 两次 move 之间读方会拿到「新的 mappings.tiny + 旧的 mappings.jar」，而 remap 用前者、
+	 * MAPPINGS_FINAL 暴露后者，于是同一次构建里这两处可能来自两代不同的映射产物。
+	 * 注意「只认最后发布的那一件」并不能解决：
+	 * 旧一代的 mappings.jar 一直留在盘上，两次发布之间它依然是「存在」的，存在性无法区分代次。
+	 * 因此这里额外要求成对标记处于就绪态：生产方在写这对产物之前先把标记置为失效值，
+	 * 两件都落位后才写回就绪值，于是「标记就绪 ⟹ 两件产物已被提交为一对」。
+	 *
+	 * <p>残余窗口：本方法检查标记与调用方随后读取两件文件之间仍有毫秒级间隙，理论上仍可能在
+	 * 生产方「发布完 mappings.tiny、尚未发布 mappings.jar」这一小段（写 zip 的时间）撞上混合产物。
+	 * 彻底消除需要版本化路径（读方先读指针、再读不可变的代次文件），改动面远超本次范围；
+	 * 相比修复前「整个重建时长（分钟级）内都可能读到混合产物」，窗口已被压到最小。
+	 *
+	 * <p>代价：标记是本次新增的，升级后第一次构建（或标记被外部清理时）暖路径会判为未就绪而进锁一次；
+	 * 锁内确认两件产物均已存在且未要求刷新后只会补写标记，不会重新提取 mappings。
+	 */
+	private boolean hasUsableMappingsPair() {
+		try {
+			return Files.exists(tinyMappings) && Files.exists(tinyMappingsJar)
+					&& PAIR_MARKER_READY.equals(Files.readString(mappingsPairMarker, StandardCharsets.UTF_8));
+		} catch (IOException e) {
+			// 读标记失败（例如正被并发原子替换的瞬间）按「未就绪」处理：进锁重新确认，不影响正确性
+			return false;
+		}
+	}
+
+	/**
+	 * 让成对就绪标记失效，直到本轮两件产物全部落位.
+	 *
+	 * <p>用原子发布写哨兵值而不是删除标记文件：删除会在「存在性检查 → 读取」之间给并发读方留下
+	 * {@code NoSuchFileException} 窗口（本类此前多处按「先查存在再读内容」两步读取共享文件）；
+	 * 原子写入则保证标记始终存在，内容只可能是哨兵或 {@link #PAIR_MARKER_READY}。
+	 *
+	 * <p>若生产中途失败，标记留在失效态，下轮构建会重新生成这对产物（安全方向）。
+	 */
+	private void invalidateMappingsPairMarker() throws IOException {
+		AtomicFiles.publish(mappingsPairMarker, tmp -> Files.writeString(tmp, PAIR_MARKER_INVALID, StandardCharsets.UTF_8));
 	}
 
 	public void setupPost(Project project) throws IOException {

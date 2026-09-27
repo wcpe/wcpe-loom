@@ -41,6 +41,15 @@ import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
 
 public final class ForgeMigratedMappingConfiguration extends MappingConfiguration {
+	/**
+	 * 就绪标记的「失效」哨兵值.
+	 *
+	 * <p>重建期间标记必须处于不可用状态，而删除标记文件会让并发读方在「存在性检查 → 读取」之间
+	 * 撞上 {@code NoSuchFileException}（{@link #isOutdated} 正是这样分两步读的），故改为原子写入
+	 * 一个不可能是合法 hash 的值：合法标记只可能是 {@code Long.toString(hash)} 的十进制表示，
+	 * 而 {@link #isOutdated} 用的是字符串比较，因此哨兵必然被判为「需重建」，判定自洽。
+	 */
+	private static final String INVALIDATED_HASH = "invalidated";
 	private final List<MappingsMigrator> migrators = List.of(new FieldMappingsMigrator(), new MethodInheritanceMappingsMigrator());
 	private Path hashPath;
 	private Path rawTinyMappings;
@@ -88,7 +97,9 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
 			hash = hash * 31 + migrator.setup(project, extension.getMinecraftProvider(), forgeCache, rawTinyMappingsWithNs, hasSrg, hasMojang);
 		}
 
-		// 无锁快路径：就绪标记与各迁移产物齐备且 hash 一致时，本次不含任何共享缓存写入，不取锁
+		// 无锁快路径：就绪标记与各迁移产物齐备且 hash 一致时，本次不含任何共享缓存写入，不取锁。
+		// 重建方在整个重建期间把标记置为失效值（见 produceMigratedMappings），故此处不会读到
+		// 「标记有效、产物却只迁移了一半」的错位状态。
 		if (!isOutdated(extension, hasSrg, hasMojang)) {
 			project.getLogger().info(":manipulated {} mappings are up to date", extension.getPlatform().get().id());
 			return;
@@ -105,13 +116,22 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
 	}
 
 	/**
-	 * 生产迁移后的 mappings：复制与迁移结果一律原子发布，就绪标记最后落位.
+	 * 生产迁移后的 mappings：复制与迁移结果一律原子发布，就绪标记先失效、最后才落位.
 	 *
 	 * <p>旧写法直接以共享产物为输出（先原地覆盖、迁移器再读回并就地重写），读方会看到半截 mappings；
 	 * 而 hash 就绪标记先于内容落位时，读方还会读到「标记在、内容半截」的错位状态。
+	 *
+	 * <p>「单文件原子」不等于「集合原子」：多件产物逐个落位，过程中盘上必然存在「部分新、部分旧」
+	 * 的混合集合，此时旧标记（内容与重建前的 hash 相同）看起来依然合法。带 refresh 的重建尤其危险——
+	 * 它是唯一「hash 未变却重写全部产物」的路径，其它 {@code refresh=false} 的进程会在整个重建时长内
+	 * 通过 {@link #isOutdated} 的 hash 比较直接判定「已就绪」，并据此读入只迁移了一半的 mappings。
+	 * 因此重建的第一步就是让标记失效，全部产物落位后才发布真实 hash，维持
+	 * 「标记有效 ⟹ 所有产物已就绪」这一不变式；若中途失败，标记留在失效态，下次构建会重建（安全方向）。
 	 */
 	private void produceMigratedMappings(Project project, LoomGradleExtension extension, Path rawTinyMappingsWithNs, Path tinyMappingsWithNs) throws IOException {
 		Stopwatch stopwatch = Stopwatch.createStarted();
+		// 先失效标记再碰任何产物：保证重建期间没有读方能凭旧标记把半迁移产物当成就绪产物
+		invalidateMigratedMappingsMarker();
 		AtomicFiles.copy(this.rawTinyMappings, this.tinyMappings);
 		AtomicFiles.copy(rawTinyMappingsWithNs, tinyMappingsWithNs);
 
@@ -142,6 +162,16 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
 	}
 
 	/**
+	 * 让迁移产物的就绪标记失效，直到本轮产物全部落位.
+	 *
+	 * <p>用原子发布写哨兵值而不是删除标记文件：删除会在「存在性检查 → 读取」之间给并发读方
+	 * 留下 {@code NoSuchFileException} 窗口，原子写入则保证标记始终存在，内容要么是哨兵、要么是完整 hash。
+	 */
+	private void invalidateMigratedMappingsMarker() throws IOException {
+		AtomicFiles.publish(this.hashPath, tmp -> Files.writeString(tmp, INVALIDATED_HASH, StandardCharsets.UTF_8));
+	}
+
+	/**
 	 * 在跨进程锁保护下生产迁移后的 mappings.
 	 *
 	 * <p>产物位于跨 daemon 共享的缓存目录（不按项目隔离），key 与 lockRoot 和
@@ -162,6 +192,12 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
 		}
 	}
 
+	/**
+	 * 迁移产物是否需要重建.
+	 *
+	 * <p>判据与「标记有效 ⟹ 所有产物已就绪」的不变式自洽：标记缺失、内容为失效哨兵
+	 * （见 {@link #INVALIDATED_HASH}，说明有进程正在重建）或与本次算出的 hash 不一致，都判为需重建。
+	 */
 	private boolean isOutdated(LoomGradleExtension extension, boolean hasSrg, boolean hasMojang) throws IOException {
 		if (extension.refreshDeps()) return true;
 		if (Files.notExists(this.tinyMappings)) return true;
