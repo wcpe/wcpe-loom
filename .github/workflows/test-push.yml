@@ -113,10 +113,18 @@ jobs:
           key: ${{ runner.os }}-testkit-gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', '**/*.gradle', '**/*.gradle.kts', 'src/test/**') }}
           restore-keys: |
             ${{ runner.os }}-testkit-gradle-
-      - name: setup jdk
+      # Forge 自带的 ForgeFlower 反编译器不支持 JDK 25，需为 forge 系列测试准备 JDK 21（放在 25 之前，避免顶掉 JAVA_HOME）
+      - name: setup jdk 21 (Forge tooling)
         uses: actions/setup-java@v5
         with:
           java-version: 21
+          distribution: 'temurin'
+      # 测试作业仍用 JDK 25：部分用例的内层构建要求 --release 25（如 noRemap.UnobfFabricAPITest 的 fabric-api），
+      # 降到 21 会直接编译失败。构建类作业用 21 是为了对齐发布运行时并守住 javadoc 一类问题。
+      - name: setup jdk
+        uses: actions/setup-java@v5
+        with:
+          java-version: 25
           distribution: 'temurin'
       - run: ./gradlew printActionsTestName --name="${{ matrix.test }}" test --tests ${{ matrix.test }} --stacktrace --warning-mode fail
         env:
@@ -149,10 +157,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
-      - name: setup jdk
+      # 同 run_tests：forge 系列测试的反编译步骤需要 JDK 21，而测试本身仍要求 JDK 25
+      - name: setup jdk 21 (Forge tooling)
         uses: actions/setup-java@v5
         with:
           java-version: 21
+          distribution: 'temurin'
+      - name: setup jdk
+        uses: actions/setup-java@v5
+        with:
+          java-version: 25
           distribution: 'temurin'
       - run: ./gradlew printActionsTestName --name="${{ matrix.test }}" test --tests ${{ matrix.test }} --stacktrace --warning-mode fail
         env:
@@ -177,7 +191,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        java: [ 21 ]
+        # 保留 JDK 25 作为额外兼容矩阵，验证 21/25 两个运行时产出的可复现性一致
+        java: [ 21, 25 ]
         os: [ windows-2025, ubuntu-24.04, macos-26 ]
 
     runs-on: ${{ matrix.os }}
