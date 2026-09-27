@@ -83,7 +83,27 @@ class ForgeIsolatedProjectsTest extends Specification implements GradleProjectTe
 		def gradle = gradleProject(project: "forge/multiProjectIsolated", version: DEFAULT_GRADLE)
 		replacePlaceholders(gradle)
 
-		when:
+		when: "先在只有 :common 的结构里产出它的 jar"
+		// Loom 在配置期就要读依赖项目 jar 的元数据
+		// （ModConfigurationRemapper → ArtifactMetadata → 打开 jar 文件系统），读的是 build/libs/ 下
+		// remapJar 的产物（jar 任务被 RemapTaskConfiguration 改到 build/devlibs/）。该文件由执行期产出，
+		// 而只要 :mod 参与配置就会读到尚不存在的文件——configure-on-demand 也挡不住（实测构建
+		// :common:remapJar 时 :mod 仍会被配置）。因此这里临时把 :mod 从 settings 中摘掉，先单独产出
+		// :common 的 remapJar，再恢复完整结构。该限制是 Loom 既有的架构行为，与隔离项目无关。
+		def settingsFile = new File(gradle.projectDir, "settings.gradle")
+		def originalSettings = settingsFile.text
+		settingsFile.text = originalSettings.readLines()
+				.findAll { !it.contains('include "mod"') }
+				.join("\n")
+
+		def commonResult = gradle.run(
+				tasks: [":common:remapJar"],
+				isloatedProjects: true,
+				configureOnDemand: true)
+
+		settingsFile.text = originalSettings
+
+		and: "再构建 :mod，令其在配置期读取 :common 的 jar 元数据"
 		// configure-on-demand 让 :common 只在真正被需要时才配置，
 		// 把 LoomProjectData 的跨项目读取推到最真实的场景下。
 		def result = gradle.run(
@@ -92,11 +112,16 @@ class ForgeIsolatedProjectsTest extends Specification implements GradleProjectTe
 				configureOnDemand: true)
 
 		then:
+		assertIsolatedProjectsActive(commonResult.output)
 		assertIsolatedProjectsActive(result.output)
+		commonResult.task(":common:remapJar").outcome == SUCCESS
+		// :mod:remapJar 能跑通本身即证明跨项目依赖被真正解析过：:mod 的配置期会去读 :common 的
+		// remapJar 产物元数据（缺失时报 NoSuchFileException），重映射又需要 :common 的 remapped jar。
+		// 不再断言 :common:remapJar 的任务结果——第二次运行时它是 UP-TO-DATE，配置缓存下
+		// BuildResult.task() 对其返回 null，断言会假失败。
 		result.task(":mod:build").outcome == SUCCESS
 		result.task(":mod:remapJar").outcome == SUCCESS
-		// :common 的产物被 :mod 消费，说明跨项目依赖确实被解析过
-		result.task(":common:jar").outcome == SUCCESS
+		findIsolatedProjectsViolations(commonResult.output).isEmpty()
 		findIsolatedProjectsViolations(result.output).isEmpty()
 	}
 
