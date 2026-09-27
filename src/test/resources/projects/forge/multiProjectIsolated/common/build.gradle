@@ -1,0 +1,25 @@
+plugins {
+	id 'dev.architectury.loom'
+}
+
+java {
+	sourceCompatibility = JavaVersion.VERSION_17
+	targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 17
+}
+
+base {
+	archivesName = "common"
+}
+
+version = project.mod_version
+group = project.maven_group
+
+dependencies {
+	minecraft "com.mojang:minecraft:@MCVERSION@"
+	mappings loom.officialMojangMappings()
+	forge "net.minecraftforge:forge:@MCVERSION@-@FORGEVERSION@"
+}

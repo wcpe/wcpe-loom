@@ -62,6 +62,7 @@ public abstract class LoomTasks implements Runnable {
 	@Override
 	public void run() {
 		LoomGradleExtension extension = LoomGradleExtension.get(getProject());
+		getTasks().named("exportLoomProjectData", task -> task.setDescription("导出隔离项目所需的项目数据"));
 
 		if (!extension.disableObfuscation()) {
 			registerMigrateMappingsTasks();
@@ -117,6 +118,7 @@ public abstract class LoomTasks implements Runnable {
 
 		registerIDETasks();
 		registerRunTasks();
+		registerForgeSourceExtractionTask(extension);
 
 		// Must be done in afterEvaluate to allow time for the build script to configure the jar config.
 		GradleUtils.afterSuccessfulEvaluation(getProject(), () -> {
@@ -133,6 +135,35 @@ public abstract class LoomTasks implements Runnable {
 			}
 
 			registerClientSetupTasks(getTasks(), versionInfo.hasNativesToExtract());
+		});
+	}
+
+	/**
+	 * 注册声明式解压 Forge 安装器源码包的任务.
+	 *
+	 * <p>该任务把“归档 -> 输出目录”的转换交给 Gradle 建模：单一 {@code @OutputDirectory} 输出便于构建缓存复用，
+	 * 同时避免与其它任务产生重叠输出。平台不是 Forge-like，或 userdev 配置尚未就绪时直接跳过注册，
+	 * 由 {@code ForgeSourcesService} 回退到内联解压路径。
+	 */
+	private void registerForgeSourceExtractionTask(LoomGradleExtension extension) {
+		if (!extension.isForgeLike()) {
+			return;
+		}
+
+		getTasks().register(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME, ExtractArchiveFilesTask.class, task -> {
+			task.setDescription("展开 Forge 安装器源码包，供 genSources 复用");
+
+			// 只保留 Java 源码条目：源码包里的资源文件不参与后续重映射。
+			task.includeSuffixes("**/*.java");
+			task.emptyMarker(ExtractArchiveFilesTask.EMPTY_MARKER_FILE);
+
+			task.getOutputDirectory().convention(
+					getProject().getLayout().getBuildDirectory().dir(ExtractArchiveFilesTask.FORGE_SOURCES_OUTPUT_DIRECTORY));
+
+			task.getArchives().from(getProject().provider(() -> {
+				final String sources = extension.getForgeUserdevProvider().getConfig().sources();
+				return dev.architectury.loom.util.DependencyDownloader.download(getProject(), sources);
+			}));
 		});
 	}
 

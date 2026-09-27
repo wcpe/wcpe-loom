@@ -109,6 +109,7 @@ public record ForgeRunTemplate(
 
 	public void applyTo(RunConfiguration settings, ConfigValue.Resolver configValueResolver) {
 		settings.getMainClass().convention(main);
+		settings.getProgramArguments().addAll(CollectionUtil.map(args, value -> value.resolve(configValueResolver)));
 		settings.getJvmArguments().addAll(CollectionUtil.map(jvmArgs, value -> value.resolve(configValueResolver)));
 
 		env.forEach((key, value) -> {
@@ -116,7 +117,12 @@ public record ForgeRunTemplate(
 			putIfAbsent(settings.getEnvironmentVars(), key, resolved);
 		});
 
-		// Add MOD_CLASSES, this is something that ForgeGradle does
+		props.forEach((key, value) -> {
+			String resolved = value.resolve(configValueResolver);
+			putIfAbsent(settings.getSystemProperties(), key, resolved);
+		});
+
+		// ForgeGradle 会为 Forge 运行注入 MOD_CLASSES，保留用户显式配置的值。
 		putIfAbsent(settings.getEnvironmentVars(), ForgeModClassesService.ENVIRONMENT_VARIABLE, ForgeModClassesService.VARIABLE_KEY);
 	}
 

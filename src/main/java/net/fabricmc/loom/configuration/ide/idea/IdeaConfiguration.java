@@ -66,6 +66,10 @@ public abstract class IdeaConfiguration implements Runnable {
 	}
 
 	private void hookDownloadSources() {
+		// 每个 Loom 项目只登记自己可提供的源码任务；根项目再按任务路径字符串添加依赖。
+		// 这样避免了从根项目遍历 allprojects 的跨项目访问，隔离项目模式下同样可用。
+		DownloadSourcesHook.register(getProject());
+
 		if (!GradleUtils.isRootProject(getProject())) {
 			return;
 		}
@@ -76,13 +80,7 @@ public abstract class IdeaConfiguration implements Runnable {
 
 		getProject().getTasks().configureEach(task -> {
 			if (task.getName().startsWith(DownloadSourcesHook.INIT_SCRIPT_NAME)) {
-				getProject().allprojects(subProject -> {
-					if (!GradleUtils.isLoomProject(subProject)) {
-						return;
-					}
-
-					new DownloadSourcesHook(subProject, task).tryHook();
-				});
+				new DownloadSourcesHook(getProject(), task).tryHook();
 			}
 		});
 	}

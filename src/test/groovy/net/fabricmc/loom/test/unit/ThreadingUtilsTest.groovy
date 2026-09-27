@@ -1,7 +1,7 @@
 /*
  * This file is part of fabric-loom, licensed under the MIT License (MIT).
  *
- * Copyright (c) 2025 FabricMC
+ * Copyright (c) 2026 FabricMC
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,46 +24,20 @@
 
 package net.fabricmc.loom.test.unit
 
+import dev.architectury.loom.util.ThreadingUtils
 import spock.lang.Specification
 
-import net.fabricmc.loom.util.AsyncCache
-
-class AsyncCacheTest extends Specification {
-	def "rethrows error"() {
+class ThreadingUtilsTest extends Specification {
+	def "task failures propagate from the completer"() {
 		given:
-		def cache = new AsyncCache()
-		def cacheKey = "testKey"
-		def supplier = { throw new RuntimeException("Test exception") }
+		def completer = ThreadingUtils.taskCompleter()
+		completer.add { throw new IllegalStateException('expected failure') }
 
 		when:
-		cache.getBlocking(cacheKey, supplier)
+		completer.complete()
 
 		then:
-		def e = thrown(RuntimeException)
-		e.message == "Test exception"
-	}
-
-	def "retries after failed future"() {
-		given:
-		def cache = new AsyncCache()
-		def attempts = 0
-
-		when:
-		cache.getBlocking("testKey") {
-			attempts++
-			throw new RuntimeException("first failure")
-		}
-		then:
-		thrown(RuntimeException)
-
-		when:
-		def result = cache.getBlocking("testKey") {
-			attempts++
-			"success"
-		}
-
-		then:
-		result == "success"
-		attempts == 2
+		def error = thrown(IllegalStateException)
+		error.message == 'expected failure'
 	}
 }

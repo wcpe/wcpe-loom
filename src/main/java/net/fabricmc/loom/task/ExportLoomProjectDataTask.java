@@ -1,7 +1,7 @@
 /*
  * This file is part of fabric-loom, licensed under the MIT License (MIT).
  *
- * Copyright (c) 2025 FabricMC
+ * Copyright (c) 2026 FabricMC
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,48 +22,29 @@
  * SOFTWARE.
  */
 
-package net.fabricmc.loom.test.unit
+package net.fabricmc.loom.task;
 
-import spock.lang.Specification
+import java.io.IOException;
 
-import net.fabricmc.loom.util.AsyncCache
+import org.gradle.api.DefaultTask;
+import org.gradle.api.file.RegularFileProperty;
+import org.gradle.api.tasks.CacheableTask;
+import org.gradle.api.tasks.OutputFile;
+import org.gradle.api.tasks.TaskAction;
 
-class AsyncCacheTest extends Specification {
-	def "rethrows error"() {
-		given:
-		def cache = new AsyncCache()
-		def cacheKey = "testKey"
-		def supplier = { throw new RuntimeException("Test exception") }
+import net.fabricmc.loom.internal.LoomProjectData;
 
-		when:
-		cache.getBlocking(cacheKey, supplier)
-
-		then:
-		def e = thrown(RuntimeException)
-		e.message == "Test exception"
+@CacheableTask
+public abstract class ExportLoomProjectDataTask extends DefaultTask {
+	public ExportLoomProjectDataTask() {
+		getOutputFile().convention(getProject().getLayout().getBuildDirectory().file("loom/project-data.json"));
 	}
 
-	def "retries after failed future"() {
-		given:
-		def cache = new AsyncCache()
-		def attempts = 0
+	@OutputFile
+	public abstract RegularFileProperty getOutputFile();
 
-		when:
-		cache.getBlocking("testKey") {
-			attempts++
-			throw new RuntimeException("first failure")
-		}
-		then:
-		thrown(RuntimeException)
-
-		when:
-		def result = cache.getBlocking("testKey") {
-			attempts++
-			"success"
-		}
-
-		then:
-		result == "success"
-		attempts == 2
+	@TaskAction
+	public void exportProjectData() throws IOException {
+		LoomProjectData.fromProject(getProject()).write(getOutputFile().get().getAsFile().toPath());
 	}
 }

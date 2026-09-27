@@ -31,10 +31,12 @@ import org.gradle.api.artifacts.Configuration;
 import org.gradle.api.file.ConfigurableFileCollection;
 import org.gradle.api.file.FileCollection;
 
+import net.fabricmc.loom.internal.LoomProjectData;
+
 public interface DeobfProjectView extends ProjectView {
 	FileCollection getDependencies(DebofConfiguration debofConfiguration, DebofConfiguration.TargetSourceSet targetSourceSet);
 
-	Stream<Project> getProjectDependencies(DebofConfiguration debofConfiguration);
+	Stream<LoomProjectData> getProjectDependencies(DebofConfiguration debofConfiguration);
 
 	FileCollection getFullClasspath();
 
@@ -49,9 +51,9 @@ public interface DeobfProjectView extends ProjectView {
 		}
 
 		@Override
-		public Stream<Project> getProjectDependencies(DebofConfiguration debofConfiguration) {
+		public Stream<LoomProjectData> getProjectDependencies(DebofConfiguration debofConfiguration) {
 			return debofConfiguration.getConfigurations(project).stream()
-					.flatMap(configuration -> getLoomProjectDependencies(configuration.getName()));
+					.flatMap(configuration -> getLoomProjectDataDependencies(configuration.getName()));
 		}
 
 		@Override

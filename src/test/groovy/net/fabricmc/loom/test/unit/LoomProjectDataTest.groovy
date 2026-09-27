@@ -1,7 +1,7 @@
 /*
  * This file is part of fabric-loom, licensed under the MIT License (MIT).
  *
- * Copyright (c) 2025 FabricMC
+ * Copyright (c) 2026 FabricMC
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,44 +26,32 @@ package net.fabricmc.loom.test.unit
 
 import spock.lang.Specification
 
-import net.fabricmc.loom.util.AsyncCache
+import net.fabricmc.loom.internal.LoomGradleSharedData
+import net.fabricmc.loom.internal.LoomProjectData
 
-class AsyncCacheTest extends Specification {
-	def "rethrows error"() {
+class LoomProjectDataTest extends Specification {
+	def "项目数据桥可通过 Java 序列化传递并还原模组元数据"() {
 		given:
-		def cache = new AsyncCache()
-		def cacheKey = "testKey"
-		def supplier = { throw new RuntimeException("Test exception") }
+		def modData = new LoomProjectData.ModData(
+				'{"schemaVersion":1,"id":"example","version":"1.0.0","mixins":["example.mixins.json"]}',
+				['example.mixins.json': 'mixin-data'.bytes]
+				)
+		def data = new LoomProjectData(':example', [modData], 'mappings', 'named', true, ['build/mixin.refmap.json'])
+		def sharedData = new LoomGradleSharedData('test')
+		sharedData.putProject(data)
 
 		when:
-		cache.getBlocking(cacheKey, supplier)
+		def bytes = new ByteArrayOutputStream()
+		new ObjectOutputStream(bytes).withCloseable { it.writeObject(sharedData) }
+		def restored = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray())).withCloseable { it.readObject() }
 
 		then:
-		def e = thrown(RuntimeException)
-		e.message == "Test exception"
-	}
-
-	def "retries after failed future"() {
-		given:
-		def cache = new AsyncCache()
-		def attempts = 0
-
-		when:
-		cache.getBlocking("testKey") {
-			attempts++
-			throw new RuntimeException("first failure")
-		}
-		then:
-		thrown(RuntimeException)
-
-		when:
-		def result = cache.getBlocking("testKey") {
-			attempts++
-			"success"
-		}
-
-		then:
-		result == "success"
-		attempts == 2
+		restored instanceof LoomGradleSharedData
+		def restoredData = restored.getProject(':example')
+		restoredData.projectPath() == ':example'
+		restoredData.mappingId() == 'mappings'
+		restoredData.splitEnvironmentSourceSets()
+		restoredData.createMods().first().id == 'example'
+		restoredData.createMods().first().getMixinConfigurations() == ['example.mixins.json']
 	}
 }

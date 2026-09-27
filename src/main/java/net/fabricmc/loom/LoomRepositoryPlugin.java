@@ -39,6 +39,7 @@ import org.gradle.api.plugins.PluginAware;
 
 import net.fabricmc.loom.configuration.providers.minecraft.library.processors.LWJGL2UpgradeLibraryProcessor;
 import net.fabricmc.loom.extension.LoomFiles;
+import net.fabricmc.loom.internal.LoomGradleSharedData;
 import net.fabricmc.loom.util.MirrorUtil;
 
 public class LoomRepositoryPlugin implements Plugin<PluginAware> {
@@ -53,15 +54,20 @@ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
 	@Override
 	public void apply(PluginAware target) {
 		if (target instanceof Settings settings) {
+			LoomGradleSharedData.beforeProject(settings.getGradle());
 			declareRepositories(settings.getDependencyResolutionManagement().getRepositories(), LoomFiles.create(settings), settings);
 
 			// leave a marker so projects don't try to override these
 			settings.getGradle().getPluginManager().apply(LoomRepositoryPlugin.class);
 		} else if (target instanceof Project project) {
+			LoomGradleSharedData.beforeProject(project.getGradle());
+
 			if (project.getGradle().getPlugins().hasPlugin(LoomRepositoryPlugin.class)) {
+				LoomGradleSharedData.beforeProject(project, LoomGradleSharedData.get(project));
 				return;
 			}
 
+			LoomGradleSharedData.beforeProject(project, LoomGradleSharedData.get(project));
 			declareRepositories(project.getRepositories(), LoomFiles.create(project), project);
 		} else if (target instanceof Gradle) {
 			return;

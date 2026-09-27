@@ -25,14 +25,19 @@
 package net.fabricmc.loom.configuration;
 
 import java.io.File;
+import java.util.Comparator;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import org.gradle.api.Project;
 import org.gradle.api.artifacts.Configuration;
 import org.gradle.api.artifacts.Dependency;
+import org.gradle.api.artifacts.DependencyArtifact;
 import org.gradle.api.artifacts.DependencySet;
 import org.gradle.api.artifacts.FileCollectionDependency;
+import org.gradle.api.artifacts.ModuleDependency;
 import org.gradle.api.artifacts.ResolvedDependency;
 import org.gradle.api.artifacts.component.ComponentIdentifier;
 import org.gradle.api.artifacts.component.ModuleComponentIdentifier;
@@ -78,6 +83,39 @@ public class DependencyInfo {
 
 	public Dependency getDependency() {
 		return dependency;
+	}
+
+	/**
+	 * 返回声明依赖的 classifier，供未解析依赖前的缓存键使用.
+	 */
+	public String getDeclaredClassifier() {
+		if (!(dependency instanceof ModuleDependency moduleDependency)) {
+			return "";
+		}
+
+		return moduleDependency.getArtifacts().stream()
+				.map(DependencyArtifact::getClassifier)
+				.filter(Objects::nonNull)
+				.sorted()
+				.collect(Collectors.joining(","));
+	}
+
+	/**
+	 * 返回声明依赖的 artifact 维度，避免不同扩展名或类型误用同一早缓存.
+	 */
+	public String getDeclaredArtifactDimensions() {
+		if (!(dependency instanceof ModuleDependency moduleDependency)) {
+			return "";
+		}
+
+		return moduleDependency.getArtifacts().stream()
+				.map(artifact -> String.join(",",
+						Objects.toString(artifact.getName(), ""),
+						Objects.toString(artifact.getType(), ""),
+						Objects.toString(artifact.getExtension(), ""),
+						Objects.toString(artifact.getClassifier(), "")))
+				.sorted(Comparator.naturalOrder())
+				.collect(Collectors.joining(";"));
 	}
 
 	public String getResolvedVersion() {
@@ -142,10 +180,14 @@ public class DependencyInfo {
 	}
 
 	public String getDepString() {
-		return dependency.getGroup() + ":" + dependency.getName() + ":" + dependency.getVersion();
+		final String classifier = getDeclaredClassifier();
+		return dependency.getGroup() + ":" + dependency.getName() + ":" + dependency.getVersion()
+				+ (classifier.isEmpty() ? "" : ":" + classifier);
 	}
 
 	public String getResolvedDepString() {
-		return dependency.getGroup() + ":" + dependency.getName() + ":" + getResolvedVersion();
+		final String classifier = getDeclaredClassifier();
+		return dependency.getGroup() + ":" + dependency.getName() + ":" + getResolvedVersion()
+				+ (classifier.isEmpty() ? "" : ":" + classifier);
 	}
 }

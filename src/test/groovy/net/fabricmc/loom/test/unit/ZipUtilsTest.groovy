@@ -27,6 +27,8 @@ package net.fabricmc.loom.test.unit
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.time.ZoneId
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 import com.google.gson.JsonObject
 import org.gradle.api.tasks.bundling.ZipEntryCompression
@@ -127,6 +129,26 @@ class ZipUtilsTest extends Specification {
 		then:
 		outputFile.exists()
 		outputFile.text == "This is a test of unpacking all"
+	}
+
+	def "unpack all rejects path traversal"() {
+		given:
+		def output = Files.createTempDirectory("loom-zip-output")
+		def zip = Files.createTempFile("loom-zip-slip", ".zip")
+		def escaped = output.parent.resolve("loom-zip-slip-${UUID.randomUUID()}.txt")
+
+		ZipOutputStream stream = new ZipOutputStream(Files.newOutputStream(zip))
+		stream.putNextEntry(new ZipEntry("../${escaped.fileName}"))
+		stream.write("should not escape".bytes)
+		stream.closeEntry()
+		stream.close()
+
+		when:
+		ZipUtils.unpackAll(zip, output)
+
+		then:
+		thrown(IOException)
+		!Files.exists(escaped)
 	}
 
 	def "is zip"() {

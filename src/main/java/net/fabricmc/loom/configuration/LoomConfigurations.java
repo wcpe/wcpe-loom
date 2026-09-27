@@ -35,6 +35,8 @@ import org.gradle.api.attributes.Usage;
 import org.gradle.api.plugins.JavaPlugin;
 
 import net.fabricmc.loom.LoomGradleExtension;
+import net.fabricmc.loom.internal.LoomProjectData;
+import net.fabricmc.loom.task.ExportLoomProjectDataTask;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.LoomVersions;
 import net.fabricmc.loom.util.gradle.GradleUtils;
@@ -53,6 +55,8 @@ public abstract class LoomConfigurations implements Runnable {
 	@Override
 	public void run() {
 		final LoomGradleExtension extension = LoomGradleExtension.get(getProject());
+		register(LoomProjectData.DATA_ELEMENTS_CONFIGURATION, Role.CONSUMABLE);
+		getProject().getArtifacts().add(LoomProjectData.DATA_ELEMENTS_CONFIGURATION, getProject().getTasks().register("exportLoomProjectData", ExportLoomProjectDataTask.class));
 
 		register(Constants.Configurations.MOD_COMPILE_CLASSPATH, Role.RESOLVABLE);
 		registerNonTransitive(Constants.Configurations.MOD_COMPILE_CLASSPATH_MAPPED, Role.RESOLVABLE);

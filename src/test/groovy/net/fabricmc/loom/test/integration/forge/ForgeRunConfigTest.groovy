@@ -24,8 +24,6 @@
 
 package net.fabricmc.loom.test.integration.forge
 
-import java.util.stream.Collectors
-
 import spock.lang.Specification
 import spock.lang.Unroll
 
@@ -50,22 +48,22 @@ class ForgeRunConfigTest extends Specification implements GradleProjectTestTrait
 			loom.runs.each {
 				def finalised = net.fabricmc.loom.configuration.ide.DefaultRunConfigurationSettings.finialise(it, project)
 				def mainClass = finalised.mainClass.get()
-				file('main_classes.txt') << "\$it.name\\t\$mainClass\\n"
+				def modClasses = finalised.environmentVars.get().get('MOD_CLASSES')
+				file('main_classes.txt') << "\$it.name\\t\$mainClass\\t\$modClasses\\n"
 			}
 		}
 		""".stripIndent()
 
 		when:
 		def result = gradle.run(task: "build")
-		def mainClasses = new File(gradle.projectDir, 'main_classes.txt')
-				.readLines()
-				.stream()
-				.map { it.split('\t') }
-				.collect(Collectors.toMap({ it[0] }) { it[1] })
+		def runValues = new File(gradle.projectDir, 'main_classes.txt').readLines().collect { it.split('\\t') }
+		def mainClasses = runValues.collectEntries { [(it[0]): it[1]] }
+		def modClasses = runValues.collectEntries { [(it[0]): it[2]] }
 
 		then:
 		result.task(":build").outcome == SUCCESS
 		mainClasses == [client: mainClass, server: mainClass]
+		modClasses == [client: '{source_roots}', server: '{source_roots}']
 
 		where:
 		mcVersion | forgeVersion | javaVersion | mainClass

@@ -31,6 +31,7 @@ import org.gradle.api.Project;
 import org.gradle.api.file.RegularFileProperty;
 import org.gradle.api.invocation.Gradle;
 import org.gradle.api.provider.Provider;
+import org.jspecify.annotations.Nullable;
 
 import net.fabricmc.loom.LoomCompanionGradlePlugin;
 import net.fabricmc.loom.LoomGradleExtension;
@@ -72,8 +73,7 @@ public final class GradleUtils {
 		LoomGradleExtension extension = LoomGradleExtension.get(project);
 
 		if (extension.isProjectIsolationActive()) {
-			// TODO write a custom property parser for isolated projects
-			return project.provider(() -> false);
+			return project.getProviders().gradleProperty(key).map(Boolean::parseBoolean);
 		}
 
 		// Works around https://github.com/gradle/gradle/issues/23572
@@ -116,12 +116,12 @@ public final class GradleUtils {
 		return getBooleanPropertyProvider(project, key).getOrElse(defaultValue);
 	}
 
+	@Nullable
 	public static Object getProperty(Project project, String key) {
 		LoomGradleExtension extension = LoomGradleExtension.get(project);
 
 		if (extension.isProjectIsolationActive()) {
-			// TODO write a custom property parser for isolated projects
-			return null;
+			return project.getProviders().gradleProperty(key).getOrNull();
 		}
 
 		return project.findProperty(key);
@@ -135,7 +135,13 @@ public final class GradleUtils {
 		return property.getAsFile().get();
 	}
 
+	/**
+	 * {@return 当前项目是否为根项目}.
+	 *
+	 * <p>通过项目隔离视图比较路径，而不是直接比较 {@code getRootProject()} 的对象引用：
+	 * 隔离项目模式下跨项目模型访问会触发校验错误，而 {@code IsolatedProject} 只暴露路径等标识信息。
+	 */
 	public static boolean isRootProject(Project project) {
-		return project.getRootProject() == project;
+		return project.getPath().equals(project.getIsolated().getRootProject().getPath());
 	}
 }

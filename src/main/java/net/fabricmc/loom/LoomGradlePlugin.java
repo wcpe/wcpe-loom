@@ -48,6 +48,8 @@ import net.fabricmc.loom.configuration.sandbox.SandboxConfiguration;
 import net.fabricmc.loom.decompilers.DecompilerConfiguration;
 import net.fabricmc.loom.extension.LoomFiles;
 import net.fabricmc.loom.extension.LoomGradleExtensionImpl;
+import net.fabricmc.loom.internal.LoomGradleSharedData;
+import net.fabricmc.loom.internal.LoomProjectData;
 import net.fabricmc.loom.task.LoomTasks;
 import net.fabricmc.loom.task.RemapTaskConfiguration;
 import net.fabricmc.loom.util.Constants;
@@ -62,6 +64,10 @@ public class LoomGradlePlugin implements Plugin<PluginAware> {
 	/** 目标是否已应用 loom（新旧任一 id）. */
 	public static boolean isApplied(PluginAware target) {
 		return target.getPluginManager().hasPlugin(NAME) || target.getPluginManager().hasPlugin(LEGACY_NAME);
+	}
+
+	public static void beforeProject(Project project, LoomGradleSharedData sharedData) {
+		LoomGradleSharedData.beforeProject(project, sharedData);
 	}
 
 	public static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
@@ -120,6 +126,8 @@ public class LoomGradlePlugin implements Plugin<PluginAware> {
 			project.getObjects().newInstance(jobClass).run();
 		}
 
+		LoomGradleSharedData sharedData = LoomGradleSharedData.get(project);
+		project.afterEvaluate(evaluatedProject -> sharedData.putProject(LoomProjectData.fromProject(evaluatedProject)));
 		project.apply(Map.of("plugin", LoomCompanionGradlePlugin.NAME));
 	}
 }

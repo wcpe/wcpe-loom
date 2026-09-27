@@ -72,6 +72,7 @@ import net.fabricmc.loom.configuration.providers.mappings.tiny.MappingsMerger;
 import net.fabricmc.loom.configuration.providers.mappings.tiny.TinyJarInfo;
 import net.fabricmc.loom.configuration.providers.mappings.unpick.UnpickMetadata;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+import net.fabricmc.loom.util.Checksum;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.ZipUtils;
@@ -112,9 +113,30 @@ public class MappingConfiguration {
 	 */
 	private static final Map<String, MappingConfiguration> SHARED_EARLY = new ConcurrentHashMap<>();
 
+	/**
+	 * 早缓存索引键：只由「声明信息」与平台维度构成，不触发依赖解析.
+	 *
+	 * <p>必须覆盖一切会影响最终 mappings 标识的维度，否则同构但不同变体的项目会互相命中：
+	 * 平台（Fabric/Quilt/Forge/NeoForge）、classifier 与 artifact 类型、是否使用中间映射、
+	 * 是否禁用混淆、以及 Forge 系的具体版本。键尾的版本号用于在维度变化时自然失效旧条目。
+	 */
 	private static String earlyKey(LoomGradleExtension extension, DependencyInfo dependency, MinecraftProvider minecraftProvider, String declaredVersion) {
-		return extension.isForgeLike() + "|" + dependency.getDependency().getGroup() + "|"
-				+ dependency.getDependency().getName() + "|" + declaredVersion + "|" + minecraftProvider.minecraftVersion();
+		final String forgeVersion = extension.isForgeLike()
+				? extension.getForgeProvider().getVersion().getCombined()
+				: "";
+		final String rawKey = String.join("\u0000",
+				"early-mappings-v2",
+				extension.getPlatform().get().id(),
+				dependency.getDependency().getGroup(),
+				dependency.getDependency().getName(),
+				declaredVersion,
+				dependency.getDeclaredClassifier(),
+				dependency.getDeclaredArtifactDimensions(),
+				minecraftProvider.minecraftVersion(),
+				Boolean.toString(extension.getUseIntermediateMappings().get()),
+				Boolean.toString(extension.disableObfuscation()),
+				forgeVersion);
+		return Checksum.of(rawKey).sha256().hex();
 	}
 
 	public final String mappingsIdentifier;

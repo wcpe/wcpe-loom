@@ -48,6 +48,8 @@ import org.gradle.api.tasks.TaskProvider;
 import org.gradle.api.tasks.util.PatternSet;
 import org.jetbrains.annotations.ApiStatus;
 
+import net.fabricmc.loom.util.gradle.GradleUtils;
+
 public class MixinExtensionImpl extends MixinExtensionApiImpl implements MixinExtension {
 	private boolean isDefault;
 	private final Property<String> defaultRefmapName;
@@ -75,7 +77,7 @@ public class MixinExtensionImpl extends MixinExtensionApiImpl implements MixinEx
 	private String getDefaultMixinRefmapName() {
 		String defaultRefmapName = project.getExtensions().getByType(BasePluginExtension.class).getArchivesName().get() + "-refmap.json";
 
-		if (project.getRootProject() != project) {
+		if (!GradleUtils.isRootProject(project)) {
 			final String archivesName = project.getExtensions().getByType(BasePluginExtension.class).getArchivesName().get();
 			final String path = project.getPath().substring(1).replace(':', '_');
 			defaultRefmapName = "%s-%s-refmap.json".formatted(archivesName, path);

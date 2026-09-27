@@ -12,6 +12,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 import java.util.function.Predicate;
 
@@ -36,6 +37,7 @@ import org.jspecify.annotations.Nullable;
 
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+import net.fabricmc.loom.task.ExtractArchiveFilesTask;
 import net.fabricmc.loom.task.GenerateSourcesTask;
 import net.fabricmc.loom.task.service.MappingsService;
 import net.fabricmc.loom.task.service.SourceRemapperService;
@@ -54,9 +56,25 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
 	private static final Logger LOGGER = Logging.getLogger(ForgeSourcesService.class);
 
 	public interface Options extends Service.Options {
+		/**
+		 * 仍以归档形态提供的 Forge 源码包，仅在未接入声明式解压任务时作为回退.
+		 */
+		@Optional
 		@InputFiles
 		@PathSensitive(PathSensitivity.NONE)
 		ConfigurableFileCollection getForgeSourceJars();
+
+		/**
+		 * 由声明式解压任务预先展开的 Forge 源码目录.
+		 *
+		 * <p>含目录本身的构建依赖（{@code getBuiltBy()}），因此任务指纹会追踪生产者，
+		 * 调用方无需额外声明 {@code dependsOn}。使用 {@link PathSensitivity#RELATIVE}
+		 * 以“目录内容”语义参与输入哈希，避免缓存目录绝对路径变化引起无谓重跑。
+		 */
+		@Optional
+		@InputFiles
+		@PathSensitive(PathSensitivity.RELATIVE)
+		ConfigurableFileCollection getForgeSourceDirectories();
 
 		@Optional
 		@Nested
@@ -77,6 +95,11 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
 
 			final String sourceDependency = extension.getForgeUserdevProvider().getConfig().sources();
 			options.getForgeSourceJars().from(DependencyDownloader.download(project, sourceDependency));
+
+			// 声明式解压任务的输出目录：路径由构建目录约定决定，无需在此解析任务，
+			// 任务依赖由 genSources / genForgePatchedSources 显式声明。
+			options.getForgeSourceDirectories().from(
+					project.getLayout().getBuildDirectory().dir(ExtractArchiveFilesTask.FORGE_SOURCES_OUTPUT_DIRECTORY));
 
 			if (!extension.isUnobfuscatedForge()) {
 				options.getSourceRemapperService().set(SourceRemapperService.TYPE.create(project, sro -> {
@@ -176,7 +199,21 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
 		}
 
 		LOGGER.lifecycle(":found {} forge source jars", forgeInstallerSources.size());
-		Map<String, byte[]> forgeSources = extractSources(forgeInstallerSources);
+		Map<String, byte[]> forgeSources;
+
+		final List<Path> extractedDirectories = getOptions().getForgeSourceDirectories().getFiles().stream()
+				.map(File::toPath)
+				.filter(Files::isDirectory)
+				.toList();
+
+		if (!extractedDirectories.isEmpty()) {
+			// 优先消费声明式解压任务的输出目录：归档解压已被 Gradle 缓存，这里只做目录遍历。
+			LOGGER.lifecycle(":using {} pre-extracted forge source directories", extractedDirectories.size());
+			forgeSources = readExtractedSources(extractedDirectories);
+		} else {
+			forgeSources = extractSources(forgeInstallerSources);
+		}
+
 		forgeSources.keySet().removeIf(classFilter.negate());
 		LOGGER.lifecycle(":extracted {} forge source classes", forgeSources.size());
 
@@ -213,23 +250,26 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
 			taskCompleter.complete();
 		}
 
-		PrintStream out = System.out;
-		PrintStream err = System.err;
+		final PrintStream out = System.out;
+		final PrintStream err = System.err;
+		final boolean verboseStderr = getOptions().getShouldShowVerboseStderr().get();
 
-		if (!getOptions().getShouldShowVerboseStderr().get()) {
-			System.setOut(new PrintStream(NullOutputStream.INSTANCE));
-			System.setErr(new PrintStream(NullOutputStream.INSTANCE));
+		try {
+			if (!verboseStderr) {
+				System.setOut(new PrintStream(NullOutputStream.INSTANCE));
+				System.setErr(new PrintStream(NullOutputStream.INSTANCE));
+			}
+
+			final SourceRemapperService remapperService = getServiceFactory().get(getOptions().getSourceRemapperService());
+			remapperService.remapSourcesJar(tmpInput, tmpOutput);
+		} finally {
+			if (!verboseStderr) {
+				System.setOut(out);
+				System.setErr(err);
+			}
 		}
 
-		final SourceRemapperService remapperService = getServiceFactory().get(getOptions().getSourceRemapperService());
-		remapperService.remapSourcesJar(tmpInput, tmpOutput);
-
-		if (!getOptions().getShouldShowVerboseStderr().get()) {
-			System.setOut(out);
-			System.setErr(err);
-		}
-
-		int[] failedToRemap = {0};
+		final AtomicInteger failedToRemap = new AtomicInteger();
 
 		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getReadOnlyJarFileSystem(tmpOutput)) {
 			ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter();
@@ -241,9 +281,9 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
 					if (Files.exists(path)) {
 						sources.put(entry.getKey(), Files.readAllBytes(path));
 					} else {
+						LOGGER.info("Forge source {} did not survive remapping, skipping it", entry.getKey());
 						sources.remove(entry.getKey());
-						LOGGER.error("Failed to remap sources for " + entry.getKey());
-						failedToRemap[0]++;
+						failedToRemap.incrementAndGet();
 					}
 				});
 			}
@@ -251,8 +291,10 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
 			taskCompleter.complete();
 		}
 
-		if (failedToRemap[0] > 0) {
-			LOGGER.error("Failed to remap {} forge sources", failedToRemap[0]);
+		if (failedToRemap.get() > 0) {
+			// 少数源码（例如仅含注解、或 Mercury 无法重写的生成类）可能在重映射后被丢弃。
+			// 这类文件不进最终源码包即可，若把它们当成致命错误会让整个 genSources 失败。
+			LOGGER.warn("{} forge source files did not survive remapping and were skipped", failedToRemap.get());
 		}
 	}
 
@@ -268,6 +310,31 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
 				if (Files.isRegularFile(filePath) && filePath.getFileName().toString().endsWith(".java")) {
 					taskCompleter.add(() -> sources.put(filePath.toString(), Files.readAllBytes(filePath)));
 				}
+			}
+		}
+
+		taskCompleter.complete();
+		return sources;
+	}
+
+	/**
+	 * 从声明式解压任务的输出目录读取 Forge 源码.
+	 *
+	 * <p>键的形态必须与归档内路径一致（以 {@code /} 开头、使用 {@code /} 分隔），
+	 * 因为下游是按 jar 文件系统路径消费这些键的；这里显式归一化，避免平台分隔符差异。
+	 */
+	static Map<String, byte[]> readExtractedSources(List<Path> extractedDirectories) throws IOException {
+		Map<String, byte[]> sources = new ConcurrentHashMap<>();
+		ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter();
+
+		for (Path directory : extractedDirectories) {
+			for (Path filePath : (Iterable<? extends Path>) Files.walk(directory)::iterator) {
+				if (!Files.isRegularFile(filePath) || !filePath.getFileName().toString().endsWith(".java")) {
+					continue;
+				}
+
+				final String key = "/" + directory.relativize(filePath).toString().replace(File.separatorChar, '/');
+				taskCompleter.add(() -> sources.put(key, Files.readAllBytes(filePath)));
 			}
 		}
 

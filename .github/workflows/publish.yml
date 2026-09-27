@@ -106,9 +106,23 @@ jobs:
             fi
           done
 
-      - name: 验证重映射缓存回归
+      - name: 发布前选定回归门禁
         if: steps.guard.outputs.skip != 'true'
-        run: ./gradlew test --tests net.fabricmc.loom.test.integration.RemapTaskCacheTest --no-daemon --stacktrace --warning-mode fail
+        run: |
+          ./gradlew test \
+            --tests net.fabricmc.loom.test.integration.RemapTaskCacheTest \
+            --tests net.fabricmc.loom.test.integration.ConfigurationCacheTest \
+            --tests net.fabricmc.loom.test.integration.forge.ForgeRunConfigTest \
+            --tests net.fabricmc.loom.test.integration.forge.AccessTransformerTest \
+            --tests net.fabricmc.loom.test.integration.forge.legacy.LegacyForgeExternalModDependencyTest \
+            --tests net.fabricmc.loom.test.unit.AsyncCacheTest \
+            --tests net.fabricmc.loom.test.unit.AsyncZipProcessorTest \
+            --tests net.fabricmc.loom.test.unit.cache.AtomicFilesTest \
+            --tests net.fabricmc.loom.test.unit.cache.CachedDataTest \
+            --tests net.fabricmc.loom.test.unit.cache.CachedFileStoreTest \
+            --tests net.fabricmc.loom.test.unit.cache.CacheEntryLockTest \
+            --tests net.fabricmc.loom.test.unit.service.MappingsServiceTest \
+            --no-daemon --stacktrace --warning-mode fail
         env:
           CI: true
           RELEASE_VERSION: ${{ steps.meta.outputs.release-version }}

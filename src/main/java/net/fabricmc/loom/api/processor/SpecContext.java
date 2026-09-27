@@ -33,6 +33,7 @@ import org.gradle.api.plugins.JavaPlugin;
 
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.processors.speccontext.ProjectView;
+import net.fabricmc.loom.internal.LoomProjectData;
 import net.fabricmc.loom.util.fmj.FabricModJson;
 
 public interface SpecContext {
@@ -59,14 +60,16 @@ public interface SpecContext {
 		return Stream.concat(modDependencies().stream(), localMods().stream()).toList();
 	}
 
-	// Returns all of the loom projects that are depended on in the main sourceset
-	// TODO make project isolation aware
-	static Stream<Project> getDependentProjects(ProjectView projectView) {
-		final Stream<Project> runtimeProjects = projectView.getLoomProjectDependencies(JavaPlugin.RUNTIME_CLASSPATH_CONFIGURATION_NAME);
-		final Stream<Project> compileProjects = projectView.getLoomProjectDependencies(JavaPlugin.COMPILE_CLASSPATH_CONFIGURATION_NAME);
+	static Stream<LoomProjectData> getDependentProjectData(ProjectView projectView) {
+		final Stream<LoomProjectData> runtimeProjects = projectView.getLoomProjectDataDependencies(JavaPlugin.RUNTIME_CLASSPATH_CONFIGURATION_NAME);
+		final Stream<LoomProjectData> compileProjects = projectView.getLoomProjectDataDependencies(JavaPlugin.COMPILE_CLASSPATH_CONFIGURATION_NAME);
 
 		return Stream.concat(runtimeProjects, compileProjects)
 				.distinct();
+	}
+
+	static Stream<Project> getDependentProjects(ProjectView projectView) {
+		return Stream.empty();
 	}
 
 	// Sort to ensure stable caching

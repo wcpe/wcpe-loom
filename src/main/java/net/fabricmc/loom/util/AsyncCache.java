@@ -27,9 +27,9 @@ package net.fabricmc.loom.util;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -65,7 +65,30 @@ public class AsyncCache<T> {
 	private final Map<Object, CompletableFuture<T>> cache = new ConcurrentHashMap<>();
 
 	public CompletableFuture<T> get(Object cacheKey, Supplier<T> supplier) {
-		return cache.computeIfAbsent(cacheKey, $ -> CompletableFuture.supplyAsync(supplier, EXECUTOR));
+		final CompletableFuture<T> cached = cache.get(cacheKey);
+
+		if (cached != null) {
+			return cached;
+		}
+
+		final CompletableFuture<T> future = new CompletableFuture<>();
+		final CompletableFuture<T> existing = cache.putIfAbsent(cacheKey, future);
+
+		if (existing != null) {
+			return existing;
+		}
+
+		// 先放入缓存再执行供应器，确保同步失败时也能安全移除失败 Future。
+		EXECUTOR.execute(() -> {
+			try {
+				future.complete(supplier.get());
+			} catch (Throwable t) {
+				future.completeExceptionally(t);
+				cache.remove(cacheKey, future);
+			}
+		});
+
+		return future;
 	}
 
 	public T getBlocking(Object cacheKey, Supplier<T> supplier) {

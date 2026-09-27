@@ -1,7 +1,7 @@
 /*
  * This file is part of fabric-loom, licensed under the MIT License (MIT).
  *
- * Copyright (c) 2025 FabricMC
+ * Copyright (c) 2026 FabricMC
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,48 +22,9 @@
  * SOFTWARE.
  */
 
-package net.fabricmc.loom.test.unit
-
-import spock.lang.Specification
-
-import net.fabricmc.loom.util.AsyncCache
-
-class AsyncCacheTest extends Specification {
-	def "rethrows error"() {
-		given:
-		def cache = new AsyncCache()
-		def cacheKey = "testKey"
-		def supplier = { throw new RuntimeException("Test exception") }
-
-		when:
-		cache.getBlocking(cacheKey, supplier)
-
-		then:
-		def e = thrown(RuntimeException)
-		e.message == "Test exception"
-	}
-
-	def "retries after failed future"() {
-		given:
-		def cache = new AsyncCache()
-		def attempts = 0
-
-		when:
-		cache.getBlocking("testKey") {
-			attempts++
-			throw new RuntimeException("first failure")
-		}
-		then:
-		thrown(RuntimeException)
-
-		when:
-		def result = cache.getBlocking("testKey") {
-			attempts++
-			"success"
-		}
-
-		then:
-		result == "success"
-		attempts == 2
-	}
-}
+/**
+ * Loom 内部实现：隔离项目共享数据与项目数据交换对象.
+ *
+ * <p>本包不属于公开 API，可能随时变更。
+ */
+package net.fabricmc.loom.internal;

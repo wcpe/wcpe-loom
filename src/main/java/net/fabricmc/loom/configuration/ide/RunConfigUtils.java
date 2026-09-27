@@ -108,7 +108,8 @@ public class RunConfigUtils {
 	 */
 	public static String formatRunDir(RunConfiguration runConfig, Project project, Function<File, String> absoluteFormatter, Function<String, String> relativeFormatter) {
 		File runDir = runConfig.getRunDirectory().getAsFile().get();
-		File projectDir = project.getRootProject().getProjectDir();
+		// 走隔离项目视图读取根项目目录：直接调用 getRootProject().getProjectDir() 在隔离项目模式下属于跨项目访问。
+		File projectDir = project.getIsolated().getRootProject().getProjectDirectory().getAsFile();
 
 		if (runDir.toPath().startsWith(projectDir.toPath())) {
 			// Windows 上 Path.toString() 使用反斜杠，而 $PROJECT_DIR$ / ${workspace_loc} 这类 IDE 宏约定用正斜杠

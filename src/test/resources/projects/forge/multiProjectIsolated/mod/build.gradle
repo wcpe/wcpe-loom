@@ -1,0 +1,31 @@
+plugins {
+	id 'dev.architectury.loom'
+}
+
+java {
+	sourceCompatibility = JavaVersion.VERSION_17
+	targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 17
+}
+
+base {
+	archivesName = "mod"
+}
+
+version = project.mod_version
+group = project.maven_group
+
+dependencies {
+	minecraft "com.mojang:minecraft:@MCVERSION@"
+	mappings loom.officialMojangMappings()
+	forge "net.minecraftforge:forge:@MCVERSION@-@FORGEVERSION@"
+
+	// 关键点：依赖另一个 Loom 子项目。
+	// 在隔离项目模式下，对这个依赖的 Loom 元数据读取必须通过可序列化的
+	// LoomProjectData DTO（loomProjectDataElements 配置 + exportLoomProjectData 任务），
+	// 而不能直接访问 common 子项目的 Project / LoomGradleExtension。
+	modImplementation project(":common")
+}
