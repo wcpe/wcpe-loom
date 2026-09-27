@@ -179,15 +179,26 @@ public class DependencyInfo {
 		return getDepString();
 	}
 
+	/**
+	 * {@return 不含 classifier 的模块坐标（{@code group:name:version}）}.
+	 *
+	 * <p>此处刻意不附带声明 classifier。现有调用方都按「三段坐标 + 自行再追加一段 classifier」的位置
+	 * 语义使用本方法：{@code ForgeProvider} 追加 {@code :userdev}/{@code :installer}，
+	 * {@code ForgeUserdevProvider} 追加 {@code :universal}；{@code MappingConfiguration}
+	 * 的 {@code getMappingsClassifier} 也按 {@code split(":")} 的位置取 classifier。
+	 * 一旦这里带上 classifier，前者会拼出 Gradle 拒绝的非法 notation，后者会把 {@code -v2} 追加两次。
+	 * 需要 classifier 维度的场合请直接调用 {@link #getDeclaredClassifier()}。
+	 */
 	public String getDepString() {
-		final String classifier = getDeclaredClassifier();
-		return dependency.getGroup() + ":" + dependency.getName() + ":" + dependency.getVersion()
-				+ (classifier.isEmpty() ? "" : ":" + classifier);
+		return dependency.getGroup() + ":" + dependency.getName() + ":" + dependency.getVersion();
 	}
 
+	/**
+	 * {@return 不含 classifier 的解析后模块坐标（{@code group:name:resolvedVersion}）}.
+	 *
+	 * <p>与 {@link #getDepString()} 同理，不附带声明 classifier。
+	 */
 	public String getResolvedDepString() {
-		final String classifier = getDeclaredClassifier();
-		return dependency.getGroup() + ":" + dependency.getName() + ":" + getResolvedVersion()
-				+ (classifier.isEmpty() ? "" : ":" + classifier);
+		return dependency.getGroup() + ":" + dependency.getName() + ":" + getResolvedVersion();
 	}
 }
