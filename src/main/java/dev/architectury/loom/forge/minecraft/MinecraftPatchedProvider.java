@@ -94,6 +94,7 @@ import net.fabricmc.loom.util.TinyRemapperHelper;
 import net.fabricmc.loom.util.ZipUtils;
 import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.loom.util.cache.CacheEntryLock;
+import net.fabricmc.loom.util.cache.JarReusability;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.service.ScopedServiceFactory;
 import net.fabricmc.loom.util.service.ServiceFactory;
@@ -174,36 +175,38 @@ public class MinecraftPatchedProvider {
 		minecraftClientExtra = forgeWorkingDir.resolve("client-extra.jar");
 	}
 
+	/**
+	 * {@return 本配置下必须可复用的共享产物列表，供 {@link #needsWork()} 判定}.
+	 *
+	 * <p>列表只包含当前 jar 配置确实会生成的产物：server-only 不提供 client jar，
+	 * {@code client-extra.jar} 既不生成也不进 classpath、不注册进 FORGE_EXTRA（见 {@link #providesClientJar()}），
+	 * 把它计入判定会让 {@link #needsWork()} 恒为真、每次构建都白取一次跨进程锁。
+	 */
 	protected Path[] getGlobalCaches() {
-		Path[] files = {
+		List<Path> files = new ArrayList<>(Arrays.asList(
 				minecraftIntermediateJar,
 				minecraftPatchedIntermediateJar,
 				minecraftPatchedIntermediateAtJar,
 				minecraftPatchedJar,
-				minecraftClientExtra,
-		};
+				minecraftClientExtra
+		));
 
-		return files;
+		if (!providesClientJar()) {
+			files.remove(minecraftClientExtra);
+		}
+
+		return files.toArray(Path[]::new);
 	}
 
 	/**
 	 * {@return 该共享产物是否可作为输入复用}.
 	 *
-	 * <p>共享缓存里的 jar 可能被其它进程写坏：仍在用「先删除再就地写」的旧版本 loom 会在替换窗口内
-	 * 让目标路径出现 22 字节的空 zip（本仓库实测到的形态），进程被中断还会留下截断文件。
-	 * 只做存在性判定会把这种半成品当成就绪产物，一路传到最终产物里，形成「补丁标记是新的、内容是坏的」
-	 * 的静默损坏。因此这里要求：能作为 zip/jar 打开，且至少含一个条目。
+	 * <p>口径与理由见 {@link JarReusability#isReusable(Path)}：能作为 zip 打开且至少含一个条目。
+	 * 实现只有那一份，其它共享缓存链（mapped minecraft jar、mcp.zip、SrgProvider 产物等）用的是同一判定；
+	 * 本方法保留，是因为 legacy 子类仍以 {@code isReusableJar} 的名字调用它。
 	 */
 	protected static boolean isReusableJar(Path jar) {
-		if (Files.notExists(jar)) {
-			return false;
-		}
-
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar, false); var entries = Files.list(fs.getPath("/"))) {
-			return entries.findAny().isPresent();
-		} catch (IOException e) {
-			return false;
-		}
+		return JarReusability.isReusable(jar);
 	}
 
 	/**
@@ -269,6 +272,9 @@ public class MinecraftPatchedProvider {
 	 *
 	 * <p>产物缺失或 Loom 补丁版本过期即需要工作。manifest 读取遇到损坏文件（多进程并发下
 	 * 的半截产物）时按需要工作处理，进入锁内走完整判定。
+	 *
+	 * <p>参与判定的产物集合由 {@link #getGlobalCaches()} 给出，它只含本配置下确实会生成的产物：
+	 * server-only 不含 client-extra，否则判定恒为「需要工作」，无锁快路径永远走不到。
 	 */
 	private boolean needsWork() {
 		// 无锁读路径：除存在性外还要拒绝空 zip／截断文件等半成品（其它进程可能正在就地重建共享缓存）
@@ -305,27 +311,42 @@ public class MinecraftPatchedProvider {
 			accessTransformForge();
 		}
 
+		// client-extra 在 remapJar 阶段生成，本阶段不重建它，但必须在这里置位重建信号：
+		// 否则会出现「needsWork 判定需要工作、providePatched 却查不出任何需要重建的件」的死角，
+		// remapJar 因 dirty=false 直接返回，损坏的 client-extra 既不被修复、又被注册进 FORGE_EXTRA
+		// （见 registerExtraDependencies），此后每次构建都重复这个空转。
+		// server-only 不生成 client-extra，不能参与判定，否则 dirty 恒为真、每轮都整链重建
+		if (providesClientJar() && !isReusableJar(minecraftClientExtra)) {
+			this.dirty = true;
+		}
+
 		return null;
 	}
 
 	/**
-	 * {@return 打补丁后的中间 Minecraft jar；产物不在时先按件补齐}.
+	 * {@return 打补丁后的中间 Minecraft jar；产物不可复用时先按件补齐}.
 	 *
 	 * <p>该 jar 位于跨 daemon 共享的 forge 缓存目录：其它工作树的构建（尤其是仍在删除整组产物的
 	 * 旧版本 loom）可能让它在被读取前一刻消失，直接读取会以
 	 * {@link java.nio.file.NoSuchFileException} 打断整个构建。
 	 *
-	 * <p>补齐走 {@link #produceIntermediateJarIfMissing()}：产物齐备时它是无锁快路径，缺失时在
+	 * <p>判定与补齐都基于「可复用」（存在、能作为 zip/jar 打开且至少含一个条目，见
+	 * {@link #isReusableJar(Path)}）而非「存在」：共享缓存里可能出现 22 字节空 zip 或截断文件，
+	 * 只判存在性会把这类半成品原样交给调用方——它能以只读 jar 文件系统打开但读不出任何 class，
+	 * 下游（FieldMappingsMigrator / MethodInheritanceMappingsMigrator）会把「读不出内容」当成
+	 * 「没有内容」，从而把空结果写进映射缓存，形成静默错误映射。
+	 *
+	 * <p>补齐走 {@link #produceIntermediateJarIfMissing()}：产物齐备时它是无锁快路径，不可复用时在
 	 * {@code forge-patched} 跨进程锁内只重建缺失件，并以原子方式落位。
 	 */
 	public Path getOrProduceMinecraftPatchedIntermediateJar() {
 		final Path jar = getMinecraftPatchedIntermediateJar();
 
-		if (Files.exists(jar)) {
+		if (isReusableJar(jar)) {
 			return jar;
 		}
 
-		logger.lifecycle(":共享缓存中的中间产物 {} 不存在，先按件补齐（其它进程可能正在重建该缓存）", jar);
+		logger.lifecycle(":共享缓存中的中间产物 {} 不可复用（缺失或损坏），先按件补齐（其它进程可能正在重建该缓存）", jar);
 
 		try {
 			produceIntermediateJarIfMissing();
@@ -333,6 +354,14 @@ public class MinecraftPatchedProvider {
 			throw new UncheckedIOException(e);
 		} catch (Exception e) {
 			throw new RuntimeException("补齐共享缓存中的 patched 中间产物失败: " + jar, e);
+		}
+
+		// 补齐后必须再校验一次：仍然不可复用说明该产物这次没能被完整生产出来
+		// （例如锁内判定把它当作可复用而跳过重建，或被外部进程在补齐后再次写坏）。
+		// 这里抛异常而不是返回坏路径：坏路径会让下游把「读不出内容」当成「没有内容」，静默产出错误映射
+		if (!isReusableJar(jar)) {
+			throw new UncheckedIOException(new IOException(
+					"补齐后共享缓存中的 patched 中间产物仍不可复用（无法作为 zip/jar 打开，或没有任何条目）: " + jar));
 		}
 
 		return jar;
@@ -360,6 +389,8 @@ public class MinecraftPatchedProvider {
 
 	private Void remapPatchedJarWithDirty(ServiceFactory serviceFactory) throws Exception {
 		// 锁内二次确认：等锁期间其它进程可能已完成生产（dirty 为幂等判定）；本方法不删除共享产物
+		// dirty 也可能只表示「client-extra 需要重建」（见 providePatched）：此时最终 jar 会被幂等地重发一次，
+		// 而 client-extra 的修复不会被跳过
 		if (dirty) {
 			if (getExtension().isUnobfuscatedForge()) {
 				publishAtomically(minecraftPatchedJar, this::mergeUnobfuscatedPatchedJar);
