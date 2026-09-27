@@ -110,7 +110,7 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 			throw new IllegalStateException("No remapped jars provided");
 		}
 
-		// 无锁快路径：shouldRefreshOutputs 仅做存在性检查，缓存就绪时不会进入下面的锁
+		// 无锁快路径：shouldRefreshOutputs 只做只读检查（产物存在且内容可复用），缓存就绪时不会进入下面的锁
 		if (shouldRefreshOutputs(context)) {
 			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
 			final Path lockRoot = extension.getFiles().getCacheLocks().toPath();
@@ -244,7 +244,7 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 	 * {@return 产物是否已就绪（无需重建）}.
 	 *
 	 * <p>供外部（如 {@code minecraft-provision} 事务锁的无锁快路径）在锁外做只读判定；
-	 * 实现即 {@link #shouldRefreshOutputs} 的取反，同样仅做文件存在性与脏标志检查。
+	 * 实现即 {@link #shouldRefreshOutputs} 的取反，判定产物存在且内容可复用（见下）。
 	 */
 	public boolean isUpToDate(ProvideContext context) {
 		return !shouldRefreshOutputs(context);
@@ -268,8 +268,11 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		}
 
 		for (OutputJar outputJar : outputJars) {
-			if (!getMavenHelper(outputJar.type()).exists(null)) {
-				LOGGER.info("Refreshing outputs for mapped jar, as {} does not exist", outputJar.outputJar());
+			// 就绪判据必须含内容校验：产物位于跨 daemon／跨 loom 版本共享的 maven 仓库，旧版本 loom 以最终路径
+			// 为输出就地写，被中断会留下 0 字节或截断的 jar。只判存在会把这类残骸当成就绪产物，作为 Gradle
+			// 依赖进入编译链，形成「标记是新的、内容是坏的」的静默损坏。
+			if (!getMavenHelper(outputJar.type()).isReusable(null)) {
+				LOGGER.info("Refreshing outputs for mapped jar, as {} is missing or not reusable", outputJar.outputJar());
 				return true;
 			}
 		}
@@ -329,7 +332,7 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		// 原子发布：remapper 先写到同目录唯一临时 jar，其余加工（Forge/NeoForge 的 object holder 改写）
 		// 也全部在这个临时文件上完成，最后才原子 move 到 outputJarPath。
 		// 发布出去的必须是终态：否则共享 maven 仓库里的 jar 会有一段「已落位但未完成加工」的中间态，
-		// 被锁外只做存在性检查的读方读到（读到未改写 object holder 的 jar）。
+		// 被锁外的读方读到（读到未改写 object holder 的 jar；内容校验只能发现截断，发现不了「完整但没加工完」）。
 		try {
 			AtomicFiles.publish(remappedJars.outputJarPath(), tmpJar -> {
 				try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(tmpJar).build()) {

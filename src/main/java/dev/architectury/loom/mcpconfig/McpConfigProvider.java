@@ -42,6 +42,7 @@ import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.DeletingFileVisitor;
 import net.fabricmc.loom.util.ZipUtils;
 import net.fabricmc.loom.util.cache.AtomicFiles;
+import net.fabricmc.loom.util.cache.JarReusability;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
 
 public class McpConfigProvider extends DependencyProvider {
@@ -110,11 +111,16 @@ public class McpConfigProvider extends DependencyProvider {
 	 * {@return zip 是否需要（重新）发布}.
 	 *
 	 * <p>无锁快路径的一部分：产物已就绪且未要求刷新时无需重建，也就不取锁。该判定只读，可在锁外安全调用。
-	 * 保持「存在即可用」口径而不额外比对输入尺寸：同一构件在不同镜像下 zip 尺寸可能不同，比对会让两个
-	 * 使用不同镜像的进程互相覆盖，造成每次构建都重建。
+	 *
+	 * <p>就绪口径含内容校验（{@link JarReusability#isReusable(Path)}：能作为 zip 打开且至少含一个条目）：
+	 * 共享缓存里的 {@code mcp.zip} 可能被旧版本 loom 的就地覆盖中断，留下空 zip 或截断文件；只判存在
+	 * 会把这类残骸当成就绪产物，后面整条 MCP 执行链都会读这个坏 zip。该口径不会拒绝正常产物。
+	 *
+	 * <p>仍然不把 zip 与输入构件比对尺寸/校验和：同一构件在不同镜像下尺寸可能不同，比对会让两个使用
+	 * 不同镜像的进程互相覆盖，造成每次构建都重建。
 	 */
 	private boolean needsZip() {
-		return refreshDeps() || Files.notExists(mcp);
+		return refreshDeps() || !JarReusability.isReusable(mcp);
 	}
 
 	/**
@@ -171,9 +177,19 @@ public class McpConfigProvider extends DependencyProvider {
 	 *         且解包结果由 zip 唯一决定，保留旧目录与换成新目录等价，不换取那份「短暂缺失」的风险；</li>
 	 *     <li>强制重建或目标目录缺失/残缺：把旧目录先用原子 rename 挪到唯一名字（不做原地递归删除：
 	 *         读方可能正打开其中的文件，删掉正在读的文件比让它读到旧内容更糟），再把临时目录 rename 就位。
-	 *         两步之间存在目标目录短暂缺失的窗口，但此时本就没有有效目录可保留，且只在显式刷新或目录残缺时发生；
-	 *         若第二步失败，旧目录以 {@code *.old} 留在原地，下次构建按「目录残缺」重建，可自愈。</li>
+	 *         两步之间存在目标目录短暂缺失的窗口（先把 {@code unpacked} 挪走、再把新目录挪回原位）。
+	 *         这个窗口无法靠目录 rename 消除，而且它并非只出现在「本来就没有有效目录可保留」的场合：
+	 *         {@code force} 也由 {@code mcp.zip} 缺失/损坏（{@link #needsZip()}）或显式刷新触发，
+	 *         此时被挪走的旧目录本来完整有效。锁外的读方——任务期的 MCP 执行链（见
+	 *         {@code McpExecutorBuilder}）——会短暂看不到目录，因此读方不再静默跳过：它在窗口内短暂重试，
+	 *         超时后抛出带路径的错误，而不是少传 {@code --data/--mappings} 等输入继续构建（那会产出被
+	 *         manifest 标记为最新、却缺少输入的 patched jar）。若第二步失败，旧目录以 {@code *.old}
+	 *         留在原地，下次构建按「目录残缺」重建，可自愈。</li>
 	 * </ul>
+	 *
+	 * <p>更彻底的方案是给解包目录加一层稳定指针（内容按唯一名存放，读方先读一个原子替换的指针文件），
+	 * 让 rename 窗口对读方完全不可见。这里没有采用：那会改变与其它 Loom 版本共享的缓存布局
+	 * （其它版本直接读写 {@code unpacked}），而 Windows 上目录符号链接需要特权，收益不抵成本。
 	 *
 	 * @param force 本次是否因输入变化而强制重建，为 true 时即使目标目录完整也替换
 	 */
