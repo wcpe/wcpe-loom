@@ -145,8 +145,13 @@ public abstract class CompileConfiguration implements Runnable {
 			final LockResult lockResult = acquireProcessLockWaiting(getLockFile());
 
 			if (lockResult != LockResult.ACQUIRED_CLEAN) {
-				getProject().getLogger().lifecycle("Found existing cache lock file ({}), rebuilding loom cache. This may have been caused by a failed or canceled build.", lockResult);
-				extension.setRefreshDeps(true);
+				// 残留锁只作为「上次构建未干净收尾」的诊断信息，不再升级为全量重建：
+				// 1) 共享产物一律「临时文件 + 原子落位」，被中断的构建不会留下半截产物，无需用重建兜底；
+				// 2) 一旦升级为 refreshDeps，多个工作树会轮流删除共享缓存，正是并发冲突的根源；
+				// 3) 是否重建改由各 provider 的产物校验决定（缺失 / 补丁版本过期 / 显式 --refresh-dependencies）。
+				getProject().getLogger().lifecycle(
+						"Found existing cache lock file ({}), assuming the previous build was canceled; reusing the existing loom cache.",
+						lockResult);
 			}
 
 			try {
@@ -574,7 +579,8 @@ public abstract class CompileConfiguration implements Runnable {
 	// 锁文件只承载两件事：是否存在（上次构建是否干净收尾）、以及 OS 文件锁（是否有进程正在配置构建）。
 	// 这里刻意不读取文件内容：读内容会被配置缓存记为文件输入，
 	// 而锁文件在构建末尾会因干净收尾被删除，下一次构建便会以 file '...lock' has been removed 为由丢弃配置缓存。
-	// 返回 ACQUIRED_CLEAN 表示上次构建干净收尾，其余结果表示需要重建 loom 缓存。
+	// 返回 ACQUIRED_CLEAN 表示上次构建干净收尾，其余结果表示上次构建未干净收尾——仅用于输出诊断信息，
+	// 不再据此触发全量重建（见 run() 中的说明）。
 	@SuppressWarnings("BusyWait")
 	private LockResult acquireProcessLockWaiting_(LockFile lockFile, Duration timeout) throws IOException {
 		final long timeoutMs = timeout.toMillis();
@@ -664,7 +670,8 @@ public abstract class CompileConfiguration implements Runnable {
 	}
 
 	// 配置失败时保留锁文件、只释放 OS 锁，
-	// 使下一次构建能判定上次未干净收尾并重建缓存，而无需等待本进程退出
+	// 使下一次构建能判定上次未干净收尾（并据此输出诊断信息），而无需等待本进程退出。
+	// 注意：残留锁不再触发全量重建——共享产物一律原子发布，被中断的构建不会留下半截产物。
 	private void disownLock() {
 		releaseProcessLock();
 	}

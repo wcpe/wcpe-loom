@@ -27,7 +27,9 @@ package net.fabricmc.loom.configuration.providers.mappings;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 
 import dev.architectury.loom.util.LoggerFilter;
 import dev.architectury.loom.util.Stopwatch;
@@ -38,6 +40,10 @@ import org.slf4j.LoggerFactory;
 import net.fabricmc.loom.api.mappings.intermediate.IntermediateMappingsProvider;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarMerger;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+import net.fabricmc.loom.util.Constants;
+import net.fabricmc.loom.util.cache.AtomicFiles;
+import net.fabricmc.loom.util.cache.CacheEntryLock;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.mappingio.MappingReader;
 import net.fabricmc.mappingio.MappingWriter;
 import net.fabricmc.mappingio.format.MappingFormat;
@@ -50,10 +56,50 @@ public abstract class GeneratedIntermediateMappingsProvider extends Intermediate
 
 	@Override
 	public void provide(Path tinyMappings) throws IOException {
-		if (Files.exists(tinyMappings)) {
+		final boolean refresh = minecraftProvider.refreshDeps();
+
+		// 无锁快路径：产物位于共享缓存目录（<userCache>/<mcVersion>/<name>.tiny），已在位且未要求刷新时直接返回
+		if (Files.exists(tinyMappings) && !refresh) {
 			return;
 		}
 
+		// 进锁前先记下产物指纹：锁内二次确认靠它判断「等锁期间是否已有人发布了新一轮产物」
+		final ArtifactStamp stampBeforeLock = ArtifactStamp.of(tinyMappings);
+
+		// 产物的共享身份 = MC 版本 + provider 名（路径即 <userCache>/<mcVersion>/<name>.tiny），
+		// 故锁 key 由这两者派生，保证不同工作树/daemon 算出同一 key；锁文件放在产物所属目录下的 .locks。
+		final Path lockRoot = tinyMappings.getParent().resolve(Constants.Cache.LOCKS_DIR);
+		final String key = "mc-intermediary:" + getMinecraftVersion().get() + ":" + getName();
+
+		try {
+			CacheEntryLock.withLock(lockRoot, key, LoomCacheService.defaultTimeout(), () -> {
+				// 锁内二次确认：
+				// - 未要求刷新：等锁期间若产物已被其它进程生成并发布，直接复用；
+				// - 要求刷新：refresh 只需保证「真正重建一次」，而该产物内容只是「合并后的 MC jar + stitch」
+				//   的函数、路径按 mcVersion 定址（同一版本的产物内容恒定），等锁期间若已有人发布过新一轮产物，
+				//   我们要的那次重建就已经发生，再生成一遍只是白等一次分钟级的合并 + stitch。
+				// 注意不能用 refresh 直接短路本判据：否则等锁期间别人刚生成好的同一份产物会被再生成一遍。
+				if (!refresh) {
+					if (Files.exists(tinyMappings)) {
+						return null;
+					}
+				} else if (wasRepublishedWhileWaiting(stampBeforeLock, tinyMappings)) {
+					return null;
+				}
+
+				generate(tinyMappings);
+				return null;
+			});
+		} catch (IOException | RuntimeException e) {
+			// 生成过程自身的失败（含 stitch 失败）与锁超时保持原有语义向上抛出
+			throw e;
+		} catch (Exception e) {
+			// 兜底：仅剩锁工具可能抛出的受检异常
+			throw new IOException("Failed to generate intermediate mappings: " + key, e);
+		}
+	}
+
+	private void generate(Path tinyMappings) throws IOException {
 		Stopwatch stopwatch = Stopwatch.createStarted();
 		LOGGER.info(":generating dummy intermediary");
 
@@ -83,9 +129,13 @@ public abstract class GeneratedIntermediateMappingsProvider extends Intermediate
 				}
 			});
 
-			try (MappingWriter writer = MappingWriter.create(tinyMappings, MappingFormat.TINY_2_FILE)) {
-				MappingReader.read(tinyV1, writer);
-			}
+			// 原子发布共享产物：先在临时文件上写完，再原子 move 到最终路径。
+			// 不再「先删后写」——删除会制造「产物不存在」窗口，锁外的存在性快路径会误判并触发重复生成。
+			AtomicFiles.publish(tinyMappings, tmp -> {
+				try (MappingWriter writer = MappingWriter.create(tmp, MappingFormat.TINY_2_FILE)) {
+					MappingReader.read(tinyV1, writer);
+				}
+			});
 		} finally {
 			Files.deleteIfExists(mergedJar);
 			Files.deleteIfExists(tinyV1);
@@ -93,6 +143,36 @@ public abstract class GeneratedIntermediateMappingsProvider extends Intermediate
 		}
 
 		LOGGER.info(":generated dummy intermediary in " + stopwatch.stop());
+	}
+
+	/**
+	 * 等锁期间该产物是否已被新一轮发布.
+	 *
+	 * <p>判据为「进锁后的指纹 ≠ 进锁前的指纹」且产物在位：产物缺失（例如被外部清理）不算已发布，
+	 * 此时仍须自己生成，否则会把「无产物」当成「已重建」。
+	 */
+	private static boolean wasRepublishedWhileWaiting(ArtifactStamp stampBeforeLock, Path tinyMappings) throws IOException {
+		final ArtifactStamp stampInLock = ArtifactStamp.of(tinyMappings);
+		return stampInLock.exists() && !stampInLock.equals(stampBeforeLock);
+	}
+
+	/**
+	 * 产物指纹：存在性 + 大小 + 修改时间.
+	 *
+	 * <p>该产物的写入方式是「临时文件 + 原子 move」，任何指纹变化都来自一次完整发布，故可用于判断
+	 * 「等锁期间是否已有人发布了新一轮产物」。退一步说，即便时间戳粒度过粗导致漏判，后果也只是
+	 * 多做一次生成，不会破坏显式刷新的语义（漏判方向是安全的）。
+	 */
+	private record ArtifactStamp(boolean exists, long size, long lastModifiedMillis) {
+		static ArtifactStamp of(Path path) throws IOException {
+			try {
+				final BasicFileAttributes attributes = Files.readAttributes(path, BasicFileAttributes.class);
+				return new ArtifactStamp(true, attributes.size(), attributes.lastModifiedTime().toMillis());
+			} catch (NoSuchFileException e) {
+				// 取指纹期间文件被外部删除：按「不存在」处理，由调用方决定是否重新生成
+				return new ArtifactStamp(false, -1L, -1L);
+			}
+		}
 	}
 
 	@Override

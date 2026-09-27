@@ -165,8 +165,8 @@ class ConfigurationCacheTest extends Specification implements GradleProjectTestT
 		// 残留锁文件不得让配置缓存失效：第 2 轮必须直接复用
 		result2.output.contains("Reusing configuration cache")
 		result3.task(":help").outcome != FAILED
-		// 重新配置时识别残留锁并重建 loom 缓存
-		result3.output.contains("rebuilding loom cache")
+		// 重新配置时识别残留锁，但仅作诊断：复用既有 loom 缓存，不再全量重建
+		result3.output.contains("reusing the existing loom cache")
 		// 后续构建不得再因锁文件被删除或内容变化而失效
 		// （loom 缓存产物被创建导致的失效属于既有行为，不在本用例范围内）
 		!result4.output.contains(".lock' has been removed")

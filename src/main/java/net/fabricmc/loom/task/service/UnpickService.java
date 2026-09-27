@@ -73,6 +73,7 @@ import net.fabricmc.loom.util.Checksum;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.SLF4JAdapterHandler;
+import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.loom.util.service.Service;
 import net.fabricmc.loom.util.service.ServiceFactory;
 import net.fabricmc.loom.util.service.ServiceType;
@@ -155,23 +156,36 @@ public class UnpickService extends Service<UnpickService.Options> {
 				Stream.ofNullable(existingClasses)
 			).flatMap(Function.identity()).toList();
 		final Path outputJar = getOptions().getUnpickOutputJar().get().getAsFile().toPath();
-		Files.deleteIfExists(outputJar);
+		// 输出位于共享工作目录 <userCache>/<mcVersion>/<mappingsIdentifier>/：同一套 mappings 的多个项目会指向
+		// 同一个文件。旧写法先 deleteIfExists 再以最终路径为输出就地写，会让并发读方看到缺失窗口或半截 jar；
+		// 改为在同目录临时文件上生成、再原子落位。临时文件本就不存在，因此同样保证输出是全新而非追加。
+		final Path staging = AtomicFiles.tempSibling(outputJar);
+		boolean published = false;
 
-		try (ZipFsClasspath zipFsClasspath = ZipFsClasspath.create(classpath);
-				InputStream unpickDefinitions = getUnpickDefinitionsInputStream()) {
-			IClassResolver classResolver = zipFsClasspath.createClassResolver().chain(ClassResolvers.classpath());
-			ConstantUninliner uninliner = ConstantUninliner.builder()
-					.logger(JAVA_LOGGER)
-					.classResolver(classResolver)
-					.grouper(ConstantGroupers.dataDriven()
-							.logger(JAVA_LOGGER)
-							.lenient(getOptions().getLenient().get())
-							.classResolver(classResolver)
-							.mappingSource(unpickDefinitions)
-							.build())
-					.build();
+		try {
+			try (ZipFsClasspath zipFsClasspath = ZipFsClasspath.create(classpath);
+					InputStream unpickDefinitions = getUnpickDefinitionsInputStream()) {
+				IClassResolver classResolver = zipFsClasspath.createClassResolver().chain(ClassResolvers.classpath());
+				ConstantUninliner uninliner = ConstantUninliner.builder()
+						.logger(JAVA_LOGGER)
+						.classResolver(classResolver)
+						.grouper(ConstantGroupers.dataDriven()
+								.logger(JAVA_LOGGER)
+								.lenient(getOptions().getLenient().get())
+								.classResolver(classResolver)
+								.mappingSource(unpickDefinitions)
+								.build())
+						.build();
 
-			AsyncZipProcessor.processEntries(inputJar, outputJar, new UnpickZipProcessor(uninliner));
+				AsyncZipProcessor.processEntries(inputJar, staging, new UnpickZipProcessor(uninliner));
+			}
+
+			AtomicFiles.move(staging, outputJar);
+			published = true;
+		} finally {
+			if (!published) {
+				Files.deleteIfExists(staging);
+			}
 		}
 
 		return outputJar;

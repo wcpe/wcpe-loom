@@ -26,7 +26,11 @@ package net.fabricmc.loom.test.unit.cache
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
+import java.nio.file.NoSuchFileException
 import java.nio.file.Path
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.stream.Collectors
 
 import spock.lang.Specification
@@ -215,5 +219,55 @@ class AtomicFilesTest extends Specification {
 		} finally {
 			fs.close()
 		}
+	}
+
+	def "并发读方在反复发布期间始终读到完整内容（无缺失窗口、无半截文件）"() {
+		given:
+		// 这条不变式是整个共享缓存并发方案的地基：跨进程读方只做存在性判定、然后直接打开文件，
+		// 因此目标路径必须满足「要么还没被替换、要么已是完整的新文件」，绝不能出现缺失窗口或半截文件。
+		// 旧实现「先 deleteIfExists(target) 再以 target 为输出就地写」正是靠删除制造了缺失窗口，
+		// 所以这里用一个持续读取的并发读方把它钉住：任何一次读到缺失或半截长度都会让用例失败。
+		def target = tempDir.resolve("shared.bin")
+		byte[] oldContent = new byte[4096]
+		byte[] newContent = new byte[8192]
+		Arrays.fill(oldContent, (byte) 1)
+		Arrays.fill(newContent, (byte) 2)
+		def oldSource = tempDir.resolve("old-source.bin")
+		def newSource = tempDir.resolve("new-source.bin")
+		Files.write(oldSource, oldContent)
+		Files.write(newSource, newContent)
+		AtomicFiles.copy(oldSource, target)
+
+		def stopped = new AtomicBoolean(false)
+		def failures = new CopyOnWriteArrayList<String>()
+		def reads = new AtomicInteger(0)
+		def reader = Thread.start {
+			while (!stopped.get()) {
+				try {
+					byte[] bytes = Files.readAllBytes(target)
+					reads.incrementAndGet()
+
+					if (bytes.length != oldContent.length && bytes.length != newContent.length) {
+						failures.add("读到半截内容: ${bytes.length} 字节")
+					}
+				} catch (NoSuchFileException e) {
+					failures.add("读到缺失窗口: ${e.file}")
+				} catch (IOException e) {
+					failures.add("读取失败: ${e}")
+				}
+			}
+		}
+
+		when:
+		(1..200).each { i ->
+			AtomicFiles.copy(i % 2 == 0 ? newSource : oldSource, target)
+		}
+		stopped.set(true)
+		reader.join(10_000)
+
+		then:
+		failures.isEmpty()
+		// 读方必须真的读到过内容，否则本用例会在「读线程没被调度」时空转通过，失去意义
+		reads.get() > 0
 	}
 }

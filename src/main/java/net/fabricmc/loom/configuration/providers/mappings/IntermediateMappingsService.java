@@ -82,7 +82,10 @@ public final class IntermediateMappingsService extends Service<IntermediateMappi
 		}
 
 		final IntermediateMappingsProvider intermediateProvider = extension.getIntermediateMappingsProvider();
-		final Path intermediaryTiny = minecraftProvider.file(intermediateProvider.getName() + ".tiny").toPath();
+		// 先取好名字：失败分支要拿它写日志，而从 provider 取名字是（可能由用户实现的）代码，
+		// 不应在异常处理路径上再执行一次
+		final String providerName = intermediateProvider.getName();
+		final Path intermediaryTiny = minecraftProvider.file(providerName + ".tiny").toPath();
 
 		try {
 			if (intermediateProvider instanceof IntermediateMappingsProviderInternal internal) {
@@ -91,16 +94,50 @@ public final class IntermediateMappingsService extends Service<IntermediateMappi
 				intermediateProvider.provide(intermediaryTiny);
 			}
 		} catch (IOException e) {
-			try {
-				Files.deleteIfExists(intermediaryTiny);
-			} catch (IOException ex) {
-				LOGGER.warn("Failed to delete intermediary mappings file", ex);
-			}
-
+			handleProvideFailure(providerName, intermediateProvider, intermediaryTiny, e);
 			throw new UncheckedIOException("Failed to provide intermediate mappings", e);
 		}
 
 		return createOptions(project, minecraftProvider, intermediaryTiny);
+	}
+
+	/**
+	 * 提供中间映射失败后的兜底处理.
+	 *
+	 * <p>内置 provider（{@link IntermediateMappingsProviderInternal} 与 {@link GeneratedIntermediateMappingsProvider}）
+	 * 都改为「临时文件 + 原子 move」发布：失败时盘上要么是旧发布的完整产物、要么是本次发布的完整产物，
+	 * 不会留下半截文件，因此不能再删除——产物位于跨工作树/daemon 共享的缓存目录
+	 * （{@code <userCache>/<mcVersion>/}），无条件删除会删掉其它进程刚成功发布的完整产物，
+	 * 使正在读它的进程遭遇 {@code NoSuchFileException}。这些 provider 会读取刷新标记，
+	 * 产物真的损坏时可用 {@code --refresh-dependencies} 强制重建（刷新不再靠删除实现）。
+	 *
+	 * <p>用户自定义的 {@link IntermediateMappingsProvider} 相反：公开 API
+	 * （{@code LoomGradleExtensionApiImpl#setIntermediateMappingsProvider}）只向它暴露 MC 版本、下载器与
+	 * 命名空间，没有任何刷新信号，实现通常「存在即返回」并就地写目标路径。这种 provider 一旦写坏，
+	 * 损坏文件会被永久复用，而 {@code --refresh-dependencies} 对它无效——故只对它保留原有的
+	 * 「失败即删除」兜底，让下次构建重新生成。
+	 */
+	private static void handleProvideFailure(String providerName, IntermediateMappingsProvider provider, Path intermediaryTiny, IOException failure) {
+		if (isAtomicProvider(provider)) {
+			LOGGER.warn("[{}] 提供中间映射失败，保留已有产物（该 provider 采用原子发布）；若产物本身已损坏，可加 --refresh-dependencies 强制重建", providerName, failure);
+			return;
+		}
+
+		try {
+			Files.deleteIfExists(intermediaryTiny);
+			LOGGER.warn("[{}] 提供中间映射失败，已删除可能损坏的产物 {}，下次构建会重新生成；自定义 provider 不受 --refresh-dependencies 影响", providerName, intermediaryTiny, failure);
+		} catch (IOException deleteFailure) {
+			// 删除失败不掩盖原始失败：原始异常仍会由调用方抛出并附带在异常链中
+			LOGGER.warn("[{}] 提供中间映射失败，且删除产物 {} 也失败；请手动删除该文件后重试", providerName, intermediaryTiny, deleteFailure);
+		}
+	}
+
+	/**
+	 * 该 provider 是否属于「已知原子发布产物」的实现（失败时无需删除兜底）.
+	 */
+	private static boolean isAtomicProvider(IntermediateMappingsProvider provider) {
+		return provider instanceof IntermediateMappingsProviderInternal
+				|| provider instanceof GeneratedIntermediateMappingsProvider;
 	}
 
 	private static Provider<Options> createOptions(Project project, MinecraftProvider minecraftProvider, Path intermediaryTiny) {

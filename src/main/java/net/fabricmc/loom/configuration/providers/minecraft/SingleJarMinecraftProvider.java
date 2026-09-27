@@ -112,10 +112,10 @@ public abstract class SingleJarMinecraftProvider extends MinecraftProvider {
 			try {
 				remapper = TinyRemapper.newRemapper(TinyRemapperLoggerAdapter.INSTANCE).build();
 
-				Files.deleteIfExists(minecraftEnvOnlyJar);
-
 				final TinyRemapper effectiveRemapper = remapper;
-				// 原子发布：remapper 先写到同目录唯一临时 jar，完整后再原子 move 到 minecraftEnvOnlyJar
+				// 原子发布：remapper 先写到同目录唯一临时 jar，完整后再原子 move 到 minecraftEnvOnlyJar。
+				// 这里不先 deleteIfExists(minecraftEnvOnlyJar)：那会制造「产物不存在」窗口，与上面无锁快路径的
+				// 存在性检查直接冲突（读方误判为未就绪，于是争抢重建锁）；原子替换本身也不需要先删。
 				AtomicFiles.publish(minecraftEnvOnlyJar, tmpJar -> {
 					// Pass through tiny remapper to fix the meta-inf
 					try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(tmpJar).build()) {
@@ -125,7 +125,8 @@ public abstract class SingleJarMinecraftProvider extends MinecraftProvider {
 					}
 				});
 			} catch (Exception e) {
-				Files.deleteIfExists(minecraftEnvOnlyJar);
+				// 失败路径不删除共享产物：旧的有效文件可能正被其它进程读取；
+				// 本次未完成的中间结果只存在于临时文件里，由 publish 负责清理。
 				throw new RuntimeException("Failed to process %s only jar".formatted(type()), e);
 			} finally {
 				if (remapper != null) {

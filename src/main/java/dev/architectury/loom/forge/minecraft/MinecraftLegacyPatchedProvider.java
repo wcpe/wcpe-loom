@@ -32,7 +32,6 @@ import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Arrays;
@@ -63,6 +62,7 @@ import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.Pair;
 import net.fabricmc.loom.util.ZipUtils;
+import net.fabricmc.loom.util.service.ScopedServiceFactory;
 import net.fabricmc.loom.util.service.ServiceFactory;
 import net.fabricmc.stitch.merge.JarMerger;
 
@@ -76,8 +76,6 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 	private Path minecraftPatchedAtJar;
 
 	private Path forgeJar;
-
-	private boolean dirty;
 
 	public MinecraftLegacyPatchedProvider(Project project, MinecraftProvider minecraftProvider, Type type) {
 		super(project, minecraftProvider, type);
@@ -108,10 +106,9 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 		}
 
 		withPatchedLock(() -> {
-			// 锁内判定：等锁期间其它进程可能已完成生产，checkCache 的 notExists 判定即为二次确认
-			checkCache();
-
-			dirty = false;
+			// 锁内二次确认：等锁期间其它进程可能已完成生产。本方法不删除任何共享产物，
+			// 需要重建时由 checkCache 的返回值表达，缺失或损坏的产物由 remapJar 的可复用性判定按件补齐
+			dirty = checkCache();
 			return null;
 		});
 	}
@@ -123,7 +120,7 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 	 * 半截产物）时按需要工作处理，进入锁内走完整判定。
 	 */
 	private boolean needsWork() {
-		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(Files::notExists)) {
+		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(jar -> !isReusableJar(jar))) {
 			return true;
 		}
 
@@ -134,9 +131,31 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 		}
 	}
 
-	protected void cleanAllCache() throws IOException {
-		for (Path path : getGlobalCaches()) {
-			Files.deleteIfExists(path);
+	/**
+	 * 锁内二次确认：判定现有产物能否复用，并返回本次是否需要整链重建.
+	 *
+	 * <p>与父类一致，本方法不再删除共享产物：删除会让锁外只做存在性判定的读方拿到缺失文件，
+	 * 也会让其它工作树互相触发重建。legacy 链没有单一版本标记产物，任一件缺失即无法确认
+	 * 其余产物与当前算法同代，因此按整链重建处理（各件仍以「临时文件 + 原子落位」重新生成）。
+	 *
+	 * @return 是否需要整链重建
+	 */
+	@Override
+	protected boolean checkCache() throws IOException {
+		if (getExtension().refreshDeps()) {
+			// 显式刷新（--refresh-dependencies / -Dloom.refresh）：强制整链重建
+			return true;
+		}
+
+		if (Stream.of(getGlobalCaches()).anyMatch(jar -> !isReusableJar(jar))) {
+			return true;
+		}
+
+		try {
+			return !isPatchedJarUpToDate(minecraftPatchedAtJar) || !isPatchedJarUpToDate(forgeJar);
+		} catch (IOException e) {
+			// manifest 读不出来：共享产物被外部破坏，同样按整链重建处理
+			return true;
 		}
 	}
 
@@ -150,65 +169,74 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 		};
 	}
 
-	protected void checkCache() throws IOException {
-		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(Files::notExists)
-				|| !isPatchedJarUpToDate(minecraftPatchedAtJar) || !isPatchedJarUpToDate(forgeJar)) {
-			cleanAllCache();
+	@Override
+	protected void produceIntermediateJarIfMissing() throws Exception {
+		// legacy 链的产物（forge.jar / client-patched.jar / server-patched.jar 等）在 remapJar 阶段生成，
+		// provide() 只做路径初始化与「是否需要重建」的判定，因此这里两步都要走一遍（均为幂等快路径）
+		provide();
+
+		try (var serviceFactory = new ScopedServiceFactory()) {
+			remapJar(serviceFactory);
 		}
 	}
 
 	@Override
 	public void remapJar(ServiceFactory serviceFactory) throws Exception {
 		// 无锁快路径：provide 已判定产物齐备（needsWork=false → dirty=false）时，本方法的全链
-		// notExists 判定都会短路，无需取锁；仅当 provide 判定需要工作（dirty 或产物缺失）才进锁
-		if (Stream.of(forgeJar, minecraftClientPatchedJar, minecraftServerPatchedJar).allMatch(Files::exists)
-				&& (type != Type.MERGED || Files.exists(minecraftMergedPatchedJar))
-				&& Files.exists(minecraftPatchedAtJar)) {
-			dirty = false;
+		// 可复用性判定（存在 + 不是空 zip／截断文件）都会短路，无需取锁；仅当 provide 判定需要工作才进锁。
+		// 注意必须带上 !dirty：显式刷新与「补丁版本过期」不再通过删除产物表达，
+		// 若这里只判存在性，就会把 provide 设好的强制重建信号清掉。
+		if (!dirty
+				&& Stream.of(forgeJar, minecraftClientPatchedJar, minecraftServerPatchedJar).allMatch(MinecraftLegacyPatchedProvider::isReusableJar)
+				&& (type != Type.MERGED || isReusableJar(minecraftMergedPatchedJar))
+				&& isReusableJar(minecraftPatchedAtJar)) {
 			return;
 		}
 
 		withPatchedLock(() -> {
-			// 锁内判定：等锁期间其它进程可能已完成生产，notExists 判定即为二次确认
-			if (Files.notExists(forgeJar)) {
+			// 锁内二次确认：等锁期间其它进程可能已完成生产；所有产物均以「临时文件 + 原子落位」生成
+			if (dirty || !isReusableJar(forgeJar)) {
 				dirty = true;
-				patchForge();
-				applyLoomPatchVersion(forgeJar);
+				publishAtomically(forgeJar, this::patchForge);
 			}
 
-			if (Files.notExists(minecraftClientPatchedJar) || Files.notExists(minecraftServerPatchedJar)) {
+			if (dirty || !isReusableJar(minecraftClientPatchedJar) || !isReusableJar(minecraftServerPatchedJar)) {
 				dirty = true;
 				patchJars();
 			}
 
-			if (type == Type.MERGED && (dirty || Files.notExists(minecraftMergedPatchedJar))) {
+			if (type == Type.MERGED && (dirty || !isReusableJar(minecraftMergedPatchedJar))) {
 				dirty = true;
-				mergeJars();
+				publishAtomically(minecraftMergedPatchedJar, this::mergeJars);
 			}
 
-			if (dirty || Files.notExists(minecraftPatchedAtJar)) {
+			if (dirty || !isReusableJar(minecraftPatchedAtJar)) {
 				dirty = true;
 				Path minecraftPatchedJar = switch (type) {
 				case CLIENT_ONLY -> minecraftClientPatchedJar;
 				case SERVER_ONLY -> minecraftServerPatchedJar;
 				case MERGED -> minecraftMergedPatchedJar;
 				};
-				accessTransform(minecraftPatchedJar, minecraftPatchedAtJar);
-				walkFileSystems(forgeJar, minecraftPatchedAtJar, (path) -> true, this::copyReplacing);
-				applyLoomPatchVersion(minecraftPatchedAtJar);
+				// AT、Forge 文件复制与补丁版本标记全部在临时文件上完成，最后原子落位
+				publishAtomically(minecraftPatchedAtJar, output -> {
+					accessTransform(minecraftPatchedJar, output);
+					walkFileSystems(forgeJar, output, (path) -> true, this::copyReplacing);
+					applyLoomPatchVersion(output);
+				});
 			}
 
 			return null;
 		});
 	}
 
-	private void patchForge() throws Exception {
+	private void patchForge(Path output) throws Exception {
 		Stopwatch stopwatch = Stopwatch.createStarted();
 		logger.lifecycle(":patching forge");
 
-		Files.copy(getExtension().getForgeUniversalProvider().getForge().toPath(), forgeJar, StandardCopyOption.REPLACE_EXISTING);
+		// output 是本次独占的临时文件：复制与全部加工都在它上面完成，最后原子落位
+		Files.copy(getExtension().getForgeUniversalProvider().getForge().toPath(), output);
 
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(forgeJar, false)) {
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(output, false)) {
 			// For the development environment, we need to remove the binpatches, otherwise forge will try to re-apply them
 			Files.delete(fs.get().getPath("binpatches.pack.lzma"));
 
@@ -266,7 +294,7 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 				.orElse(null);
 		if (log4jBeta9 != null) {
 			Predicate<Path> isHelper = path -> path.startsWith("/org/apache/logging/log4j/core/helpers");
-			walkFileSystems(log4jBeta9, forgeJar, isHelper, this::copyReplacing);
+			walkFileSystems(log4jBeta9, output, isHelper, this::copyReplacing);
 		}
 
 		// While Forge will discover mods on the classpath, it won't do the same for ATs, coremods or tweakers.
@@ -275,12 +303,15 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 		// No clue why FG went the hack route when it's the same project and they could have just added first-party
 		// support for loading both from the classpath right into Forge (it's even really simply to do).
 		// We'll have none of those hacks and instead patch first-party support into Forge.
-		ZipUtils.transform(forgeJar, Stream.of(new Pair<>(CoreModManagerTransformer.FILE, original -> {
+		ZipUtils.transform(output, Stream.of(new Pair<>(CoreModManagerTransformer.FILE, original -> {
 			ClassReader reader = new ClassReader(original);
 			ClassWriter writer = new ClassWriter(reader, 0);
 			reader.accept(new CoreModManagerTransformer(writer), 0);
 			return writer.toByteArray();
 		})));
+
+		// 补丁版本标记是就绪标记：必须在原子落位之前写入临时文件，读方才能「见到即完整」
+		applyLoomPatchVersion(output);
 
 		logger.lifecycle(":patched forge in " + stopwatch.stop());
 	}
@@ -291,8 +322,10 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 
 		MinecraftProvider minecraftProvider = getExtension().getMinecraftProvider();
 		PatchProvider patchProvider = getExtension().getPatchProvider();
-		patchJars(minecraftProvider.getMinecraftServerJar().toPath(), minecraftServerPatchedJar, patchProvider.extractServerPatches());
-		patchJars(minecraftProvider.getMinecraftClientJar().toPath(), minecraftClientPatchedJar, patchProvider.extractClientPatches());
+		// 两件产物各自「临时文件 + 原子落位」：任一件失败都不会在共享缓存里留下半截 jar，
+		// 也不会破坏另一件已发布的有效产物
+		publishAtomically(minecraftServerPatchedJar, output -> patchJars(minecraftProvider.getMinecraftServerJar().toPath(), output, patchProvider.extractServerPatches()));
+		publishAtomically(minecraftClientPatchedJar, output -> patchJars(minecraftProvider.getMinecraftClientJar().toPath(), output, patchProvider.extractClientPatches()));
 
 		logger.lifecycle(":patched jars in " + stopwatch.stop());
 	}
@@ -309,18 +342,19 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 		modifyClasses(output, ParameterAnnotationsFixer::new);
 	}
 
-	private void mergeJars() throws Exception {
+	private void mergeJars(Path output) throws Exception {
 		logger.info(":merging jars");
 		Stopwatch stopwatch = Stopwatch.createStarted();
 
-		try (JarMerger jarMerger = new JarMerger(minecraftClientPatchedJar.toFile(), minecraftServerPatchedJar.toFile(), minecraftMergedPatchedJar.toFile())) {
+		// output 是本次独占的临时文件，合并与后续类改写都在它上面完成，最后原子落位
+		try (JarMerger jarMerger = new JarMerger(minecraftClientPatchedJar.toFile(), minecraftServerPatchedJar.toFile(), output.toFile())) {
 			jarMerger.enableSyntheticParamsOffset();
 			jarMerger.merge();
 		}
 
 		// The JarMerger adds Sided annotations but so do the Forge patches. The latter doesn't require extra
 		// dependencies beyond Forge, so we'll keep those and convert any non-redundant Fabric ones.
-		modifyClasses(minecraftMergedPatchedJar, SideAnnotationMerger::new);
+		modifyClasses(output, SideAnnotationMerger::new);
 
 		logger.info(":merged jars in " + stopwatch);
 	}

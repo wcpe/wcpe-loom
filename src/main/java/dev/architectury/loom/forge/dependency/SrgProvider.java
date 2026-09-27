@@ -28,6 +28,7 @@ import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.Reader;
 import java.io.UncheckedIOException;
@@ -101,21 +102,72 @@ public class SrgProvider extends DependencyProvider {
 	/**
 	 * {@return 是否需要生产 srg 相关产物}.
 	 *
-	 * <p>无锁快路径：srg.tsrg 缺失或要求刷新时直接判定需要；否则读 srg.tsrg 首行判断形态，
+	 * <p>无锁快路径：srg.tsrg 缺失或不可复用、要求刷新时直接判定需要；否则读 srg.tsrg 首行判断形态，
 	 * 仅 tsrgV2（现代 MC）才存在 merged mojmap 产物，legacy 形态下其缺失属正常，无需生产。
+	 *
+	 * <p>所有判定都用「可复用」而非「存在」：这些文件位于跨 daemon 共享的 userCache，另一进程可能正在
+	 * 就地重建（旧版本 loom）或被中断留下残骸，存在性判定会把残骸当成就绪产物继续用下去。
 	 */
 	private boolean needsSrgProduction() throws IOException {
-		if (Files.notExists(srg) || refreshDeps()) {
+		if (refreshDeps() || !isReusableTsrg(srg)) {
 			return true;
 		}
 
 		try (BufferedReader reader = Files.newBufferedReader(srg)) {
-			if (!reader.readLine().startsWith("tsrg2")) {
+			final String firstLine = reader.readLine();
+
+			if (firstLine == null || !firstLine.startsWith("tsrg2")) {
 				return false;
 			}
 		}
 
-		return Files.notExists(mergedMojangRaw) || Files.notExists(mergedMojangTrimmed);
+		return !isReusableTsrg(mergedMojangRaw) || !isReusableTsrg(mergedMojangTrimmed);
+	}
+
+	/**
+	 * {@return 该 tsrg 产物是否可作为输入复用}.
+	 *
+	 * <p>存在性判定不足以证明内容完整：这些文件位于跨 daemon 共享的 userCache，旧版本 loom 以最终路径为输出
+	 * 就地写，进程被中断会留下 0 字节或写到一半的文本；而截断的 tsrg 未必让 {@code MappingReader} 报错，
+	 * 结果是静默的错误映射。因此要求「非空、首行有内容、以行终止符结尾」：
+	 *
+	 * <ul>
+	 *     <li>非空且首行有内容：排除「先删后写」中途被杀留下的空文件、只剩换行的残骸；</li>
+	 *     <li>以行终止符结尾：tsrg 是逐行文本，写入方写完一行才会收尾该行，被截断的写入停在行中间的概率
+	 *     远高于正好停在行尾，这条能拦下绝大部分截断产物。</li>
+	 * </ul>
+	 *
+	 * <p>这三条对正常产物恒真（MCPConfig 的 {@code joined.tsrg}、lorenz 的 {@code TSrgWriter}、
+	 * mapping-io 的 TSRG2 writer、InstallerTools 的 {@code MERGE_MAPPING} 产物均满足），
+	 * 因此不会把正常产物永久判为不可用、把构建拖进「每次构建都重建」。
+	 *
+	 * <p>局限：截断恰好停在行边界、或只丢掉尾部若干完整记录时，这三条判据发现不了。要发现它只能做内容哈希
+	 * 或全量解析，而 raw+trimmed 合计接近 10MB，每次暖构建都解析会带来秒级开销，故不在此处做。
+	 */
+	private static boolean isReusableTsrg(Path path) {
+		try {
+			if (Files.notExists(path) || Files.size(path) == 0) {
+				return false;
+			}
+
+			try (BufferedReader reader = Files.newBufferedReader(path)) {
+				final String firstLine = reader.readLine();
+
+				if (firstLine == null || firstLine.isBlank()) {
+					return false;
+				}
+			}
+
+			final byte[] tail = new byte[1];
+
+			try (InputStream input = Files.newInputStream(path)) {
+				input.skipNBytes(Files.size(path) - 1);
+				return input.read(tail) == 1 && tail[0] == '\n';
+			}
+		} catch (IOException e) {
+			// 读取失败（例如文件正被其它进程删除/替换）同样按不可复用处理，让调用方重建
+			return false;
+		}
 	}
 
 	/**
@@ -144,7 +196,8 @@ public class SrgProvider extends DependencyProvider {
 	}
 
 	private void produceSrg(DependencyInfo dependency) throws IOException {
-		if (Files.exists(srg) && !refreshDeps()) {
+		// 锁内二次确认：等锁期间其它进程可能已产出可用产物（按「可复用」判定，避免把残骸当成果）
+		if (!refreshDeps() && isReusableTsrg(srg)) {
 			return;
 		}
 
@@ -181,40 +234,79 @@ public class SrgProvider extends DependencyProvider {
 			return;
 		}
 
-		if (Files.exists(mergedMojangRaw) && Files.exists(mergedMojangTrimmed) && !refreshDeps()) {
+		// 按件判定：只重建缺失或不可复用的那一件，不因一件有问题就删掉另一件已发布的产物。
+		// trimmed 由 raw 派生，因此 raw 不可复用时 trimmed 也要连带重建：否则会出现「只补下游件、
+		// 读了截断的上游件」的静默错误映射（trimmed 自身看起来完全正常）。
+		final boolean refresh = refreshDeps();
+		final boolean needsRaw = refresh || !isReusableTsrg(mergedMojangRaw);
+		final boolean needsTrimmed = needsRaw || !isReusableTsrg(mergedMojangTrimmed);
+
+		if (!needsRaw && !needsTrimmed) {
 			return;
 		}
 
 		Stopwatch stopwatch = Stopwatch.createStarted();
 		getProject().getLogger().lifecycle(":merging mappings (InstallerTools, srg + mojmap)");
 
-		Files.deleteIfExists(mergedMojangRaw);
-		Path mojmapTsrg2 = getMojmapTsrg2(getProject(), getExtension());
-		ForgeToolValueSource.exec(getProject(), settings -> {
-			settings.classpath(DependencyDownloader.download(getProject(), LoomVersions.FORGE_INSTALLER_TOOLS.mavenNotation()));
-			settings.getMainClass().set(INSTALLER_TOOLS_MAIN_CLASS);
-			settings.args(
-					"--task",
-					"MERGE_MAPPING",
-					"--left",
-					getSrg().toAbsolutePath().toString(),
-					"--right",
-					mojmapTsrg2.toAbsolutePath().toString(),
-					"--classes",
-					"--output",
-					mergedMojangRaw.toAbsolutePath().toString()
-			);
-		});
+		if (needsRaw) {
+			produceMergedMojangRaw();
+		}
 
+		if (needsTrimmed) {
+			// 从已完整落位的 raw 产物派生：失败最多让 trimmed 缺失，下次只需重建这一件；
+			// 已发布的 raw 不受影响（旧写法在开始前就把它删了，失败会连累读方）
+			produceMergedMojangTrimmed();
+		}
+
+		getProject().getLogger().lifecycle(":merged mappings (InstallerTools, srg + mojmap) in " + stopwatch.stop());
+	}
+
+	/**
+	 * 生产 raw 形态的 merged mojmap tsrg.
+	 *
+	 * <p>InstallerTools 自行创建 {@code --output} 指定的文件，因此先让它写「同目录唯一临时文件」，
+	 * 成功后再原子落位，读方不会看到半截产物，也不再需要先删除既有产物。
+	 */
+	private void produceMergedMojangRaw() throws IOException {
+		Path mojmapTsrg2 = getMojmapTsrg2(getProject(), getExtension());
+		final Path temp = AtomicFiles.tempSibling(mergedMojangRaw);
+
+		try {
+			ForgeToolValueSource.exec(getProject(), settings -> {
+				settings.classpath(DependencyDownloader.download(getProject(), LoomVersions.FORGE_INSTALLER_TOOLS.mavenNotation()));
+				settings.getMainClass().set(INSTALLER_TOOLS_MAIN_CLASS);
+				settings.args(
+						"--task",
+						"MERGE_MAPPING",
+						"--left",
+						getSrg().toAbsolutePath().toString(),
+						"--right",
+						mojmapTsrg2.toAbsolutePath().toString(),
+						"--classes",
+						"--output",
+						temp.toAbsolutePath().toString()
+				);
+			});
+
+			AtomicFiles.move(temp, mergedMojangRaw);
+		} finally {
+			Files.deleteIfExists(temp);
+		}
+	}
+
+	/**
+	 * 从已发布的 raw 产物派生 trimmed 形态并原子发布.
+	 */
+	private void produceMergedMojangTrimmed() throws IOException {
 		MemoryMappingTree tree = new MemoryMappingTree();
 		MappingVisitor visitor = new ArgDroppingVisitor(new FieldDescWrappingVisitor(tree));
 		MappingReader.read(mergedMojangRaw, visitor);
 
-		try (MappingWriter writer = MappingWriter.create(mergedMojangTrimmed, MappingFormat.TSRG_2_FILE)) {
-			tree.accept(writer);
-		}
-
-		getProject().getLogger().lifecycle(":merged mappings (InstallerTools, srg + mojmap) in " + stopwatch.stop());
+		AtomicFiles.publish(mergedMojangTrimmed, temp -> {
+			try (MappingWriter writer = MappingWriter.create(temp, MappingFormat.TSRG_2_FILE)) {
+				tree.accept(writer);
+			}
+		});
 	}
 
 	// A visitor that drop all method args from srg

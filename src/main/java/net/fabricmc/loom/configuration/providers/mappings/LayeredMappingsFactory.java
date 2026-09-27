@@ -53,6 +53,7 @@ import net.fabricmc.loom.configuration.providers.mappings.unpick.UnpickMetadata;
 import net.fabricmc.loom.configuration.providers.mappings.utils.AddConstructorMappingVisitor;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.ZipUtils;
+import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.mappingio.adapter.MappingDstNsReorder;
 import net.fabricmc.mappingio.adapter.MappingSourceNsSwitch;
@@ -127,12 +128,23 @@ public record LayeredMappingsFactory(LayeredMappingSpec spec) {
 		var processor = new LayeredMappingsProcessor(spec, !useIntermediateMappings);
 		List<MappingLayer> layers = processor.resolveLayers(mappingContext);
 
-		Files.deleteIfExists(mappingsZip);
+		// 该产物是一个 jar，需要连续拼装多个条目（mappings/mappings.tiny、注解、签名修复、unpick 数据）：
+		// 整份在「同目录唯一临时文件」上拼装完再原子落位，避免任一环节失败留下半截 jar
+		//（存在性快路径会把半截 jar 当成已完成产物）。
+		// 不再先删除最终产物：删除会制造「产物不存在」窗口，并可能删掉其它进程正在读的全局仓库副本。
+		final Path tmp = AtomicFiles.tempSibling(mappingsZip);
 
-		writeMapping(processor, layers, mappingsZip, useIntermediateMappings);
-		writeAnnotationData(processor, layers, mappingsZip);
-		writeSignatureFixes(processor, layers, mappingsZip);
-		writeUnpickData(processor, layers, mappingsZip);
+		try {
+			writeMapping(processor, layers, tmp, useIntermediateMappings);
+			writeAnnotationData(processor, layers, tmp);
+			writeSignatureFixes(processor, layers, tmp);
+			writeUnpickData(processor, layers, tmp);
+
+			AtomicFiles.move(tmp, mappingsZip);
+		} finally {
+			// 原子 move 成功后 tmp 已不存在；失败时清理残留，避免遗留垃圾临时文件
+			Files.deleteIfExists(tmp);
+		}
 
 		return mappingsZip;
 	}
@@ -186,7 +198,7 @@ public record LayeredMappingsFactory(LayeredMappingSpec spec) {
 			AddConstructorMappingVisitor addConstructor = new AddConstructorMappingVisitor(nsSwitch);
 			mappings.accept(addConstructor);
 
-			Files.deleteIfExists(mappingsFile);
+			// 传入的是本次专用的临时文件（尚不存在），由 ZipUtils 自行创建，故无需先删除已有产物
 			ZipUtils.add(mappingsFile, "mappings/mappings.tiny", writer.toString().getBytes(StandardCharsets.UTF_8));
 		}
 	}

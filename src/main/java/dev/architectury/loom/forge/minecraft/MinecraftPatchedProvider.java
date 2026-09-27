@@ -92,7 +92,9 @@ import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.LoomVersions;
 import net.fabricmc.loom.util.TinyRemapperHelper;
 import net.fabricmc.loom.util.ZipUtils;
+import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.loom.util.cache.CacheEntryLock;
+import net.fabricmc.loom.util.cache.JarReusability;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.service.ScopedServiceFactory;
 import net.fabricmc.loom.util.service.ServiceFactory;
@@ -130,7 +132,8 @@ public class MinecraftPatchedProvider {
 	private Path minecraftPatchedJar;
 	private Path minecraftClientExtra;
 
-	private boolean dirty = false;
+	// 对子类开放：legacy Forge 子类需要读写该标志，且 isDirty() 必须能反映子类的重建状态
+	protected boolean dirty = false;
 
 	public static MinecraftPatchedProvider get(Project project) {
 		MinecraftProvider provider = LoomGradleExtension.get(project).getMinecraftProvider();
@@ -172,28 +175,66 @@ public class MinecraftPatchedProvider {
 		minecraftClientExtra = forgeWorkingDir.resolve("client-extra.jar");
 	}
 
-	protected void cleanAllCache() throws IOException {
-		for (Path path : getGlobalCaches()) {
-			Files.deleteIfExists(path);
-		}
-	}
-
+	/**
+	 * {@return 本配置下必须可复用的共享产物列表，供 {@link #needsWork()} 判定}.
+	 *
+	 * <p>列表只包含当前 jar 配置确实会生成的产物：server-only 不提供 client jar，
+	 * {@code client-extra.jar} 既不生成也不进 classpath、不注册进 FORGE_EXTRA（见 {@link #providesClientJar()}），
+	 * 把它计入判定会让 {@link #needsWork()} 恒为真、每次构建都白取一次跨进程锁。
+	 */
 	protected Path[] getGlobalCaches() {
-		Path[] files = {
+		List<Path> files = new ArrayList<>(Arrays.asList(
 				minecraftIntermediateJar,
 				minecraftPatchedIntermediateJar,
 				minecraftPatchedIntermediateAtJar,
 				minecraftPatchedJar,
-				minecraftClientExtra,
-		};
+				minecraftClientExtra
+		));
 
-		return files;
+		if (!providesClientJar()) {
+			files.remove(minecraftClientExtra);
+		}
+
+		return files.toArray(Path[]::new);
 	}
 
-	protected void checkCache() throws IOException {
-		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(Files::notExists)
-				|| !isPatchedJarUpToDate(minecraftPatchedJar)) {
-			cleanAllCache();
+	/**
+	 * {@return 该共享产物是否可作为输入复用}.
+	 *
+	 * <p>口径与理由见 {@link JarReusability#isReusable(Path)}：能作为 zip 打开且至少含一个条目。
+	 * 实现只有那一份，其它共享缓存链（mapped minecraft jar、mcp.zip、SrgProvider 产物等）用的是同一判定；
+	 * 本方法保留，是因为 legacy 子类仍以 {@code isReusableJar} 的名字调用它。
+	 */
+	protected static boolean isReusableJar(Path jar) {
+		return JarReusability.isReusable(jar);
+	}
+
+	/**
+	 * 锁内二次确认：判定现有产物能否复用，并返回本次是否需要整链重建.
+	 *
+	 * <p>本方法刻意不再删除共享产物。这些 jar 位于跨 daemon 共享的 forge 缓存目录：
+	 * 删除会让锁外只做存在性判定的读方拿到缺失文件，也会让其它工作树误判「需要重建」而互相触发重建。
+	 * 取而代之的策略是：
+	 * <ul>
+	 *     <li>可复用的产物原样保留，缺失或损坏的产物由后续步骤按件补齐（{@link #needsWork()} 同样基于可复用性判定）；</li>
+	 *     <li>需要整链重建时由返回值表达，各步骤以「临时文件 + 原子落位」重新生成，
+	 *     读方见到的要么是旧文件、要么是完整的新文件。</li>
+	 * </ul>
+	 *
+	 * @return 是否需要整链重建
+	 */
+	protected boolean checkCache() throws IOException {
+		if (getExtension().refreshDeps()) {
+			// 显式刷新（--refresh-dependencies / -Dloom.refresh）：强制整链重建
+			return true;
+		}
+
+		// 最终产物的 manifest 承载补丁版本标记；缺失或版本过期时，中间产物无法证明与当前算法同代，整链重建
+		try {
+			return !isPatchedJarUpToDate(minecraftPatchedJar);
+		} catch (IOException e) {
+			// manifest 读不出来：共享产物被外部破坏，同样按整链重建处理
+			return true;
 		}
 	}
 
@@ -231,9 +272,13 @@ public class MinecraftPatchedProvider {
 	 *
 	 * <p>产物缺失或 Loom 补丁版本过期即需要工作。manifest 读取遇到损坏文件（多进程并发下
 	 * 的半截产物）时按需要工作处理，进入锁内走完整判定。
+	 *
+	 * <p>参与判定的产物集合由 {@link #getGlobalCaches()} 给出，它只含本配置下确实会生成的产物：
+	 * server-only 不含 client-extra，否则判定恒为「需要工作」，无锁快路径永远走不到。
 	 */
 	private boolean needsWork() {
-		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(Files::notExists)) {
+		// 无锁读路径：除存在性外还要拒绝空 zip／截断文件等半成品（其它进程可能正在就地重建共享缓存）
+		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(jar -> !isReusableJar(jar))) {
 			return true;
 		}
 
@@ -245,27 +290,91 @@ public class MinecraftPatchedProvider {
 	}
 
 	private Void providePatched() throws Exception {
-		// 锁内判定：等锁期间其它进程可能已完成生产，checkCache 与 notExists 均为幂等二次确认
-		checkCache();
+		// 锁内二次确认：等锁期间其它进程可能已完成生产。本方法不删除任何共享产物，
+		// 「整链重建」由 checkCache 的返回值表达，缺失或损坏的产物则由下面的可复用性判定按件补齐
+		final boolean forceRebuild = checkCache();
+		this.dirty = forceRebuild;
 
-		this.dirty = false;
-
-		if (Files.notExists(minecraftIntermediateJar)) {
+		if (forceRebuild || !isReusableJar(minecraftIntermediateJar)) {
 			this.dirty = true;
-			createPrePatchJar();
+			// 原子落位：临时文件写完才替换最终产物，锁外读方不会看到半截 jar
+			publishAtomically(minecraftIntermediateJar, this::createPrePatchJar);
 		}
 
-		if (dirty || Files.notExists(minecraftPatchedIntermediateJar)) {
+		if (dirty || !isReusableJar(minecraftPatchedIntermediateJar)) {
 			this.dirty = true;
-			patchJars();
+			publishAtomically(minecraftPatchedIntermediateJar, this::producePatchedIntermediate);
 		}
 
-		if (dirty || Files.notExists(minecraftPatchedIntermediateAtJar)) {
+		if (dirty || !isReusableJar(minecraftPatchedIntermediateAtJar)) {
 			this.dirty = true;
 			accessTransformForge();
 		}
 
+		// client-extra 在 remapJar 阶段生成，本阶段不重建它，但必须在这里置位重建信号：
+		// 否则会出现「needsWork 判定需要工作、providePatched 却查不出任何需要重建的件」的死角，
+		// remapJar 因 dirty=false 直接返回，损坏的 client-extra 既不被修复、又被注册进 FORGE_EXTRA
+		// （见 registerExtraDependencies），此后每次构建都重复这个空转。
+		// server-only 不生成 client-extra，不能参与判定，否则 dirty 恒为真、每轮都整链重建
+		if (providesClientJar() && !isReusableJar(minecraftClientExtra)) {
+			this.dirty = true;
+		}
+
 		return null;
+	}
+
+	/**
+	 * {@return 打补丁后的中间 Minecraft jar；产物不可复用时先按件补齐}.
+	 *
+	 * <p>该 jar 位于跨 daemon 共享的 forge 缓存目录：其它工作树的构建（尤其是仍在删除整组产物的
+	 * 旧版本 loom）可能让它在被读取前一刻消失，直接读取会以
+	 * {@link java.nio.file.NoSuchFileException} 打断整个构建。
+	 *
+	 * <p>判定与补齐都基于「可复用」（存在、能作为 zip/jar 打开且至少含一个条目，见
+	 * {@link #isReusableJar(Path)}）而非「存在」：共享缓存里可能出现 22 字节空 zip 或截断文件，
+	 * 只判存在性会把这类半成品原样交给调用方——它能以只读 jar 文件系统打开但读不出任何 class，
+	 * 下游（FieldMappingsMigrator / MethodInheritanceMappingsMigrator）会把「读不出内容」当成
+	 * 「没有内容」，从而把空结果写进映射缓存，形成静默错误映射。
+	 *
+	 * <p>补齐走 {@link #produceIntermediateJarIfMissing()}：产物齐备时它是无锁快路径，不可复用时在
+	 * {@code forge-patched} 跨进程锁内只重建缺失件，并以原子方式落位。
+	 */
+	public Path getOrProduceMinecraftPatchedIntermediateJar() {
+		final Path jar = getMinecraftPatchedIntermediateJar();
+
+		if (isReusableJar(jar)) {
+			return jar;
+		}
+
+		logger.lifecycle(":共享缓存中的中间产物 {} 不可复用（缺失或损坏），先按件补齐（其它进程可能正在重建该缓存）", jar);
+
+		try {
+			produceIntermediateJarIfMissing();
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		} catch (Exception e) {
+			throw new RuntimeException("补齐共享缓存中的 patched 中间产物失败: " + jar, e);
+		}
+
+		// 补齐后必须再校验一次：仍然不可复用说明该产物这次没能被完整生产出来
+		// （例如锁内判定把它当作可复用而跳过重建，或被外部进程在补齐后再次写坏）。
+		// 这里抛异常而不是返回坏路径：坏路径会让下游把「读不出内容」当成「没有内容」，静默产出错误映射
+		if (!isReusableJar(jar)) {
+			throw new UncheckedIOException(new IOException(
+					"补齐后共享缓存中的 patched 中间产物仍不可复用（无法作为 zip/jar 打开，或没有任何条目）: " + jar));
+		}
+
+		return jar;
+	}
+
+	/**
+	 * 确保 {@link #getMinecraftPatchedIntermediateJar()} 指向的产物已存在.
+	 *
+	 * <p>默认实现调用 {@link #provide()}；legacy 链的产物在 {@link #remapJar(ServiceFactory)}
+	 * 阶段生成（{@code provide()} 只做判定），由子类覆盖补齐。
+	 */
+	protected void produceIntermediateJarIfMissing() throws Exception {
+		provide();
 	}
 
 	public void remapJar(ServiceFactory serviceFactory) throws Exception {
@@ -279,16 +388,18 @@ public class MinecraftPatchedProvider {
 	}
 
 	private Void remapPatchedJarWithDirty(ServiceFactory serviceFactory) throws Exception {
-		// 锁内判定：等锁期间其它进程可能已完成生产，dirty/notExists 判定即为二次确认
+		// 锁内二次确认：等锁期间其它进程可能已完成生产（dirty 为幂等判定）；本方法不删除共享产物
+		// dirty 也可能只表示「client-extra 需要重建」（见 providePatched）：此时最终 jar 会被幂等地重发一次，
+		// 而 client-extra 的修复不会被跳过
 		if (dirty) {
 			if (getExtension().isUnobfuscatedForge()) {
-				mergeUnobfuscatedPatchedJar();
+				publishAtomically(minecraftPatchedJar, this::mergeUnobfuscatedPatchedJar);
 			} else {
-				remapPatchedJar(serviceFactory);
+				publishAtomically(minecraftPatchedJar, output -> remapPatchedJar(output, serviceFactory));
 			}
 
 			if (providesClientJar()) {
-				fillClientExtraJar(serviceFactory);
+				publishAtomically(minecraftClientExtra, output -> fillClientExtraJar(serviceFactory, output));
 			}
 		}
 
@@ -328,6 +439,36 @@ public class MinecraftPatchedProvider {
 	}
 
 	/**
+	 * 原子发布：在「临时文件 + 原子落位」保护下执行可能抛出任意受检异常的生产动作.
+	 *
+	 * <p>补丁步骤会调用外部工具（binpatcher / installer tools 等），其受检异常不限于 {@link IOException}，
+	 * 无法直接作为 {@link AtomicFiles.IOConsumer}；这里统一折叠为 {@link UncheckedIOException} 后向上抛，
+	 * 以保证共享缓存里永远不会出现半截产物。
+	 *
+	 * @param target   最终落位路径（位于跨 daemon 共享的缓存目录）
+	 * @param producer 内容生产者，接收本次独占的临时文件路径
+	 */
+	protected static void publishAtomically(Path target, ThrowingProducer producer) throws IOException {
+		AtomicFiles.publish(target, tmp -> {
+			try {
+				producer.accept(tmp);
+			} catch (IOException e) {
+				throw e;
+			} catch (Exception e) {
+				throw new UncheckedIOException(new IOException("原子发布 " + target + " 失败", e));
+			}
+		});
+	}
+
+	/**
+	 * 允许抛出任意受检异常的生产回调（{@link AtomicFiles.IOConsumer} 只允许 {@link IOException}）.
+	 */
+	@FunctionalInterface
+	protected interface ThrowingProducer {
+		void accept(Path output) throws Exception;
+	}
+
+	/**
 	 * server-only 的 jar 配置不提供 client jar，client-extra 既不生成也不加入 classpath.
 	 *
 	 * <p>否则 getMinecraftClientJar 会抛 "Not configured to provide client jar"。
@@ -336,31 +477,30 @@ public class MinecraftPatchedProvider {
 		return getExtension().getMinecraftJarConfiguration().get() != MinecraftJarConfiguration.SERVER_ONLY;
 	}
 
-	private void mergeUnobfuscatedPatchedJar() throws IOException {
+	private void mergeUnobfuscatedPatchedJar(Path output) throws IOException {
 		logger.lifecycle(":merging userdev into minecraft");
-		Path mcOutput = minecraftPatchedJar;
 		Path forgeUserdevJar = getForgeUserdevJar().toPath();
 
-		Files.deleteIfExists(mcOutput);
-		Files.copy(minecraftPatchedIntermediateAtJar, mcOutput);
+		// output 是本次独占的临时文件：整份写入后在它上面完成全部加工，再由调用方原子落位
+		Files.copy(minecraftPatchedIntermediateAtJar, output);
 
 		// No manifest available to reuse here (mergetool's output has none, Forge's own jar is signed).
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(mcOutput, false)) {
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(output, false)) {
 			createEmptyJarManifest(fs.getPath("META-INF", "MANIFEST.MF"));
 		}
 
-		copyUserdevFiles(forgeUserdevJar, mcOutput);
-		applyLoomPatchVersion(mcOutput);
+		copyUserdevFiles(forgeUserdevJar, output);
+		applyLoomPatchVersion(output);
 	}
 
-	private void createPrePatchJar() throws IOException {
+	private void createPrePatchJar(Path output) throws IOException {
 		if (getExtension().isUnobfuscatedForge()) {
-			createUnobfuscatedPrePatchJar();
+			createUnobfuscatedPrePatchJar(output);
 			return;
 		}
 
 		if (shouldUseNeoForgeInstallerToolsToCreatePrePatchJar()) {
-			createNeoForgeInstallerToolsPrePatchJar();
+			createNeoForgeInstallerToolsPrePatchJar(output);
 			return;
 		}
 
@@ -368,22 +508,23 @@ public class MinecraftPatchedProvider {
 			McpExecutorBuilder builder = createMcpExecutor(tempFiles.directory("loom-mcp"));
 			builder.enqueue("rename");
 			McpExecutor executor = serviceFactory.get(builder.build());
-			Path output = executor.execute();
-			Files.copy(output, minecraftIntermediateJar);
+			Path result = executor.execute();
+			// output 是本次独占的临时文件，写完后由调用方原子落位到共享缓存
+			Files.copy(result, output);
 		}
 	}
 
-	private void createUnobfuscatedPrePatchJar() throws IOException {
+	private void createUnobfuscatedPrePatchJar(Path output) throws IOException {
 		try (var tempFiles = new TempFiles(); var serviceFactory = new ScopedServiceFactory()) {
 			McpExecutorBuilder builder = createMcpExecutor(tempFiles.directory("loom-mcp"));
 			builder.enqueue(getExtension().isNeoForge() ? "preProcessJar" : "merge");
 			McpExecutor executor = serviceFactory.get(builder.build());
-			Path output = executor.execute();
-			Files.copy(output, minecraftIntermediateJar, StandardCopyOption.REPLACE_EXISTING);
+			Path result = executor.execute();
+			Files.copy(result, output, StandardCopyOption.REPLACE_EXISTING);
 		}
 	}
 
-	private void createNeoForgeInstallerToolsPrePatchJar() throws IOException {
+	private void createNeoForgeInstallerToolsPrePatchJar(Path output) throws IOException {
 		try (var tempFiles = new TempFiles()) {
 			final Path mappings = tempFiles.file("mappings", ".txt");
 
@@ -407,16 +548,16 @@ public class MinecraftPatchedProvider {
 				}
 
 				settings.args("--input-mappings", mappings.toAbsolutePath().toString());
-				settings.args("--output", minecraftIntermediateJar.toAbsolutePath().toString());
+				// 外部工具自行创建该文件：指向本次独占的临时文件，避免锁外读方看到半截产物
+				settings.args("--output", output.toAbsolutePath().toString());
 				settings.args("--neoform-data", getExtension().getMcpConfigProvider().getMcp().toAbsolutePath().toString());
 			});
 		}
 	}
 
-	private void fillClientExtraJar(ServiceFactory serviceFactory) throws IOException {
-		Files.deleteIfExists(minecraftClientExtra);
-
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(minecraftClientExtra, true)) {
+	private void fillClientExtraJar(ServiceFactory serviceFactory, Path output) throws IOException {
+		// output 是本次独占的临时文件：原子发布要求生产者自行创建目标，故无需（也不应）先删除任何共享产物
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(output, true)) {
 			Path manifestPath = fs.getPath("META-INF", "MANIFEST.MF");
 
 			if (getExtension().isNeoForge()) {
@@ -432,7 +573,7 @@ public class MinecraftPatchedProvider {
 			}
 		}
 
-		copyNonClassFiles(minecraftProvider.getMinecraftClientJar().toPath(), minecraftClientExtra);
+		copyNonClassFiles(minecraftProvider.getMinecraftClientJar().toPath(), output);
 	}
 
 	// Generates the jar manifest for NeoForge client-extra jars.
@@ -611,7 +752,8 @@ public class MinecraftPatchedProvider {
 	}
 
 	protected void accessTransformForge() throws IOException {
-		accessTransform(minecraftPatchedIntermediateJar, minecraftPatchedIntermediateAtJar);
+		// 原子落位：AT 后的 jar 属于共享缓存，必须先完整生成再替换，避免锁外读方拿到半截 jar
+		AtomicFiles.publish(minecraftPatchedIntermediateAtJar, tmp -> accessTransform(minecraftPatchedIntermediateJar, tmp));
 	}
 
 	/**
@@ -634,13 +776,12 @@ public class MinecraftPatchedProvider {
 		logger.lifecycle(":access transformed minecraft in " + stopwatch.stop());
 	}
 
-	private void remapPatchedJar(ServiceFactory serviceFactory) throws Exception {
+	private void remapPatchedJar(Path mcOutput, ServiceFactory serviceFactory) throws Exception {
 		logger.lifecycle(":remapping minecraft (TinyRemapper, {} -> official)", IntermediaryNamespaces.intermediary(project));
 		Path mcInput = minecraftPatchedIntermediateAtJar;
-		Path mcOutput = minecraftPatchedJar;
 		Path forgeJar = getForgeJar().toPath();
 		Path forgeUserdevJar = getForgeUserdevJar().toPath();
-		Files.deleteIfExists(mcOutput);
+		// mcOutput 是本次独占的临时文件（尚不存在），tiny-remapper 自行创建；无需先删任何共享产物
 
 		TinyRemapper remapper = buildRemapper(serviceFactory, mcInput);
 
@@ -673,16 +814,22 @@ public class MinecraftPatchedProvider {
 		CoreModClassRemapper.remapJar(project, isRuntimeMojang, patchedJar, mappings);
 	}
 
-	private void patchJars() throws Exception {
+	/**
+	 * 生产打补丁后的中间产物.
+	 *
+	 * <p>{@code output} 是本次独占的临时文件：binpatcher 与后续的类改写全部作用在它上面，
+	 * 完整生成后才由调用方原子落位到共享缓存路径。
+	 */
+	private void producePatchedIntermediate(Path output) throws Exception {
 		Stopwatch stopwatch = Stopwatch.createStarted();
 		logger.lifecycle(":patching jars");
-		patchJars(minecraftIntermediateJar, minecraftPatchedIntermediateJar, type.patches.apply(getExtension().getPatchProvider(), getExtension().getForgeUserdevProvider()));
+		patchJars(minecraftIntermediateJar, output, type.patches.apply(getExtension().getPatchProvider(), getExtension().getForgeUserdevProvider()));
 
-		copyMissingClasses(minecraftIntermediateJar, minecraftPatchedIntermediateJar);
-		deleteParameterNames(minecraftPatchedIntermediateJar);
+		copyMissingClasses(minecraftIntermediateJar, output);
+		deleteParameterNames(output);
 
 		if (getExtension().isForgeLikeAndNotOfficial() && !getExtension().isUnobfuscatedForge()) {
-			fixParameterAnnotation(minecraftPatchedIntermediateJar);
+			fixParameterAnnotation(output);
 		}
 
 		logger.lifecycle(":patched jars in " + stopwatch.stop());

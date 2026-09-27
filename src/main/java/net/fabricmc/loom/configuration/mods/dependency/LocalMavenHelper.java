@@ -35,6 +35,8 @@ import java.nio.file.StandardCopyOption;
 
 import org.jspecify.annotations.Nullable;
 
+import net.fabricmc.loom.util.cache.JarReusability;
+
 public record LocalMavenHelper(String group, String name, String version, @Nullable String baseClassifier, Path root, @Nullable String snapshotVersion) {
 	public LocalMavenHelper(String group, String name, String version, @Nullable String baseClassifier, Path root) {
 		this(group, name, version, baseClassifier, root, null);
@@ -73,8 +75,28 @@ public record LocalMavenHelper(String group, String name, String version, @Nulla
 		}
 	}
 
+	/**
+	 * {@return 该 maven 构件的 jar 与 pom 是否都存在}.
+	 *
+	 * <p>只做存在性判定，不校验内容，语义保持不变。若调用点需要的是「内容可用」——典型场景是把产物
+	 * 当作跨 daemon／跨 loom 版本共享缓存里的就绪判据——请改用 {@link #isReusable(String)}。
+	 */
 	public boolean exists(String classifier) {
 		return Files.exists(getOutputFile(classifier)) && Files.exists(getPomPath());
+	}
+
+	/**
+	 * {@return 该 maven 构件是否既存在、内容又可复用}.
+	 *
+	 * <p>在 {@link #exists(String)} 之上追加 jar 的内容校验（见 {@link JarReusability#isReusable(Path)}）：
+	 * 这些仓库目录跨 daemon、跨 loom 版本共享，旧版本 loom 以最终路径为输出就地写，
+	 * 被中断会留下 0 字节或截断的 jar；只判存在会让这类残骸被当成暖缓存，作为 Gradle 依赖进入编译链。
+	 *
+	 * <p>该口径不会把正常产物判为不可用——按「临时文件 + 原子落位」发布的 jar 必然可打开且非空——
+	 * 因此不会引起「每次构建都重建」。
+	 */
+	public boolean isReusable(@Nullable String classifier) {
+		return exists(classifier) && JarReusability.isReusable(getOutputFile(classifier));
 	}
 
 	public String getNotation() {
