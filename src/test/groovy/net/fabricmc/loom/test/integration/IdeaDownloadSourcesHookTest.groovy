@@ -92,27 +92,43 @@ class IdeaDownloadSourcesHookTest extends Specification implements GradleProject
 
 	// 探针任务：打印 Loom 为 IDE 下载源码准备的坐标，以及构建级登记表里该坐标已登记的任务路径。
 	// 全部走动态调用，不依赖构建脚本能编译到 Loom 的类。
+	//
+	// 读取时机是这里的关键：登记表由各项目在配置期逐条写入，只有当所有项目都配置完成后它才是终态，
+	// 所以不能在根项目 build.gradle 求值时读；而任务的执行动作又不得触碰 project / gradle，
+	// 因为该用例以 --configuration-cache 运行。任务「实现」（realize）正好落在两者之间：
+	// 注册任务的配置动作在任务图计算阶段执行，此时配置已全部结束、登记表已是终态，且仍属于配置期。
+	// 于是把读到的内容固化成纯字符串列表交给闭包字段，执行期只负责逐行打印。
 	private static String probeTask() {
 		return """
 tasks.register("$PROBE_TASK_NAME") {
+	def lines = collectLoomSourcesProbeLines()
+
 	doLast {
-		def extension = project.extensions.getByName("loom")
-		def provider = extension.getNamedMinecraftProvider()
-		provider.getDependencyTypes().each { type ->
-			println "LOOM_SOURCES_NOTATION=" + provider.getMavenHelper(type).withClassifier("sources").getNotation()
-		}
+		lines.each { println it }
+	}
+}
 
-		def registry = gradle.extensions.findByName("loomIdeaDownloadSources")
+// 由探针任务在实现时（配置期）调用。只返回纯字符串，闭包不会因此持有任何 Gradle 模型对象，
+// 配置缓存可以安全地把它连同任务动作一起序列化。
+def collectLoomSourcesProbeLines() {
+	def lines = []
+	def extension = project.extensions.getByName("loom")
+	def provider = extension.getNamedMinecraftProvider()
+	provider.getDependencyTypes().each { type ->
+		lines << "LOOM_SOURCES_NOTATION=" + provider.getMavenHelper(type).withClassifier("sources").getNotation()
+	}
 
-		if (registry == null) {
-			println "LOOM_SOURCES_REGISTRY=<absent>"
-			return
-		}
+	def registry = gradle.extensions.findByName("loomIdeaDownloadSources")
 
+	if (registry == null) {
+		lines << "LOOM_SOURCES_REGISTRY=<absent>"
+	} else {
 		def field = registry.getClass().getDeclaredField("taskPathsByNotation")
 		field.setAccessible(true)
-		field.get(registry).each { key, value -> println "LOOM_SOURCES_REGISTRY=" + key + " -> " + value }
+		field.get(registry).each { key, value -> lines << "LOOM_SOURCES_REGISTRY=" + key + " -> " + value }
 	}
+
+	return lines
 }
 """
 	}
