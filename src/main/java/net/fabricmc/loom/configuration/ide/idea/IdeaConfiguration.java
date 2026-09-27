@@ -68,7 +68,14 @@ public abstract class IdeaConfiguration implements Runnable {
 	private void hookDownloadSources() {
 		// 每个 Loom 项目只登记自己可提供的源码任务；根项目再按任务路径字符串添加依赖。
 		// 这样避免了从根项目遍历 allprojects 的跨项目访问，隔离项目模式下同样可用。
-		DownloadSourcesHook.register(getProject());
+		//
+		// 登记必须推迟到本项目配置完成之后：Minecraft 提供器由 CompileConfiguration 在自己的
+		// afterEvaluate 中安装，而 SETUP_JOBS 里 CompileConfiguration 先于本类注册，两处的
+		// afterEvaluate 动作按注册顺序执行，因此这里登记时提供器一定已就绪。
+		// 若改回在插件 apply 期直接登记，提供器尚为空，getNamedMinecraftProvider() 抛出的 NPE
+		// 会被 register() 静默吞掉，登记表将永远为空，ijDownloadSources 也就挂不上任何
+		// genSources 任务（IDE 的「下载源码」因此失效）。
+		GradleUtils.afterSuccessfulEvaluation(getProject(), () -> DownloadSourcesHook.register(getProject()));
 
 		if (!GradleUtils.isRootProject(getProject())) {
 			return;

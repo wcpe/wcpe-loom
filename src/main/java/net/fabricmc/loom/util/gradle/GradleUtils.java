@@ -93,6 +93,21 @@ public final class GradleUtils {
 	}
 
 	public static Provider<Integer> getIntegerPropertyProvider(Project project, String key) {
+		LoomGradleExtension extension = LoomGradleExtension.get(project);
+
+		if (extension.isProjectIsolationActive()) {
+			// Project.findProperty 在属性未定义时会沿项目层级向父项目查找，隔离项目下会被判定为
+			// 跨项目访问（cannot dynamically look up a property in the parent project）。
+			// 与 getBooleanPropertyProvider / getProperty 保持一致，改用 gradleProperty。
+			return project.getProviders().gradleProperty(key).map(value -> {
+				try {
+					return Integer.parseInt(value);
+				} catch (final NumberFormatException ex) {
+					throw new IllegalArgumentException("Property " + key + " must be an integer", ex);
+				}
+			});
+		}
+
 		return project.provider(() -> {
 			final Object value = project.findProperty(key);
 
