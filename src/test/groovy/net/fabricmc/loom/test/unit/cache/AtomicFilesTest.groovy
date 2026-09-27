@@ -30,6 +30,7 @@ import java.nio.file.NoSuchFileException
 import java.nio.file.Path
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.stream.Collectors
 
 import spock.lang.Specification
@@ -239,10 +240,12 @@ class AtomicFilesTest extends Specification {
 
 		def stopped = new AtomicBoolean(false)
 		def failures = new CopyOnWriteArrayList<String>()
+		def reads = new AtomicInteger(0)
 		def reader = Thread.start {
 			while (!stopped.get()) {
 				try {
 					byte[] bytes = Files.readAllBytes(target)
+					reads.incrementAndGet()
 
 					if (bytes.length != oldContent.length && bytes.length != newContent.length) {
 						failures.add("读到半截内容: ${bytes.length} 字节")
@@ -264,5 +267,7 @@ class AtomicFilesTest extends Specification {
 
 		then:
 		failures.isEmpty()
+		// 读方必须真的读到过内容，否则本用例会在「读线程没被调度」时空转通过，失去意义
+		reads.get() > 0
 	}
 }

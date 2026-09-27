@@ -25,21 +25,43 @@
 package net.fabricmc.loom.util.cache;
 
 import java.io.IOException;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Duration;
 import java.util.UUID;
 
 /**
  * 原子发布工具：保证「文件存在 ⟺ 内容完整」这一不变量成立.
  *
- * <p>各最终产物先写入「与 target 同目录的唯一临时文件」，写完整后再用原子 move 落位。
+ * <p>各最终产物先写入「与目标同目录的唯一临时文件」，写完整后再用原子 move 落位。
  * 这样跨 daemon 的无锁存在性检查不会在写入期间看到半成品：读方要么看到旧文件、要么看到完整的新文件。
+ *
+ * <h2>Windows 的替换限制</h2>
+ *
+ * <p>POSIX 的 {@code rename(2)} 可以覆盖任何同名文件，但 Windows 不允许替换（或删除）正被其它句柄打开的文件：
+ * 只要读方还持有句柄，{@code MoveFileEx(REPLACE_EXISTING)} 就会以 {@code ERROR_ACCESS_DENIED} 失败，
+ * Java 侧表现为 {@link AccessDeniedException}。实测 {@code InputStream}、{@code FileChannel}、
+ * {@code ZipFile} 与 {@code FileSystem}(zipfs) 的读取句柄都会触发该限制。
+ *
+ * <p>因此 {@link #move} 对这种情况做「有上限的退避重试」：短生命周期的读方（例如反复读取的构建）会被自动让过，
+ * 持续占用则最终抛出带诊断信息的异常，而不是把平台限制原样丢给调用方。读方的不变量不受影响——
+ * 重试期间目标始终是旧的完整文件。
  */
 public final class AtomicFiles {
 	private AtomicFiles() {
 	}
+
+	/**
+	 * 替换被读方占用时的重试预算.
+	 *
+	 * <p>超过该时长仍无法替换即判定为「读方长期持有句柄」，抛出可诊断的异常。
+	 */
+	private static final Duration REPLACE_RETRY_BUDGET = Duration.ofSeconds(30);
+	private static final long RETRY_INITIAL_MILLIS = 5;
+	private static final long RETRY_MAX_MILLIS = 250;
 
 	/**
 	 * 接收一个 Path 并向其写入内容的回调，允许抛出 {@link IOException}.
@@ -103,12 +125,56 @@ public final class AtomicFiles {
 	 *
 	 * <p>用于调用方已将内容写入同目录临时文件、需把其原子落位到 target 的场景
 	 * （例如一次产生多个输出、不便用 {@link #publish} 逐个包裹时）。
+	 *
+	 * <p>目标被其它进程/线程的读取句柄占用时（Windows 的替换限制，见类注释）会做有上限的退避重试，
+	 * 让过短生命周期的读方；持续占用则抛出带诊断信息的 {@link IOException}。
 	 */
 	public static void move(Path source, Path target) throws IOException {
+		final long deadline = System.nanoTime() + REPLACE_RETRY_BUDGET.toNanos();
+		long backoffMillis = RETRY_INITIAL_MILLIS;
+
+		while (true) {
+			try {
+				try {
+					Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+				} catch (AtomicMoveNotSupportedException e) {
+					Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+				}
+
+				return;
+			} catch (AccessDeniedException e) {
+				// Windows 上读方持有目标句柄时的表现。读方是短生命周期的，重试即可成功；
+				// 因此这里不立刻失败，避免把「另一个进程正在读」变成构建失败。
+				if (System.nanoTime() >= deadline) {
+					throw new IOException(describeShareConflict(target), e);
+				}
+
+				sleepBriefly(backoffMillis);
+				backoffMillis = Math.min(backoffMillis * 2, RETRY_MAX_MILLIS);
+			}
+		}
+	}
+
+	/**
+	 * 构造可诊断的替换冲突说明.
+	 *
+	 * <p>把平台限制、最可能的原因与用户可采取的动作写进消息里——原始 {@link AccessDeniedException}
+	 * 只给出「拒绝访问」，无法指向真正的问题。
+	 */
+	private static String describeShareConflict(Path target) {
+		return "无法替换共享缓存产物 %s：目标文件正被其它进程或线程读取。".formatted(target.toAbsolutePath())
+				+ " Windows 不允许替换（或删除）已被打开的文件，已等待 %d 秒仍未能落位。"
+				.formatted(REPLACE_RETRY_BUDGET.toSeconds())
+				+ " 若同时运行多个工作树或 Gradle daemon 共享同一 userCache，请错开构建；"
+				+ "单个构建内出现该提示通常意味着另一个 Loom 进程长期持有该文件。";
+	}
+
+	private static void sleepBriefly(long millis) throws IOException {
 		try {
-			Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-		} catch (AtomicMoveNotSupportedException e) {
-			Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+			Thread.sleep(millis);
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new IOException("等待替换共享缓存产物时被中断", e);
 		}
 	}
 }
