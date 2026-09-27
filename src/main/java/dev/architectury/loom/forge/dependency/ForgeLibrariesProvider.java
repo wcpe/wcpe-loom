@@ -32,6 +32,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
 
 import dev.architectury.loom.forge.ModDirTransformerDiscovererPatch;
 import dev.architectury.loom.forge.RemapObjectHolderVisitor;
@@ -64,6 +65,8 @@ import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.ExceptionUtil;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.LoomVersions;
+import net.fabricmc.loom.util.cache.AtomicFiles;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.service.ScopedServiceFactory;
 import net.fabricmc.loom.util.service.ServiceFactory;
 import net.fabricmc.mappingio.tree.MappingTree;
@@ -213,45 +216,55 @@ public class ForgeLibrariesProvider {
 		final Path inputJar = artifact.getFile().toPath();
 		final Path outputJar = mavenHelper.getOutputFile(null);
 
-		final TinyMappingsService mappingsService = mappingConfiguration.getMappingsService(project, serviceFactory, MappingOption.DEFAULT);
-		final MappingTree mappings = mappingsService.getMappingTree();
-
 		// Modify jar.
-		if (!Files.exists(outputJar) || extension.refreshDeps()) {
-			mavenHelper.copyToMaven(inputJar, null);
-
-			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(outputJar, false)) {
-				Path path = fs.get().getPath("META-INF/services/cpw.mods.modlauncher.api.INameMappingService");
-				Files.deleteIfExists(path);
-
-				if (Files.exists(fs.get().getPath(FORGE_OBJECT_HOLDER_FILE))) {
-					remapObjectHolder(project, outputJar, mappingConfiguration);
+		if (!mavenHelper.exists(null) || extension.refreshDeps()) {
+			withForgeDependencyLock(project, mavenHelper, () -> {
+				// 锁内二次确认：等锁期间其它进程可能已完成生产（jar 与 pom 一并就绪才算完成）
+				if (mavenHelper.exists(null) && !extension.refreshDeps()) {
+					return null;
 				}
 
-				if (Files.exists(fs.getPath(FORGE_MOD_DIR_TRANSFORMER_DISCOVERER_FILE))) {
-					ClassVisitorUtil.rewriteClassFile(fs.getPath(FORGE_MOD_DIR_TRANSFORMER_DISCOVERER_FILE), true, ModDirTransformerDiscovererPatch::new);
-				}
+				final TinyMappingsService mappingsService = mappingConfiguration.getMappingsService(project, serviceFactory, MappingOption.DEFAULT);
+				final MappingTree mappings = mappingsService.getMappingTree();
 
-				if (Files.exists(fs.getPath(NEOFORGE_OBJECT_HOLDER_FILE))) {
-					remapNeoForgeObjectHolder(project, outputJar, mappingConfiguration);
-				}
+				// 「复制输入 + 全部就地加工」都在同目录临时文件上完成，最后一次性原子发布：
+				// 旧写法先 copyToMaven 发布输入 jar、再以 outputJar 为输出就地改写，其它 daemon 会读到半加工的 jar
+				publishTransformedJar(mavenHelper, inputJar, outputJar, jar -> {
+					try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar, false)) {
+						Path path = fs.get().getPath("META-INF/services/cpw.mods.modlauncher.api.INameMappingService");
+						Files.deleteIfExists(path);
 
-				if (Files.exists(fs.getPath(NEOFORGE_LAUNCH_HANDLER_FILE))) {
-					ClassVisitorUtil.rewriteClassFile(fs.getPath(NEOFORGE_LAUNCH_HANDLER_FILE), StringConstantPatcher::forUserdevLaunchHandler);
-				}
+						if (Files.exists(fs.get().getPath(FORGE_OBJECT_HOLDER_FILE))) {
+							remapObjectHolder(project, jar, mappingConfiguration);
+						}
 
-				if (Files.exists(fs.getPath(NEOFORGE_LOADER_FILE))) {
-					ClassVisitorUtil.rewriteClassFile(fs.getPath(NEOFORGE_LOADER_FILE), next -> StringConstantPatcher.forFmlLoader(next, mappings));
-				}
+						if (Files.exists(fs.getPath(FORGE_MOD_DIR_TRANSFORMER_DISCOVERER_FILE))) {
+							ClassVisitorUtil.rewriteClassFile(fs.getPath(FORGE_MOD_DIR_TRANSFORMER_DISCOVERER_FILE), true, ModDirTransformerDiscovererPatch::new);
+						}
 
-				if (Files.exists(fs.getPath(NEOFORGE_GAME_LOCATOR_FILE))) {
-					ClassVisitorUtil.rewriteClassFile(fs.getPath(NEOFORGE_GAME_LOCATOR_FILE), next -> StringConstantPatcher.forGameLocator(next, mappings));
-				}
+						if (Files.exists(fs.getPath(NEOFORGE_OBJECT_HOLDER_FILE))) {
+							remapNeoForgeObjectHolder(project, jar, mappingConfiguration);
+						}
 
-				if (Files.exists(fs.getPath(NEOFORGE_REQUIRED_SYSTEM_FILES_FILE))) {
-					ClassVisitorUtil.rewriteClassFile(fs.getPath(NEOFORGE_REQUIRED_SYSTEM_FILES_FILE), next -> StringConstantPatcher.forRequiredSystemFiles(next, mappings));
-				}
-			}
+						if (Files.exists(fs.getPath(NEOFORGE_LAUNCH_HANDLER_FILE))) {
+							ClassVisitorUtil.rewriteClassFile(fs.getPath(NEOFORGE_LAUNCH_HANDLER_FILE), StringConstantPatcher::forUserdevLaunchHandler);
+						}
+
+						if (Files.exists(fs.getPath(NEOFORGE_LOADER_FILE))) {
+							ClassVisitorUtil.rewriteClassFile(fs.getPath(NEOFORGE_LOADER_FILE), next -> StringConstantPatcher.forFmlLoader(next, mappings));
+						}
+
+						if (Files.exists(fs.getPath(NEOFORGE_GAME_LOCATOR_FILE))) {
+							ClassVisitorUtil.rewriteClassFile(fs.getPath(NEOFORGE_GAME_LOCATOR_FILE), next -> StringConstantPatcher.forGameLocator(next, mappings));
+						}
+
+						if (Files.exists(fs.getPath(NEOFORGE_REQUIRED_SYSTEM_FILES_FILE))) {
+							ClassVisitorUtil.rewriteClassFile(fs.getPath(NEOFORGE_REQUIRED_SYSTEM_FILES_FILE), next -> StringConstantPatcher.forRequiredSystemFiles(next, mappings));
+						}
+					}
+				});
+				return null;
+			});
 
 			// Copy sources when not running under CI.
 			if (!ModConfigurationRemapper.isCIBuild()) {
@@ -287,17 +300,69 @@ public class ForgeLibrariesProvider {
 		final Path outputJar = mavenHelper.getOutputFile(null);
 
 		// Modify jar.
-		if (!Files.exists(outputJar) || extension.refreshDeps()) {
-			mavenHelper.copyToMaven(inputJar, null);
-
-			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(outputJar, false)) {
-				if (Files.exists(fs.getPath(FORGE_MOD_DIR_TRANSFORMER_DISCOVERER_FILE))) {
-					ClassVisitorUtil.rewriteClassFile(fs.getPath(FORGE_MOD_DIR_TRANSFORMER_DISCOVERER_FILE), true, ModDirTransformerDiscovererPatch::new);
+		if (!mavenHelper.exists(null) || extension.refreshDeps()) {
+			withForgeDependencyLock(project, mavenHelper, () -> {
+				// 锁内二次确认：等锁期间其它进程可能已完成生产
+				if (mavenHelper.exists(null) && !extension.refreshDeps()) {
+					return null;
 				}
-			}
+
+				publishTransformedJar(mavenHelper, inputJar, outputJar, jar -> {
+					try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar, false)) {
+						if (Files.exists(fs.getPath(FORGE_MOD_DIR_TRANSFORMER_DISCOVERER_FILE))) {
+							ClassVisitorUtil.rewriteClassFile(fs.getPath(FORGE_MOD_DIR_TRANSFORMER_DISCOVERER_FILE), true, ModDirTransformerDiscovererPatch::new);
+						}
+					}
+				});
+				return null;
+			});
 		}
 
 		return mavenHelper.getNotation();
+	}
+
+	/**
+	 * 在共享的 Forge 依赖仓库中发布「已复制输入 + 已完成加工」的 jar，并配套写入 pom.
+	 *
+	 * <p>全部加工都在「与仓库产物同目录的唯一临时文件」上完成，最后一步才原子落位，因此读方
+	 * 要么看到完整的旧产物、要么看到完整的新产物，不会看到只加工了一半的 jar（例如已删掉
+	 * {@code INameMappingService} 服务文件、但还没改写 FML 类）。
+	 *
+	 * <p>jar 先落位、pom 后落位（pom 只有一份模板内容，且新产物出现后才会被解析），
+	 * 这样「pom 可见」蕴含「jar 可见」，暖缓存判定 {@code mavenHelper.exists(null)} 不会误判。
+	 */
+	private static void publishTransformedJar(LocalMavenHelper mavenHelper, Path inputJar, Path outputJar, AtomicFiles.IOConsumer<Path> transform) throws IOException {
+		Files.createDirectories(outputJar.getParent());
+		final Path temp = AtomicFiles.tempSibling(outputJar);
+
+		try {
+			Files.copy(inputJar, temp);
+			transform.accept(temp);
+			AtomicFiles.move(temp, outputJar);
+			mavenHelper.savePom();
+		} finally {
+			Files.deleteIfExists(temp);
+		}
+	}
+
+	/**
+	 * 在跨进程锁保护下生产一个 Forge 依赖仓库产物.
+	 *
+	 * <p>仓库位于跨 daemon 共享的 userCache（不按项目隔离），同一坐标 + 同一映射集的多个并发构建会写
+	 * 同一路径；key 由仓库坐标派生——group 已编码映射集哈希（或后续处理标记），因此不同工作树算出同一把锁，
+	 * 不同产物仍可并行。锁内判定为幂等的二次确认。
+	 */
+	private static void withForgeDependencyLock(Project project, LocalMavenHelper mavenHelper, Callable<Void> action) throws IOException {
+		final Path lockRoot = LoomGradleExtension.get(project).getFiles().getForgeDependencyRepo().toPath().resolve(Constants.Cache.LOCKS_DIR);
+		final String lockKey = "forge-dependency:" + mavenHelper.group() + ":" + mavenHelper.name() + ":" + mavenHelper.version();
+
+		try {
+			LoomCacheService.get(project).get().runExclusive(lockRoot, lockKey, LoomCacheService.defaultTimeout(), action);
+		} catch (IOException e) {
+			throw e;
+		} catch (Exception e) {
+			throw new RuntimeException("Could not transform Forge dependency " + mavenHelper.getNotation(), e);
+		}
 	}
 
 	private static void remapObjectHolder(Project project, Path outputJar, MappingConfiguration mappingConfiguration) throws IOException {

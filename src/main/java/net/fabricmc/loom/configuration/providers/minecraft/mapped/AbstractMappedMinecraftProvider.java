@@ -326,7 +326,10 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 			configureRemapper(remappedJars, builder);
 		}, classNames);
 
-		// 原子发布：remapper 先写到同目录唯一临时 jar，完整后再原子 move 到 outputJarPath
+		// 原子发布：remapper 先写到同目录唯一临时 jar，其余加工（Forge/NeoForge 的 object holder 改写）
+		// 也全部在这个临时文件上完成，最后才原子 move 到 outputJarPath。
+		// 发布出去的必须是终态：否则共享 maven 仓库里的 jar 会有一段「已落位但未完成加工」的中间态，
+		// 被锁外只做存在性检查的读方读到（读到未改写 object holder 的 jar）。
 		try {
 			AtomicFiles.publish(remappedJars.outputJarPath(), tmpJar -> {
 				try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(tmpJar).build()) {
@@ -339,6 +342,23 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 					remapper.readInputs(remappedJars.inputJar());
 					remapper.apply(outputConsumer);
 				}
+
+				// object holder 的类名字符串同样要在落位前改写掉，理由见上面对「终态」的说明
+				if (extension.isForgeLikeAndOfficial()) {
+					final MappingOption mappingOption = MappingOption.forPlatform(extension);
+					final TinyMappingsService mappingsService = extension.getMappingConfiguration().getMappingsService(project, configContext.serviceFactory(), mappingOption);
+					final String className;
+
+					if (extension.isNeoForge()) {
+						className = "net.neoforged.neoforge.registries.ObjectHolderRegistry";
+					} else {
+						className = "net.minecraftforge.registries.ObjectHolderRegistry";
+					}
+
+					final String sourceNamespace = extension.getProductionNamespace().get();
+					final MemoryMappingTree mappings = mappingsService.getMappingTree();
+					RemapObjectHolderVisitor.remapObjectHolder(tmpJar, className, mappings, sourceNamespace, "named");
+				}
 			});
 		} catch (Exception e) {
 			throw new RuntimeException("Failed to remap JAR " + remappedJars.inputJar() + " with mappings from " + mappingConfiguration.tinyMappings, e);
@@ -347,22 +367,6 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		}
 
 		getMavenHelper(remappedJars.type()).savePom();
-
-		if (extension.isForgeLikeAndOfficial()) {
-			final MappingOption mappingOption = MappingOption.forPlatform(extension);
-			final TinyMappingsService mappingsService = extension.getMappingConfiguration().getMappingsService(project, configContext.serviceFactory(), mappingOption);
-			final String className;
-
-			if (extension.isNeoForge()) {
-				className = "net.neoforged.neoforge.registries.ObjectHolderRegistry";
-			} else {
-				className = "net.minecraftforge.registries.ObjectHolderRegistry";
-			}
-
-			final String sourceNamespace = extension.getProductionNamespace().get();
-			final MemoryMappingTree mappings = mappingsService.getMappingTree();
-			RemapObjectHolderVisitor.remapObjectHolder(remappedJars.outputJar().getPath(), className, mappings, sourceNamespace, "named");
-		}
 	}
 
 	protected void configureRemapper(RemappedJars remappedJars, TinyRemapper.Builder tinyRemapperBuilder) {

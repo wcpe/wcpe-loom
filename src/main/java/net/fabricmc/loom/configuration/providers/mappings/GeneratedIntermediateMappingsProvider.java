@@ -38,6 +38,10 @@ import org.slf4j.LoggerFactory;
 import net.fabricmc.loom.api.mappings.intermediate.IntermediateMappingsProvider;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarMerger;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+import net.fabricmc.loom.util.Constants;
+import net.fabricmc.loom.util.cache.AtomicFiles;
+import net.fabricmc.loom.util.cache.CacheEntryLock;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.mappingio.MappingReader;
 import net.fabricmc.mappingio.MappingWriter;
 import net.fabricmc.mappingio.format.MappingFormat;
@@ -50,10 +54,36 @@ public abstract class GeneratedIntermediateMappingsProvider extends Intermediate
 
 	@Override
 	public void provide(Path tinyMappings) throws IOException {
-		if (Files.exists(tinyMappings)) {
+		// 无锁快路径：产物位于共享缓存目录（<userCache>/<mcVersion>/<name>.tiny），已在位且未要求刷新时直接返回
+		if (Files.exists(tinyMappings) && !minecraftProvider.refreshDeps()) {
 			return;
 		}
 
+		// 产物的共享身份 = MC 版本 + provider 名（路径即 <userCache>/<mcVersion>/<name>.tiny），
+		// 故锁 key 由这两者派生，保证不同工作树/daemon 算出同一 key；锁文件放在产物所属目录下的 .locks。
+		final Path lockRoot = tinyMappings.getParent().resolve(Constants.Cache.LOCKS_DIR);
+		final String key = "mc-intermediary:" + getMinecraftVersion().get() + ":" + getName();
+
+		try {
+			CacheEntryLock.withLock(lockRoot, key, LoomCacheService.defaultTimeout(), () -> {
+				// 锁内二次确认：等锁期间可能已被其它进程生成并发布，避免重复做昂贵的合并 + stitch
+				if (!minecraftProvider.refreshDeps() && Files.exists(tinyMappings)) {
+					return null;
+				}
+
+				generate(tinyMappings);
+				return null;
+			});
+		} catch (IOException | RuntimeException e) {
+			// 生成过程自身的失败（含 stitch 失败）与锁超时保持原有语义向上抛出
+			throw e;
+		} catch (Exception e) {
+			// 兜底：仅剩锁工具可能抛出的受检异常
+			throw new IOException("Failed to generate intermediate mappings: " + key, e);
+		}
+	}
+
+	private void generate(Path tinyMappings) throws IOException {
 		Stopwatch stopwatch = Stopwatch.createStarted();
 		LOGGER.info(":generating dummy intermediary");
 
@@ -83,9 +113,13 @@ public abstract class GeneratedIntermediateMappingsProvider extends Intermediate
 				}
 			});
 
-			try (MappingWriter writer = MappingWriter.create(tinyMappings, MappingFormat.TINY_2_FILE)) {
-				MappingReader.read(tinyV1, writer);
-			}
+			// 原子发布共享产物：先在临时文件上写完，再原子 move 到最终路径。
+			// 不再「先删后写」——删除会制造「产物不存在」窗口，锁外的存在性快路径会误判并触发重复生成。
+			AtomicFiles.publish(tinyMappings, tmp -> {
+				try (MappingWriter writer = MappingWriter.create(tmp, MappingFormat.TINY_2_FILE)) {
+					MappingReader.read(tinyV1, writer);
+				}
+			});
 		} finally {
 			Files.deleteIfExists(mergedJar);
 			Files.deleteIfExists(tinyV1);

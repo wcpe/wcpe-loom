@@ -91,12 +91,11 @@ public final class IntermediateMappingsService extends Service<IntermediateMappi
 				intermediateProvider.provide(intermediaryTiny);
 			}
 		} catch (IOException e) {
-			try {
-				Files.deleteIfExists(intermediaryTiny);
-			} catch (IOException ex) {
-				LOGGER.warn("Failed to delete intermediary mappings file", ex);
-			}
-
+			// 不再删除产物：它位于共享缓存目录（<userCache>/<mcVersion>/），出错时无条件删除会删掉其它
+			// 工作树/daemon 已成功发布的完整产物，使正在读它的进程遭遇 NoSuchFileException。
+			// 各 provider 已改为「原子发布」，读方要么看到旧的完整文件、要么看到新的完整文件；
+			// 若本次确实留下了损坏产物，可用 --refresh-dependencies 强制重建（刷新不再靠删除实现）。
+			LOGGER.warn("提供中间映射失败，保留已有产物；若该产物本身已损坏，可加 --refresh-dependencies 强制重建", e);
 			throw new UncheckedIOException("Failed to provide intermediate mappings", e);
 		}
 

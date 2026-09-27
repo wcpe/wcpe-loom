@@ -56,6 +56,7 @@ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
+import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.mappingio.MappingReader;
 import net.fabricmc.mappingio.format.tiny.Tiny2FileWriter;
 import net.fabricmc.mappingio.tree.MappingTree;
@@ -84,20 +85,23 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
 				});
 			}
 		} else {
-			Files.deleteIfExists(migratedFieldsCache);
 			migratedFields.clear();
 
 			if (hasSrg) {
-				migratedFields.addAll(generateNewFieldMigration(MinecraftPatchedProvider.get(project).getMinecraftPatchedIntermediateJar(), MappingsNamespace.SRG.toString(), rawMappings).entrySet());
+				// 共享缓存可能正被其它进程重建（或其它工作树仍在用会删除整组产物的旧版本 loom）：
+				// 用 getOrProduce... 在产物缺失时先按件补齐，避免直接读取抛 NoSuchFileException
+				migratedFields.addAll(generateNewFieldMigration(MinecraftPatchedProvider.get(project).getOrProduceMinecraftPatchedIntermediateJar(), MappingsNamespace.SRG.toString(), rawMappings).entrySet());
 			} else if (hasMojang) {
-				migratedFields.addAll(generateNewFieldMigration(MinecraftPatchedProvider.get(project).getMinecraftPatchedIntermediateJar(), MappingsNamespace.MOJANG.toString(), rawMappings).entrySet());
+				migratedFields.addAll(generateNewFieldMigration(MinecraftPatchedProvider.get(project).getOrProduceMinecraftPatchedIntermediateJar(), MappingsNamespace.MOJANG.toString(), rawMappings).entrySet());
 			}
 
 			Map<String, String> map = new HashMap<>();
 			migratedFields.forEach(entry -> {
 				map.put(entry.getKey().owner + "#" + entry.getKey().field, entry.getValue());
 			});
-			Files.writeString(migratedFieldsCache, new Gson().toJson(map));
+			// 原子发布：缓存位于跨 daemon 共享的 forge 缓存目录（不按项目隔离），旧写法先删除再就地写入，
+			// 读方会看到内容缺失或半截
+			AtomicFiles.publish(migratedFieldsCache, tmp -> Files.writeString(tmp, new Gson().toJson(map)));
 		}
 
 		this.migratedFields.sort(Comparator.comparing(entry -> entry.getKey().owner + "#" + entry.getKey().field));

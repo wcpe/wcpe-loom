@@ -104,9 +104,9 @@ public final class SplitMinecraftProvider extends MinecraftProvider {
 				AtomicFiles.move(tmpClientOnly, minecraftClientOnlyJar);
 				AtomicFiles.move(tmpCommon, minecraftCommonJar);
 			} catch (Exception e) {
-				Files.deleteIfExists(minecraftClientOnlyJar);
-				Files.deleteIfExists(minecraftCommonJar);
-
+				// 失败路径不删除共享产物：两个拆分产物都在跨进程共享的 <userCache>/<mcVersion> 下，
+				// 删掉会破坏其它进程（或其它工作树）正在读的文件，并引发无谓的重建。
+				// 本次未完成的中间结果只存在于临时文件里，由下面的 finally 清理。
 				throw new RuntimeException("Failed to split minecraft", e);
 			} finally {
 				// 原子 move 成功后临时文件已不存在；失败时清理残留

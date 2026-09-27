@@ -181,40 +181,77 @@ public class SrgProvider extends DependencyProvider {
 			return;
 		}
 
-		if (Files.exists(mergedMojangRaw) && Files.exists(mergedMojangTrimmed) && !refreshDeps()) {
+		// 按件判定：只重建缺失（或要求刷新）的那一件，不因一件缺失就删掉另一件已发布的产物
+		final boolean refresh = refreshDeps();
+		final boolean needsRaw = refresh || Files.notExists(mergedMojangRaw);
+		final boolean needsTrimmed = refresh || Files.notExists(mergedMojangTrimmed);
+
+		if (!needsRaw && !needsTrimmed) {
 			return;
 		}
 
 		Stopwatch stopwatch = Stopwatch.createStarted();
 		getProject().getLogger().lifecycle(":merging mappings (InstallerTools, srg + mojmap)");
 
-		Files.deleteIfExists(mergedMojangRaw);
-		Path mojmapTsrg2 = getMojmapTsrg2(getProject(), getExtension());
-		ForgeToolValueSource.exec(getProject(), settings -> {
-			settings.classpath(DependencyDownloader.download(getProject(), LoomVersions.FORGE_INSTALLER_TOOLS.mavenNotation()));
-			settings.getMainClass().set(INSTALLER_TOOLS_MAIN_CLASS);
-			settings.args(
-					"--task",
-					"MERGE_MAPPING",
-					"--left",
-					getSrg().toAbsolutePath().toString(),
-					"--right",
-					mojmapTsrg2.toAbsolutePath().toString(),
-					"--classes",
-					"--output",
-					mergedMojangRaw.toAbsolutePath().toString()
-			);
-		});
+		if (needsRaw) {
+			produceMergedMojangRaw();
+		}
 
+		if (needsTrimmed) {
+			// 从已完整落位的 raw 产物派生：失败最多让 trimmed 缺失，下次只需重建这一件；
+			// 已发布的 raw 不受影响（旧写法在开始前就把它删了，失败会连累读方）
+			produceMergedMojangTrimmed();
+		}
+
+		getProject().getLogger().lifecycle(":merged mappings (InstallerTools, srg + mojmap) in " + stopwatch.stop());
+	}
+
+	/**
+	 * 生产 raw 形态的 merged mojmap tsrg.
+	 *
+	 * <p>InstallerTools 自行创建 {@code --output} 指定的文件，因此先让它写「同目录唯一临时文件」，
+	 * 成功后再原子落位，读方不会看到半截产物，也不再需要先删除既有产物。
+	 */
+	private void produceMergedMojangRaw() throws IOException {
+		Path mojmapTsrg2 = getMojmapTsrg2(getProject(), getExtension());
+		final Path temp = AtomicFiles.tempSibling(mergedMojangRaw);
+
+		try {
+			ForgeToolValueSource.exec(getProject(), settings -> {
+				settings.classpath(DependencyDownloader.download(getProject(), LoomVersions.FORGE_INSTALLER_TOOLS.mavenNotation()));
+				settings.getMainClass().set(INSTALLER_TOOLS_MAIN_CLASS);
+				settings.args(
+						"--task",
+						"MERGE_MAPPING",
+						"--left",
+						getSrg().toAbsolutePath().toString(),
+						"--right",
+						mojmapTsrg2.toAbsolutePath().toString(),
+						"--classes",
+						"--output",
+						temp.toAbsolutePath().toString()
+				);
+			});
+
+			AtomicFiles.move(temp, mergedMojangRaw);
+		} finally {
+			Files.deleteIfExists(temp);
+		}
+	}
+
+	/**
+	 * 从已发布的 raw 产物派生 trimmed 形态并原子发布.
+	 */
+	private void produceMergedMojangTrimmed() throws IOException {
 		MemoryMappingTree tree = new MemoryMappingTree();
 		MappingVisitor visitor = new ArgDroppingVisitor(new FieldDescWrappingVisitor(tree));
 		MappingReader.read(mergedMojangRaw, visitor);
 
-		try (MappingWriter writer = MappingWriter.create(mergedMojangTrimmed, MappingFormat.TSRG_2_FILE)) {
-			tree.accept(writer);
-		}
-
-		getProject().getLogger().lifecycle(":merged mappings (InstallerTools, srg + mojmap) in " + stopwatch.stop());
+		AtomicFiles.publish(mergedMojangTrimmed, temp -> {
+			try (MappingWriter writer = MappingWriter.create(temp, MappingFormat.TSRG_2_FILE)) {
+				tree.accept(writer);
+			}
+		});
 	}
 
 	// A visitor that drop all method args from srg
