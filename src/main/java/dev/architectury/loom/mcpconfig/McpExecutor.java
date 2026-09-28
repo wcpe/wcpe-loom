@@ -250,6 +250,7 @@ public final class McpExecutor extends Service<McpExecutor.Options> {
 			}
 
 			if (getOptions().getManualRefreshDeps().get()) {
+				// MCP 下载器支持显式绕过自身缓存，不向不认识该参数的 Forge 工具透传刷新标志。
 				builder.forceDownload();
 			}
 

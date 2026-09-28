@@ -65,6 +65,7 @@ import net.fabricmc.loom.configuration.providers.minecraft.mapped.IntermediaryMi
 import net.fabricmc.loom.configuration.providers.minecraft.mapped.MojangMappedMinecraftProvider;
 import net.fabricmc.loom.configuration.providers.minecraft.mapped.NamedMinecraftProvider;
 import net.fabricmc.loom.configuration.providers.minecraft.mapped.SrgMinecraftProvider;
+import net.fabricmc.loom.internal.LoomGradleSharedData;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.Lazy;
 import net.fabricmc.loom.util.ModPlatform;
@@ -111,6 +112,7 @@ public abstract class LoomGradleExtensionImpl extends LoomGradleExtensionApiImpl
 	@Inject
 	public LoomGradleExtensionImpl(Project project, LoomFiles files) {
 		super(project, files);
+		LoomGradleSharedData.get(project);
 		this.project = project;
 		// Initiate with newInstance to allow gradle to decorate our extension
 		this.mixinApExtension = project.getObjects().newInstance(MixinExtensionImpl.class, project);

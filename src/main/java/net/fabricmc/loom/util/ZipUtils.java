@@ -84,6 +84,9 @@ public class ZipUtils {
 	}
 
 	public static void unpackAll(Path zip, Path output) throws IOException {
+		Files.createDirectories(output);
+		final Path outputRoot = output.toAbsolutePath().normalize();
+
 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(zip);
 				Stream<Path> walk = Files.walk(fs.getRoot())) {
 			Iterator<Path> iterator = walk.iterator();
@@ -91,12 +94,32 @@ public class ZipUtils {
 			while (iterator.hasNext()) {
 				Path fsPath = iterator.next();
 				if (!Files.isRegularFile(fsPath)) continue;
-				Path dstPath = output.resolve(fs.getRoot().relativize(fsPath).toString());
-				Path dstPathParent = dstPath.getParent();
-				if (dstPathParent != null) Files.createDirectories(dstPathParent);
+				Path relative = fs.getRoot().relativize(fsPath);
+				Path dstPath = resolveSafeExtractionPath(outputRoot, relative);
 				Files.copy(fsPath, dstPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
 			}
 		}
+	}
+
+	private static Path resolveSafeExtractionPath(Path outputRoot, Path relative) throws IOException {
+		final Path realRoot = outputRoot.toRealPath();
+		final Path destination = realRoot.resolve(relative.toString()).normalize();
+
+		if (!destination.startsWith(realRoot)) {
+			throw new IOException("Archive entry escapes extraction directory: " + relative);
+		}
+
+		final Path parent = destination.getParent();
+
+		if (parent != null) {
+			Files.createDirectories(parent);
+
+			if (!parent.toRealPath().startsWith(realRoot)) {
+				throw new IOException("Archive entry uses a symbolic link outside extraction directory: " + relative);
+			}
+		}
+
+		return destination;
 	}
 
 	public static byte @Nullable [] unpackNullable(Path zip, String path) throws IOException {

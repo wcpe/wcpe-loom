@@ -44,10 +44,10 @@ import org.gradle.api.file.FileCollection;
 
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.api.processor.SpecContext;
+import net.fabricmc.loom.internal.LoomProjectData;
 import net.fabricmc.loom.util.AsyncCache;
 import net.fabricmc.loom.util.fmj.FabricModJson;
 import net.fabricmc.loom.util.fmj.FabricModJsonFactory;
-import net.fabricmc.loom.util.fmj.FabricModJsonHelpers;
 
 public record DeobfSpecContext(List<FabricModJson> modDependencies,
 								List<FabricModJson> localMods,
@@ -106,8 +106,8 @@ public record DeobfSpecContext(List<FabricModJson> modDependencies,
 
 		// Add project dependencies
 		if (!projectView.disableProjectDependantMods()) {
-			for (Project dependentProject : SpecContext.getDependentProjects(projectView).toList()) {
-				allMods.addAll(fmjCache.getBlocking(dependentProject.getPath(), () -> FabricModJsonHelpers.getModsInProject(dependentProject)));
+			for (LoomProjectData dependentProject : SpecContext.getDependentProjectData(projectView).toList()) {
+				allMods.addAll(fmjCache.getBlocking(dependentProject.projectPath(), dependentProject::createMods));
 			}
 		}
 
@@ -141,8 +141,8 @@ public record DeobfSpecContext(List<FabricModJson> modDependencies,
 
 		if (!projectView.disableProjectDependantMods()) {
 			// Add all the dependent projects
-			for (Project dependentProject : SpecContext.getDependentProjects(projectView).toList()) {
-				futures.add(fmjCache.get(dependentProject.getPath(), () -> FabricModJsonHelpers.getModsInProject(dependentProject)));
+			for (LoomProjectData dependentProject : SpecContext.getDependentProjectData(projectView).toList()) {
+				futures.add(fmjCache.get(dependentProject.projectPath(), dependentProject::createMods));
 			}
 		}
 
@@ -190,8 +190,8 @@ public record DeobfSpecContext(List<FabricModJson> modDependencies,
 	private static List<FabricModJson> getCompileRuntimeProjectMods(DeobfProjectView projectView, AsyncCache<List<FabricModJson>> fmjCache) {
 		var mods = new ArrayList<FabricModJson>();
 
-		for (Project dependentProject : getCompileRuntimeProjectDependencies(projectView).toList()) {
-			List<FabricModJson> projectMods = fmjCache.getBlocking(dependentProject.getPath(), () -> FabricModJsonHelpers.getModsInProject(dependentProject));
+		for (LoomProjectData dependentProject : getCompileRuntimeProjectDependencies(projectView).toList()) {
+			List<FabricModJson> projectMods = fmjCache.getBlocking(dependentProject.projectPath(), dependentProject::createMods);
 
 			mods.addAll(projectMods);
 		}
@@ -200,13 +200,13 @@ public record DeobfSpecContext(List<FabricModJson> modDependencies,
 	}
 
 	// Returns a list of Loom Projects found in both the runtime and compile classpath
-	private static Stream<Project> getCompileRuntimeProjectDependencies(DeobfProjectView projectView) {
+	private static Stream<LoomProjectData> getCompileRuntimeProjectDependencies(DeobfProjectView projectView) {
 		if (projectView.disableProjectDependantMods()) {
 			return Stream.empty();
 		}
 
-		final Stream<Project> runtimeProjects = projectView.getProjectDependencies(DebofConfiguration.RUNTIME);
-		final List<Project> compileProjects = projectView.getProjectDependencies(DebofConfiguration.COMPILE).toList();
+		final Stream<LoomProjectData> runtimeProjects = projectView.getProjectDependencies(DebofConfiguration.RUNTIME);
+		final List<LoomProjectData> compileProjects = projectView.getProjectDependencies(DebofConfiguration.COMPILE).toList();
 
 		return runtimeProjects
 				.filter(compileProjects::contains); // Use the intersection of the two configurations.

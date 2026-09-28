@@ -42,4 +42,28 @@ class AsyncCacheTest extends Specification {
 		def e = thrown(RuntimeException)
 		e.message == "Test exception"
 	}
+
+	def "retries after failed future"() {
+		given:
+		def cache = new AsyncCache()
+		def attempts = 0
+
+		when:
+		cache.getBlocking("testKey") {
+			attempts++
+			throw new RuntimeException("first failure")
+		}
+		then:
+		thrown(RuntimeException)
+
+		when:
+		def result = cache.getBlocking("testKey") {
+			attempts++
+			"success"
+		}
+
+		then:
+		result == "success"
+		attempts == 2
+	}
 }
