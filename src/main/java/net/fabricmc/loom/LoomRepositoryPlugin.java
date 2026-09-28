@@ -36,6 +36,7 @@ import org.gradle.api.initialization.Settings;
 import org.gradle.api.invocation.Gradle;
 import org.gradle.api.plugins.ExtensionAware;
 import org.gradle.api.plugins.PluginAware;
+import org.gradle.api.plugins.PluginContainer;
 
 import net.fabricmc.loom.configuration.providers.minecraft.library.processors.LWJGL2UpgradeLibraryProcessor;
 import net.fabricmc.loom.extension.LoomFiles;
@@ -43,6 +44,10 @@ import net.fabricmc.loom.internal.LoomGradleSharedData;
 import net.fabricmc.loom.util.MirrorUtil;
 
 public class LoomRepositoryPlugin implements Plugin<PluginAware> {
+	/** 本 fork 的插件 id. */
+	public static final String NAME = "top.wcpe.loom-repositories";
+	/** 上一层分叉（architectury）的插件 id，作为兼容别名保留. */
+	public static final String LEGACY_NAME = "dev.architectury.loom-repositories";
 	private static final List<String> FORGE_GROUPS = List.of(
 			"net.minecraftforge",
 			"cpw.mods",
@@ -50,6 +55,24 @@ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
 			"net.jodah",
 			"org.mcmodlauncher"
 	);
+
+	/**
+	 * 构建是否已由 settings 侧声明过仓库.
+	 *
+	 * <p>判据必须与 classloader 无关：当 Loom 被两个 classloader 各加载一份时
+	 * （settings 与 project classpath 各一份、buildSrc/约定插件与 plugins 块各一份、复合构建），
+	 * {@code hasPlugin(LoomRepositoryPlugin.class)} 走的是类型身份比较，对本 classloader 而言恒判 false，
+	 * marker 静默失效，项目侧会重复声明整套仓库并二次重排（不报错，只是静默地做了两遍）。
+	 * 插件 id 是字符串，Gradle 在注册表内部按「注册者那一侧的 class」比对，天然跨 classloader 一致，
+	 * 与 {@link LoomGradlePlugin#isApplied(PluginAware)} 同理。
+	 *
+	 * @param gradle 目标构建
+	 * @return 构建上是否已有 Loom 的仓库声明 marker
+	 */
+	public static boolean isRepositoriesDeclared(Gradle gradle) {
+		PluginContainer plugins = gradle.getPlugins();
+		return plugins.hasPlugin(NAME) || plugins.hasPlugin(LEGACY_NAME);
+	}
 
 	@Override
 	public void apply(PluginAware target) {
@@ -61,13 +84,12 @@ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
 			settings.getGradle().getPluginManager().apply(LoomRepositoryPlugin.class);
 		} else if (target instanceof Project project) {
 			LoomGradleSharedData.beforeProject(project.getGradle());
+			LoomGradleSharedData.beforeProject(project, LoomGradleSharedData.get(project));
 
-			if (project.getGradle().getPlugins().hasPlugin(LoomRepositoryPlugin.class)) {
-				LoomGradleSharedData.beforeProject(project, LoomGradleSharedData.get(project));
+			if (isRepositoriesDeclared(project.getGradle())) {
 				return;
 			}
 
-			LoomGradleSharedData.beforeProject(project, LoomGradleSharedData.get(project));
 			declareRepositories(project.getRepositories(), LoomFiles.create(project), project);
 		} else if (target instanceof Gradle) {
 			return;

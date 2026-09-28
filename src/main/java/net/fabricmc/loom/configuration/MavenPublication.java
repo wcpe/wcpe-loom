@@ -57,7 +57,9 @@ public abstract class MavenPublication implements Runnable {
 			JavaPlugin.API_ELEMENTS_CONFIGURATION_NAME, "compile",
 			JavaPlugin.RUNTIME_ELEMENTS_CONFIGURATION_NAME, "runtime"
 	);
-	private static final Set<Publication> EXCLUDED_PUBLICATIONS = Collections.newSetFromMap(new WeakHashMap<>());
+	// 静态集合会在「每个项目的 setup job（contains）」与「用户调用 excludePublication（add）」之间跨项目并发访问，
+	// 而 WeakHashMap 本身无同步，故加同步；弱引用语义保留 —— 构建结束后条目可回收，daemon 复用不会钉住 publication.
+	private static final Set<Publication> EXCLUDED_PUBLICATIONS = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
 
 	@Inject
 	protected abstract Project getProject();
