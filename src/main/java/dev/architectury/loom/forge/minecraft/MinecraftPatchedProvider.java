@@ -639,7 +639,9 @@ public class MinecraftPatchedProvider {
 		Stopwatch stopwatch = Stopwatch.createStarted();
 
 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jarFile, false)) {
-			ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter();
+			// best-effort：这里逐类修补注解，单个类解析/写入失败只应该让该类保持原样，
+			// 而不应该让整个 patched jar 流程在「已经改了一半」的状态下失败。
+			ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter().tolerateFailures();
 
 			for (Path file : (Iterable<? extends Path>) Files.walk(fs.getPath("/"))::iterator) {
 				if (!file.toString().endsWith(".class")) continue;
@@ -662,7 +664,7 @@ public class MinecraftPatchedProvider {
 				});
 			}
 
-			completer.complete();
+			completer.completeToleratingFailures("parameter annotation fixes in " + jarFile.toAbsolutePath());
 		}
 
 		logger.info(":fixed parameter annotations for " + jarFile.toAbsolutePath() + " in " + stopwatch.stop());
@@ -673,7 +675,8 @@ public class MinecraftPatchedProvider {
 		Stopwatch stopwatch = Stopwatch.createStarted();
 
 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jarFile, false)) {
-			ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter();
+			// best-effort：与 fixParameterAnnotation 同理，逐类改名，单类失败不应该让整个 jar 流程失败。
+			ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter().tolerateFailures();
 			Pattern vignetteParameters = Pattern.compile("p_[0-9a-zA-Z]+_(?:[0-9a-zA-Z]+_)?");
 
 			for (Path file : (Iterable<? extends Path>) Files.walk(fs.getPath("/"))::iterator) {
@@ -716,7 +719,7 @@ public class MinecraftPatchedProvider {
 				});
 			}
 
-			completer.complete();
+			completer.completeToleratingFailures("parameter name removals in " + jarFile.toAbsolutePath());
 		}
 
 		logger.info(":deleted parameter names for " + jarFile.toAbsolutePath() + " in " + stopwatch.stop());

@@ -166,6 +166,9 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
 
 	private static Map<FieldMember, String> generateNewFieldMigration(Path patchedJar, String patchedJarNamespace, Path mappingsPath) throws IOException {
 		Map<FieldMember, String> fieldDescriptorMap = new ConcurrentHashMap<>();
+		// 这里刻意保持「失败即致命」：扫描结果会被写成 migrated-fields.json 并用于改写映射本身，
+		// 任何一个类读不出来都意味着它的字段描述符不会被迁移，而错误结果还会被缓存下来。
+		// 也就是说这类失败会让产物静默出错，而不是像源码包那样只少一个无关文件。
 		ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter();
 
 		class Visitor extends ClassVisitor {

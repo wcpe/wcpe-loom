@@ -138,7 +138,9 @@ record DownloadSourcesHook(Project project, Task task) {
 
 				break;
 			} catch (IOException e) {
-				// Ignore
+				// 这里失败会让 ijDownloadSources 任务照常成功却什么都不做（不会挂上任何 genSources 任务），
+				// 因此必须留下默认可见的日志，不能像以前那样静默吞掉。
+				LOGGER.warn("Failed to read IDEA init script {}, no genSources task will be hooked up", initScript, e);
 			}
 		}
 	}

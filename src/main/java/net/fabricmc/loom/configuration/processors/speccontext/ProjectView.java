@@ -25,7 +25,6 @@
 package net.fabricmc.loom.configuration.processors.speccontext;
 
 import java.util.List;
-import java.util.Objects;
 import java.util.stream.Stream;
 
 import org.gradle.api.Project;
@@ -42,10 +41,26 @@ import net.fabricmc.loom.util.gradle.GradleUtils;
 
 // Used to abstract out the Gradle API usage to ease unit testing.
 public interface ProjectView {
-	// 返回指定配置中的 Loom 项目数据
+	/**
+	 * 返回指定配置中依赖项目的跨项目数据.
+	 *
+	 * @param name 配置名（通常是 {@code runtimeClasspath} / {@code compileClasspath}）
+	 * @return 依赖项目的数据流；不是 Loom 项目的依赖不会出现在其中
+	 */
 	Stream<LoomProjectData> getLoomProjectDataDependencies(String name);
 
-	// 保留旧接口以兼容测试替身，但隔离模式不再返回跨项目 Project 对象
+	/**
+	 * 旧的跨项目 {@link Project} 视图，现恒为空.
+	 *
+	 * <p>隔离模式不允许触碰其它项目的模型，这个方法已经没有任何实现会返回非空值；
+	 * 调用它只会静默拿到空集合。需要依赖项目的信息请改用
+	 * {@link #getLoomProjectDataDependencies(String)} 与 {@code LoomProjectData}。
+	 *
+	 * @param name 配置名
+	 * @return 恒为空流
+	 * @deprecated 已无生产实现，改用 {@link #getLoomProjectDataDependencies(String)}
+	 */
+	@Deprecated
 	default Stream<Project> getLoomProjectDependencies(String name) {
 		return Stream.empty();
 	}
@@ -87,8 +102,9 @@ public interface ProjectView {
 			return configuration.getAllDependencies()
 					.withType(ProjectDependency.class)
 					.stream()
-					.map(dependency -> LoomProjectData.fromDependency(project, dependency))
-					.filter(Objects::nonNull);
+					// 不是 Loom 项目时 fromDependency 返回空；数据文件存在却读不出来时会抛异常，
+					// 不再像以前那样被 filter 静默丢掉（那会让依赖方的 mod/mixin 映射悄悄消失）。
+					.flatMap(dependency -> LoomProjectData.fromDependency(project, dependency).stream());
 		}
 
 		@Override

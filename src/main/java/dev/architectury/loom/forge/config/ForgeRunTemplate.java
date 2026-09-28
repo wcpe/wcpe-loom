@@ -109,7 +109,10 @@ public record ForgeRunTemplate(
 
 	public void applyTo(RunConfiguration settings, ConfigValue.Resolver configValueResolver) {
 		settings.getMainClass().convention(main);
-		settings.getProgramArguments().addAll(CollectionUtil.map(args, value -> value.resolve(configValueResolver)));
+		// 这里刻意不把 args 写进 programArguments：同一批 args 已经由 GenerateDLIConfigTask 写进
+		// dev-launcher-config.json 的 commonArgs/<env>Args，而 DLI（fabric.dli.main 的入口）在启动时会把
+		// 配置里的 args 插到命令行 args 之前一起传给真实主类——两处都写就会把同一组参数传两遍。
+		// 因此 Forge 运行参数只有 DLI 配置这一个来源，这里保持不动。
 		settings.getJvmArguments().addAll(CollectionUtil.map(jvmArgs, value -> value.resolve(configValueResolver)));
 
 		env.forEach((key, value) -> {
