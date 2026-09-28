@@ -19,3 +19,10 @@ dependencies {
 	// Loom 的跨项目数据链路（ProjectView.getLoomProjectDataDependencies）根本不会被触发。
 	implementation project(":lib")
 }
+
+// 配置顺序探针（ProjectDataColdStartTest 断言用）：build 脚本自己的 afterEvaluate 注册晚于
+// Loom 插件注册的那一个，而 Loom 正是在自己的 afterEvaluate 里读取依赖项目数据的，
+// 因此这条日志出现时，本次构建对 :lib 数据的读取已经结束。
+afterEvaluate {
+	logger.lifecycle("coldstart-probe app-config-finished")
+}

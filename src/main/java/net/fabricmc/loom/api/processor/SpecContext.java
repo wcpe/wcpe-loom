@@ -82,6 +82,21 @@ public interface SpecContext {
 	 * <p>去重依赖 {@link LoomProjectData#equals(Object)} 按项目路径判等：同一项目经内存共享表与
 	 * 导出文件两条路径可能得到两个实例，只有路径判等才能把它们视作同一个项目。
 	 *
+	 * <p>这些数据会参与 jar processor spec 的 {@code hashCode}，从而决定 processed jar 的路径与共享
+	 * 缓存命中，所以「配置期拿到哪些依赖项目的数据」必须是确定的：
+	 *
+	 * <ul>
+	 *     <li><b>非隔离模式</b>：读取前会强制每个依赖项目先完成求值
+	 *         （见 {@link ProjectView#getLoomProjectDataDependencies(String)}），依赖项目在
+	 *         {@code afterEvaluate} 里登记的数据因此必定先于本次读取，结果与配置顺序、{@code --parallel}
+	 *         无关；
+	 *     <li><b>隔离模式（Isolated Projects）</b>：Gradle 禁止跨项目求值，上面的保证无法兑现，
+	 *         依赖项目的数据是否可得取决于它是否恰好已被配置完，Loom 只能对确实缺失的情况输出一条
+	 *         按（项目，依赖）去重的告警，无法让结果变确定；
+	 *     <li>彻底消除这种不确定性需要把 mapped/processed jar 的产出从配置期搬进任务，属于架构级改动，
+	 *         不在当前版本范围内。
+	 * </ul>
+	 *
 	 * @param projectView 当前项目的视图
 	 * @return 依赖项目的数据流
 	 */
