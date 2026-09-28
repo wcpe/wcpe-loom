@@ -1,0 +1,7 @@
+rootProject.name = "project-data-cold-start"
+
+// 顺序即配置顺序：消费方 :app 必须排在生产者 :lib 之前。
+// 这样冷启动时 :app 会先进入 afterEvaluate，Loom 的内存共享表（LoomGradleSharedData）里
+// 还没有 :lib，只能回退去读 :lib 导出的 build/loom/project-data.json。
+include "app"
+include "lib"
