@@ -74,8 +74,14 @@ class LoomProjectDataTest extends Specification {
 		expect:
 		fromSharedTable == fromExportedFile
 		fromSharedTable.hashCode() == fromExportedFile.hashCode()
-		[fromSharedTable, fromExportedFile].toSet().size() == 1
-		[fromSharedTable, fromExportedFile].stream().distinct().count() == 1
+		[
+			fromSharedTable,
+			fromExportedFile
+		].toSet().size() == 1
+		[
+			fromSharedTable,
+			fromExportedFile
+		].stream().distinct().count() == 1
 
 		and:
 		fromSharedTable != new LoomProjectData(':other', [modData], 'mappings', 'named', false, [])
