@@ -26,7 +26,6 @@ package net.fabricmc.loom.configuration.providers.minecraft;
 
 import java.io.File;
 import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Objects;
@@ -37,6 +36,7 @@ import org.slf4j.LoggerFactory;
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.ConfigContext;
 import net.fabricmc.loom.util.cache.AtomicFiles;
+import net.fabricmc.loom.util.cache.JarReusability;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
 
 public class MergedMinecraftProvider extends MinecraftProvider {
@@ -75,14 +75,16 @@ public class MergedMinecraftProvider extends MinecraftProvider {
 			throw new UnsupportedOperationException("This version does not provide both the client and server jars - please select the client-only or server-only jar configuration!");
 		}
 
-		// 无锁快路径：merged jar 已就绪且未要求刷新时不获取文件锁
-		if (!Files.exists(minecraftMergedJar) || getExtension().refreshDeps()) {
+		// 无锁快路径：merged jar 已就绪（内容级判据，见 JarReusability.isReusable）且未要求刷新时不获取文件锁。
+		// 不能只判存在：该产物落在跨 daemon／跨工作树共享的 <userCache>/<mcVersion> 下，被中断就地写会留下
+		// 0 字节或截断的 merged jar，PR #8 移除「残留锁 → 全量重建」兜底后，存在性判定会把它永久复用。
+		if (!JarReusability.isReusable(minecraftMergedJar) || getExtension().refreshDeps()) {
 			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
 			final Path lockRoot = getExtension().getFiles().getCacheLocks().toPath();
 
 			cacheService.runExclusive(lockRoot, cacheKey(), LoomCacheService.defaultTimeout(), () -> {
 				// 锁内二次确认：可能已被他人在等锁期间合并完成
-				if (!Files.exists(minecraftMergedJar) || getExtension().refreshDeps()) {
+				if (!JarReusability.isReusable(minecraftMergedJar) || getExtension().refreshDeps()) {
 					try {
 						mergeJars();
 					} catch (Throwable e) {

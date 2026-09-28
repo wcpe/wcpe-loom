@@ -465,7 +465,10 @@ public class ForgeUserdevProvider extends DependencyProvider {
 			repo.setUrl(sourceRepo);
 		});
 
-		if (!sourcesMaven.exists(null)) {
+		// 就绪判据为内容级：该产物是带 sources classifier 的 maven 构件（见 getNotation），仓库位于全局
+		// forge 缓存，跨 daemon／跨 loom 版本共享；只判存在会让旧版本 loom 就地写留下的 0 字节或截断 jar
+		// 被当作已就绪，Gradle 解析该坐标后 IDE／反编译读到空源码。
+		if (!sourcesMaven.isReusable(null)) {
 			try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(userdevJarPath)) {
 				sourcesMaven.copyToMaven(fs.getPath(LEGACY_SOURCES_FILE), null);
 			}

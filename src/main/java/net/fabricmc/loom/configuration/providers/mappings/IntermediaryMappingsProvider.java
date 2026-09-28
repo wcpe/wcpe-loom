@@ -65,7 +65,12 @@ public abstract class IntermediaryMappingsProvider extends IntermediateMappingsP
 
 	@Override
 	public void provide(Path tinyMappings, @Nullable Project project) throws IOException {
-		if (Files.exists(tinyMappings) && !getRefreshDeps().get()) {
+		// 无锁快路径：产物位于共享缓存目录（<userCache>/<mcVersion>/<name>.tiny），已就绪且未要求刷新时直接返回。
+		// 就绪判据与 GeneratedIntermediateMappingsProvider 同族——内容级（存在且非空），不能只判存在：
+		// 该产物跨 daemon／跨 loom 版本共享，旧版本 loom 的就地重建被中断会留下 0 字节残骸，
+		// PR #8 移除「残留锁 → 全量重建」这条兜底后，纯存在性判定会把它永久复用，
+		// 下游 MappingReader 由此读到空映射，属于静默的错误映射。
+		if (MappingConfiguration.isReusableMappingsText(tinyMappings) && !getRefreshDeps().get()) {
 			return;
 		}
 

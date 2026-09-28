@@ -60,13 +60,15 @@ public final class SplitModDependency extends ModDependency {
 
 	@Override
 	public boolean isCacheInvalid(Project project, @Nullable String variant) {
-		boolean exists = switch (target) {
-		case COMMON_ONLY -> getCommonMaven().exists(variant);
-		case CLIENT_ONLY -> getClientMaven().exists(variant);
-		case SPLIT -> getCommonMaven().exists(variant) && getClientMaven().exists(variant);
+		// 与 SimpleModDependency 同一口径：exists 只判存在，被中断留下的 0 字节残骸会被永久复用。
+		// isReusable 在其上追加「可打开且非空」校验。
+		boolean usable = switch (target) {
+		case COMMON_ONLY -> getCommonMaven().isReusable(variant);
+		case CLIENT_ONLY -> getClientMaven().isReusable(variant);
+		case SPLIT -> getCommonMaven().isReusable(variant) && getClientMaven().isReusable(variant);
 		};
 
-		return !exists;
+		return !usable;
 	}
 
 	@Override

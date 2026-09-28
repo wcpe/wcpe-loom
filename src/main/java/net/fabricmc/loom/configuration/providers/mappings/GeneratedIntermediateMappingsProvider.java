@@ -58,8 +58,10 @@ public abstract class GeneratedIntermediateMappingsProvider extends Intermediate
 	public void provide(Path tinyMappings) throws IOException {
 		final boolean refresh = minecraftProvider.refreshDeps();
 
-		// 无锁快路径：产物位于共享缓存目录（<userCache>/<mcVersion>/<name>.tiny），已在位且未要求刷新时直接返回
-		if (Files.exists(tinyMappings) && !refresh) {
+		// 无锁快路径：产物位于共享缓存目录（<userCache>/<mcVersion>/<name>.tiny），已就绪且未要求刷新时直接返回。
+		// 就绪判据为内容级（存在且非空），不能只判存在：被中断的就地写会留下 0 字节残骸，
+		// PR #8 移除「残留锁 → 全量重建」这条兜底后，存在性判定会把它永久复用。
+		if (isReusableTiny(tinyMappings) && !refresh) {
 			return;
 		}
 
@@ -80,7 +82,7 @@ public abstract class GeneratedIntermediateMappingsProvider extends Intermediate
 				//   我们要的那次重建就已经发生，再生成一遍只是白等一次分钟级的合并 + stitch。
 				// 注意不能用 refresh 直接短路本判据：否则等锁期间别人刚生成好的同一份产物会被再生成一遍。
 				if (!refresh) {
-					if (Files.exists(tinyMappings)) {
+					if (isReusableTiny(tinyMappings)) {
 						return null;
 					}
 				} else if (wasRepublishedWhileWaiting(stampBeforeLock, tinyMappings)) {
@@ -143,6 +145,31 @@ public abstract class GeneratedIntermediateMappingsProvider extends Intermediate
 		}
 
 		LOGGER.info(":generated dummy intermediary in " + stopwatch.stop());
+	}
+
+	/**
+	 * {@return 该 intermediary 产物是否可作为输入复用}.
+	 *
+	 * <p>这是 {@code .tiny} 文本产物而非 jar，故不适用 {@link net.fabricmc.loom.util.cache.JarReusability#isReusable(Path)}
+	 * 的 zip 口径（拿文本去开 zipfs 必然失败，会把正常产物永久判为不可用）。等价的内容判据取「存在且非空」：
+	 *
+	 * <ul>
+	 *     <li>正常产物恒非空——它由 {@code generate} 经 tiny v2 writer 写出，至少含映射头，故这条不会引起
+	 *     「每次构建都重建」；</li>
+	 *     <li>能拦下「先删后写」被中断、或旧版本 loom 就地重建时留下的 0 字节残骸——这正是实测中出现过的形态，
+	 *     而 0 字节产物会让下游 {@code MappingReader} 读到空映射，属于静默的错误映射。</li>
+	 * </ul>
+	 *
+	 * <p>刻意不做逐行解析等更严的校验：该判定位于每次构建的无锁快路径上，全量解析一份 stitch 产物是秒级开销，
+	 * 收益却只覆盖「截断到非 0 长度」这一小类残骸。
+	 */
+	private static boolean isReusableTiny(Path tinyMappings) {
+		try {
+			return Files.size(tinyMappings) > 0;
+		} catch (IOException e) {
+			// 不存在（NoSuchFileException）或读不到元数据：按不可复用处理，交由调用方重新生成
+			return false;
+		}
 	}
 
 	/**

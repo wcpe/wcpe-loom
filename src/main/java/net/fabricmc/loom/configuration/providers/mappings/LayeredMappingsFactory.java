@@ -54,6 +54,7 @@ import net.fabricmc.loom.configuration.providers.mappings.utils.AddConstructorMa
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.ZipUtils;
 import net.fabricmc.loom.util.cache.AtomicFiles;
+import net.fabricmc.loom.util.cache.JarReusability;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.mappingio.adapter.MappingDstNsReorder;
 import net.fabricmc.mappingio.adapter.MappingSourceNsSwitch;
@@ -87,12 +88,14 @@ public record LayeredMappingsFactory(LayeredMappingSpec spec) {
 		final LocalMavenHelper maven = new LocalMavenHelper(GROUP, MODULE, mappingVersion, null, mavenRepoDir);
 		final boolean refresh = configContext.extension().refreshDeps();
 
-		// 无锁快路径（关键）：全局仓库已存在该 layered mapping 产物且未要求刷新时，直接返回——
+		// 无锁快路径（关键）：全局仓库已存在可复用的 layered mapping 产物且未要求刷新时，直接返回——
 		// 既不取跨进程锁，也不重写全局产物。
 		// layered mapping 产物按内容寻址（版本号含 hash），一旦存在即不会变化；
 		// 这是暖缓存下多 daemon 并发构建同一版本时「明明只是读取，却互相抢 layered-mappings 锁、
 		// 且不断把 mappings jar 重写进全局仓库、导致另一 daemon 的依赖解析冲突」的根因，必须在锁外短路。
-		if (!refresh && maven.exists(null)) {
+		// 就绪判据用 isReusable 而非 exists：该产物位于跨 daemon／跨 loom 版本共享的全局 maven 仓库，
+		// 被中断的就地写会留下 0 字节或截断的 jar，存在性判定会把残骸当成暖缓存直接喂给依赖解析。
+		if (!refresh && maven.isReusable(null)) {
 			return;
 		}
 
@@ -103,7 +106,7 @@ public record LayeredMappingsFactory(LayeredMappingSpec spec) {
 		// 避免多个 daemon 同时首次产出同一 layered mapping spec 时互相踩踏。
 		cacheService.runExclusive(lockRoot, "layered-mappings:" + mappingVersion, LoomCacheService.defaultTimeout(), () -> {
 			// 锁内二次确认：等锁期间可能已被其它进程产出，避免重复写
-			if (!refresh && maven.exists(null)) {
+			if (!refresh && maven.isReusable(null)) {
 				return null;
 			}
 
@@ -120,7 +123,10 @@ public record LayeredMappingsFactory(LayeredMappingSpec spec) {
 		final Path mappingsDir = mappingContext.minecraftProvider().dir("layered").toPath();
 		final Path mappingsZip = mappingsDir.resolve(String.format("%s.%s-%s.jar", GROUP, MODULE, mappingVersion));
 
-		if (Files.exists(mappingsZip) && !mappingContext.refreshDeps()) {
+		// 无锁快路径：产物已在位且未要求刷新时直接复用。
+		// 这是本次拼装多个条目的 jar，同样位于跨进程共享的目录下，故判据用内容级而非存在性：
+		// 上一次失败若留下 0 字节或截断的 jar，只判存在会让它被永久当成有效产物。
+		if (JarReusability.isReusable(mappingsZip) && !mappingContext.refreshDeps()) {
 			return mappingsZip;
 		}
 
