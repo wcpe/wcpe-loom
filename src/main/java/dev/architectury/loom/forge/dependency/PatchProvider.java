@@ -101,15 +101,45 @@ public class PatchProvider extends DependencyProvider {
 		return serverPatches;
 	}
 
+	/**
+	 * {@return 该补丁产物是否可作为输入复用}.
+	 *
+	 * <p>补丁是 LZMA 压缩流，既不是 zip 也不是文本，故两类既有口径都不适用：拿它去开 zipfs 必然失败
+	 * （会把正常产物永久判为不可用），而按文本判据同样只是「存在且非空」的等价说法。这里的判据取「存在且非空」：
+	 *
+	 * <ul>
+	 *     <li>正常产物恒非空——{@link #extractPatches} 落位 installer jar 内的 {@code data/client.lzma}
+	 *     （或 {@code data/server.lzma}）原始字节，{@link #extractLegacyPatches} 则写出由 pack200 解包结果
+	 *     再次压缩的补丁流，两者都必然多于 0 字节，故这条不会把正常产物拖进「每次构建都重建」；</li>
+	 *     <li>能拦下旧版本 loom 以最终路径为输出就地写、或在提取中途被中断留下的 0 字节残骸：这些文件位于
+	 *     跨 daemon 共享的 forge 缓存目录，被复用后 LZMA 解码阶段才炸开（或更糟：被当成「已提取」而让构建
+	 *     整个跳过提取步骤）。</li>
+	 * </ul>
+	 *
+	 * <p>刻意不做解压校验：补丁体积接近百 MB，每次暖构建都完整解压一遍的开销远超收益；而「截断到非 0 长度」
+	 * 的残骸在 LZMA 解码时会抛 {@link IOException}，属于显式失败，不会静默产出错误的打补丁结果。
+	 */
+	private static boolean isReusablePatches(Path patches) {
+		try {
+			return Files.size(patches) > 0;
+		} catch (IOException e) {
+			// 不存在（NoSuchFileException）或读不到元数据：按不可复用处理，交由调用方重新提取
+			return false;
+		}
+	}
+
 	private void extractPatches(Path targetPath, String name) {
-		if (Files.exists(targetPath) && !refreshDeps()) {
+		// 就绪判据为内容级（见 isReusablePatches）：这些产物位于跨 daemon 共享的 forge 缓存目录，
+		// 只判存在会让 0 字节残骸被当作「已提取」而永久复用
+		if (isReusablePatches(targetPath) && !refreshDeps()) {
 			// No need to extract
 			return;
 		}
 
 		withPatchLock(() -> {
-			// 锁内二次确认：等锁期间可能已被其它进程提取完成
-			if (Files.exists(targetPath) && !refreshDeps()) {
+			// 锁内二次确认：等锁期间可能已被其它进程提取完成（判据与外层快路径一致，
+			// 否则残骸会被锁内判为「已产出」而直接返回，快路径每轮进锁却永远修不好它）
+			if (isReusablePatches(targetPath) && !refreshDeps()) {
 				return null;
 			}
 
@@ -155,14 +185,17 @@ public class PatchProvider extends DependencyProvider {
 	}
 
 	private void extractLegacyPatches(Path clientPatches, Path serverPatches) throws IOException {
-		if (Files.exists(clientPatches) && Files.exists(serverPatches) && !refreshDeps()) {
+		// 就绪判据为内容级（见 isReusablePatches）：两件产物缺一不可，且各自都必须非空。
+		// 这两件产物由同一次提取成对写出（见本方法内的原子落位），任何一件为 0 字节都说明这一对没写完。
+		if (isReusablePatches(clientPatches) && isReusablePatches(serverPatches) && !refreshDeps()) {
 			// No need to extract
 			return;
 		}
 
 		withPatchLock(() -> {
-			// 锁内二次确认：等锁期间可能已被其它进程提取完成
-			if (Files.exists(clientPatches) && Files.exists(serverPatches) && !refreshDeps()) {
+			// 锁内二次确认：等锁期间可能已被其它进程提取完成（判据与外层快路径一致，
+			// 否则残骸会被锁内判为「已产出」而直接返回，快路径每轮进锁却永远修不好它）
+			if (isReusablePatches(clientPatches) && isReusablePatches(serverPatches) && !refreshDeps()) {
 				return null;
 			}
 

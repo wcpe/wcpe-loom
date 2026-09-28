@@ -217,10 +217,14 @@ public class ForgeLibrariesProvider {
 		final Path outputJar = mavenHelper.getOutputFile(null);
 
 		// Modify jar.
-		if (!mavenHelper.exists(null) || extension.refreshDeps()) {
+		// 就绪判据为内容级：LocalMavenHelper.isReusable(null) 在「jar 与 pom 都存在」之上追加 jar 的内容校验
+		// （见 JarReusability.isReusable）。该仓库跨 daemon／跨 loom 版本共享，旧版本 loom 以最终路径为输出
+		// 就地写，被中断会留下 0 字节或截断的 jar；只判存在会让这类残骸被当成暖缓存，
+		// 作为 Gradle 依赖进入编译链，形成「标记是新的、内容是坏的」的静默损坏。
+		if (!mavenHelper.isReusable(null) || extension.refreshDeps()) {
 			withForgeDependencyLock(project, mavenHelper, () -> {
-				// 锁内二次确认：等锁期间其它进程可能已完成生产（jar 与 pom 一并就绪才算完成）
-				if (mavenHelper.exists(null) && !extension.refreshDeps()) {
+				// 锁内二次确认：等锁期间其它进程可能已完成生产（jar 与 pom 一并就绪且 jar 内容可复用才算完成）
+				if (mavenHelper.isReusable(null) && !extension.refreshDeps()) {
 					return null;
 				}
 
@@ -300,10 +304,13 @@ public class ForgeLibrariesProvider {
 		final Path outputJar = mavenHelper.getOutputFile(null);
 
 		// Modify jar.
-		if (!mavenHelper.exists(null) || extension.refreshDeps()) {
+		// 就绪判据为内容级，与上面 remapFmlLoader 用的是同一把尺子：同一个 LocalMavenHelper、同一种产物
+		// （加工后的 jar + 配套 pom），落在同一个跨 daemon／跨 loom 版本共享的 forge 依赖仓库。
+		// 只判存在会让旧版本 loom 就地写留下的 0 字节或截断 jar 被当作暖缓存，作为 Gradle 依赖进入编译链。
+		if (!mavenHelper.isReusable(null) || extension.refreshDeps()) {
 			withForgeDependencyLock(project, mavenHelper, () -> {
-				// 锁内二次确认：等锁期间其它进程可能已完成生产
-				if (mavenHelper.exists(null) && !extension.refreshDeps()) {
+				// 锁内二次确认：等锁期间其它进程可能已完成生产（与快路径同判据，否则残骸既不会自愈、也不会报警）
+				if (mavenHelper.isReusable(null) && !extension.refreshDeps()) {
 					return null;
 				}
 
@@ -329,7 +336,7 @@ public class ForgeLibrariesProvider {
 	 * {@code INameMappingService} 服务文件、但还没改写 FML 类）。
 	 *
 	 * <p>jar 先落位、pom 后落位（pom 只有一份模板内容，且新产物出现后才会被解析），
-	 * 这样「pom 可见」蕴含「jar 可见」，暖缓存判定 {@code mavenHelper.exists(null)} 不会误判。
+	 * 这样「pom 可见」蕴含「jar 可见」，暖缓存判定 {@code mavenHelper.isReusable(null)} 不会误判。
 	 */
 	private static void publishTransformedJar(LocalMavenHelper mavenHelper, Path inputJar, Path outputJar, AtomicFiles.IOConsumer<Path> transform) throws IOException {
 		Files.createDirectories(outputJar.getParent());

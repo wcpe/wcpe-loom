@@ -49,7 +49,11 @@ public final class SimpleModDependency extends ModDependency {
 
 	@Override
 	public boolean isCacheInvalid(Project project, @Nullable String variant) {
-		return !maven.exists(variant);
+		// 就绪判据为内容级（见 LocalMavenHelper.isReusable）：该缓存是 remapped mod 的本地 maven 仓库，
+		// 产物由 copyToMaven 以「临时文件 + 原子落位」发布；但仓库本身跨 daemon／跨 loom 版本共享，
+		// 旧版本 loom 就地写留下的 0 字节或截断 jar 在存在性判定下会被当作暖缓存，
+		// 随后作为 remapped 依赖进入编译链，形成「标记是新的、内容是坏的」的静默损坏。
+		return !maven.isReusable(variant);
 	}
 
 	@Override

@@ -26,7 +26,6 @@ package net.fabricmc.loom.configuration.providers.minecraft.mapped;
 
 import java.io.File;
 import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
@@ -62,6 +61,7 @@ import net.fabricmc.loom.extension.LoomFiles;
 import net.fabricmc.loom.util.SidedClassVisitor;
 import net.fabricmc.loom.util.TinyRemapperHelper;
 import net.fabricmc.loom.util.cache.AtomicFiles;
+import net.fabricmc.loom.util.cache.JarReusability;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.mappingio.tree.MemoryMappingTree;
 import net.fabricmc.tinyremapper.OutputConsumerPath;
@@ -279,8 +279,12 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 
 		if (requiresBackupJars()) {
 			for (OutputJar outputJar : outputJars) {
-				if (!Files.exists(getBackupJarPath(outputJar.outputJar()))) {
-					LOGGER.info("Refreshing outputs for mapped jar, as backup jar does not exist for {}", outputJar.outputJar());
+				// backup 是 remapped jar 的逐字节副本（由 AtomicFiles.copy 落位），故它同样是 jar，
+				// 用与上面同一条内容级判据。注意其文件名以 .backup 结尾、不是 .jar/.zip：
+				// 内容损坏时 zipfs 抛的是运行时异常而非 IOException，JarReusability 已把该族异常
+				// 一并归入「不可复用」（见其实现注释），否则这里会从「重建」变成构建崩溃。
+				if (!JarReusability.isReusable(getBackupJarPath(outputJar.outputJar()))) {
+					LOGGER.info("Refreshing outputs for mapped jar, as backup jar is missing or not reusable for {}", outputJar.outputJar());
 					return true;
 				}
 			}

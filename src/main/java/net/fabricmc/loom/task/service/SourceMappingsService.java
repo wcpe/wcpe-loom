@@ -50,6 +50,7 @@ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.ConfigContextImpl;
 import net.fabricmc.loom.configuration.processors.MappingProcessorContextImpl;
 import net.fabricmc.loom.configuration.processors.MinecraftJarProcessorManager;
+import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration;
 import net.fabricmc.loom.task.GenerateSourcesTask;
 import net.fabricmc.loom.util.service.ScopedServiceFactory;
 import net.fabricmc.loom.util.service.Service;
@@ -119,7 +120,11 @@ public class SourceMappingsService extends Service<SourceMappingsService.Options
 
 		final Path path = dir.resolve(hash + ".tiny");
 
-		if (Files.exists(path) && !extension.refreshDeps()) {
+		// 就绪判据为内容级，与共享 mappings 产物同一把尺子（见 MappingConfiguration.isReusableMappingsText）：
+		// 本文件是按补丁 hash 命名的纯文本 tiny，由 createMappings 用 Tiny2FileWriter 直接写最终路径
+		// （先删后写、且没有取锁），被中断或与并发 daemon 交错时都会留下 0 字节残骸；
+		// 只判存在会让这份残骸被永久复用，源码反编译静默地按空映射进行。
+		if (MappingConfiguration.isReusableMappingsText(path) && !extension.refreshDeps()) {
 			LOGGER.debug("Using cached source mappings");
 			return path;
 		}

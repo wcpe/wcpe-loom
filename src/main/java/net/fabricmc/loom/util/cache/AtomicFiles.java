@@ -27,10 +27,12 @@ package net.fabricmc.loom.util.cache;
 import java.io.IOException;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
+import java.util.Locale;
 import java.util.UUID;
 
 /**
@@ -145,14 +147,56 @@ public final class AtomicFiles {
 			} catch (AccessDeniedException e) {
 				// Windows 上读方持有目标句柄时的表现。读方是短生命周期的，重试即可成功；
 				// 因此这里不立刻失败，避免把「另一个进程正在读」变成构建失败。
-				if (System.nanoTime() >= deadline) {
-					throw new IOException(describeShareConflict(target), e);
+				backoffMillis = retryOrFail(target, deadline, backoffMillis, e);
+			} catch (FileSystemException e) {
+				// 共享冲突的另一族表现：JDK 的 WindowsException.translateToIOException 只把
+				// ERROR_ACCESS_DENIED(5) 映射为 AccessDeniedException，ERROR_SHARING_VIOLATION(32)
+				//（源或目标被占用，网络盘/部分锁定语义下常见）会落到普通 FileSystemException，
+				// 消息形如 "...being used by another process"。这类冲突与上面的成因相同、同样是短生命周期，
+				// 若漏在这个 catch 之外，退避预算就完全不起作用，只好把平台限制原样丢给调用方。
+				// 注意 FileSystemException 是 AccessDeniedException 的父类：本分支必须写在它之后。
+				if (!isShareConflict(e)) {
+					throw e;
 				}
 
-				sleepBriefly(backoffMillis);
-				backoffMillis = Math.min(backoffMillis * 2, RETRY_MAX_MILLIS);
+				backoffMillis = retryOrFail(target, deadline, backoffMillis, e);
 			}
 		}
+	}
+
+	/**
+	 * 判断一个 {@link FileSystemException} 是否属于「文件被其它进程占用」这一族.
+	 *
+	 * <p>Java 没有暴露错误码，只能按消息匹配：覆盖英文与中文两种系统消息形态，以及
+	 * 「cannot access the file」这一不带 because 从句的变体（源或目标被占用都会走到这里）。
+	 * 误判的代价是有上限的——最多多等一个退避预算（见 {@link #REPLACE_RETRY_BUDGET}）后
+	 * 仍以带诊断信息的异常结束，不会吞掉真正的失败。
+	 */
+	private static boolean isShareConflict(FileSystemException e) {
+		final String message = e.getMessage();
+
+		if (message == null) {
+			return false;
+		}
+
+		final String lower = message.toLowerCase(Locale.ROOT);
+		return lower.contains("being used by another process")
+				|| lower.contains("used by another process")
+				|| lower.contains("cannot access the file")
+				|| lower.contains("另一个程序正在使用")
+				|| lower.contains("正由另一进程使用")
+				|| lower.contains("被另一进程使用");
+	}
+
+	// 退避预算内则休眠后重试，超出预算则抛出带诊断信息的异常（复用 describeShareConflict）；
+	// {@return 下一次的退避时长}
+	private static long retryOrFail(Path target, long deadline, long backoffMillis, IOException cause) throws IOException {
+		if (System.nanoTime() >= deadline) {
+			throw new IOException(describeShareConflict(target), cause);
+		}
+
+		sleepBriefly(backoffMillis);
+		return Math.min(backoffMillis * 2, RETRY_MAX_MILLIS);
 	}
 
 	/**
