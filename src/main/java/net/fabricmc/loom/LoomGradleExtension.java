@@ -66,8 +66,34 @@ import net.fabricmc.loom.util.download.DownloadBuilder;
 
 @ApiStatus.Internal
 public interface LoomGradleExtension extends LoomGradleExtensionAPI {
+	/**
+	 * 取项目上的 Loom 扩展.
+	 *
+	 * <p>判据只做 {@code instanceof} 而不直接强转：当 Loom 被两个 classloader 各加载一份时（settings 与
+	 * project classpath 各一份、buildSrc/约定插件与 plugins 块各一份、复合构建），「loom」这个名字查得到，
+	 * 但对象是由另一份 Loom 创建的，裸强转会抛不带任何业务信息的 ClassCastException。
+	 * 跨 classloader 复用对方实例在语言层面不可能（同名类不是同一个 Class），因此退化为可诊断的失败，
+	 * 明确指出占用者实际类型与其 classloader，并给出可能成因。
+	 *
+	 * @param project 目标项目
+	 * @return 该项目上的 Loom 扩展
+	 * @throws org.gradle.api.UnknownDomainObjectException 项目上没有名为「loom」的扩展（项目未应用 Loom）
+	 * @throws GradleException 扩展存在但由另一份 classloader 的 Loom 创建
+	 */
 	static LoomGradleExtension get(Project project) {
-		return (LoomGradleExtension) project.getExtensions().getByName("loom");
+		final Object extension = project.getExtensions().getByName("loom");
+
+		if (extension instanceof LoomGradleExtension loomExtension) {
+			return loomExtension;
+		}
+
+		throw new GradleException(String.format(
+				"项目 %s 上的「loom」扩展由另一份 classloader 的 Loom 创建：扩展实际类型为 %s（由 classloader %s 加载），"
+						+ "当前 Loom 期望 %s。跨 classloader 无法复用对方实例，常见成因是 Loom 被两个 classloader 各加载了一份"
+						+ "（settings 与项目 classpath 各一份、buildSrc/约定插件与 plugins 块各一份、复合构建），"
+						+ "请把 Loom 统一到单一来源，或改用不遍历其它项目的隔离模式路径。",
+				project.getPath(), extension.getClass().getName(), extension.getClass().getClassLoader(),
+				LoomGradleExtension.class.getName()));
 	}
 
 	LoomFiles getFiles();

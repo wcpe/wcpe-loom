@@ -92,7 +92,9 @@ public record InstallerData(String version, JsonObject installerJson) {
 
 			// If user choose to use dependencyResolutionManagement, then they should declare
 			// these repositories manually in the settings file.
-			if (project.getGradle().getPlugins().hasPlugin(LoomRepositoryPlugin.class)) {
+			// 判据必须与 classloader 无关：按 Class 判定在 settings 与项目 classpath 各有一份 Loom 时恒为 false，
+			// 会静默绕过 settings 侧的声明重复添加仓库。
+			if (LoomRepositoryPlugin.isRepositoriesDeclared(project.getGradle())) {
 				continue;
 			}
 
