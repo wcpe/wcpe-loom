@@ -41,6 +41,7 @@ import org.gradle.api.artifacts.Configuration;
 import org.gradle.api.artifacts.Dependency;
 import org.gradle.api.artifacts.ExcludeRule;
 import org.gradle.api.artifacts.ModuleDependency;
+import org.gradle.api.logging.Logging;
 import org.gradle.api.plugins.JavaPlugin;
 import org.gradle.api.publish.Publication;
 import org.gradle.api.publish.PublishingExtension;
@@ -80,14 +81,29 @@ public abstract class MavenPublication implements Runnable {
 		});
 	}
 
-	private static boolean hasSoftwareComponent(Publication publication) {
+	private static SoftwareComponentState softwareComponentState(Publication publication) {
 		try {
 			Method getComponent = publication.getClass().getMethod("getComponent");
-			return getComponent.invoke(publication) != null;
+			return getComponent.invoke(publication) != null ? SoftwareComponentState.PRESENT : SoftwareComponentState.ABSENT;
 		} catch (ReflectiveOperationException e) {
-			// our hacks have broken!
-			return false;
+			// 以前这里静默返回 false，于是「确实没有 software component」和「Loom 的反射探测坏了」
+			// 两种完全不同的原因得到同一条弃用警告，用户看到的文案与真实原因无关。这里把真实原因记下来，
+			// 由调用方据此区分两条路径。
+			Logging.getLogger(MavenPublication.class).warn("Loom failed to inspect the software component of {} via reflection", publication.getClass().getName(), e);
+			return SoftwareComponentState.UNKNOWN;
 		}
+	}
+
+	/**
+	 * 发布项是否带有 software component 的探测结果.
+	 */
+	private enum SoftwareComponentState {
+		/** 有 component，无需手工注入依赖数据. */
+		PRESENT,
+		/** 确实没有 component，属于旧的、已弃用的发布配置方式. */
+		ABSENT,
+		/** 反射探测失败，说明 Loom 依赖的内部 API 变了，属于 Loom 自身的问题. */
+		UNKNOWN
 	}
 
 	private void processEntry(String scope, Configuration config, PublishingExtension mavenPublish, AtomicBoolean reportedDeprecation) {
@@ -97,11 +113,17 @@ public abstract class MavenPublication implements Runnable {
 					continue;
 				}
 
-				if (hasSoftwareComponent(publication) || EXCLUDED_PUBLICATIONS.contains(publication)) {
+				final SoftwareComponentState componentState = softwareComponentState(publication);
+
+				if (componentState == SoftwareComponentState.PRESENT || EXCLUDED_PUBLICATIONS.contains(publication)) {
 					continue;
 				} else if (!reportedDeprecation.get() && !LoomGradleExtension.get(getProject()).isForgeLike()) {
 					DeprecationHelper deprecationHelper = LoomGradleExtension.get(getProject()).getDeprecationHelper();
-					deprecationHelper.warn("Loom is applying dependency data manually to publications instead of using a software component (from(components[\"java\"])). This is deprecated.");
+					// 两条路径的文案必须可区分：探测失败时不能把用户引向「你该改用 software component」，
+					// 因为问题出在 Loom 自己身上。
+					deprecationHelper.warn(componentState == SoftwareComponentState.UNKNOWN
+							? "Loom is applying dependency data manually to publications because it could not inspect their software component (see the warning above). This is a Loom bug."
+							: "Loom is applying dependency data manually to publications instead of using a software component (from(components[\"java\"])). This is deprecated.");
 					reportedDeprecation.set(true);
 				}
 

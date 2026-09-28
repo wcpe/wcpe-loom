@@ -85,7 +85,11 @@ public abstract class ExtractArchiveFilesTask extends DefaultTask {
 	protected abstract ConfigurableFileCollection getArchives();
 
 	/**
-	 * 只保留这些后缀的条目；为空表示保留全部条目.
+	 * 只保留这些后缀的条目.
+	 *
+	 * <p>该属性必须显式赋值：空列表的语义是「保留全部条目」，与 {@link #includeSuffixes(String, String...)}
+	 * 的名称直觉相反，因此不提供默认值，未配置时任务会直接报错（见 {@link #run()}）；
+	 * 确实需要全部条目时请显式调用 {@link #includeAllSuffixes()}。
 	 */
 	@Input
 	protected abstract ListProperty<String> getIncludedSuffixes();
@@ -97,10 +101,26 @@ public abstract class ExtractArchiveFilesTask extends DefaultTask {
 	protected abstract ListProperty<String> getEmptyMarkers();
 
 	/**
-	 * 只解压这些后缀的条目；配合 {@link #getIncludedSuffixes()} 的约定（空列表表示全部）.
+	 * 只解压这些后缀的条目.
+	 *
+	 * <p>至少需要一个后缀：空列表表示「保留全部条目」，为避免误用，这里把它从参数层面排除，
+	 * 需要保留全部条目请调用 {@link #includeAllSuffixes()}。
+	 *
+	 * @param firstSuffix 第一个后缀
+	 * @param otherSuffixes 其余后缀
 	 */
-	public void includeSuffixes(String... suffixes) {
-		getIncludedSuffixes().set(java.util.List.of(suffixes));
+	public void includeSuffixes(String firstSuffix, String... otherSuffixes) {
+		final java.util.List<String> suffixes = new java.util.ArrayList<>();
+		suffixes.add(firstSuffix);
+		suffixes.addAll(java.util.List.of(otherSuffixes));
+		getIncludedSuffixes().set(suffixes);
+	}
+
+	/**
+	 * 显式声明保留全部条目（即不做后缀过滤），与 {@link #includeSuffixes(String, String...)} 互斥.
+	 */
+	public void includeAllSuffixes() {
+		getIncludedSuffixes().set(java.util.List.of());
 	}
 
 	public void emptyMarker(String marker) {
@@ -123,11 +143,23 @@ public abstract class ExtractArchiveFilesTask extends DefaultTask {
 
 	@TaskAction
 	protected void run() throws IOException {
+		if (!getIncludedSuffixes().isPresent()) {
+			throw new IllegalStateException("必须显式声明过滤规则：调用 includeSuffixes(...) 或 includeAllSuffixes()");
+		}
+
+		if (!getEmptyMarkers().isPresent()) {
+			throw new IllegalStateException("必须显式声明空标记文件名：调用 emptyMarker(...)");
+		}
+
 		final Path outputDir = getOutputDirectory().get().getAsFile().toPath();
 		final java.util.List<String> suffixes = getIncludedSuffixes().get();
 		final Path emptyMarker = outputDir.resolve(getEmptyMarkers().get().getFirst());
 
 		Files.createDirectories(outputDir);
+
+		// 标记文件由本任务自己维护，不在 sync 的内容里：这里显式删除，而不是依赖 sync 把它当成
+		// 陈旧文件清理掉。这样标记的生命周期只由「本次执行是否解压出内容」决定，与 sync 的实现解耦。
+		Files.deleteIfExists(emptyMarker);
 
 		getFileSystemOperations().sync(spec -> {
 			spec.into(outputDir);
@@ -143,18 +175,16 @@ public abstract class ExtractArchiveFilesTask extends DefaultTask {
 			}
 		});
 
-		if (isEmptyDirectory(outputDir, emptyMarker)) {
+		if (isEmptyDirectory(outputDir)) {
 			Files.writeString(emptyMarker, "", StandardCharsets.UTF_8);
-		} else {
-			Files.deleteIfExists(emptyMarker);
 		}
 	}
 
-	private static boolean isEmptyDirectory(Path outputDir, Path emptyMarker) throws IOException {
+	// 标记文件已在 sync 之前删除，因此这里不需要再把它排除在「是否为空」的判断之外。
+	private static boolean isEmptyDirectory(Path outputDir) throws IOException {
 		try (var stream = Files.walk(outputDir)) {
 			return stream
 					.filter(path -> !path.equals(outputDir))
-					.filter(path -> !path.equals(emptyMarker))
 					.findAny()
 					.isEmpty();
 		}

@@ -27,6 +27,7 @@ package dev.architectury.loom.util;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -37,7 +38,12 @@ import java.util.concurrent.Future;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import org.gradle.api.logging.Logger;
+import org.gradle.api.logging.Logging;
+
 public class ThreadingUtils {
+	private static final Logger LOGGER = Logging.getLogger(ThreadingUtils.class);
+
 	public static <T> void run(T[] values, UnsafeConsumer<T> action) {
 		run(Arrays.stream(values)
 				.<UnsafeRunnable>map(t -> () -> action.accept(t))
@@ -138,6 +144,39 @@ public class ThreadingUtils {
 		List<CompletableFuture<?>> tasks = new ArrayList<>();
 		ExecutorService service = Executors.newFixedThreadPool(Math.max(1, Runtime.getRuntime().availableProcessors()));
 		List<UnsafeConsumer<Stopwatch>> completionListener = new ArrayList<>();
+		private final List<Throwable> failures = Collections.synchronizedList(new ArrayList<>());
+		private volatile boolean tolerateFailures;
+
+		/**
+		 * 把本 completer 切换为 best-effort 模式：单个任务失败只被收集，不再让 {@link #complete()} 上抛.
+		 *
+		 * <p>适用于「成千上万个互不依赖的条目、丢掉个别条目不影响产物整体有效性」的循环；
+		 * 必须在 {@link #add(UnsafeRunnable)} 之前调用。需要保证产物完整性的循环不要打开它。
+		 *
+		 * @return 本 completer
+		 */
+		public TaskCompleter tolerateFailures() {
+			this.tolerateFailures = true;
+			return this;
+		}
+
+		/**
+		 * 返回收集到的失败（best-effort 模式下才有内容）.
+		 *
+		 * @return 失败列表，顺序与完成顺序一致
+		 */
+		public List<Throwable> failures() {
+			return List.copyOf(failures);
+		}
+
+		/**
+		 * 返回失败的条目数量.
+		 *
+		 * @return 失败数量
+		 */
+		public int failureCount() {
+			return failures.size();
+		}
 
 		public TaskCompleter add(UnsafeRunnable job) {
 			if (!stopwatch.isRunning()) {
@@ -148,6 +187,11 @@ public class ThreadingUtils {
 				try {
 					job.run();
 				} catch (Throwable throwable) {
+					if (tolerateFailures) {
+						failures.add(throwable);
+						return;
+					}
+
 					if (throwable instanceof RuntimeException runtimeException) {
 						throw runtimeException;
 					}
@@ -166,6 +210,28 @@ public class ThreadingUtils {
 		public TaskCompleter onComplete(UnsafeConsumer<Stopwatch> consumer) {
 			completionListener.add(consumer);
 			return this;
+		}
+
+		/**
+		 * 以 best-effort 语义结束：先 {@link #complete()}，再把收集到的失败按 warn 级别汇总一次.
+		 *
+		 * <p>汇总使用默认可见的级别，避免「产物少了一些条目」这种事在默认控制台里完全看不见。
+		 * 注册在 {@link #onComplete(UnsafeConsumer)} 上的清理动作失败仍然会上抛：那属于资源释放失败，
+		 * 会直接影响产物完整性，不能降级。
+		 *
+		 * @param description 被处理对象的描述（例如「被打上注解的 jar」），用于日志
+		 * @return 收集到的失败数量
+		 */
+		public int completeToleratingFailures(String description) {
+			complete();
+			final List<Throwable> failures = failures();
+
+			if (failures.isEmpty()) {
+				return 0;
+			}
+
+			LOGGER.warn("{} of {} entries in {} failed and were skipped", failures.size(), tasks.size(), description, failures.getFirst());
+			return failures.size();
 		}
 
 		public void complete() {

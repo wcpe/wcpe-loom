@@ -79,6 +79,21 @@ public final class FabricModJsonFactory {
 		};
 	}
 
+	/**
+	 * 用已解析的元数据文件重建模组视图（mods.toml / architectury.common.json / mcmod.info 等非 FMJ 形态）.
+	 *
+	 * <p>跨项目数据（{@code LoomProjectData}）不会给非 FMJ 元数据补 {@code schemaVersion}，
+	 * 消费端必须走这条路径，才能保持与源对象一致的 {@code getId()}/{@code getVersion()}/{@code getCustom()}
+	 * 与 mixin/AT 列表语义；否则会被重建成 {@link FabricModJsonV1}，静默丢掉元数据里的信息。
+	 *
+	 * @param modMetadata 元数据文件
+	 * @param source 资源读取来源
+	 * @return 与元数据文件对应的模组视图
+	 */
+	public static FabricModJson createFromModMetadata(ModMetadataFile modMetadata, FabricModJsonSource source) {
+		return new ModMetadataFabricModJson(modMetadata, source);
+	}
+
 	public static FabricModJson createFromZip(Path zipPath) {
 		try {
 			return create(ZipUtils.unpackGson(zipPath, FABRIC_MOD_JSON, JsonObject.class), new FabricModJsonSource.ZipSource(zipPath));

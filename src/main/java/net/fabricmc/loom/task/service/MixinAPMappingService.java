@@ -76,6 +76,28 @@ public class MixinAPMappingService extends Service<MixinAPMappingService.Options
 		Property<String> getTo();
 	}
 
+	/**
+	 * 收集用于 Mixin AP 的映射来源.
+	 *
+	 * <p>两种模式覆盖的项目集合不同，这是隔离模式下的已知取舍（不是等价实现）：
+	 *
+	 * <ul>
+	 *     <li>非隔离模式用 {@link GradleUtils#allLoomProjects} 遍历<b>整个构建</b>中 mappingId 相同的
+	 *         Loom 项目。它需要读其它项目的扩展状态，在 Isolated Projects 下是不允许的；
+	 *     <li>隔离模式只覆盖<b>当前项目</b>与 {@link LoomProjectData#getDependencies(Project)} 得到的
+	 *         runtime/compileClasspath 上的<b>直接</b> {@code ProjectDependency}（同样按 mappingId 过滤）。
+	 *         DTO 里没有依赖图，不读别的项目就无法递归展开传递依赖。
+	 * </ul>
+	 *
+	 * <p>后果：若项目 A 通过 B 间接依赖 C，隔离模式下 C 的 mixin 映射不会被纳入，
+	 * A 重映射出的 refmap 可能与普通模式不同；直接依赖的场景不受影响。
+	 * 需要完整覆盖时请关闭 Isolated Projects，或把 C 也声明成直接依赖。
+	 *
+	 * @param thisProject 当前项目
+	 * @param from 源命名空间
+	 * @param to 目标命名空间
+	 * @return 每个（项目，源集）组合一份选项的惰性提供者
+	 */
 	public static Provider<List<Options>> createOptions(Project thisProject, Provider<String> from, Provider<String> to) {
 		final LoomGradleExtension thisExtension = LoomGradleExtension.get(thisProject);
 		String mappingId = thisExtension.getMappingConfiguration().mappingsIdentifier;
@@ -106,12 +128,17 @@ public class MixinAPMappingService extends Service<MixinAPMappingService.Options
 		};
 
 		if (thisExtension.isProjectIsolationActive()) {
+			// 隔离模式：只允许读本项目与 DTO。这里刻意不遍历 gradle.allprojects——那会在别的项目
+			// 还没配置完时读取它们的扩展状态。覆盖范围差异见本方法 Javadoc。
 			processProject.accept(thisProject);
 
 			for (LoomProjectData projectData : LoomProjectData.getDependencies(thisProject)) {
-				if (mappingId.equals(projectData.mappingId())) {
-					processProjectData(thisProject, projectData, from, to, providers);
+				if (!mappingId.equals(projectData.mappingId())) {
+					LOGGER.debug("Skipping mixin mappings of {}: its mapping id {} differs from {}", projectData.projectPath(), projectData.mappingId(), mappingId);
+					continue;
 				}
+
+				processProjectData(thisProject, projectData, from, to, providers);
 			}
 		} else {
 			GradleUtils.allLoomProjects(thisProject.getGradle(), project -> {
