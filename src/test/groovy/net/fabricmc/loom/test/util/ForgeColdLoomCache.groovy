@@ -95,17 +95,40 @@ final class ForgeColdLoomCache {
 		}
 	}
 
+	/**
+	 * 拷贝冷 gradle home，跳过 {@code *.lock} 并对其余失败短暂退避重试。
+	 *
+	 * <p>源目录是共享的 TestKit gradle home，其中 {@code caches/<版本>/fileContent/fileContent.lock}
+	 * 等锁文件被**正在运行的 Gradle 守护进程持续持有**——实测在 Windows 上拷贝这些文件必然以
+	 * FileSystemException 失败，且**不是暂时性的**（重试再多次也一样，因为守护进程活着就一直占着）。
+	 * 锁文件是运行时产物，对「冷 home 种子」没有意义，直接跳过。
+	 *
+	 * <p>保留重试是为了覆盖其它真正的短暂占用（例如刚写完尚未释放）。
+	 */
 	private static void copyIfExists(File source, File target) {
 		if (!source.exists()) {
 			return
 		}
 
-		if (source.isDirectory()) {
-			target.mkdirs()
-			FileUtils.copyDirectory(source, target)
-		} else {
-			target.parentFile.mkdirs()
-			FileUtils.copyFile(source, target)
+		IOException last = null
+
+		for (int attempt = 0; attempt < 5; attempt++) {
+			try {
+				if (source.isDirectory()) {
+					target.mkdirs()
+					FileUtils.copyDirectory(source, target, { File file -> !file.name.endsWith(".lock") } as FileFilter)
+				} else {
+					target.parentFile.mkdirs()
+					FileUtils.copyFile(source, target)
+				}
+
+				return
+			} catch (IOException e) {
+				last = e
+				Thread.sleep(200L * (attempt + 1))
+			}
 		}
+
+		throw new RuntimeException("Could not copy " + source + " to " + target + " after retries", last)
 	}
 }
