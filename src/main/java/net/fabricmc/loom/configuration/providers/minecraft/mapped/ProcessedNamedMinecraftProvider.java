@@ -45,6 +45,7 @@ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftSourceSets;
 import net.fabricmc.loom.configuration.providers.minecraft.SingleJarEnvType;
 import net.fabricmc.loom.configuration.providers.minecraft.SingleJarMinecraftProvider;
 import net.fabricmc.loom.configuration.providers.minecraft.SplitMinecraftProvider;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 
 public abstract class ProcessedNamedMinecraftProvider<M extends MinecraftProvider, P extends NamedMinecraftProvider<M>> extends NamedMinecraftProvider<M> {
 	private final P parentMinecraftProvider;
@@ -65,13 +66,31 @@ public abstract class ProcessedNamedMinecraftProvider<M extends MinecraftProvide
 
 		parentMinecraftProvider.provide(context.withApplyDependencies(false));
 
+		// 无锁快路径：requiresProcessing 仅做存在性/处理判定，缓存就绪时不会进入下面的锁
 		boolean requiresProcessing = shouldRefreshOutputs(context) || parentMinecraftJars.stream()
 				.map(this::getProcessedPath)
 				.anyMatch(jarProcessorManager::requiresProcessingJar);
 
 		if (requiresProcessing) {
-			processJars(minecraftJarOutputMap, context.configContext());
-			createBackupJars(minecraftJars);
+			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
+			final Path lockRoot = extension.getFiles().getCacheLocks().toPath();
+			// 产物写入 LOCAL 仓库但跨同根多子项目共享（getName 含 jar processor 哈希），--parallel 下需 per-key 互斥。
+			// key 含 processor 哈希以与父类 remap 锁区分；父 provide() 已在上面返回，此处非嵌套持锁。
+			final String key = "processed:" + getTargetNamespace().name() + ":" + getVersion() + ":" + jarProcessorManager.getJarHash();
+
+			cacheService.runExclusive(lockRoot, key, LoomCacheService.defaultTimeout(), () -> {
+				// 锁内二次确认：可能已被其它进程/线程在等锁期间处理完成
+				boolean stillRequiresProcessing = shouldRefreshOutputs(context) || parentMinecraftJars.stream()
+						.map(this::getProcessedPath)
+						.anyMatch(jarProcessorManager::requiresProcessingJar);
+
+				if (stillRequiresProcessing) {
+					processJars(minecraftJarOutputMap, context.configContext());
+					createBackupJars(minecraftJars);
+				}
+
+				return null;
+			});
 		}
 
 		if (context.applyDependencies()) {
