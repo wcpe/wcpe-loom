@@ -117,4 +117,29 @@ class IdeaDownloadSourcesRegistryTest extends Specification {
 		firstRegistry.register(MERGED_SOURCES, ":genSources")
 		secondRegistry.taskPathsFor(MERGED_SOURCES).isEmpty()
 	}
+
+	def "构建级名字被外来对象占用时不抛异常，且同一构建内实例唯一"() {
+		given: "构建级扩展名已被另一个 classloader 的对象占用"
+		def rootProject = ProjectBuilder.builder().withName("root").build()
+		def subProject = ProjectBuilder.builder().withName("sub").withParent(rootProject).build()
+		def foreign = new Object()
+		rootProject.getGradle().getExtensions().add("loomIdeaDownloadSources", foreign)
+
+		when: "本 classloader 取登记表（原先会在 add 处抛 Cannot add extension with name 'loomIdeaDownloadSources'）"
+		def fromRoot = IdeaDownloadSourcesRegistry.get(rootProject)
+		def fromSub = IdeaDownloadSourcesRegistry.get(subProject)
+		def again = IdeaDownloadSourcesRegistry.get(rootProject)
+
+		then: "不抛异常，且同一构建内始终是同一份兜底登记表"
+		fromRoot != null
+		fromSub.is(fromRoot)
+		again.is(fromRoot)
+
+		and: "外来对象仍然占着构建级名字，本登记表没有被塞进构建级容器"
+		rootProject.getGradle().getExtensions().getByName("loomIdeaDownloadSources").is(foreign)
+
+		and: "兜底登记表在本 classloader 内仍然可用"
+		fromSub.register(MERGED_SOURCES, ":sub:genSources")
+		fromRoot.taskPathsFor(MERGED_SOURCES) == [":sub:genSources"]
+	}
 }
