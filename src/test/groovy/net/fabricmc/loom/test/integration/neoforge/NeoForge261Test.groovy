@@ -53,7 +53,8 @@ class NeoForge261Test extends Specification implements GradleProjectTestTrait {
 		then:
 		result.task(":build").outcome == SUCCESS
 		gradle.getOutputZipEntry("fabric-example-mod-1.0.0.jar", "META-INF/accesstransformer.cfg") == expectedAt
-		Checksum.of(gradle.getOutputFile("fabric-example-mod-1.0.0.jar")).md5().hex() == 'f583b1d0fc1e054568c799d7c3959d73'
+		// 该哈希随上游快照版本重发而变化，属已知脆弱断言；当前值取自 CI 报告（2026-09-15，跨两次独立运行一致）
+		Checksum.of(gradle.getOutputFile("fabric-example-mod-1.0.0.jar")).md5().hex() == 'ee6792ac4b665d5da09f97cd02d8c72c'
 
 		where:
 		mcVersion            | neoforgeVersion

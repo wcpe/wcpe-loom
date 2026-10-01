@@ -46,7 +46,7 @@ class PatchedDecompileTest extends Specification implements GradleProjectTestTra
 
 		when:
 		// TODO: Enable configuration cache if/when the task supports it
-		def result = gradle.run(task: "genForgePatchedSources", configurationCache: false)
+		def result = gradle.run(task: "genForgePatchedSources", configurationCache: false, args: jdk21Args())
 
 		then:
 		result.task(":genForgePatchedSources").outcome == SUCCESS
@@ -56,5 +56,21 @@ class PatchedDecompileTest extends Specification implements GradleProjectTestTra
 		'1.19.2'  | "43.1.1"     | '17'
 		'1.18.1'  | "39.0.63"    | '17'
 		'1.17.1'  | "37.0.67"    | '16'
+	}
+
+	/**
+	 * Forge 自带的 ForgeFlower 解析不了 JDK 25 类文件中的常量池项（CONSTANT_Dynamic），
+	 * 反编译步骤需改用 JDK 21 运行；CI 由 setup-java 提供 JAVA_HOME_21_* 环境变量。
+	 */
+	private static List<String> jdk21Args() {
+		def jdk21 = System.getenv('JAVA_HOME_21_X64') ?: System.getenv('JAVA_HOME_21_ARM64')
+
+		if (jdk21 == null) {
+			return []
+		}
+
+		return [
+			"-Dorg.gradle.java.home=${jdk21}".toString()
+		]
 	}
 }
