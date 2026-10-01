@@ -30,7 +30,10 @@ def runNumber = ENV.GITHUB_RUN_NUMBER ?: "9999"
 
 def isSnapshot = ENV.PR_NUM != null
 
-if (!isSnapshot) {
+if (ENV.RELEASE_VERSION) {
+	// 发布流程可显式指定版本号（如从 tag 推导的 1.17.3），优先于按运行号推导
+	version = ENV.RELEASE_VERSION
+} else if (!isSnapshot) {
 	version = baseVersion + "." + runNumber
 } else {
 	version = baseVersion + "-PR." + ENV.PR_NUM + "." + runNumber
@@ -357,6 +360,18 @@ import org.w3c.dom.Element
 import org.w3c.dom.Node
 
 publishing {
+	repositories {
+		// WCPE Maven 仓库（CI 发布写入 maven-releases）
+		maven {
+			name = 'WCPE'
+			url = project.findProperty('wcpeMavenUrl') ?: 'https://maven.wcpe.top/repository/maven-releases/'
+			credentials {
+				username = project.findProperty('wcpeUsername')?.toString() ?: ''
+				password = project.findProperty('wcpePassword')?.toString() ?: ''
+			}
+		}
+	}
+
 	publications {
 		if (!isSnapshot && !ENV.EXPERIMENTAL) {
 			// Also publish a snapshot so people can use the latest version if they wish
