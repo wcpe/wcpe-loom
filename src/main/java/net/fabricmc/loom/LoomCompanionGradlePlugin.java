@@ -32,8 +32,17 @@ import net.fabricmc.loom.task.launch.ExportClasspathTask;
 import net.fabricmc.loom.util.Constants;
 
 public class LoomCompanionGradlePlugin implements Plugin<Project> {
-	public static final String NAME = "dev.architectury.loom-companion";
+	public static final String NAME = "top.wcpe.loom-companion";
+	/** 上一层分叉（architectury）的插件 id，作为兼容别名保留. */
+	public static final String ARCH_NAME = "dev.architectury.loom-companion";
 	public static final String UPSTREAM_NAME = "net.fabricmc.fabric-loom-companion";
+
+	/** 本项目是否已应用 companion（本 fork / architectury / 上游任一 id）. */
+	public static boolean isApplied(Project project) {
+		return project.getPluginManager().hasPlugin(NAME)
+				|| project.getPluginManager().hasPlugin(ARCH_NAME)
+				|| project.getPluginManager().hasPlugin(UPSTREAM_NAME);
+	}
 
 	@Override
 	public void apply(Project project) {

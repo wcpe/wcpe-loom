@@ -2,7 +2,7 @@ plugins {
 	id "java"
 }
 
-apply plugin: "gg.essential.loom"
+apply plugin: "top.wcpe.loom"
 
 version = "1.0.0"
 

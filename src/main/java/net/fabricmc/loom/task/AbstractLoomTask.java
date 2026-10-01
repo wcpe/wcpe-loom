@@ -49,7 +49,7 @@ public abstract class AbstractLoomTask extends DefaultTask {
 
 		// Store the platform if Loom is applied.
 		// This code might run in projects without Loom, such as Loom Companion projects.
-		if (getProject().getPluginManager().hasPlugin(LoomGradlePlugin.NAME)) {
+		if (LoomGradlePlugin.isApplied(getProject())) {
 			getModPlatform().value(getExtension().getPlatform()).finalizeValue();
 		}
 	}
