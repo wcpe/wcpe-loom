@@ -28,12 +28,18 @@ import static net.fabricmc.loom.util.Constants.Configurations;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.Objects;
-import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
 import javax.inject.Inject;
@@ -96,7 +102,6 @@ import net.fabricmc.loom.extension.MixinExtension;
 import net.fabricmc.loom.task.service.ClasspathGroupService;
 import net.fabricmc.loom.util.Checksum;
 import net.fabricmc.loom.util.ExceptionUtil;
-import net.fabricmc.loom.util.ProcessUtil;
 import net.fabricmc.loom.util.gradle.GradleUtils;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.gradle.SourceSetHelper;
@@ -106,6 +111,10 @@ import net.fabricmc.loom.util.service.ServiceFactory;
 
 public abstract class CompileConfiguration implements Runnable {
 	private static final String LOCK_PROPERTY_KEY = "fabric.loom.internal.global.lock";
+	// 本进程当前持有的构建锁路径，用于识别同一进程内的重复加锁
+	private static final Set<Path> OWNED_LOCKS = ConcurrentHashMap.newKeySet();
+	private FileLock processLock;
+	private FileChannel processLockChannel;
 
 	@Inject
 	protected abstract Project getProject();
@@ -514,12 +523,38 @@ public abstract class CompileConfiguration implements Runnable {
 	enum LockResult {
 		// acquired immediately or after waiting for another process to release
 		ACQUIRED_CLEAN,
-		// already owned by current pid
+		// already owned by the current process
 		ACQUIRED_ALREADY_OWNED,
-		// acquired due to current owner not existing
-		ACQUIRED_PREVIOUS_OWNER_MISSING,
-		// acquired due to previous owner disowning the lock
-		ACQUIRED_PREVIOUS_OWNER_DISOWNED
+		// acquired after a previous build left the lock file behind
+		ACQUIRED_PREVIOUS_OWNER_MISSING
+	}
+
+	// 判断锁文件是否存在。
+	// 不能直接用 Files.exists / File.exists：这类存在性判断会被配置缓存记入指纹，
+	// 而锁文件是配置阶段创建、构建末尾删除的瞬时文件。
+	// 一旦某次构建带着上次被杀留下的锁文件启动，构建就会记录“文件存在”，
+	// 但该文件在本次构建末尾被删除，于是下一次构建读到“文件不存在”，
+	// 配置缓存被判为失效（the file system entry '...lock' has been removed），白白重算约 33 秒。
+	// 这里改用文件通道探测：打开成功即存在，通道打开不会被配置缓存记录。
+	private static boolean lockFileExists(Path file) {
+		try (FileChannel channel = FileChannel.open(file, StandardOpenOption.WRITE)) {
+			return true;
+		} catch (final NoSuchFileException e) {
+			return false;
+		} catch (final IOException e) {
+			// 无法判定时保守视为存在，交由后续加锁逻辑处理
+			return true;
+		}
+	}
+
+	// 删除锁文件，文件本来就不存在时静默返回。
+	// 不使用 Files.deleteIfExists，因为它内部同样包含会污染配置缓存指纹的存在性判断。
+	private static void deleteLockFile(Path file) throws IOException {
+		try {
+			Files.delete(file);
+		} catch (final NoSuchFileException ignored) {
+			// 文件已不存在，无需处理
+		}
 	}
 
 	private LockResult acquireProcessLockWaiting(LockFile lockFile) {
@@ -535,89 +570,88 @@ public abstract class CompileConfiguration implements Runnable {
 		}
 	}
 
-	// Returns true if our process already owns the lock
+	// 取得跨进程构建锁。
+	// 锁文件只承载两件事：是否存在（上次构建是否干净收尾）、以及 OS 文件锁（是否有进程正在配置构建）。
+	// 这里刻意不读取文件内容：读内容会被配置缓存记为文件输入，
+	// 而锁文件在构建末尾会因干净收尾被删除，下一次构建便会以 file '...lock' has been removed 为由丢弃配置缓存。
+	// 返回 ACQUIRED_CLEAN 表示上次构建干净收尾，其余结果表示需要重建 loom 缓存。
 	@SuppressWarnings("BusyWait")
 	private LockResult acquireProcessLockWaiting_(LockFile lockFile, Duration timeout) throws IOException {
 		final long timeoutMs = timeout.toMillis();
 		final Logger logger = Logging.getLogger("loom_acquireProcessLockWaiting");
-		final long currentPid = ProcessHandle.current().pid();
-		boolean abrupt = false;
-		boolean disowned = false;
+		final Path lock = lockFile.file;
 
-		if (Files.exists(lockFile.file)) {
-			long lockingProcessId = -1;
+		if (OWNED_LOCKS.contains(lock)) {
+			// 同一进程已持有该锁
+			return LockResult.ACQUIRED_ALREADY_OWNED;
+		}
 
-			try {
-				String lockValue = Files.readString(lockFile.file);
+		// createDirectories 在目录已存在时不会报错，省去一次会污染配置缓存指纹的存在性判断
+		Files.createDirectories(lock.getParent());
 
-				if ("disowned".equals(lockValue)) {
-					disowned = true;
-				} else {
-					lockingProcessId = Long.parseLong(lockValue);
-					logger.lifecycle("\"{}\" is currently held by pid '{}'.", lockFile, lockingProcessId);
+		// 锁文件在干净收尾时会被删除，因此它存在即表示上次构建没能清理自己
+		final boolean leftByPreviousBuild = lockFileExists(lock);
+
+		if (leftByPreviousBuild) {
+			logger.lifecycle("Lock file \"{}\" was left by a previous build, assuming abrupt termination.", lockFile);
+		}
+
+		// 仅以写方式打开，不读取文件内容
+		final FileChannel channel = FileChannel.open(lock, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+		FileLock fileLock = null;
+		long waitedMs = 0;
+		boolean reported = false;
+
+		try {
+			while (fileLock == null) {
+				try {
+					fileLock = channel.tryLock();
+				} catch (OverlappingFileLockException e) {
+					// 同一 JVM 内已持有，按被占用处理
 				}
-			} catch (final Exception ignored) {
-				// ignored
-			}
 
-			if (lockingProcessId == currentPid) {
-				return LockResult.ACQUIRED_ALREADY_OWNED;
-			}
+				if (fileLock != null) {
+					break;
+				}
 
-			Optional<ProcessHandle> handle = ProcessHandle.of(lockingProcessId);
+				if (!reported) {
+					reported = true;
+					logger.lifecycle("\"{}\" is currently held by another process, waiting for it to be released...", lockFile);
+				}
 
-			if (disowned) {
-				logger.lifecycle("Previous process has disowned the lock due to abrupt termination.");
-				Files.deleteIfExists(lockFile.file);
-			} else if (handle.isEmpty()) {
-				logger.lifecycle("Locking process does not exist, assuming abrupt termination and deleting lock file.");
-				Files.deleteIfExists(lockFile.file);
-				abrupt = true;
-			} else {
-				ProcessUtil processUtil = ProcessUtil.create(getProject());
-				logger.lifecycle(processUtil.printWithParents(handle.get()));
-				logger.lifecycle("Waiting for lock to be released...");
-				long sleptMs = 0;
+				try {
+					Thread.sleep(100);
+				} catch (final InterruptedException e) {
+					Thread.currentThread().interrupt();
+					throw new IOException("Interrupted while waiting for " + lockFile, e);
+				}
 
-				while (Files.exists(lockFile.file)) {
-					try {
-						Thread.sleep(100);
-					} catch (final InterruptedException e) {
-						Thread.currentThread().interrupt();
-					}
+				waitedMs += 100;
 
-					sleptMs += 100;
+				if (waitedMs >= 1000 * 60 && waitedMs % (1000 * 60) == 0L) {
+					logger.lifecycle(
+							"""
+									Have been waiting on "{}" held by another process for {} minute(s).
+									If this persists for an unreasonable length of time, kill this process, run './gradlew --stop' and then try again.""",
+							lockFile, waitedMs / 1000 / 60
+					);
+				}
 
-					if (sleptMs >= 1000 * 60 && sleptMs % (1000 * 60) == 0L) {
-						logger.lifecycle(
-								"""
-										Have been waiting on "{}" held by pid '{}' for {} minute(s).
-										If this persists for an unreasonable length of time, kill this process, run './gradlew --stop' and then try again.""",
-								lockFile, lockingProcessId, sleptMs / 1000 / 60
-						);
-					}
-
-					if (sleptMs >= timeoutMs) {
-						throw new GradleException("Have been waiting on lock file '%s' for %s ms. Giving up as timeout is %s ms."
-								.formatted(lockFile, sleptMs, timeoutMs));
-					}
+				if (waitedMs >= timeoutMs) {
+					throw new GradleException("Have been waiting on lock file '%s' for %s ms. Giving up as timeout is %s ms."
+							.formatted(lockFile, waitedMs, timeoutMs));
 				}
 			}
+		} catch (Throwable t) {
+			closeQuietly(channel);
+			throw t;
 		}
 
-		if (!Files.exists(lockFile.file.getParent())) {
-			Files.createDirectories(lockFile.file.getParent());
-		}
+		processLock = fileLock;
+		processLockChannel = channel;
+		OWNED_LOCKS.add(lock);
 
-		Files.writeString(lockFile.file, String.valueOf(currentPid));
-
-		if (disowned) {
-			return LockResult.ACQUIRED_PREVIOUS_OWNER_DISOWNED;
-		} else if (abrupt) {
-			return LockResult.ACQUIRED_PREVIOUS_OWNER_MISSING;
-		}
-
-		return LockResult.ACQUIRED_CLEAN;
+		return leftByPreviousBuild ? LockResult.ACQUIRED_PREVIOUS_OWNER_MISSING : LockResult.ACQUIRED_CLEAN;
 	}
 
 	private static Duration getDefaultTimeout() {
@@ -629,27 +663,51 @@ public abstract class CompileConfiguration implements Runnable {
 		return Duration.ofHours(1);
 	}
 
-	// When we fail to configure, write "disowned" to the lock file to release it from this process
-	// This allows the next run to rebuild without waiting for this process to exit
+	// 配置失败时保留锁文件、只释放 OS 锁，
+	// 使下一次构建能判定上次未干净收尾并重建缓存，而无需等待本进程退出
 	private void disownLock() {
-		final Path lock = getLockFile().file;
-
-		try {
-			Files.writeString(lock, "disowned");
-		} catch (IOException e) {
-			throw new RuntimeException(e);
-		}
+		releaseProcessLock();
 	}
 
-	private void releaseLock() {
-		final Path lock = getLockFile().file;
+	private void releaseProcessLock() {
+		final FileLock lock = processLock;
+		final FileChannel channel = processLockChannel;
+		processLock = null;
+		processLockChannel = null;
 
-		if (!Files.exists(lock)) {
+		if (lock == null) {
 			return;
 		}
 
 		try {
-			Files.delete(lock);
+			lock.release();
+		} catch (IOException ignored) {
+			// 忽略
+		}
+
+		closeQuietly(channel);
+		OWNED_LOCKS.remove(getLockFile().file);
+	}
+
+	private static void closeQuietly(FileChannel channel) {
+		if (channel == null) {
+			return;
+		}
+
+		try {
+			channel.close();
+		} catch (IOException ignored) {
+			// 忽略
+		}
+	}
+
+	private void releaseLock() {
+		releaseProcessLock();
+
+		final Path lock = getLockFile().file;
+
+		try {
+			deleteLockFile(lock);
 		} catch (IOException e1) {
 			try {
 				// If we failed to delete the lock file, moving it before trying to delete it may help.

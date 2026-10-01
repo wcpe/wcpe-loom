@@ -68,7 +68,7 @@ class OfflineModeTest extends Specification implements GradleProjectTestTrait {
 		result1.task(":build").outcome == SUCCESS
 		result2.task(":build").outcome == SUCCESS
 
-		result2.output.contains("is currently held by pid '12345'")
+		result2.output.contains("was left by a previous build, assuming abrupt termination.")
 		result2.output.contains("rebuilding loom cache")
 	}
 }
