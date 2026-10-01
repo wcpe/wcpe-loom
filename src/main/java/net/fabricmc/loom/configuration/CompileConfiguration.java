@@ -304,9 +304,9 @@ public abstract class CompileConfiguration implements Runnable {
 	}
 
 	/**
-	 * 跨进程供给已映射的 Minecraft jar。
-	 * <p>
-	 * getGlobalLockObject 只覆盖 JVM 内（同一 daemon 的多个 classloader），多个 daemon 并发构建同一版本时
+	 * 跨进程供给已映射的 Minecraft jar.
+	 *
+	 * <p>getGlobalLockObject 只覆盖 JVM 内（同一 daemon 的多个 classloader），多个 daemon 并发构建同一版本时
 	 * 仍会同时生产共享缓存产物并互相踩踏；因此按 Minecraft 版本 + 映射标识叠加一把 per-key 跨进程文件锁，
 	 * 不同版本仍可并行。输出检查与重建必须同属一个事务，否则另一进程会在本项目读取 intermediary 时将它删除并重建。
 	 */
