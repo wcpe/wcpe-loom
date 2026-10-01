@@ -24,6 +24,7 @@
 
 package net.fabricmc.loom.configuration.mods.dependency;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
@@ -158,6 +159,16 @@ public record LocalMavenHelper(String group, String name, String version, @Nulla
 		final String fileName = classifier == null ? String.format("%s-%s.jar", name, version)
 													: String.format("%s-%s-%s.jar", name, version, classifier);
 		return getDirectory().resolve(fileName);
+	}
+
+	/**
+	 * 产出文件相对于仓库根的路径（以 {@code /} 分隔）.
+	 *
+	 * <p>供文件依赖构造使用：任务持有产出根目录，消费方据此换算出文件依赖，
+	 * 从而获得携带任务依赖的引用（见架构 §5.1.1）。
+	 */
+	public String getRelativeArtifactPath(@Nullable String classifier) {
+		return root.relativize(getOutputFile(classifier)).toString().replace(File.separatorChar, '/');
 	}
 
 	public LocalMavenHelper withClassifier(String classifier) {

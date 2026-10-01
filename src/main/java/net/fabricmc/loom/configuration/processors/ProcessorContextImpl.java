@@ -29,6 +29,7 @@ import dev.architectury.loom.mappings.MappingOption;
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.api.processor.ProcessorContext;
+import net.fabricmc.loom.build.IntermediaryNamespaces;
 import net.fabricmc.loom.configuration.ConfigContext;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJar;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
@@ -38,8 +39,10 @@ import net.fabricmc.tinyremapper.TinyRemapper;
 
 public record ProcessorContextImpl(ConfigContext configContext, MinecraftJar minecraftJar) implements ProcessorContext {
 	@Override
-	public MinecraftJarConfiguration getJarConfiguration() {
-		return configContext.extension().getMinecraftJarConfiguration().get();
+	public boolean isSplit() {
+		// split 配置的两个 jar 与单边的 server only / client only 在环境信息上完全一致，
+		// 只能回到配置本身来区分
+		return configContext.extension().getMinecraftJarConfiguration().get() == MinecraftJarConfiguration.SPLIT;
 	}
 
 	@Override
@@ -77,5 +80,10 @@ public record ProcessorContextImpl(ConfigContext configContext, MinecraftJar min
 	@Override
 	public MappingsNamespace getProductionNamespace() {
 		return configContext().extension().getProductionNamespaceEnum().get();
+	}
+
+	@Override
+	public MappingsNamespace getIntermediaryNamespace() {
+		return IntermediaryNamespaces.intermediaryNamespace(configContext().project());
 	}
 }

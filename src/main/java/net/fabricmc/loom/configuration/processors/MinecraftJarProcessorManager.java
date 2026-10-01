@@ -125,6 +125,25 @@ public final class MinecraftJarProcessorManager {
 		return Checksum.of(getCacheValue()).sha1().hex(10);
 	}
 
+	/**
+	 * {@return 本 manager 实际会执行的有序 processor 链，顺序即处理顺序}.
+	 *
+	 * <p>返回的链与 {@link #processJar} 内部遍历的那一张表是同一份（已剔除 spec 为 null 的
+	 * processor），因此把链投影成任务输入时不必在别处重建——重建会得到第二份语义。
+	 */
+	public List<MinecraftJarProcessor<?>> getProcessors() {
+		return jarProcessors.stream()
+				.<MinecraftJarProcessor<?>>map(ProcessorEntry::processor)
+				.toList();
+	}
+
+	/** {@return 与 {@link #getProcessors()} 一一对应的 spec 链，顺序一致}. */
+	public List<MinecraftJarProcessor.Spec> getSpecs() {
+		return jarProcessors.stream()
+				.<MinecraftJarProcessor.Spec>map(ProcessorEntry::spec)
+				.toList();
+	}
+
 	public String getSourceMappingsHash() {
 		return Checksum.of(getCacheValue()).sha1().hex();
 	}

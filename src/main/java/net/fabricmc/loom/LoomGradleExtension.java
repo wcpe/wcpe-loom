@@ -155,7 +155,48 @@ public interface LoomGradleExtension extends LoomGradleExtensionAPI {
 		};
 	}
 
+	/**
+	 * 取某个命名空间下的 Minecraft jar 集合.
+	 *
+	 * <p>已登记任务产出（见 {@link #setMinecraftJarsTaskOutputs}）时，返回的集合派生自产出任务，
+	 * 携带任务依赖；未登记时回退到配置期已经落盘的文件，此时集合里是裸 {@link java.io.File}，
+	 * 不携带任何任务依赖。
+	 *
+	 * <h4>同一命名空间返回的是同一份集合实例</h4>
+	 * 消费方通常在**自己的任务注册期**就调用本方法，而产出方的登记发生在更晚（{@code afterEvaluate}
+	 * 里的 {@code provide}）。因此登记不是「换一份新集合」，而是把任务产出并进已发出的那一份
+	 * （见 {@link #setMinecraftJarsTaskOutputs}）；否则先取走引用的消费方手里永远是未登记时的快照，
+	 * 任务依赖会静默丢失，冷缓存下消费方就会读到一个还不存在的 jar。
+	 *
+	 * @param mappingsNamespace 目标命名空间
+	 * @return 该命名空间下的 Minecraft jar 集合
+	 */
 	FileCollection getMinecraftJarsCollection(MappingsNamespace mappingsNamespace);
+
+	/**
+	 * 登记某个命名空间下、由任务产出的 Minecraft jar 集合.
+	 *
+	 * <h4>为什么必须由产出方登记</h4>
+	 * 消费方（{@code ValidateAccessWidenerTask}、{@code ValidateModProvidedJavadocTask} 等）
+	 * 在注册自己的任务时看不到产出 MC jar 的那个 {@code TaskProvider}，无法自行接上依赖；
+	 * 产出方在注册任务之后调用本方法，是唯一能把这份依赖传播给全部消费方的位置。
+	 *
+	 * <h4>对入参的要求</h4>
+	 * {@code taskOutputs} 必须派生自 {@code TaskProvider}，例如
+	 * {@code project.files(remapTask.flatMap(t -> t.getOutputJar()))}。
+	 * 携带任务依赖的是 {@code Provider} 本身，裸 {@code File}/{@code Path} 不会携带——
+	 * 传入裸文件等价于没有登记。
+	 *
+	 * <h4>登记是「并进」而不是「替换引用」</h4>
+	 * 本方法把 {@code taskOutputs} 并进 {@link #getMinecraftJarsCollection} 为该命名空间返回的
+	 * 那一份集合实例（尚未取过则现建一份），因此已经持有引用的消费方同样能拿到任务依赖。
+	 * 同一命名空间重复登记时内容以最后一次为准——后一次会整体替换前一次的内容，
+	 * 而不是把两份 jar 都留在集合里（例如 processed provider 覆盖未处理的 provider）。
+	 *
+	 * @param mappingsNamespace 该集合所属的命名空间
+	 * @param taskOutputs 由任务产出的 jar 集合
+	 */
+	void setMinecraftJarsTaskOutputs(MappingsNamespace mappingsNamespace, FileCollection taskOutputs);
 
 	@Override
 	MixinExtension getMixin();

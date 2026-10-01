@@ -29,7 +29,9 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.function.Supplier;
 
@@ -78,6 +80,19 @@ public abstract class LoomGradleExtensionImpl extends LoomGradleExtensionApiImpl
 	private final MixinExtension mixinApExtension;
 	private final LoomFiles loomFiles;
 	private final ConfigurableFileCollection unmappedMods;
+
+	/** 各命名空间下由任务产出的 MC jar 集合；接线前为空，{@code getMinecraftJarsCollection} 会回退到配置期落盘的文件. */
+	private final Map<MappingsNamespace, FileCollection> minecraftJarTaskOutputs = new EnumMap<>(MappingsNamespace.class);
+
+	/**
+	 * 每个命名空间「同一份」可配置文件集合：消费方取走的是它，产出方登记时也把任务产出并进它.
+	 *
+	 * <p>必须是同一份实例：消费方（{@code ValidateAccessWidenerTask}、{@code TinyRemapperService} 等）
+	 * 通常在**自己的任务注册期**就调用 {@code getMinecraftJarsCollection}，而产出方的登记发生在更晚的
+	 * {@code afterEvaluate}。若每次返回新实例，消费方手里那份永远是「尚未登记」的快照——里面是裸文件、
+	 * 不携带任何任务依赖，接线会静默失效（表现为冷缓存下消费方读不到还不存在的 jar）。
+	 */
+	private final Map<MappingsNamespace, ConfigurableFileCollection> minecraftJarCollections = new EnumMap<>(MappingsNamespace.class);
 
 	private final List<AccessWidenerFile> transitiveAccessWideners = new ArrayList<>();
 
@@ -257,11 +272,42 @@ public abstract class LoomGradleExtensionImpl extends LoomGradleExtensionApiImpl
 
 	@Override
 	public FileCollection getMinecraftJarsCollection(MappingsNamespace mappingsNamespace) {
-		return getProject().files(
-			getProject().provider(() ->
-				getProject().files(getMinecraftJars(mappingsNamespace).stream().map(Path::toFile).toList())
-			)
-		);
+		return minecraftJarsCollection(mappingsNamespace);
+	}
+
+	/** {@return 该命名空间的集合实例} 见 {@link #minecraftJarCollections} 对「必须是同一份实例」的说明. */
+	private ConfigurableFileCollection minecraftJarsCollection(MappingsNamespace mappingsNamespace) {
+		// 同一命名空间只建一次：消费方在登记之前取走的引用，会在登记时被并进任务产出（见 setMinecraftJarsTaskOutputs）
+		return minecraftJarCollections.computeIfAbsent(mappingsNamespace, namespace -> {
+			final ConfigurableFileCollection collection = getProject().getObjects().fileCollection();
+
+			// 未登记时的回退：配置期已经落盘的文件。外层 Provider 只做延迟解析，内层是裸 File 列表，
+			// 不携带任何任务依赖——消费侧看不到「谁产出这些 jar」，也就不会在消费前先跑产出任务。
+			// 登记之后本项会被 setFrom 整体替换掉，因此「未登记」与「已登记」不会同时生效。
+			collection.from(getProject().provider(() ->
+					getMinecraftJars(namespace).stream().map(Path::toFile).toList()
+			));
+
+			final FileCollection registered = minecraftJarTaskOutputs.get(namespace);
+
+			if (registered != null) {
+				// 本次调用发生在登记之后：直接把任务产出放进来
+				collection.setFrom(registered);
+			}
+
+			return collection;
+		});
+	}
+
+	@Override
+	public void setMinecraftJarsTaskOutputs(MappingsNamespace mappingsNamespace, FileCollection taskOutputs) {
+		Objects.requireNonNull(taskOutputs, "taskOutputs");
+		minecraftJarTaskOutputs.put(mappingsNamespace, taskOutputs);
+		// setFrom 而不是新建实例：消费方可能已经取走过集合引用，换实例会把任务依赖留在旧实例上。
+		// setFrom 也顺带满足「同一命名空间重复登记以最后一次为准」——后一次登记（例如 processed provider
+		// 覆盖未处理的 provider）整体替换掉前一次的内容，而不是把两份 jar 都留在集合里。
+		// 任务依赖由入参自身携带（它派生自 TaskProvider），setFrom 会把它一并纳入。
+		minecraftJarsCollection(mappingsNamespace).setFrom(taskOutputs);
 	}
 
 	@Override
