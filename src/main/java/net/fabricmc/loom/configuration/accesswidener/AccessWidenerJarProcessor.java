@@ -24,6 +24,7 @@
 
 package net.fabricmc.loom.configuration.accesswidener;
 
+import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -36,6 +37,7 @@ import java.util.List;
 import javax.inject.Inject;
 
 import org.gradle.api.file.RegularFileProperty;
+import org.gradle.api.model.ObjectFactory;
 import org.jspecify.annotations.Nullable;
 
 import net.fabricmc.classtweaker.api.ClassTweaker;
@@ -101,6 +103,14 @@ public class AccessWidenerJarProcessor implements MinecraftJarProcessor<AccessWi
 		return name;
 	}
 
+	@Override
+	public Descriptor descriptor() {
+		// access widener 的属性对象无法放进任务状态，这里只保留重建所需的文件路径
+		return new Descriptor(name, includeTransitive, localAccessWidenerProperty.isPresent()
+				? localAccessWidenerProperty.get().getAsFile().getAbsolutePath()
+				: null);
+	}
+
 	public record Spec(List<AccessWidenerEntry> accessWideners) implements MinecraftJarProcessor.Spec {
 		List<AccessWidenerEntry> accessWidenersForContext(ProcessorContext context) {
 			return accessWideners.stream()
@@ -159,5 +169,26 @@ public class AccessWidenerJarProcessor implements MinecraftJarProcessor<AccessWi
 	@Override
 	public @Nullable MappingsProcessor<Spec> processMappings() {
 		return TransitiveAccessWidenerMappingsProcessor.INSTANCE;
+	}
+
+	/**
+	 * 用于在执行期重建 {@link AccessWidenerJarProcessor} 的描述符.
+	 *
+	 * @param name processor 名称
+	 * @param includeTransitive 是否包含传递性 access widener
+	 * @param localAccessWidenerPath 本地 access widener 的绝对路径，未配置时为 {@code null}
+	 */
+	public record Descriptor(String name, boolean includeTransitive, @Nullable String localAccessWidenerPath)
+			implements MinecraftJarProcessor.ProcessorDescriptor<AccessWidenerJarProcessor> {
+		@Override
+		public AccessWidenerJarProcessor createProcessor(ObjectFactory objectFactory) {
+			final RegularFileProperty localAccessWidener = objectFactory.fileProperty();
+
+			if (localAccessWidenerPath != null) {
+				localAccessWidener.fileValue(new File(localAccessWidenerPath));
+			}
+
+			return objectFactory.newInstance(AccessWidenerJarProcessor.class, name, includeTransitive, localAccessWidener);
+		}
 	}
 }

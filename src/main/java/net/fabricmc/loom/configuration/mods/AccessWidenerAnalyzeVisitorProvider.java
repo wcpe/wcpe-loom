@@ -25,6 +25,7 @@
 package net.fabricmc.loom.configuration.mods;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.List;
 
 import org.objectweb.asm.ClassVisitor;
@@ -39,12 +40,18 @@ import net.fabricmc.loom.util.ModPlatform;
 import net.fabricmc.tinyremapper.TinyRemapper;
 
 public record AccessWidenerAnalyzeVisitorProvider(ClassTweaker accessWidener) implements TinyRemapper.AnalyzeVisitorProvider {
-	static AccessWidenerAnalyzeVisitorProvider createFromMods(String namespace, List<ModDependency> mods, ModPlatform platform) throws IOException {
+	/**
+	 * 从若干 mod jar 合并出 access widener 分析器.
+	 *
+	 * <p>只读取各 jar 内的 AW 内容，不触碰 {@link ModDependency} 的任何缓存或项目状态，
+	 * 因此可在执行期调用（L3 任务路径）。
+	 */
+	public static AccessWidenerAnalyzeVisitorProvider createFromPaths(String namespace, List<Path> modJars, ModPlatform platform) throws IOException {
 		ClassTweaker accessWidener = ClassTweaker.newInstance();
 		accessWidener.visitHeader(namespace);
 
-		for (ModDependency mod : mods) {
-			final var accessWidenerData = AccessWidenerUtils.readAccessWidenerData(mod.getInputFile(), platform);
+		for (Path modJar : modJars) {
+			final var accessWidenerData = AccessWidenerUtils.readAccessWidenerData(modJar, platform);
 
 			if (accessWidenerData == null) {
 				continue;

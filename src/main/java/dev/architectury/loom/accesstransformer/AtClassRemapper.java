@@ -37,6 +37,7 @@ import java.util.function.UnaryOperator;
 import dev.architectury.loom.util.collection.CollectionUtil;
 import org.gradle.api.Project;
 import org.gradle.api.logging.Logger;
+import org.gradle.api.logging.Logging;
 
 import net.fabricmc.loom.build.IntermediaryNamespaces;
 import net.fabricmc.loom.util.Constants;
@@ -47,9 +48,18 @@ import net.fabricmc.mappingio.tree.MappingTree;
  * Remaps AT classes from SRG to Yarn.
  */
 public final class AtClassRemapper {
-	public static void remap(Project project, Path jar, MappingTree mappings) throws IOException {
-		final Logger logger = project.getLogger();
-		final String sourceNamespace = IntermediaryNamespaces.intermediary(project);
+	private static final Logger LOGGER = Logging.getLogger(AtClassRemapper.class);
+
+	/**
+	 * 重映射 jar 内 AT 条目的类名（SRG → named）.
+	 *
+	 * <p>不依赖 {@link Project}：源命名空间由调用方给出，日志走静态 logger。
+	 * 项目模型版本委托到此，二者共用同一份实现，避免任务化时出现第二份拷贝。
+	 *
+	 * @param sourceNamespace AT 条目当前所处的命名空间
+	 */
+	public static void remap(Path jar, MappingTree mappings, String sourceNamespace) throws IOException {
+		final Logger logger = LOGGER;
 
 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar, false)) {
 			Path atPath = fs.getPath(Constants.Forge.ACCESS_TRANSFORMER_PATH);
@@ -136,5 +146,9 @@ public final class AtClassRemapper {
 		} catch (IOException e) {
 			throw new AssertionError(e);
 		}
+	}
+
+	public static void remap(Project project, Path jar, MappingTree mappings) throws IOException {
+		remap(jar, mappings, IntermediaryNamespaces.intermediary(project));
 	}
 }

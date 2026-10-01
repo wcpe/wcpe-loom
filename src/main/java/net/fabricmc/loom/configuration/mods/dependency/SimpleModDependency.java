@@ -62,7 +62,7 @@ public final class SimpleModDependency extends ModDependency {
 	}
 
 	@Override
-	public void applyToProject(Project project) {
-		project.getDependencies().add(targetConfig.getName(), maven.getNotation());
+	public void applyToProject(Project project, RemappedModArtifacts artifacts) {
+		project.getDependencies().add(targetConfig.getName(), artifacts.dependency(maven.getRelativeArtifactPath(null)));
 	}
 }
