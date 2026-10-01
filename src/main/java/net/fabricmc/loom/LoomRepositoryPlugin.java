@@ -114,6 +114,9 @@ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
 			});
 			repo.metadataSources(sources -> {
 				sources.mavenPom();
+				// forge 上大量制品只有 jar/zip 没有 POM（如 de.oceanlabs.mcp 的 MCP 映射数据、
+				// 各 classifier 产物），只查 POM 会漏掉它们
+				sources.artifact();
 				sources.ignoreGradleMetadataRedirection();
 			});
 		});

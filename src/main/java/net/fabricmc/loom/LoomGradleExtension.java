@@ -215,8 +215,8 @@ public interface LoomGradleExtension extends LoomGradleExtensionAPI {
 	/**
 	 * 是否为 legacy Forge（1.8-1.16，ForgeGradle 2 时代）.
 	 *
-	 * <p>判定依据是 userdev 配置里有没有 {@code mcp} 段，因此必须在 userdev 解析完成后调用；
-	 * 未解析时 {@link ForgeUserdevProvider#isLegacyForge()} 会抛异常。
+	 * <p>判定依据是 userdev 配置的形态（FG2 与 userdev3 都算 legacy），
+	 * 因此必须在 userdev 解析完成后调用；未解析时 {@link ForgeUserdevProvider#isLegacyForge()} 会抛异常。
 	 */
 	default boolean isLegacyForge() {
 		return isForge() && getForgeUserdevProvider().isLegacyForge();
