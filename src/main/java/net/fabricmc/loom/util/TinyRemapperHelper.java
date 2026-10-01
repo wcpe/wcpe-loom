@@ -68,23 +68,33 @@ public final class TinyRemapperHelper {
 		return getTinyRemapper(project, serviceFactory, fromM, toM, false, true, (builder) -> { }, Set.of());
 	}
 
-	public static TinyRemapper getTinyRemapper(Project project, ServiceFactory serviceFactory, String fromM, String toM, boolean fixRecords, boolean validateTargetNamespace, Consumer<TinyRemapper.Builder> builderConsumer, Set<String> fromClassNames) throws IOException {
-		LoomGradleExtension extension = LoomGradleExtension.get(project);
-		final MappingOption mappingOption = MappingOption.forPlatform(extension);
-		MemoryMappingTree mappingTree = extension.getMappingConfiguration().getMappingsService(project, serviceFactory, mappingOption).getMappingTree();
-
+	/**
+	 * 构建重映射器，全部输入由调用方备妥.
+	 *
+	 * <p>不依赖 {@link Project}，这是把重映射算法从「依赖装满运行状态的 {@code LoomGradleExtension}」改造为
+	 * 「输入文件 + 显式参数 → 结果」的落点。任务化之后，重映射可以在执行阶段
+	 * 用已经解析好的参数构造，而不必在配置阶段触碰项目模型。
+	 *
+	 * @param mappingTree 已解析好的映射树（不经过 Project 获取）
+	 * @param isForgeLike 是否 Forge/NeoForge 系（影响冲突忽略策略与内部类映射）
+	 * @param knownIndyBsms 已知的 indy BSM 集合
+	 */
+	public static TinyRemapper getTinyRemapper(MemoryMappingTree mappingTree, String fromM, String toM,
+			boolean fixRecords, boolean validateTargetNamespace,
+			Consumer<TinyRemapper.Builder> builderConsumer, Set<String> fromClassNames,
+			boolean isForgeLike, Set<String> knownIndyBsms) throws IOException {
 		int intermediaryNsId = mappingTree.getNamespaceId(MappingsNamespace.INTERMEDIARY.toString());
 		int fromNsId = mappingTree.getNamespaceId(fromM);
 
 		TinyRemapper.Builder builder = TinyRemapper.newRemapper(TinyRemapperLoggerAdapter.INSTANCE)
-				.ignoreConflicts(extension.isForgeLike())
+				.ignoreConflicts(isForgeLike)
 				.threads(Runtime.getRuntime().availableProcessors())
 				.withMappings(create(mappingTree, fromM, toM, true, validateTargetNamespace))
 				.renameInvalidLocals(true)
 				.rebuildSourceFilenames(true)
 				.invalidLvNamePattern(MC_LV_PATTERN)
 				.inferNameFromSameLvIndex(true)
-				.withKnownIndyBsm(extension.getKnownIndyBsms().get())
+				.withKnownIndyBsm(knownIndyBsms)
 				.extraPreApplyVisitor((cls, next) -> {
 					if (fixRecords && !cls.isRecord() && "java/lang/Record".equals(cls.getSuperName())) {
 						return new RecordComponentFixVisitor(next, mappingTree, fromNsId, intermediaryNsId);
@@ -93,7 +103,7 @@ public final class TinyRemapperHelper {
 					return next;
 				});
 
-		if (extension.isForgeLike()) {
+		if (isForgeLike) {
 			if (!fromClassNames.isEmpty()) {
 				builder.withMappings(InnerClassRemapper.of(fromClassNames, mappingTree, fromM, toM));
 			}
@@ -103,6 +113,17 @@ public final class TinyRemapperHelper {
 
 		builderConsumer.accept(builder);
 		return builder.build();
+	}
+
+	public static TinyRemapper getTinyRemapper(Project project, ServiceFactory serviceFactory, String fromM, String toM, boolean fixRecords, boolean validateTargetNamespace, Consumer<TinyRemapper.Builder> builderConsumer, Set<String> fromClassNames) throws IOException {
+		LoomGradleExtension extension = LoomGradleExtension.get(project);
+		final MappingOption mappingOption = MappingOption.forPlatform(extension);
+		MemoryMappingTree mappingTree = extension.getMappingConfiguration().getMappingsService(project, serviceFactory, mappingOption).getMappingTree();
+
+		// 委托给不依赖 Project 的重载：项目模型只在这里被读取一次，
+		// 之后的重映射构造完全由显式参数驱动。
+		return getTinyRemapper(mappingTree, fromM, toM, fixRecords, validateTargetNamespace,
+				builderConsumer, fromClassNames, extension.isForgeLike(), extension.getKnownIndyBsms().get());
 	}
 
 	private static IMappingProvider.Member memberOf(String className, String memberName, String descriptor) {
