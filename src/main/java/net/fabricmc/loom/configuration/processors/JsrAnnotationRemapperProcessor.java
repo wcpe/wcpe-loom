@@ -30,6 +30,7 @@ import java.util.Map;
 
 import javax.inject.Inject;
 
+import org.gradle.api.model.ObjectFactory;
 import org.jspecify.annotations.Nullable;
 
 import net.fabricmc.loom.api.processor.MinecraftJarProcessor;
@@ -80,9 +81,28 @@ public class JsrAnnotationRemapperProcessor implements MinecraftJarProcessor<Jsr
 		return name;
 	}
 
+	@Override
+	public Descriptor descriptor() {
+		return new Descriptor(name);
+	}
+
 	public record Spec(Map<String, String> annotationMapping) implements MinecraftJarProcessor.Spec {
 		public IMappingProvider getMappings() {
 			return out -> annotationMapping.forEach(out::acceptClass);
+		}
+	}
+
+	/**
+	 * 用于在执行期重建 {@link JsrAnnotationRemapperProcessor} 的描述符.
+	 *
+	 * <p>映射表本身是常量，重建时不需要保存，故描述符中只有 processor 名称。
+	 *
+	 * @param name processor 名称
+	 */
+	public record Descriptor(String name) implements MinecraftJarProcessor.ProcessorDescriptor<JsrAnnotationRemapperProcessor> {
+		@Override
+		public JsrAnnotationRemapperProcessor createProcessor(ObjectFactory objectFactory) {
+			return objectFactory.newInstance(JsrAnnotationRemapperProcessor.class, name);
 		}
 	}
 }
