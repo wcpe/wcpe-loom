@@ -140,6 +140,9 @@ class ArtifactMetadataTest extends Specification {
 		"1.4"       | "1.4.local"
 		"1.5"       | "1.4.99"
 		"2.0"       | "1.4.99"
+		"1.17-wcpe-6" | "1.17-wcpe-5"
+		"1.17-wcpe-6" | "1.17-wcpe-6"
+		"1.18-wcpe-6" | "1.17-wcpe-5"
 	}
 
 	// Test that a mod with the same or older version of loom can be read
@@ -157,6 +160,23 @@ class ArtifactMetadataTest extends Specification {
 		"1.4"       | "1.5.00"
 		"1.4"       | "2.0"
 		"1.4"       | "2.4"
+		"1.17-wcpe-6" | "1.18-wcpe-1"
+	}
+
+	def "Invalid formatted loom version"() {
+		given:
+		def zip = createModWithRemapType(modLoomVersion, "static")
+		when:
+		createMetadata(zip, loomVersion)
+		then:
+		def e = thrown(IllegalStateException)
+		e.message == "Invalid Loom version: $invalidVersion"
+		where:
+		loomVersion      | modLoomVersion      | invalidVersion
+		"1.x"            | "1.17-wcpe-6"      | "1.x"
+		"1.17-wcpe-6"   | "1.x"              | "1.x"
+		"1.17-wcpe-6"   | "1.17-wcpe-x"     | "1.17-wcpe-x"
+		"1.17-wcpe-6"   | "1.17-wcpe-"      | "1.17-wcpe-"
 	}
 
 	def "Accepts all Loom versions for remap 'false'"() {
