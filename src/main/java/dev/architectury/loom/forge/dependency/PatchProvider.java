@@ -37,7 +37,7 @@ import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
+import java.util.concurrent.Callable;
 import java.util.jar.JarEntry;
 import java.util.jar.JarInputStream;
 import java.util.jar.JarOutputStream;
@@ -54,6 +54,9 @@ import net.fabricmc.loom.configuration.DependencyInfo;
 import net.fabricmc.loom.configuration.providers.forge.fg2.Pack200Provider;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
+import net.fabricmc.loom.util.cache.AtomicFiles;
+import net.fabricmc.loom.util.cache.CacheEntryLock;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 
 public class PatchProvider extends DependencyProvider {
 	private Path projectCacheFolder;
@@ -104,10 +107,40 @@ public class PatchProvider extends DependencyProvider {
 			return;
 		}
 
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(installerJar)) {
-			Files.copy(fs.getPath("data", name), targetPath, StandardCopyOption.REPLACE_EXISTING);
+		withPatchLock(() -> {
+			// 锁内二次确认：等锁期间可能已被其它进程提取完成
+			if (Files.exists(targetPath) && !refreshDeps()) {
+				return null;
+			}
+
+			try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(installerJar)) {
+				final byte[] data = fs.readAllBytes("data/" + name);
+				AtomicFiles.publish(targetPath, tmp -> Files.write(tmp, data));
+			} catch (IOException e) {
+				throw new UncheckedIOException(e);
+			}
+
+			return null;
+		});
+	}
+
+	/**
+	 * 在跨进程锁保护下提取补丁文件.
+	 *
+	 * <p>补丁位于跨 daemon 共享的 forge 缓存目录（不按项目隔离），同一 MC+Forge 版本的多个并发构建
+	 * 会写同一路径；由首个取得锁的进程写入，其余进程等待后直接复用。锁内二次确认。
+	 */
+	private void withPatchLock(Callable<Void> action) {
+		final String lockKey = "forge-patches:" + getExtension().getMinecraftProvider().minecraftVersion()
+				+ ":" + getExtension().getForgeProvider().getVersion().getCombined();
+		final Path lockRoot = projectCacheFolder.resolve(Constants.Cache.LOCKS_DIR);
+
+		try {
+			CacheEntryLock.withLock(lockRoot, lockKey, LoomCacheService.defaultTimeout(), action);
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);
+		} catch (Exception e) {
+			throw new RuntimeException("Could not extract Forge patches", e);
 		}
 	}
 
@@ -127,12 +160,36 @@ public class PatchProvider extends DependencyProvider {
 			return;
 		}
 
-		byte[] unpackedBytes;
+		withPatchLock(() -> {
+			// 锁内二次确认：等锁期间可能已被其它进程提取完成
+			if (Files.exists(clientPatches) && Files.exists(serverPatches) && !refreshDeps()) {
+				return null;
+			}
 
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(installerJar)) {
-			unpackedBytes = unpack200Lzma(fs.getPath("binpatches.pack.lzma"));
-		}
+			byte[] unpackedBytes;
 
+			try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(installerJar)) {
+				unpackedBytes = unpack200Lzma(fs.getPath("binpatches.pack.lzma"));
+			}
+
+			// 两个产物都先写「同目录唯一临时文件」再原子 move，避免读方看到半截内容
+			final Path clientTmp = AtomicFiles.tempSibling(clientPatches);
+			final Path serverTmp = AtomicFiles.tempSibling(serverPatches);
+
+			try {
+				writeLegacyPatches(unpackedBytes, clientTmp, serverTmp);
+				AtomicFiles.move(clientTmp, clientPatches);
+				AtomicFiles.move(serverTmp, serverPatches);
+			} finally {
+				Files.deleteIfExists(clientTmp);
+				Files.deleteIfExists(serverTmp);
+			}
+
+			return null;
+		});
+	}
+
+	private void writeLegacyPatches(byte[] unpackedBytes, Path clientPatches, Path serverPatches) throws IOException {
 		try (JarInputStream in = new JarInputStream(new ByteArrayInputStream(unpackedBytes));
 				OutputStream clientFileOut = Files.newOutputStream(clientPatches, CREATE, TRUNCATE_EXISTING);
 				LzmaOutputStream clientLzmaOut = new LzmaOutputStream(clientFileOut, new Encoder());

@@ -40,6 +40,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -91,6 +92,8 @@ import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.LoomVersions;
 import net.fabricmc.loom.util.TinyRemapperHelper;
 import net.fabricmc.loom.util.ZipUtils;
+import net.fabricmc.loom.util.cache.CacheEntryLock;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.service.ScopedServiceFactory;
 import net.fabricmc.loom.util.service.ServiceFactory;
 import net.fabricmc.mappingio.tree.MappingTree;
@@ -213,6 +216,11 @@ public class MinecraftPatchedProvider {
 
 	public void provide() throws Exception {
 		initPatchedFiles();
+		withPatchedLock(this::providePatched);
+	}
+
+	private Void providePatched() throws Exception {
+		// 锁内判定：等锁期间其它进程可能已完成生产，checkCache 与 notExists 均为幂等二次确认
 		checkCache();
 
 		this.dirty = false;
@@ -231,9 +239,16 @@ public class MinecraftPatchedProvider {
 			this.dirty = true;
 			accessTransformForge();
 		}
+
+		return null;
 	}
 
 	public void remapJar(ServiceFactory serviceFactory) throws Exception {
+		withPatchedLock(() -> remapPatchedJarWithDirty(serviceFactory));
+	}
+
+	private Void remapPatchedJarWithDirty(ServiceFactory serviceFactory) throws Exception {
+		// 锁内判定：等锁期间其它进程可能已完成生产，dirty/notExists 判定即为二次确认
 		if (dirty) {
 			if (getExtension().isUnobfuscatedForge()) {
 				mergeUnobfuscatedPatchedJar();
@@ -252,6 +267,29 @@ public class MinecraftPatchedProvider {
 
 		if (providesClientJar()) {
 			DependencyProvider.addDependency(project, minecraftClientExtra, Constants.Configurations.FORGE_EXTRA);
+		}
+
+		return null;
+	}
+
+	/**
+	 * 在跨进程锁保护下执行 patched jar 生产.
+	 *
+	 * <p>产物位于跨 daemon 共享的 forge 缓存目录（不按项目隔离），且 {@code client-extra.jar} 在
+	 * 各 Type 实例间共享同一路径；同一 MC+Forge 版本的多个并发构建会互相读写/删除同一批文件，
+	 * 必须整段生产串行化。锁内判定均为幂等二次确认，等锁期间其它进程完成生产后直接复用。
+	 */
+	protected void withPatchedLock(Callable<Void> action) {
+		final String lockKey = "forge-patched:" + getExtension().getMinecraftProvider().minecraftVersion()
+				+ ":" + getExtension().getForgeProvider().getVersion().getCombined();
+		final Path lockRoot = ForgeProvider.getForgeCache(project).resolve(Constants.Cache.LOCKS_DIR);
+
+		try {
+			CacheEntryLock.withLock(lockRoot, lockKey, LoomCacheService.defaultTimeout(), action);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		} catch (Exception e) {
+			throw new RuntimeException("Could not produce patched Minecraft jars", e);
 		}
 	}
 

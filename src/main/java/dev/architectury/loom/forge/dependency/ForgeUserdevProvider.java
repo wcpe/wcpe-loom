@@ -26,6 +26,7 @@ package dev.architectury.loom.forge.dependency;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -50,6 +51,9 @@ import net.fabricmc.loom.configuration.mods.dependency.LocalMavenHelper;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.ZipUtils;
+import net.fabricmc.loom.util.cache.AtomicFiles;
+import net.fabricmc.loom.util.cache.CacheEntryLock;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 
 public class ForgeUserdevProvider extends DependencyProvider {
 	/** FG2 形态 userdev jar 内的 AT 文件名，与 {@link #createLegacyAts()} 的条目保持一致. */
@@ -94,27 +98,14 @@ public class ForgeUserdevProvider extends DependencyProvider {
 		// 缓存内保留 forge 发布的原始配置（userdev3 也原样保留），形态判定与 manifest 派生都以它为准
 		byte[] configBytes = Files.notExists(configJson) ? null : Files.readAllBytes(configJson);
 		UserdevForm form = configBytes == null ? null : UserdevForm.of(parse(configBytes));
-		JsonObject rawJson;
 
 		if (needsUserdevRework(form)) {
-			File resolved = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve Forge userdev"));
-			configBytes = readUserdevConfig(resolved.toPath());
-			rawJson = parse(configBytes);
-			form = UserdevForm.of(rawJson);
-			Files.write(configJson, configBytes);
-
-			if (form == UserdevForm.USERDEV3) {
-				// userdev3 与 legacy 分支期待的 FG2 形态不兼容，必须在配置期归一——依赖解析本身就发生在
-				// 配置期（afterEvaluate），任务级 dependsOn 一律晚于该时点
-				json = createNormalizedUserdev3Jar(dependency, resolved.toPath(), rawJson);
-			} else {
-				Files.copy(resolved.toPath(), userdevJar.toPath(), StandardCopyOption.REPLACE_EXISTING);
-				json = createManifest(dependency, rawJson, form, userdevJar.toPath());
-			}
+			// 需要生产：userdev jar / config.json 位于跨 daemon 共享的 userCache（不按项目隔离），
+			// 同一 MC+Forge 版本的多个并发构建会写同一路径，必须串行化（锁内二次确认）。
+			form = produceWithLock(dependency, configJson);
 		} else {
 			// 命中缓存：manifest 由缓存的原始配置重新派生（legacy 形态的 sources 落位是幂等的）
-			rawJson = parse(configBytes);
-			json = createManifest(dependency, rawJson, form, userdevJar.toPath());
+			json = createManifest(dependency, parse(configBytes), form, userdevJar.toPath());
 		}
 
 		isLegacyForge = form.isLegacy();
@@ -131,7 +122,58 @@ public class ForgeUserdevProvider extends DependencyProvider {
 		addDependency(config.universal(), Constants.Configurations.FORGE_UNIVERSAL);
 
 		if (!isLegacyForge && Files.notExists(joinedPatches)) {
-			Files.write(joinedPatches, ZipUtils.unpack(userdevJar.toPath(), config.binpatches()));
+			// 原子发布：写临时文件后原子落位，跨 daemon 读方不会看到半截内容
+			AtomicFiles.publish(joinedPatches, tmp -> Files.write(tmp, ZipUtils.unpack(userdevJar.toPath(), config.binpatches())));
+		}
+	}
+
+	/**
+	 * 在跨进程锁保护下生产 userdev 缓存（userdev jar 与 config.json）.
+	 *
+	 * <p>缓存位于 {@code userCache}（不按项目隔离），同一 MC+Forge 版本的多个 daemon 会指向同一路径；
+	 * 生产结果只取决于目标版本，故由首个取得锁的进程写入，其余进程等待后直接复用。锁内二次确认，
+	 * 等锁期间可能已被其它进程完成生产。
+	 *
+	 * @return 生产（或复用）后的 userdev 形态
+	 */
+	private UserdevForm produceWithLock(DependencyInfo dependency, Path configJson) throws IOException {
+		final String lockKey = "forge-userdev:" + getExtension().getMinecraftProvider().minecraftVersion()
+				+ ":" + getExtension().getForgeProvider().getVersion().getCombined();
+		final Path lockRoot = getExtension().getForgeProvider().getGlobalCache().toPath().resolve(Constants.Cache.LOCKS_DIR);
+
+		try {
+			return CacheEntryLock.withLock(lockRoot, lockKey, LoomCacheService.defaultTimeout(), () -> {
+				// 锁内二次确认：等锁期间可能已被其它进程完成生产
+				final byte[] cached = Files.notExists(configJson) ? null : Files.readAllBytes(configJson);
+				final UserdevForm cachedForm = cached == null ? null : UserdevForm.of(parse(cached));
+
+				if (needsUserdevRework(cachedForm)) {
+					final File resolved = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve Forge userdev"));
+					final byte[] config = readUserdevConfig(resolved.toPath());
+					final JsonObject raw = parse(config);
+					final UserdevForm form = UserdevForm.of(raw);
+					Files.write(configJson, config);
+
+					if (form == UserdevForm.USERDEV3) {
+						// userdev3 与 legacy 分支期待的 FG2 形态不兼容，必须在配置期归一——依赖解析本身就发生在
+						// 配置期（afterEvaluate），任务级 dependsOn 一律晚于该时点
+						json = createNormalizedUserdev3Jar(dependency, resolved.toPath(), raw);
+					} else {
+						Files.copy(resolved.toPath(), userdevJar.toPath(), StandardCopyOption.REPLACE_EXISTING);
+						json = createManifest(dependency, raw, form, userdevJar.toPath());
+					}
+
+					return form;
+				}
+
+				// 其它进程已生产：manifest 由缓存的原始配置重新派生（legacy 形态的 sources 落位是幂等的）
+				json = createManifest(dependency, parse(cached), cachedForm, userdevJar.toPath());
+				return cachedForm;
+			});
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		} catch (Exception e) {
+			throw new RuntimeException("Could not produce Forge userdev cache", e);
 		}
 	}
 
