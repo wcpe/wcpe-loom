@@ -38,6 +38,7 @@ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftSourceSets;
 import net.fabricmc.loom.configuration.providers.minecraft.SingleJarEnvType;
 import net.fabricmc.loom.configuration.providers.minecraft.SingleJarMinecraftProvider;
 import net.fabricmc.loom.configuration.providers.minecraft.SplitMinecraftProvider;
+import net.fabricmc.loom.pipeline.RemapMinecraftTask;
 import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.tinyremapper.TinyRemapper;
@@ -83,8 +84,20 @@ public abstract class NamedMinecraftProvider<M extends MinecraftProvider> extend
 			super(project, minecraftProvider);
 			server = new SingleJarImpl(project, minecraftProvider.getServerMinecraftProvider(), SingleJarEnvType.SERVER);
 			client = new SingleJarImpl(project, minecraftProvider.getClientMinecraftProvider(), SingleJarEnvType.CLIENT);
+			// 两个委托的产物在配置期就被下面的 mergeJars 读取，故它们不参与任务生产（见基类 taskProduction）
+			server.disableTaskProduction();
+			client.disableTaskProduction();
 		}
 
+		/**
+		 * legacy merged（MC 1.3 之前的合并 jar）刻意不参与本次的任务切换.
+		 *
+		 * <p>本方法覆写了 {@code provide}，走的是「分别重映射 client/server 再合并」而不是一次重映射，
+		 * {@link RemapMinecraftTask} 无从承载（它的输入契约是一对输入/输出 jar）。因此这里保持配置期生产
+		 * ——与改造前逐字一致。它也是 {@code AbstractMappedMinecraftProvider.provide} 里那条回退路径的
+		 * 一种形态，但回退点是本覆写本身，判据在 {@link #getRemappedJars()}（它直接抛异常）。
+		 * 解除条件：为「合并」单列一个任务，并把 client/server 两条重映射链一并投影。
+		 */
 		@Override
 		public List<MinecraftJar> provide(ProvideContext context) throws Exception {
 			final ProvideContext childContext = context.withApplyDependencies(false);
@@ -175,6 +188,14 @@ public abstract class NamedMinecraftProvider<M extends MinecraftProvider> extend
 		@Override
 		public List<MinecraftJar.Type> getDependencyTypes() {
 			return List.of(MinecraftJar.Type.CLIENT_ONLY, MinecraftJar.Type.COMMON);
+		}
+
+		// 覆写体就是上面这一行静态调用，逐字核对无歧义：效果 = configureSplitRemapper 的判据
+		// （非 merged 且含客户端才挂 SidedClassVisitor.CLIENT），故声明为 SPLIT_CLIENT_VISITOR_ONLY，
+		// 允许逐 jar 投影。
+		@Override
+		protected RemapperHookKind remapperHookKind() {
+			return RemapperHookKind.SPLIT_CLIENT_VISITOR_ONLY;
 		}
 	}
 

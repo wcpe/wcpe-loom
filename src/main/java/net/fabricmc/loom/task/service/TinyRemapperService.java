@@ -134,12 +134,37 @@ public class TinyRemapperService extends Service<TinyRemapperService.Options> im
 		});
 	}
 
+	/**
+	 * 与 {@link #createSimple(Project, Provider, Provider, ClasspathLibraries)} 相同，但 classpath 由调用方显式给出.
+	 *
+	 * <p>供「产物由任务产出」的场景使用：此时的 classpath 需要接线到上游任务的输出
+	 * （一个由 {@code Provider} 支撑的 {@link FileCollection}），而不是从
+	 * {@code extension.getMinecraftJars(...)} 读配置期已经落盘的文件。
+	 *
+	 * <p>其余输入仍来自项目模型——它们是纯值（映射配置、已知 BSM、remapper 扩展），
+	 * 在配置期读取是允许的，且会被序列化进任务的输入。
+	 */
+	public static Provider<Options> createSimple(Project project, Provider<String> from, Provider<String> to, FileCollection classpath) {
+		return TYPE.create(project, options -> {
+			final LoomGradleExtension extension = LoomGradleExtension.get(project);
+
+			options.getFrom().set(from);
+			options.getTo().set(to);
+			options.getMappings().add(MappingsService.createOptionsWithProjectMappings(project, options.getFrom(), options.getTo()));
+			options.getUselegacyMixinAP().set(true);
+			options.getClasspath().from(classpath);
+			options.getKnownIndyBsms().set(extension.getKnownIndyBsms().get().stream().sorted().toList());
+			options.getRemapperExtensions().set(extension.getRemapperExtensions());
+		});
+	}
+
 	private static FileCollection getRemapClasspath(Project project, Provider<String> from, ClasspathLibraries classpathLibraries) {
 		final LoomGradleExtension extension = LoomGradleExtension.get(project);
 		final ConfigurationContainer configurations = project.getConfigurations();
 
 		if (from.get().equals(MappingsNamespace.INTERMEDIARY.toString())) {
-			ConfigurableFileCollection files = project.files(extension.getMinecraftJars(MappingsNamespace.INTERMEDIARY));
+			// 走 getMinecraftJarsCollection：登记了任务产出时它会携带产出任务
+			ConfigurableFileCollection files = project.files(extension.getMinecraftJarsCollection(MappingsNamespace.INTERMEDIARY));
 
 			if (classpathLibraries == ClasspathLibraries.INCLUDE) {
 				files = files.from(configurations.named(Constants.Configurations.MINECRAFT_COMPILE_LIBRARIES));

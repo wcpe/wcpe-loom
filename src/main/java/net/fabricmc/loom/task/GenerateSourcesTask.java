@@ -201,18 +201,17 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
 	public GenerateSourcesTask(DecompilerOptions decompilerOptions) {
 		this.decompilerOptions = decompilerOptions;
 
+		// 这里只**算路径**，刻意不做存在性检查：Gradle 会在**任务图计算阶段**查询本属性的值来收集
+		// 依赖（任务依赖的值里含 inputs.files），那时产出任务还没跑、backup 自然还不存在
+		// （改造后 backup 由任务在执行期落位）。把检查放在值提供者里，等于把「产物尚未生产」变成
+		// 「Could not determine the dependencies of task ':genSources…'」的硬失败，产出任务连执行的
+		// 机会都没有——冷缓存下必然踩到。检查与诊断改在执行期，见 getClassesInputJarPath()。
 		getClassesInputJar().fileProvider(getInputJarName().map(minecraftJarName -> {
 			final List<MinecraftJar> minecraftJars = getExtension().getNamedMinecraftProvider().getMinecraftJars();
 
 			for (MinecraftJar minecraftJar : minecraftJars) {
 				if (minecraftJar.getName().equals(minecraftJarName)) {
-					final Path backupJarPath = AbstractMappedMinecraftProvider.getBackupJarPath(minecraftJar);
-
-					if (Files.notExists(backupJarPath)) {
-						throw new IllegalStateException("Input minecraft jar not found at: " + backupJarPath);
-					}
-
-					return backupJarPath.toFile();
+					return AbstractMappedMinecraftProvider.getBackupJarPath(minecraftJar).toFile();
 				}
 			}
 
@@ -232,6 +231,20 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
 
 		getClasspath().from(decompilerOptions.getClasspath()).finalizeValueOnRead();
 		dependsOn(decompilerOptions.getClasspath().getBuiltBy());
+
+		// 反编译的输入是 named MC jar 的 backup（见上面的 getClassesInputJar），而 named jar 由任务在
+		// **执行期**落位：这份依赖必须由本任务自己声明。
+		//
+		// 这里刻意不依赖「间接排序」：各 genSources 任务恰好都 dependsOn(validateAccessWidener)，而后者
+		// 消费了扩展登记的 MC jar 集合（见 ValidateAccessWidenerTask 的构造器注释），于是产出任务今天确实
+		// 会被排在前面。但那是两条各自独立的接线凑出来的巧合——validateAccessWidener 的输入一变，本任务的
+		// 输入就会在产出任务之前被解析，报出的却是与「产物还没生产」混在一起的
+		// 「Input minecraft jar not found at ...」硬失败。声明成显式依赖后，顺序不再依赖别人。
+		//
+		// 依赖取自扩展登记的产出集合（它派生自 TaskProvider，携带生产者的任务依赖）：
+		// 未登记任务产出的命名空间（回退到配置期生产）里它是裸文件，此时不加任何依赖，行为与改造前一致。
+		// MappingsNamespace.NAMED 而非其他命名空间：反编译的输入固定是 named 分支的 jar。
+		dependsOn(getExtension().getMinecraftJarsCollection(MappingsNamespace.NAMED).getBuildDependencies());
 
 		getMinecraftCompileLibraries().from(getProject().getConfigurations().named(Constants.Configurations.MINECRAFT_COMPILE_LIBRARIES));
 		getDecompileCacheFile().set(getExtension().getFiles().getDecompileCache(CACHE_VERSION));
@@ -326,8 +339,33 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
 		}
 	}
 
+	/**
+	 * {@return 反编译的输入 jar 路径（named MC jar 的 backup）}
+	 *
+	 * <p><b>存在性检查放在这里，即执行期，不能放回 {@link #getClassesInputJar()} 的值提供者。</b>
+	 * Gradle 会在任务图计算阶段查询属性的值来收集依赖，那时产出任务还没跑。职责分工是：
+	 * 「backup 何时出现」由任务依赖保证（见构造器末尾声明的产出依赖），
+	 * 「出现后是否真的存在」在这里检查。
+	 *
+	 * <p>走到本方法时输入仍然缺失，说明产出依赖没接上（例如命名空间没登记任务产出）。这时报一条
+	 * 能直接定位的错误，而不是让反编译器读输入时才失败。
+	 *
+	 * @throws IllegalStateException 输入 jar 在执行期仍不存在
+	 */
+	private Path getClassesInputJarPath() {
+		final Path path = getClassesInputJar().get().getAsFile().toPath();
+
+		if (Files.notExists(path)) {
+			throw new IllegalStateException("Input minecraft jar not found at: " + path
+					+ "。named MC jar 及其 backup 由产出任务写出（RemapMinecraftTask 或 "
+					+ "WriteMinecraftJarSidecarsTask）；执行期仍缺失说明本任务没拿到对应的产出依赖。");
+		}
+
+		return path;
+	}
+
 	private void runWithCache(ServiceFactory serviceFactory, Path cacheRoot) throws IOException {
-		final Path classesInputJar = getClassesInputJar().get().getAsFile().toPath();
+		final Path classesInputJar = getClassesInputJarPath();
 		final Path sourcesOutputJar = getSourcesOutputJar().get().getAsFile().toPath();
 		final Path classesOutputJar = getClassesOutputJar().get().getAsFile().toPath();
 		final var cacheRules = new CachedFileStoreImpl.CacheRules(getMaxCachedFiles().get(), Duration.ofDays(getMaxCacheFileAge().get()));
@@ -395,7 +433,7 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
 	}
 
 	private void runWithoutCache(ServiceFactory serviceFactory) throws IOException {
-		final Path classesInputJar = getClassesInputJar().get().getAsFile().toPath();
+		final Path classesInputJar = getClassesInputJarPath();
 		final Path sourcesOutputJar = getSourcesOutputJar().get().getAsFile().toPath();
 		final Path classesOutputJar = getClassesOutputJar().get().getAsFile().toPath();
 
@@ -455,6 +493,16 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
 
 		if (mappingsHash != null) {
 			sj.add(mappingsHash);
+		}
+
+		// Forge 源码是**执行期注入**进产物的，而注入发生在缓存条目被写出之前——缓存里存的是注入后的内容。
+		// 因此缓存键必须覆盖注入的输入（Forge 源码包、预解压目录，以及重映射这些源码用的映射文件），
+		// 否则「换了注入输入、类字节却没变」时会全命中：任务因输入变化重跑，产物却与改动前逐字节相同，
+		// 新的注入内容被静默忽略（见 ForgeSourcesService.getSourcesCacheKey）。
+		final @Nullable ForgeSourcesService forgeSourcesService = serviceFactory.getOrNull(getForgeSourcesOptions());
+
+		if (forgeSourcesService != null) {
+			sj.add(forgeSourcesService.getSourcesCacheKey());
 		}
 
 		getLogger().info("Decompile cache data: {}", sj);

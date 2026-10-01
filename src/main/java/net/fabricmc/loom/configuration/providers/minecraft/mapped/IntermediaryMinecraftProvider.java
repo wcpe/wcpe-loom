@@ -84,6 +84,9 @@ public abstract sealed class IntermediaryMinecraftProvider<M extends MinecraftPr
 			super(project, minecraftProvider);
 			server = new SingleJarImpl(project, minecraftProvider.getServerMinecraftProvider(), SingleJarEnvType.SERVER);
 			client = new SingleJarImpl(project, minecraftProvider.getClientMinecraftProvider(), SingleJarEnvType.CLIENT);
+			// 两个委托的产物在配置期就被下面的 mergeJars 读取，故它们不参与任务生产（见基类 taskProduction）
+			server.disableTaskProduction();
+			client.disableTaskProduction();
 		}
 
 		@Override
@@ -149,6 +152,14 @@ public abstract sealed class IntermediaryMinecraftProvider<M extends MinecraftPr
 		@Override
 		protected void configureRemapper(RemappedJars remappedJars, TinyRemapper.Builder tinyRemapperBuilder) {
 			configureSplitRemapper(remappedJars, tinyRemapperBuilder);
+		}
+
+		// 覆写体就是上面这一行静态调用，逐字核对无歧义：效果 = configureSplitRemapper 的判据
+		// （非 merged 且含客户端才挂 SidedClassVisitor.CLIENT），故声明为 SPLIT_CLIENT_VISITOR_ONLY，
+		// 允许逐 jar 投影。
+		@Override
+		protected RemapperHookKind remapperHookKind() {
+			return RemapperHookKind.SPLIT_CLIENT_VISITOR_ONLY;
 		}
 	}
 
