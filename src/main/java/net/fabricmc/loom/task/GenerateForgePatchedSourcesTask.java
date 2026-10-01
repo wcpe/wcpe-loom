@@ -131,6 +131,13 @@ public abstract class GenerateForgePatchedSourcesTask extends AbstractLoomTask {
 		getOutputJar().fileProvider(getProject().provider(() -> GenerateSourcesTask.getJarFileWithSuffix(getRuntimeJar(), "-sources.jar")));
 		getForgeSourcesOptions().convention(ForgeSourcesService.createOptions(getProject()));
 
+		// 提前展开 Forge 源码包（声明式、可缓存），避免每次执行都手工遍历归档。
+		// 用 provider 延迟探测任务是否存在，避免在尚未注册时抛错。
+		dependsOn(getProject().getProviders().provider(() ->
+				getProject().getTasks().findByName(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME) == null
+						? java.util.List.of()
+						: java.util.List.of(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME)));
+
 		final TempFiles tempFiles = new TempFiles();
 		getTempFiles().value(tempFiles).finalizeValue();
 		final Path cache;

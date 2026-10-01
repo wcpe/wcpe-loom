@@ -1,0 +1,4 @@
+rootProject.name = "forge-multi-project-isolated"
+
+include "common"
+include "mod"

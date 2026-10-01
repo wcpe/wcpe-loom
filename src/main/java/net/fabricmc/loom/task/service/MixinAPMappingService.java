@@ -48,6 +48,7 @@ import org.slf4j.LoggerFactory;
 
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.LoomNoRemapGradlePlugin;
+import net.fabricmc.loom.internal.LoomProjectData;
 import net.fabricmc.loom.build.mixin.AnnotationProcessorInvoker;
 import net.fabricmc.loom.util.TinyRemapperHelper;
 import net.fabricmc.loom.util.gradle.GradleUtils;
@@ -105,8 +106,13 @@ public class MixinAPMappingService extends Service<MixinAPMappingService.Options
 		};
 
 		if (thisExtension.isProjectIsolationActive()) {
-			// TODO provide a project isolated way of remapping with dependency mixin mapping
 			processProject.accept(thisProject);
+
+			for (LoomProjectData projectData : LoomProjectData.getDependencies(thisProject)) {
+				if (mappingId.equals(projectData.mappingId())) {
+					processProjectData(thisProject, projectData, from, to, providers);
+				}
+			}
 		} else {
 			GradleUtils.allLoomProjects(thisProject.getGradle(), project -> {
 				if (LoomNoRemapGradlePlugin.isApplied(project)) {
@@ -126,6 +132,18 @@ public class MixinAPMappingService extends Service<MixinAPMappingService.Options
 		}
 
 		return thisProject.provider(() -> providers.stream().map(Provider::get).toList());
+	}
+
+	private static void processProjectData(Project project, LoomProjectData projectData, Provider<String> from, Provider<String> to, List<Provider<Options>> providers) {
+		for (String mappingFile : projectData.mixinMappingFiles()) {
+			Path path = Path.of(mappingFile);
+			providers.add(TYPE.create(project, options -> {
+				options.getCompileOutputs().from(path);
+				options.getMixinMappingFileName().set(path.getFileName().toString());
+				options.getFrom().set(from);
+				options.getTo().set(to);
+			}));
+		}
 	}
 
 	@Nullable

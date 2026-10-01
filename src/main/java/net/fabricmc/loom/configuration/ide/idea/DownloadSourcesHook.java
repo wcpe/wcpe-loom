@@ -39,7 +39,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import net.fabricmc.loom.LoomGradleExtension;
-import net.fabricmc.loom.configuration.mods.dependency.LocalMavenHelper;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJar;
 import net.fabricmc.loom.configuration.providers.minecraft.mapped.NamedMinecraftProvider;
 
@@ -61,7 +60,54 @@ record DownloadSourcesHook(Project project, Task task) {
 		return false;
 	}
 
+	/**
+	 * 由每个 Loom 项目在自身配置阶段调用：把「源码坐标 → genSources 任务路径」登记到构建级注册表.
+	 *
+	 * <p>登记的是本项目自己的信息，不涉及跨项目访问，因此在隔离项目模式下也是安全的。
+	 *
+	 * @param project 当前正在配置的 Loom 项目
+	 */
+	static void register(Project project) {
+		if (!hasInitScript(project)) {
+			return;
+		}
+
+		final LoomGradleExtension extension = LoomGradleExtension.get(project);
+		final NamedMinecraftProvider<?> minecraftProvider;
+
+		try {
+			minecraftProvider = extension.getNamedMinecraftProvider();
+		} catch (RuntimeException e) {
+			// Minecraft 提供器尚未就绪（例如未启用混淆配置）时无需登记。
+			LOGGER.debug("Minecraft provider not ready in {}, skipping download sources registration", project.getPath());
+			return;
+		}
+
+		final List<MinecraftJar.Type> dependencyTypes = minecraftProvider.getDependencyTypes();
+
+		if (dependencyTypes.isEmpty()) {
+			return;
+		}
+
+		final var decompileConfiguration = extension.getMinecraftJarConfiguration().get().createDecompileConfiguration(project);
+		final IdeaDownloadSourcesRegistry registry = IdeaDownloadSourcesRegistry.get(project);
+
+		for (MinecraftJar.Type type : dependencyTypes) {
+			final String notation = minecraftProvider.getMavenHelper(type).withClassifier("sources").getNotation();
+			registry.register(notation, taskPath(project, decompileConfiguration.getTaskName(type)));
+		}
+	}
+
+	// 以任务路径字符串表达依赖：Gradle 在任务图阶段自行解析，无需读取其它项目的 TaskContainer。
+	private static String taskPath(Project project, String taskName) {
+		return project.getPath().equals(":") ? ":" + taskName : project.getPath() + ":" + taskName;
+	}
+
+	/**
+	 * 由根项目调用：为自己的 {@code ijDownloadSources} 任务添加对各子项目 genSources 任务的依赖.
+	 */
 	void tryHook() {
+		final IdeaDownloadSourcesRegistry registry = IdeaDownloadSourcesRegistry.get(project);
 		List<File> initScripts = project.getGradle().getStartParameter().getInitScripts();
 
 		for (File initScript : initScripts) {
@@ -78,17 +124,18 @@ record DownloadSourcesHook(Project project, Task task) {
 					continue;
 				}
 
-				final MinecraftJar.Type jarType = getJarType(notation);
+				final List<String> taskPaths = registry.taskPathsFor(notation);
 
-				if (jarType == null) {
-					LOGGER.debug("init script is trying to download sources for another Minecraft jar ({}) not used by this project ({})", notation, project.getPath());
+				if (taskPaths.isEmpty()) {
+					LOGGER.debug("init script is trying to download sources for another Minecraft jar ({}) not used by this build", notation);
 					continue;
 				}
 
-				String sourcesTaskName = getGenSourcesTaskName(jarType);
-				task.dependsOn(project.getTasks().named(sourcesTaskName));
+				for (String taskPath : taskPaths) {
+					task.dependsOn(taskPath);
+					LOGGER.info("Running genSources task: {} for {}", taskPath, notation);
+				}
 
-				LOGGER.info("Running genSources task: {} in project: {} for {}", sourcesTaskName, project.getPath(), notation);
 				break;
 			} catch (IOException e) {
 				// Ignore
@@ -108,34 +155,6 @@ record DownloadSourcesHook(Project project, Task task) {
 
 		if (matcher.find()) {
 			return matcher.group("notation");
-		}
-
-		return null;
-	}
-
-	private String getGenSourcesTaskName(MinecraftJar.Type jarType) {
-		LoomGradleExtension extension = LoomGradleExtension.get(project);
-		return extension.getMinecraftJarConfiguration().get()
-				.createDecompileConfiguration(project)
-				.getTaskName(jarType);
-	}
-
-	// Return the jar type, or null when this jar isnt used by the project
-	private MinecraftJar.@Nullable Type getJarType(String name) {
-		final LoomGradleExtension extension = LoomGradleExtension.get(project);
-		final NamedMinecraftProvider<?> minecraftProvider = extension.getNamedMinecraftProvider();
-		final List<MinecraftJar.Type> dependencyTypes = minecraftProvider.getDependencyTypes();
-
-		if (dependencyTypes.isEmpty()) {
-			throw new IllegalStateException();
-		}
-
-		for (MinecraftJar.Type type : dependencyTypes) {
-			final LocalMavenHelper mavenHelper = minecraftProvider.getMavenHelper(type).withClassifier("sources");
-
-			if (mavenHelper.getNotation().equals(name)) {
-				return type;
-			}
 		}
 
 		return null;

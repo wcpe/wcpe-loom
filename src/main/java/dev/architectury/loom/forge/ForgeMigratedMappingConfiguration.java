@@ -77,7 +77,10 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
 		boolean hasSrg = extension.shouldGenerateSrgTiny();
 		boolean hasMojang = extension.isNeoForge();
 
-		this.hashPath = forgeCache.resolve("mappings-migrated.hash");
+		// 状态文件必须与它守护的产物同域：产物都落在 mappings 工作目录下，而 forgeCache 按 MC+Forge
+		// 版本共享；若状态文件放在 forgeCache，同版本下不同 mappings 配置会互相覆盖哈希，
+		// 导致 shouldMigrate() 与错误的基准比较——要么空跑迁移，要么把过期映射当成有效复用。
+		this.hashPath = mappingsWorkingDir().resolve("mappings-migrated.hash");
 		this.hash = 1;
 
 		this.rawTinyMappings = this.tinyMappings;

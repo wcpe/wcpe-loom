@@ -24,15 +24,14 @@
 
 package dev.architectury.loom.forge.dependency;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.List;
 
 import com.google.gson.Gson;
@@ -152,14 +151,14 @@ public class ForgeUserdevProvider extends DependencyProvider {
 					final byte[] config = readUserdevConfig(resolved.toPath());
 					final JsonObject raw = parse(config);
 					final UserdevForm form = UserdevForm.of(raw);
-					Files.write(configJson, config);
+					AtomicFiles.publish(configJson, temporary -> Files.write(temporary, config));
 
 					if (form == UserdevForm.USERDEV3) {
 						// userdev3 与 legacy 分支期待的 FG2 形态不兼容，必须在配置期归一——依赖解析本身就发生在
 						// 配置期（afterEvaluate），任务级 dependsOn 一律晚于该时点
 						json = createNormalizedUserdev3Jar(dependency, resolved.toPath(), raw);
 					} else {
-						Files.copy(resolved.toPath(), userdevJar.toPath(), StandardCopyOption.REPLACE_EXISTING);
+						AtomicFiles.copy(resolved.toPath(), userdevJar.toPath());
 						json = createManifest(dependency, raw, form, userdevJar.toPath());
 					}
 
@@ -339,38 +338,57 @@ public class ForgeUserdevProvider extends DependencyProvider {
 	 */
 	private JsonObject createNormalizedUserdev3Jar(DependencyInfo dependency, Path sourceJar, JsonObject userdev3Json) throws IOException {
 		final Path target = userdevJar.toPath();
-		final Path temp = Files.createTempFile(target.getParent(), target.getFileName().toString(), ".tmp");
+		final JsonObject[] manifest = new JsonObject[1];
 
-		try {
-			Files.copy(sourceJar, temp, StandardCopyOption.REPLACE_EXISTING);
-			ZipUtils.add(temp, LEGACY_AT_FILE, ZipUtils.unpack(sourceJar, getUserdev3AtsPath(userdev3Json)));
-			ZipUtils.add(temp, LEGACY_SOURCES_FILE, downloadUserdev3Sources(userdev3Json));
+		AtomicFiles.publish(target, temporary -> {
+			Files.copy(sourceJar, temporary);
+			ZipUtils.add(temporary, LEGACY_AT_FILE, mergeUserdev3Ats(sourceJar, userdev3Json));
+			ZipUtils.add(temporary, LEGACY_SOURCES_FILE, downloadUserdev3Sources(userdev3Json));
 
-			final JsonObject manifest = createManifestFromUserdev3(dependency, userdev3Json, temp);
-			ZipUtils.add(temp, "config.json", new Gson().toJson(manifest));
+			manifest[0] = createManifestFromUserdev3(dependency, userdev3Json, temporary);
+			ZipUtils.add(temporary, "config.json", new Gson().toJson(manifest[0]));
+		});
 
-			move(temp, target);
-			return manifest;
-		} finally {
-			Files.deleteIfExists(temp);
-		}
+		return manifest[0];
 	}
 
 	/**
-	 * {@return userdev3 配置里声明的 AT 路径}.
-	 *
-	 * <p>ATTENTION：内容是 {@code ats/forge_at.cfg} 而落位到 {@code merged_at.cfg}，与 FG2 userdev
-	 * 自带的 {@code merged_at.cfg} 是「语义近似」而非等价转换——实测 1.12.2 的 2860 与 2847 上两者
-	 * 的有效指令（去掉空行与注释行后）完全一致，但字节不同（前者含更多空行与注释行）。
+	 * 合并 userdev3 配置中声明的全部访问变换器，生成 legacy 管线使用的单一文件.
 	 */
-	private static String getUserdev3AtsPath(JsonObject userdev3Json) {
+	private static byte[] mergeUserdev3Ats(Path sourceJar, JsonObject userdev3Json) throws IOException {
 		final JsonArray ats = userdev3Json.getAsJsonArray("ats");
 
 		if (ats == null || ats.isEmpty()) {
 			throw new IllegalStateException("Forge userdev3 config does not declare any access transformers");
 		}
 
-		return ats.get(0).getAsString();
+		final ByteArrayOutputStream merged = new ByteArrayOutputStream();
+		boolean hasContent = false;
+
+		for (JsonElement at : ats) {
+			final byte[] bytes = ZipUtils.unpack(sourceJar, at.getAsString());
+
+			if (bytes.length == 0) {
+				continue;
+			}
+
+			if (hasContent && merged.toByteArray()[merged.size() - 1] != '\n') {
+				merged.write('\n');
+			}
+
+			merged.write(bytes);
+			hasContent = true;
+
+			if (bytes[bytes.length - 1] != '\n') {
+				merged.write('\n');
+			}
+		}
+
+		if (!hasContent) {
+			throw new IllegalStateException("Forge userdev3 config declares only empty access transformers");
+		}
+
+		return merged.toByteArray();
 	}
 
 	/**
@@ -384,14 +402,6 @@ public class ForgeUserdevProvider extends DependencyProvider {
 		final File sourcesJar = DependencyDownloader.download(getProject(), notation, false, true).getSingleFile();
 
 		return Files.readAllBytes(sourcesJar.toPath());
-	}
-
-	private static void move(Path source, Path target) throws IOException {
-		try {
-			Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-		} catch (AtomicMoveNotSupportedException e) {
-			Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
-		}
 	}
 
 	private static JsonObject createLegacyBinpatcher() {

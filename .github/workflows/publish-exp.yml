@@ -11,7 +11,7 @@ jobs:
       - name: setup jdk
         uses: actions/setup-java@v5
         with:
-          java-version: 25
+          java-version: 21
           distribution: 'temurin'
       - uses: actions/checkout@v6
       - uses: gradle/actions/wrapper-validation@v6
@@ -22,6 +22,34 @@ jobs:
         with:
           token: ${{ secrets.github_token }}
           prefix: "build/exp/${{ github.ref }}"
+
+      - name: 发布前选定回归门禁
+        run: |
+          ./gradlew test \
+            --tests net.fabricmc.loom.test.integration.RemapTaskCacheTest \
+            --tests net.fabricmc.loom.test.integration.ConfigurationCacheTest \
+            --tests net.fabricmc.loom.test.integration.forge.ForgeRunConfigTest \
+            --tests net.fabricmc.loom.test.integration.forge.AccessTransformerTest \
+            --tests net.fabricmc.loom.test.integration.forge.legacy.LegacyForgeExternalModDependencyTest \
+            --tests net.fabricmc.loom.test.unit.AsyncCacheTest \
+            --tests net.fabricmc.loom.test.unit.AsyncZipProcessorTest \
+            --tests net.fabricmc.loom.test.unit.cache.AtomicFilesTest \
+            --tests net.fabricmc.loom.test.unit.cache.CachedDataTest \
+            --tests net.fabricmc.loom.test.unit.cache.CachedFileStoreTest \
+            --tests net.fabricmc.loom.test.unit.cache.CacheEntryLockTest \
+            --tests net.fabricmc.loom.test.unit.service.MappingsServiceTest \
+            --no-daemon --stacktrace --warning-mode fail
+        env:
+          CI: true
+
+      - name: 上传发布门禁失败报告
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: publish-exp-regression-results
+          path: |
+            build/reports/tests/test/
+            build/test-results/test/
 
       - run: ./gradlew build publish exportVersion -x test --stacktrace
         env:

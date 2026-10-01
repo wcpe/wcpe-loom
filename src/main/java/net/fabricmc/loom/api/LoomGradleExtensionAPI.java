@@ -475,7 +475,7 @@ public interface LoomGradleExtensionAPI {
 	 * <p>This method only works in Fabric and Quilt mods.
 	 *
 	 * <p>Code example:
-	 * {@snippet : lang=groovy
+	 * {@snippet lang=groovy :
 	 * loom.injectAccessWidener(tasks.named('jar'))
 	 * }
 	 *

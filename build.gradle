@@ -2,6 +2,7 @@ plugins {
 	id 'java'
 	id 'maven-publish'
 	id 'java-gradle-plugin'
+	id 'com.gradle.plugin-publish' version '2.2.1'
 	id 'idea'
 	id 'eclipse'
 	id 'groovy'
@@ -10,6 +11,10 @@ plugins {
 	alias(libs.plugins.kotlin)
 	alias(libs.plugins.spotless)
 	alias(libs.plugins.retry)
+}
+
+if (!JavaVersion.current().isCompatibleWith(JavaVersion.VERSION_21)) {
+	throw new GradleException("本项目构建需要 JDK 21 或更高版本，当前运行时为 ${System.getProperty('java.version')}")
 }
 
 tasks.withType(JavaCompile).configureEach {
@@ -277,22 +282,52 @@ gradlePlugin {
 		wcpeLoom {
 			id = 'top.wcpe.loom'
 			implementationClass = 'net.fabricmc.loom.LoomGradlePlugin'
+			compatibility(it) {
+				features {
+					configurationCache = true
+					isolatedProjects = true
+				}
+			}
 		}
 		wcpeLoomNoRemap {
 			id = 'top.wcpe.loom-no-remap'
 			implementationClass = 'net.fabricmc.loom.LoomNoRemapGradlePlugin'
+			compatibility(it) {
+				features {
+					configurationCache = true
+					isolatedProjects = true
+				}
+			}
 		}
 		wcpeLoomRemap {
 			id = 'top.wcpe.loom-remap'
 			implementationClass = 'net.fabricmc.loom.LoomRemapGradlePlugin'
+			compatibility(it) {
+				features {
+					configurationCache = true
+					isolatedProjects = true
+				}
+			}
 		}
 		wcpeLoomCompanion {
 			id = 'top.wcpe.loom-companion'
 			implementationClass = 'net.fabricmc.loom.LoomCompanionGradlePlugin'
+			compatibility(it) {
+				features {
+					configurationCache = true
+					isolatedProjects = true
+				}
+			}
 		}
 		wcpeLoomRepositories {
 			id = 'top.wcpe.loom-repositories'
 			implementationClass = 'net.fabricmc.loom.LoomRepositoryPlugin'
+			compatibility(it) {
+				features {
+					configurationCache = true
+					isolatedProjects = true
+				}
+			}
 		}
 
 		// 兼容别名：上一层分叉（architectury）的 id。
@@ -300,22 +335,52 @@ gradlePlugin {
 		fabricLoom {
 			id = 'dev.architectury.loom'
 			implementationClass = 'net.fabricmc.loom.LoomGradlePlugin'
+			compatibility(it) {
+				features {
+					configurationCache = true
+					isolatedProjects = true
+				}
+			}
 		}
 		fabricLoomNoRemap {
 			id = 'dev.architectury.loom-no-remap'
 			implementationClass = 'net.fabricmc.loom.LoomNoRemapGradlePlugin'
+			compatibility(it) {
+				features {
+					configurationCache = true
+					isolatedProjects = true
+				}
+			}
 		}
 		fabricLoomRemap {
 			id = 'dev.architectury.loom-remap'
 			implementationClass = 'net.fabricmc.loom.LoomRemapGradlePlugin'
+			compatibility(it) {
+				features {
+					configurationCache = true
+					isolatedProjects = true
+				}
+			}
 		}
 		fabricLoomCompanion {
 			id = 'dev.architectury.loom-companion'
 			implementationClass = 'net.fabricmc.loom.LoomCompanionGradlePlugin'
+			compatibility(it) {
+				features {
+					configurationCache = true
+					isolatedProjects = true
+				}
+			}
 		}
 		fabricLoomRepositories {
 			id = 'dev.architectury.loom-repositories'
 			implementationClass = 'net.fabricmc.loom.LoomRepositoryPlugin'
+			compatibility(it) {
+				features {
+					configurationCache = true
+					isolatedProjects = true
+				}
+			}
 		}
 	}
 }

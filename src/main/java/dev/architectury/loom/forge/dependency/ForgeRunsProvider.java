@@ -118,7 +118,9 @@ public class ForgeRunsProvider implements ConfigValue.Resolver {
 		} else if (key.equals("source_roots")) {
 			// ignored, handled later using ForgeModClassesService
 		} else if (key.equals("mcp_mappings")) {
-			string = "loom.stub";
+			string = extension.disableObfuscation()
+					? "loom.stub"
+					: extension.getMappingConfiguration().getPlatformMappingFile(extension).toAbsolutePath().toString();
 		} else if (key.equals("modules")) {
 			string = StreamSupport.stream(json.getAsJsonArray("modules").spliterator(), false)
 					.map(JsonElement::getAsString)

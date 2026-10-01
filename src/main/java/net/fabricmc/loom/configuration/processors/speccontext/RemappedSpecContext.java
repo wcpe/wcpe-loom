@@ -46,10 +46,10 @@ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.api.RemapConfigurationSettings;
 import net.fabricmc.loom.api.processor.SpecContext;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftSourceSets;
+import net.fabricmc.loom.internal.LoomProjectData;
 import net.fabricmc.loom.util.AsyncCache;
 import net.fabricmc.loom.util.fmj.FabricModJson;
 import net.fabricmc.loom.util.fmj.FabricModJsonFactory;
-import net.fabricmc.loom.util.fmj.FabricModJsonHelpers;
 
 /**
  * @param modDependencies External mods that are depended on
@@ -94,8 +94,8 @@ public record RemappedSpecContext(
 
 		if (!projectView.disableProjectDependantMods()) {
 			// Add all the dependent projects
-			for (Project dependentProject : SpecContext.getDependentProjects(projectView).toList()) {
-				futures.add(fmjCache.get(dependentProject.getPath(), () -> FabricModJsonHelpers.getModsInProject(dependentProject)));
+			for (LoomProjectData dependentProject : SpecContext.getDependentProjectData(projectView).toList()) {
+				futures.add(fmjCache.get(dependentProject.projectPath(), dependentProject::createMods));
 			}
 		}
 
@@ -106,10 +106,8 @@ public record RemappedSpecContext(
 	private static List<ModHolder> getCompileRuntimeMods(RemappedProjectView projectView, AsyncCache<List<FabricModJson>> fmjCache) {
 		var mods = new ArrayList<>(getCompileRuntimeModsFromRemapConfigs(projectView, fmjCache));
 
-		for (Project dependentProject : getCompileRuntimeProjectDependencies(projectView).toList()) {
-			List<FabricModJson> projectMods = fmjCache.getBlocking(dependentProject.getPath(), () -> {
-				return FabricModJsonHelpers.getModsInProject(dependentProject);
-			});
+		for (LoomProjectData dependentProject : getCompileRuntimeProjectDependencies(projectView).toList()) {
+			List<FabricModJson> projectMods = fmjCache.getBlocking(dependentProject.projectPath(), dependentProject::createMods);
 
 			for (FabricModJson mod : projectMods) {
 				mods.add(new ModHolder(mod));
@@ -182,13 +180,13 @@ public record RemappedSpecContext(
 	}
 
 	// Returns a list of Loom Projects found in both the runtime and compile classpath
-	private static Stream<Project> getCompileRuntimeProjectDependencies(ProjectView projectView) {
+	private static Stream<LoomProjectData> getCompileRuntimeProjectDependencies(ProjectView projectView) {
 		if (projectView.disableProjectDependantMods()) {
 			return Stream.empty();
 		}
 
-		final Stream<Project> runtimeProjects = projectView.getLoomProjectDependencies(JavaPlugin.RUNTIME_CLASSPATH_CONFIGURATION_NAME);
-		final List<Project> compileProjects = projectView.getLoomProjectDependencies(JavaPlugin.COMPILE_CLASSPATH_CONFIGURATION_NAME).toList();
+		final Stream<LoomProjectData> runtimeProjects = projectView.getLoomProjectDataDependencies(JavaPlugin.RUNTIME_CLASSPATH_CONFIGURATION_NAME);
+		final List<LoomProjectData> compileProjects = projectView.getLoomProjectDataDependencies(JavaPlugin.COMPILE_CLASSPATH_CONFIGURATION_NAME).toList();
 
 		return runtimeProjects
 				.filter(compileProjects::contains); // Use the intersection of the two configurations.

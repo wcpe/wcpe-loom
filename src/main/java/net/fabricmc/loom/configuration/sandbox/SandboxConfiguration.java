@@ -61,12 +61,7 @@ public abstract class SandboxConfiguration implements Runnable {
 	public void run() {
 		LoomGradleExtension extension = LoomGradleExtension.get(getProject());
 
-		if (extension.isProjectIsolationActive()) {
-			LOGGER.debug("Skipping sandbox configuration as project isolation is enabled.");
-			return;
-		}
-
-		if (getProject().findProperty(Constants.Properties.SANDBOX) == null) {
+		if (GradleUtils.getProperty(getProject(), Constants.Properties.SANDBOX) == null) {
 			LOGGER.debug("No fabric sandbox property set");
 			return;
 		}
@@ -75,7 +70,7 @@ public abstract class SandboxConfiguration implements Runnable {
 	}
 
 	private void evaluate() {
-		final String sandboxNotation = (String) Objects.requireNonNull(getProject().findProperty(Constants.Properties.SANDBOX));
+		final String sandboxNotation = Objects.toString(Objects.requireNonNull(GradleUtils.getProperty(getProject(), Constants.Properties.SANDBOX)));
 		final LoomGradleExtension extension = LoomGradleExtension.get(getProject());
 		final ExternalModuleDependency dependency = getDependencyFactory().create(sandboxNotation);
 		final Configuration configuration = getProject().getConfigurations().detachedConfiguration(dependency);

@@ -120,7 +120,7 @@ public interface ForgeExtensionAPI {
 	 * to the corresponding {@link net.fabricmc.loom.task.RemapJarTask#getAtAccessWideners() atAccessWideners} property.
 	 *
 	 * <p>Usage example on unobfuscated versions:
-	 * {@snippet : lang=groovy
+	 * {@snippet lang=groovy :
 	 * loom.forge.convertAccessWideners(tasks.jar, "my_mod.accesswidener")
 	 * }
 	 *

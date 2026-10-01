@@ -133,7 +133,7 @@ public class ThreadingUtils {
 		return new TaskCompleter();
 	}
 
-	public static class TaskCompleter implements Function<Throwable, Void> {
+	public static class TaskCompleter {
 		Stopwatch stopwatch = Stopwatch.createUnstarted();
 		List<CompletableFuture<?>> tasks = new ArrayList<>();
 		ExecutorService service = Executors.newFixedThreadPool(Math.max(1, Runtime.getRuntime().availableProcessors()));
@@ -148,9 +148,17 @@ public class ThreadingUtils {
 				try {
 					job.run();
 				} catch (Throwable throwable) {
-					throw new RuntimeException(throwable);
+					if (throwable instanceof RuntimeException runtimeException) {
+						throw runtimeException;
+					}
+
+					if (throwable instanceof Error error) {
+						throw error;
+					}
+
+					throw new java.util.concurrent.CompletionException(throwable);
 				}
-			}, service).exceptionally(this));
+			}, service));
 
 			return this;
 		}
@@ -161,30 +169,46 @@ public class ThreadingUtils {
 		}
 
 		public void complete() {
+			Throwable failure = null;
+
 			try {
-				CompletableFuture.allOf(tasks.toArray(new CompletableFuture[0])).exceptionally(this).get();
+				CompletableFuture.allOf(tasks.toArray(new CompletableFuture[0])).get();
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				failure = e;
+			} catch (java.util.concurrent.ExecutionException e) {
+				failure = e.getCause();
+			} finally {
 				service.shutdownNow();
 
 				if (stopwatch.isRunning()) {
 					stopwatch.stop();
 				}
-			} catch (Throwable e) {
-				throw new RuntimeException(e);
-			} finally {
-				try {
-					for (UnsafeConsumer<Stopwatch> consumer : completionListener) {
+
+				for (UnsafeConsumer<Stopwatch> consumer : completionListener) {
+					try {
 						consumer.accept(stopwatch);
+					} catch (Throwable listenerFailure) {
+						if (failure == null) {
+							failure = listenerFailure;
+						} else {
+							failure.addSuppressed(listenerFailure);
+						}
 					}
-				} catch (Throwable e) {
-					e.printStackTrace();
 				}
 			}
-		}
 
-		@Override
-		public Void apply(Throwable throwable) {
-			throwable.printStackTrace();
-			return null;
+			if (failure != null) {
+				if (failure instanceof Error error) {
+					throw error;
+				}
+
+				if (failure instanceof RuntimeException runtimeException) {
+					throw runtimeException;
+				}
+
+				throw new RuntimeException(failure);
+			}
 		}
 	}
 }

@@ -25,6 +25,7 @@
 package net.fabricmc.loom.configuration.processors.speccontext;
 
 import java.util.List;
+import java.util.Objects;
 import java.util.stream.Stream;
 
 import org.gradle.api.Project;
@@ -33,6 +34,7 @@ import org.gradle.api.artifacts.ProjectDependency;
 import org.gradle.api.attributes.Usage;
 
 import net.fabricmc.loom.LoomGradleExtension;
+import net.fabricmc.loom.internal.LoomProjectData;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.fmj.FabricModJson;
 import net.fabricmc.loom.util.fmj.FabricModJsonHelpers;
@@ -40,8 +42,13 @@ import net.fabricmc.loom.util.gradle.GradleUtils;
 
 // Used to abstract out the Gradle API usage to ease unit testing.
 public interface ProjectView {
-	//Returns a list of Loom Projects found in the specified Configuration
-	Stream<Project> getLoomProjectDependencies(String name);
+	// 返回指定配置中的 Loom 项目数据
+	Stream<LoomProjectData> getLoomProjectDataDependencies(String name);
+
+	// 保留旧接口以兼容测试替身，但隔离模式不再返回跨项目 Project 对象
+	default Stream<Project> getLoomProjectDependencies(String name) {
+		return Stream.empty();
+	}
 
 	// Returns the mods defined in the current project
 	List<FabricModJson> getMods();
@@ -75,13 +82,13 @@ public interface ProjectView {
 		}
 
 		@Override
-		public Stream<Project> getLoomProjectDependencies(String name) {
+		public Stream<LoomProjectData> getLoomProjectDataDependencies(String name) {
 			final Configuration configuration = project.getConfigurations().getByName(name);
 			return configuration.getAllDependencies()
 					.withType(ProjectDependency.class)
 					.stream()
-					.map((d) -> project.project(d.getPath()))
-					.filter(GradleUtils::isLoomProject);
+					.map(dependency -> LoomProjectData.fromDependency(project, dependency))
+					.filter(Objects::nonNull);
 		}
 
 		@Override
@@ -91,10 +98,7 @@ public interface ProjectView {
 
 		@Override
 		public boolean disableProjectDependantMods() {
-			final LoomGradleExtension extension = LoomGradleExtension.get(project);
-			// TODO provide a project isolated way of doing this.
-			return extension.isProjectIsolationActive()
-					|| GradleUtils.getBooleanProperty(project, Constants.Properties.DISABLE_PROJECT_DEPENDENT_MODS);
+			return GradleUtils.getBooleanProperty(project, Constants.Properties.DISABLE_PROJECT_DEPENDENT_MODS);
 		}
 
 		@Override

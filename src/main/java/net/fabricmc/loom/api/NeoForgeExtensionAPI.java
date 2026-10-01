@@ -89,7 +89,7 @@ public interface NeoForgeExtensionAPI {
 	 * to the corresponding {@link net.fabricmc.loom.task.RemapJarTask#getAtAccessWideners() atAccessWideners} property.
 	 *
 	 * <p>Usage example:
-	 * {@snippet : lang=kotlin
+	 * {@snippet lang=kotlin :
 	 * loom.neoForge.convertAccessWideners(tasks.jar, "my_mod.accesswidener")
 	 * }
 	 *
