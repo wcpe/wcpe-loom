@@ -32,11 +32,14 @@ import java.io.InputStreamReader;
 import java.io.Reader;
 import java.io.UncheckedIOException;
 import java.io.Writer;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import dev.architectury.loom.forge.tool.ForgeToolValueSource;
 import dev.architectury.loom.util.DependencyDownloader;
@@ -55,6 +58,8 @@ import net.fabricmc.loom.configuration.providers.mappings.mojmap.MojangMappingsS
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.LoomVersions;
 import net.fabricmc.loom.util.ZipUtils;
+import net.fabricmc.loom.util.cache.CacheEntryLock;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.mappingio.MappingReader;
 import net.fabricmc.mappingio.MappingVisitor;
 import net.fabricmc.mappingio.MappingWriter;
@@ -70,7 +75,8 @@ public class SrgProvider extends DependencyProvider {
 	private Boolean isTsrgV2;
 	private Path mergedMojangRaw;
 	private Path mergedMojangTrimmed;
-	private static Map<String, Path> mojmapTsrg2Map = new HashMap<>();
+	// 写入由 CacheEntryLock 串行化，故通常不会并发访问；用并发实现免去未来出现真并发时的隐患
+	private static Map<String, Path> mojmapTsrg2Map = new ConcurrentHashMap<>();
 
 	public SrgProvider(Project project) {
 		super(project);
@@ -227,16 +233,60 @@ public class SrgProvider extends DependencyProvider {
 		Path mojmapTsrg2 = extension.getMinecraftProvider().dir("forge").toPath().resolve("mojmap.tsrg2");
 
 		if (Files.notExists(mojmapTsrg2) || extension.refreshDeps()) {
-			try (MappingWriter writer = MappingWriter.create(mojmapTsrg2, MappingFormat.TSRG_2_FILE)) {
+			// 该文件位于 userCache（不按项目隔离），同一 MC 版本的多个 daemon 会指向同一路径；
+			// 生成结果只取决于目标版本，故由首个取得锁的进程写入，其余进程等待后直接复用。
+			// 写入在临时文件上完成并原子替换，避免读取方看到半截内容。
+			writeMojmapTsrg2WithLock(project, extension, mojmapTsrg2);
+		}
+
+		mojmapTsrg2Map.put(minecraftVersion, mojmapTsrg2);
+		return mojmapTsrg2;
+	}
+
+	private static void writeMojmapTsrg2WithLock(Project project, LoomGradleExtension extension, Path mojmapTsrg2) {
+		final String lockKey = "mojmap-tsrg2:" + extension.getMinecraftProvider().minecraftVersion();
+		final Path lockRoot = mojmapTsrg2.getParent().resolve(Constants.Cache.LOCKS_DIR);
+
+		try {
+			CacheEntryLock.withLock(lockRoot, lockKey, LoomCacheService.defaultTimeout(), () -> {
+				if (Files.exists(mojmapTsrg2) && !extension.refreshDeps()) {
+					return null;
+				}
+
+				writeMojmapTsrg2(project, mojmapTsrg2);
+				return null;
+			});
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		} catch (Exception e) {
+			throw new RuntimeException("Could not write " + mojmapTsrg2, e);
+		}
+	}
+
+	private static void writeMojmapTsrg2(Project project, Path mojmapTsrg2) throws IOException {
+		Files.createDirectories(mojmapTsrg2.getParent());
+		final Path temp = Files.createTempFile(mojmapTsrg2.getParent(), "mojmap", ".tsrg2.tmp");
+
+		try {
+			try (MappingWriter writer = MappingWriter.create(temp, MappingFormat.TSRG_2_FILE)) {
 				GradleMappingContext context = new GradleMappingContext(project, "tmp-mojmap");
 				MemoryMappingTree tree = new MemoryMappingTree();
 				visitMojangMappings(tree, context);
 				tree.accept(writer);
 			}
-		}
 
-		mojmapTsrg2Map.put(minecraftVersion, mojmapTsrg2);
-		return mojmapTsrg2;
+			move(temp, mojmapTsrg2);
+		} finally {
+			Files.deleteIfExists(temp);
+		}
+	}
+
+	private static void move(Path source, Path target) throws IOException {
+		try {
+			Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+		} catch (AtomicMoveNotSupportedException e) {
+			Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+		}
 	}
 
 	public static void visitMojangMappings(MappingVisitor visitor, MappingContext context) {
