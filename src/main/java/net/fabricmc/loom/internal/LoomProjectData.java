@@ -301,9 +301,13 @@ public final class LoomProjectData implements Serializable {
 			return Optional.empty();
 		}
 
-		// 能解析出文件说明数据确实存在，之后任何失败都是真失败。
-		return Optional.of(read(path).orElseThrow(() -> new IllegalStateException(
-				"Loom project data file of dependency " + dependency.getPath() + " is missing: " + path)));
+		// 解析成功只说明「依赖项目声明了这个产物路径」，**不代表文件已产出**：冷启动（或该依赖
+		// 从未构建过）时 exportLoomProjectData 尚未执行，这里必然拿到一个不存在的路径。
+		// 因此「文件不存在」属于常规情形，直接返回空，绝不能升级成失败——那会在配置期把冷启动
+		// 打死：配置本项目的 afterEvaluate → 需要该数据文件 → 文件需对端任务产出 → 任务需所有
+		// 项目配置完成 → 回到起点。
+		// 文件存在却读不出来仍由 read 抛出（见其 javadoc），损坏不会被伪装成「没有数据」。
+		return read(path);
 	}
 
 	/**

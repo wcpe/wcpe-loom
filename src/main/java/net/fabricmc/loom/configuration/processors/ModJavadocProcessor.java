@@ -40,6 +40,7 @@ import java.util.Objects;
 import javax.inject.Inject;
 
 import com.google.gson.JsonElement;
+import org.gradle.api.model.ObjectFactory;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -77,6 +78,11 @@ public abstract class ModJavadocProcessor implements MinecraftJarProcessor<ModJa
 	}
 
 	@Override
+	public Descriptor descriptor() {
+		return new Descriptor(name);
+	}
+
+	@Override
 	public ModJavadocProcessor.@Nullable Spec buildSpec(SpecContext context) {
 		List<ModJavadoc> javadocs = new ArrayList<>();
 
@@ -97,6 +103,21 @@ public abstract class ModJavadocProcessor implements MinecraftJarProcessor<ModJa
 	}
 
 	public record Spec(List<ModJavadoc> javadocs) implements MinecraftJarProcessor.Spec {
+	}
+
+	/**
+	 * 用于在执行期重建 {@link ModJavadocProcessor} 的描述符.
+	 *
+	 * <p>本 processor 只在 {@code processMappings} 中生效，重建时除名称外不需要其他输入。
+	 *
+	 * @param name processor 名称
+	 */
+	public record Descriptor(String name) implements MinecraftJarProcessor.ProcessorDescriptor<ModJavadocProcessor> {
+		@Override
+		public ModJavadocProcessor createProcessor(ObjectFactory objectFactory) {
+			// 本类是抽象类，交由 Gradle 生成子类实例，因此必须经由 ObjectFactory 而不是 new
+			return objectFactory.newInstance(ModJavadocProcessor.class, name);
+		}
 	}
 
 	@Override
