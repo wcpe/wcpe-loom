@@ -69,6 +69,17 @@ class LoomCacheServiceTest extends Specification {
 		callCount.get() == 1
 	}
 
+	def "同名异步缓存复用实例且不同名称隔离"() {
+		when:
+		def metadata1 = service.getAsyncCache("metadata")
+		def metadata2 = service.getAsyncCache("metadata")
+		def mappings = service.getAsyncCache("mappings")
+
+		then:
+		metadata1.is(metadata2)
+		!metadata1.is(mappings)
+	}
+
 	def "同 key 并发 runExclusive 严格互斥且每个 action 都执行"() {
 		given:
 		int threads = 8
