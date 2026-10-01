@@ -33,7 +33,9 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonSyntaxException;
@@ -130,8 +132,41 @@ public final class FabricModJsonFactory {
 		return create(jsonObject, new FabricModJsonSource.ZipSource(zipPath));
 	}
 
+	/**
+	 * 跨项目缓存：读取 jar 内的 fabric.mod.json 是纯操作，而同构项目（共用同一批 mod jar）
+	 * 会反复解析同一批文件。键取「路径 + 大小 + 修改时间」，足以识别内容变化。
+	 */
+	private static final Map<ZipFmjKey, Optional<FabricModJson>> ZIP_FMJ_CACHE = new ConcurrentHashMap<>();
+
 	public static Optional<FabricModJson> createFromZipOptional(Path zipPath) {
-		return Optional.ofNullable(createFromZipNullable(zipPath));
+		final ZipFmjKey key = ZipFmjKey.of(zipPath);
+
+		if (key != null) {
+			final Optional<FabricModJson> cached = ZIP_FMJ_CACHE.get(key);
+
+			if (cached != null) {
+				return cached;
+			}
+		}
+
+		final Optional<FabricModJson> result = Optional.ofNullable(createFromZipNullable(zipPath));
+
+		if (key != null) {
+			ZIP_FMJ_CACHE.put(key, result);
+		}
+
+		return result;
+	}
+
+	private record ZipFmjKey(String path, long size, long modified) {
+		static ZipFmjKey of(Path zipPath) {
+			try {
+				return new ZipFmjKey(zipPath.toAbsolutePath().toString(), Files.size(zipPath), Files.getLastModifiedTime(zipPath).toMillis());
+			} catch (IOException e) {
+				// 取不到指纹时不缓存，退化为每次都读（保持原语义）
+				return null;
+			}
+		}
 	}
 
 	public static FabricModJson createFromFile(File file) {

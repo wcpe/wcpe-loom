@@ -31,7 +31,9 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.jar.Manifest;
 
 import net.fabricmc.loom.util.FileSystemUtil;
@@ -42,11 +44,48 @@ public record TinyJarInfo(boolean v2, Optional<String> minecraftVersionId) {
 	private static final String MANIFEST_PATH = "META-INF/MANIFEST.MF";
 	private static final String MANIFEST_VERSION_ID_ATTRIBUTE = "Minecraft-Version-Id";
 
+	/**
+	 * 进程内缓存：TinyJarInfo 只由 jar 内容决定，而同构项目（共用同一套 mappings）会反复查询同一个 jar。
+	 * 键取「路径 + 大小 + 修改时间」，足以识别内容变化；同一 daemon 内所有项目共享。
+	 */
+	private static final Map<CacheKey, TinyJarInfo> CACHE = new ConcurrentHashMap<>();
+
 	public static TinyJarInfo get(Path jar) {
+		final CacheKey key = CacheKey.of(jar);
+
+		if (key != null) {
+			final TinyJarInfo cached = CACHE.get(key);
+
+			if (cached != null) {
+				return cached;
+			}
+		}
+
+		final TinyJarInfo info = read(jar);
+
+		if (key != null) {
+			CACHE.put(key, info);
+		}
+
+		return info;
+	}
+
+	private static TinyJarInfo read(Path jar) {
 		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
 			return new TinyJarInfo(doesJarContainV2Mappings(delegate), getMinecraftVersionId(delegate));
 		} catch (IOException e) {
 			throw new UncheckedIOException("Failed to read tiny jar info", e);
+		}
+	}
+
+	private record CacheKey(String path, long size, long modified) {
+		static CacheKey of(Path jar) {
+			try {
+				return new CacheKey(jar.toAbsolutePath().toString(), Files.size(jar), Files.getLastModifiedTime(jar).toMillis());
+			} catch (IOException e) {
+				// 取不到指纹时不缓存，退化为每次都读（保持原语义）
+				return null;
+			}
 		}
 	}
 
