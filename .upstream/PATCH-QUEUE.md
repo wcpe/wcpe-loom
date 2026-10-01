@@ -95,3 +95,10 @@ Forwarded: <取值>
 2. **不自动打发布 tag**、不自动推送改写后的队列；改写后必须人工确认内容等价再切换分支。
 3. 内容等价判据：`git diff <改写后> <改写前>` 为空（或差异仅限明确预期的那几个文件）。
 4. 每次换基底或改写队列后，同步更新 `migration-1.17.md` 与本节第 3 节的溯源归类。
+
+### 追加补丁的溯源归类（WCPE 后续开发）
+
+| 主题 | Origin | Forwarded |
+|---|---|---|
+| 本线自行开发的补丁，以及 CI/文档/脚本等仓库元数据 | `vendor, wcpe-loom` | `not-needed` |
+| 其中修复既有缺陷、值得反馈上游者（AW/AT 条目纯值化进配置缓存、SourceRemapper 静默丢 MC classpath、ForgeSources 空 jar 与反编译缓存键、Forge 处理器执行期重建两处缺陷） | `vendor, wcpe-loom` | `no` |
