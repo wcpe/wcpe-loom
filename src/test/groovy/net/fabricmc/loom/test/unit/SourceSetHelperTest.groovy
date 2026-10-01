@@ -53,6 +53,8 @@ class SourceSetHelperTest extends Specification {
 		mockSourceSet.getName() >> "main"
 
 		System.setProperty("fabric-loom.unit.testing", "true")
+		// IDEA 输出目录仅在 IDE 驱动构建时注入（读 .idea/misc.xml 内容会成为配置缓存输入）
+		System.setProperty("idea.active", "true")
 
 		def ref = new SourceSetReference(mockSourceSet, mockProject)
 		when:
@@ -63,6 +65,35 @@ class SourceSetHelperTest extends Specification {
 		!result[0].toString().startsWith("file:")
 
 		println(result[0].toString())
+	}
+
+	@RestoreSystemProperties
+	def "idea classpath is skipped for non-ide driven builds"() {
+		given:
+		// 命令行构建（既非 IDE 同步、也未由 IDE 启动）：不得探测 .idea/misc.xml，
+		// 否则该文件内容会成为 Gradle 配置缓存输入，IDE 每次改写都令配置缓存条目失效。
+		def miscXml = new File(projectDir, ".idea/misc.xml")
+		miscXml.parentFile.mkdirs()
+		miscXml.text = MISC_XML
+
+		def mockProject = Mock(Project)
+		def mockSourceSet = Mock(SourceSet)
+
+		mockProject.getName() >> "UnitTest"
+		mockProject.getRootDir() >> projectDir
+		mockSourceSet.getName() >> "main"
+
+		System.setProperty("fabric-loom.unit.testing", "true")
+		System.clearProperty("idea.active")
+		System.clearProperty("idea.sync.active")
+
+		def ref = new SourceSetReference(mockSourceSet, mockProject)
+		when:
+		def result = SourceSetHelper.getIdeaClasspath(ref, mockProject)
+
+		then:
+		!SourceSetHelper.isIdeDrivenBuild()
+		result.isEmpty()
 	}
 
 	@RestoreSystemProperties
