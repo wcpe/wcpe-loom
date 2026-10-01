@@ -103,7 +103,11 @@ public class ScopedServiceFactory implements ServiceFactory, Closeable {
 			//noinspection unchecked
 			return (S) serviceClass.getDeclaredConstructors()[0].newInstance(options, serviceFactory);
 		} catch (InstantiationException | IllegalAccessException | InvocationTargetException e) {
-			throw new RuntimeException("Failed to create service instance", e);
+			// 必须展开 InvocationTargetException：服务构造器内部抛出的真实异常被它包裹，
+			// 若不展开，调用方只能看到一句 "Failed to create service instance" 而拿不到根因
+			// （实测 remapJar 偶发失败时日志里没有 Caused by 链，排查因此被阻断）。
+			final Throwable cause = e instanceof InvocationTargetException && e.getCause() != null ? e.getCause() : e;
+			throw new RuntimeException("Failed to create service instance of " + serviceClass.getName() + ": " + cause, cause);
 		}
 	}
 
