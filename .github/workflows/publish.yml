@@ -23,6 +23,15 @@ on:
 permissions:
   contents: read
 
+# 同一次推送若同时涉及分支与 tag（先推代码、再打正式版 tag 是标准流程），
+# 两个事件会各触发一次完整构建，等于把同一个提交构建两遍。
+# 这里按提交 SHA 归并：后到的正式版运行会取消先到的开发版运行；
+# 而正式版自身不可被取消（cancel-in-progress 仅在分支推送上为真），
+# 避免正式发布的运行被随后到来的分支事件打断。
+concurrency:
+  group: publish-${{ github.sha }}
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -34,6 +43,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          fetch-tags: true
 
       - name: 配置 JDK
         uses: actions/setup-java@v5
@@ -63,14 +73,27 @@ jobs:
             echo "is-prerelease=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: 判断该提交是否已是正式版
+        id: guard
+        shell: bash
+        run: |
+          # 正式版运行自身不跳过；分支推送若指向已带 wcpe-v* tag 的提交，则不再重复构建开发版
+          if [[ "${GITHUB_REF_TYPE}" == "branch" ]] && git tag --points-at HEAD | grep -q '^wcpe-v'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "该提交已带正式版 tag，跳过开发版构建"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: 验证重映射缓存回归
+        if: steps.guard.outputs.skip != 'true'
         run: ./gradlew test --tests net.fabricmc.loom.test.integration.RemapTaskCacheTest --no-daemon --stacktrace --warning-mode fail
         env:
           CI: true
           RELEASE_VERSION: ${{ steps.meta.outputs.release-version }}
 
       - name: 上传缓存回归失败报告
-        if: failure()
+        if: failure() && steps.guard.outputs.skip != 'true'
         uses: actions/upload-artifact@v5
         with:
           name: remap-cache-test-results
@@ -79,6 +102,7 @@ jobs:
             build/test-results/test/
 
       - name: 构建并发布
+        if: steps.guard.outputs.skip != 'true'
         run: ./gradlew build publish exportVersion -x test --no-daemon --stacktrace
         env:
           CI: true
