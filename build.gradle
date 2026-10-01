@@ -615,7 +615,17 @@ abstract class WriteActionsTestMatrix extends DefaultTask {
 
 		// Arch: read tests from subdirs
 		// Subdirectories combined into one test run each
-		def mergedSubdirs = ['architectury', 'neoforge']
+		// pipeline/ 收的是 Minecraft jar 生产任务化（L3/L4）的等价性与冷缓存用例，
+		// 它们守护的是「产物与配置期逐条目一致」这类核心正确性，必须进 CI 才有意义。
+		//
+		// 放 mergedSubdirs 而不是 directSubdirs 是有意的：同一次 Gradle test 调用里这些用例
+		// 共用 TestKit 的 gradle_home，只有第一个付冷启动成本（CI 未缓存 caches/fabric-loom，
+		// 现有的 forge / neoforge 用例本来也要冷建工具链），拆成独立矩阵项反而会各付一次。
+		def mergedSubdirs = [
+			'architectury',
+			'neoforge',
+			'pipeline'
+		]
 		// Subdirectories where individual tests are added to the matrix (= longer tests)
 		def directSubdirs = ['forge']
 

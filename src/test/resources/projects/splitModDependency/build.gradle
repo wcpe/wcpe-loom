@@ -1,0 +1,23 @@
+plugins {
+	id 'dev.architectury.loom'
+}
+
+loom {
+	// 环境拆分是 SplitModDependency 被选中的前提之一：
+	// 只有开启它，main 的 remap 配置才会带上 client 目标配置（见 ModDependencyFactory.create）。
+	splitEnvironmentSourceSets()
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:1.20.1"
+	mappings "net.fabricmc:yarn:1.20.1+build.10:v2"
+
+	// 三个 jar 的内容完全相同，差别只在 manifest 声明——用来在同一次构建里做对照：
+	// plain-mod       未声明拆分环境        -> SimpleModDependency
+	// split-basic-mod 声明拆分、无 client 条目 -> SplitModDependency(COMMON_ONLY)
+	// split-full-mod  声明拆分、有 client 条目 -> SplitModDependency(SPLIT)
+	// jar 由测试在运行前写入 mod-deps 目录（依赖在配置期解析，运行时再写就来不及了）。
+	modImplementation files("mod-deps/plain-mod.jar")
+	modImplementation files("mod-deps/split-basic-mod.jar")
+	modImplementation files("mod-deps/split-full-mod.jar")
+}
