@@ -46,7 +46,7 @@ public record TinyJarInfo(boolean v2, Optional<String> minecraftVersionId) {
 
 	/**
 	 * 进程内缓存：TinyJarInfo 只由 jar 内容决定，而同构项目（共用同一套 mappings）会反复查询同一个 jar。
-	 * 键取「路径 + 大小 + 修改时间」，足以识别内容变化；同一 daemon 内所有项目共享。
+	 * 键取「路径 + 大小 + 修改时间」，足以识别内容变化；同一 daemon 内所有项目共享.
 	 */
 	private static final Map<CacheKey, TinyJarInfo> CACHE = new ConcurrentHashMap<>();
 
