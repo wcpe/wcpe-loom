@@ -1,0 +1,22 @@
+plugins {
+	id "java"
+	id "dev.architectury.loom"
+}
+
+version = "1.0.0"
+
+base {
+	archivesName = "coldlib"
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:1.20.4"
+	mappings "net.fabricmc:yarn:1.20.4+build.3:v2"
+	modImplementation "net.fabricmc:fabric-loader:0.19.2"
+}
+
+// 配置顺序探针（ProjectDataColdStartTest 断言用）：Loom 往构建级共享表登记项目数据的
+// afterEvaluate 注册得更早，因此这条日志出现时本项目的数据已经登记完毕。
+afterEvaluate {
+	logger.lifecycle("coldstart-probe lib-evaluated")
+}
