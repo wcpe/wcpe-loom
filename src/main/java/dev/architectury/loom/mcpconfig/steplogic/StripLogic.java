@@ -67,6 +67,8 @@ public final class StripLogic extends StepLogic<Service.Options> {
 
 		try (FileSystemUtil.Delegate output = FileSystemUtil.getJarFileSystem(context.setOutput("stripped.jar"), true)) {
 			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(input, false)) {
+				// 这里刻意保持「失败即致命」：stripped.jar 是本步骤的唯一产物，少一个类就是一个残缺的 jar，
+				// 后续编译会因此报出一堆与真实原因无关的错误，不如在源头失败。
 				ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter();
 
 				for (Path path : (Iterable<? extends Path>) Files.walk(fs.get().getPath("/"))::iterator) {

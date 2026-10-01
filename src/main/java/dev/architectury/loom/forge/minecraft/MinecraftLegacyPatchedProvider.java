@@ -361,7 +361,8 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 
 	private void modifyClasses(Path jarFile, Function<ClassVisitor, ClassVisitor> func) throws Exception {
 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jarFile, false)) {
-			ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter();
+			// best-effort：逐类改写注解，单个类失败时保留该类原样即可，不应该让整个合并流程失败。
+			ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter().tolerateFailures();
 
 			for (Path file : (Iterable<? extends Path>) Files.walk(fs.getPath("/"))::iterator) {
 				if (!file.toString().endsWith(".class")) continue;
@@ -381,7 +382,7 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 				});
 			}
 
-			completer.complete();
+			completer.completeToleratingFailures("class modifications in " + jarFile.toAbsolutePath());
 		}
 	}
 

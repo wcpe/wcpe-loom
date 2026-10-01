@@ -60,16 +60,37 @@ public interface SpecContext {
 		return Stream.concat(modDependencies().stream(), localMods().stream()).toList();
 	}
 
+	/**
+	 * 返回 {@link SpecContext} 依赖的其它项目的 {@link Project}，现恒为空.
+	 *
+	 * <p>该方法与 {@link ProjectView#getLoomProjectDependencies(String)} 一样，是隔离模式之前
+	 * 直接访问跨项目模型的旧 SPI：现在没有任何实现会返回非空值，第三方 processor 调用它只会
+	 * 静默拿到空集合。需要依赖项目的信息请改用 {@link #getDependentProjectData(ProjectView)}。
+	 *
+	 * @param projectView 当前项目的视图
+	 * @return 恒为空流
+	 * @deprecated 已无生产实现，改用 {@link #getDependentProjectData(ProjectView)}
+	 */
+	@Deprecated
+	static Stream<Project> getDependentProjects(ProjectView projectView) {
+		return Stream.empty();
+	}
+
+	/**
+	 * 返回 runtime/compile classpath 上去重后的依赖项目数据.
+	 *
+	 * <p>去重依赖 {@link LoomProjectData#equals(Object)} 按项目路径判等：同一项目经内存共享表与
+	 * 导出文件两条路径可能得到两个实例，只有路径判等才能把它们视作同一个项目。
+	 *
+	 * @param projectView 当前项目的视图
+	 * @return 依赖项目的数据流
+	 */
 	static Stream<LoomProjectData> getDependentProjectData(ProjectView projectView) {
 		final Stream<LoomProjectData> runtimeProjects = projectView.getLoomProjectDataDependencies(JavaPlugin.RUNTIME_CLASSPATH_CONFIGURATION_NAME);
 		final Stream<LoomProjectData> compileProjects = projectView.getLoomProjectDataDependencies(JavaPlugin.COMPILE_CLASSPATH_CONFIGURATION_NAME);
 
 		return Stream.concat(runtimeProjects, compileProjects)
 				.distinct();
-	}
-
-	static Stream<Project> getDependentProjects(ProjectView projectView) {
-		return Stream.empty();
 	}
 
 	// Sort to ensure stable caching

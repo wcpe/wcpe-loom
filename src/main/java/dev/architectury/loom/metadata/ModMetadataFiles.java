@@ -65,6 +65,18 @@ public final class ModMetadataFiles {
 	}
 
 	/**
+	 * 用内存中的原文重建模组元数据文件，供跨项目数据（{@code LoomProjectData}）在依赖方复原非 FMJ 形态.
+	 *
+	 * @param fileName {@link ModMetadataFile#getFileName()} 返回的文件名
+	 * @param bytes 元数据文件的原始内容
+	 * @return 重建的元数据文件；文件名不在已知范围内（例如带 {@code [erroring]} 后缀）时返回 {@code null}
+	 */
+	public static @Nullable ModMetadataFile fromBytes(String fileName, byte[] bytes) {
+		final Function<byte[], ModMetadataFile> factory = SINGLE_FILE_METADATA_TYPES.get(fileName);
+		return factory == null ? null : factory.apply(bytes);
+	}
+
+	/**
 	 * Reads the mod metadata file from a jar.
 	 *
 	 * @param jar the path to the jar file
