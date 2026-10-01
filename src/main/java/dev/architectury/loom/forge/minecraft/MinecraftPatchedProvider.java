@@ -83,6 +83,7 @@ import org.objectweb.asm.tree.ClassNode;
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.build.IntermediaryNamespaces;
 import net.fabricmc.loom.configuration.providers.mappings.TinyMappingsService;
+import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
 import net.fabricmc.loom.util.Check;
 import net.fabricmc.loom.util.Constants;
@@ -240,14 +241,27 @@ public class MinecraftPatchedProvider {
 				remapPatchedJar(serviceFactory);
 			}
 
-			fillClientExtraJar(serviceFactory);
+			if (providesClientJar()) {
+				fillClientExtraJar(serviceFactory);
+			}
 		}
 
 		if (getExtension().isUnobfuscatedForge()) {
 			DependencyProvider.addDependency(project, getForgeJar(), Constants.Configurations.FORGE_EXTRA);
 		}
 
-		DependencyProvider.addDependency(project, minecraftClientExtra, Constants.Configurations.FORGE_EXTRA);
+		if (providesClientJar()) {
+			DependencyProvider.addDependency(project, minecraftClientExtra, Constants.Configurations.FORGE_EXTRA);
+		}
+	}
+
+	/**
+	 * server-only 的 jar 配置不提供 client jar，client-extra 既不生成也不加入 classpath.
+	 *
+	 * <p>否则 getMinecraftClientJar 会抛 "Not configured to provide client jar"。
+	 */
+	private boolean providesClientJar() {
+		return getExtension().getMinecraftJarConfiguration().get() != MinecraftJarConfiguration.SERVER_ONLY;
 	}
 
 	private void mergeUnobfuscatedPatchedJar() throws IOException {
