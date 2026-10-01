@@ -107,7 +107,7 @@ public abstract class MinecraftProvider {
 
 				if (provideServer()) {
 					// 锁内读取 bundle 元数据用于决定是否抽取（extractBundledServerJar 依赖该字段）
-					serverBundleMetadata = BundleMetadata.fromJar(minecraftServerJar.toPath());
+					serverBundleMetadata = readServerBundleMetadata();
 
 					if (serverBundleMetadata != null) {
 						extractBundledServerJar();
@@ -124,13 +124,28 @@ public abstract class MinecraftProvider {
 
 		// 暖路径补设字段：上面锁内可能整段跳过（缓存就绪时未进入生产），但 server jar 必已就绪，
 		// 故在锁外对已存在的 server jar 再读取一次，保证暖缓存下 serverBundleMetadata 也正确。
+		// 该读取走 L2 缓存（按制品 sha1），稳定命中时不会打开 jar，配置期也就不再观察它。
 		if (provideServer() && serverBundleMetadata == null) {
-			serverBundleMetadata = BundleMetadata.fromJar(minecraftServerJar.toPath());
+			serverBundleMetadata = readServerBundleMetadata();
 		}
 
 		// 内存配置：libraryProvider 每次都必须执行
 		final MinecraftLibraryProvider libraryProvider = new MinecraftLibraryProvider(this, configContext.project());
 		libraryProvider.provide();
+	}
+
+	/**
+	 * 读取服务端制品的 bundle 元数据.
+	 *
+	 * <p>走 L2 规格缓存：身份取制品在 version json 中声明的 sha1，因此后续构建无需打开 jar。
+	 * 这是把服务端下载移出配置期的先决条件——见
+	 * {@link BundleMetadata#fromJarCached(net.fabricmc.loom.spec.SpecStore, Path, String)}。
+	 */
+	private BundleMetadata readServerBundleMetadata() throws IOException {
+		final MinecraftVersionMeta.Download serverDownload = getVersionInfo().download("server");
+		final String sha1 = serverDownload != null ? serverDownload.sha1() : null;
+		final var store = new net.fabricmc.loom.spec.SpecStore(getExtension().getFiles().getUserCache().toPath());
+		return BundleMetadata.fromJarCached(store, minecraftServerJar.toPath(), sha1);
 	}
 
 	// 下载/抽取产物的跨进程锁 key：始终按版本，确保同一 mcVersion 的所有 jar 配置共享同一把下载锁、只下载一次。

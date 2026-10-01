@@ -116,8 +116,9 @@ public abstract class LoomCacheService implements BuildService<BuildServiceParam
 	 * mod 依赖重映射写 LOCAL 共享 {@code remapped_mods} 缓存时的互斥 key（按根项目目录 + mappings 标识分）.
 	 *
 	 * <p>同一 checkout 的多个并发构建（如同时跑 client 与 server）共享该 key、串行化写入；
-	 * 不同 checkout 根目录不同 → key 不同 → 互不阻塞。两处写入点（ModProcessor / SourceRemapper）
-	 * 用同一助手生成 key，避免写法漂移。
+	 * 不同 checkout 根目录不同 → key 不同 → 互不阻塞。当前唯一的取锁点是
+	 * {@code SourceRemapper.remapAll}（sources 缓存）；二进制产出已改由 L3 任务持有产出目录、
+	 * 由任务图串行化，不再使用本 key。key 由本助手统一生成，避免两处写法漂移。
 	 */
 	public static String modDepsKey(File rootDir, String mappingsIdentifier) {
 		return "mod-deps:" + rootDir.getAbsolutePath() + ":" + mappingsIdentifier;

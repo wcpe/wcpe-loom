@@ -34,16 +34,25 @@ import java.util.function.Function;
 import org.gradle.api.Project;
 import org.gradle.api.provider.Property;
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.LoomGradlePlugin;
 import net.fabricmc.loom.configuration.ConfigContext;
 import net.fabricmc.loom.configuration.DependencyInfo;
 import net.fabricmc.loom.configuration.providers.minecraft.ManifestLocations.ManifestLocation;
+import net.fabricmc.loom.configuration.providers.minecraft.VersionsManifest.Version;
+import net.fabricmc.loom.spec.SpecStore;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.download.DownloadBuilder;
 
 public final class MinecraftMetadataProvider {
+	/** L2 规格层命名空间：版本清单的「目标版本条目」缓存. */
+	private static final String NAMESPACE_VERSIONS_MANIFEST = "versions-manifest";
+
+	private static final Logger LOGGER = LoggerFactory.getLogger(MinecraftMetadataProvider.class);
+
 	private final Options options;
 	private final Function<String, DownloadBuilder> download;
 
@@ -142,14 +151,58 @@ public final class MinecraftMetadataProvider {
 
 		final Path cacheFile = location.cacheFile(options.userCache());
 		final String versionManifest = builder.downloadString(cacheFile);
-		final VersionsManifest manifest = LoomGradlePlugin.GSON.fromJson(versionManifest, VersionsManifest.class);
-		final VersionsManifest.Version version = manifest.getVersion(options.minecraftVersion());
+		final VersionsManifest.Version version = findVersion(versionManifest, cacheFile);
 
 		if (version != null) {
 			return new ManifestEntryLocation(location, version);
 		}
 
 		return null;
+	}
+
+	/**
+	 * 从版本清单中取出目标版本，解析结果按清单文件的内容身份落盘.
+	 *
+	 * <p>版本清单是**全部** Minecraft 版本的清单（数百 KB ～ MB），而每次配置只需要其中一条。
+	 * 逐次全文 GSON 解析是不必要的重复：清单内容一旦下载完成就不再变化，因此把「目标版本在这一代
+	 * 清单中的条目」缓存下来，后续配置只解析这一条。
+	 *
+	 * <p>缓存键含清单文件的内容身份（大小 + mtime），清单被刷新（含 {@code forceDownload}）后
+	 * 身份变化、自然失效，不会读到过期条目。缓存只存派生数据，丢失仅意味着多解析一次。
+	 *
+	 * @param manifestJson 清单的原始 JSON（已确保为最新一代）
+	 * @param manifestFile 清单的落盘位置，用于取内容身份
+	 * @return 目标版本条目；清单中不存在该版本时为空
+	 */
+	private @Nullable Version findVersion(String manifestJson, Path manifestFile) {
+		final SpecStore store = new SpecStore(options.userCache());
+		final var identity = SpecStore.inputIdentity(manifestFile);
+
+		if (identity.isPresent()) {
+			final var cached = store.load(NAMESPACE_VERSIONS_MANIFEST, identity.get(), options.minecraftVersion());
+
+			if (cached.isPresent()) {
+				// 空内容表示「这一代清单里确实没有该版本」，是已解析过的结论，不是缓存缺失
+				if (cached.get().isEmpty()) {
+					return null;
+				}
+
+				try {
+					return LoomGradlePlugin.GSON.fromJson(cached.get(), Version.class);
+				} catch (RuntimeException e) {
+					// 缓存条目损坏：退回全文解析，本轮顺带把它覆盖成正确内容
+					LOGGER.debug("Corrupt spec cache entry for manifest {}, re-parsing", manifestFile, e);
+				}
+			}
+		}
+
+		final VersionsManifest manifest = LoomGradlePlugin.GSON.fromJson(manifestJson, VersionsManifest.class);
+		final VersionsManifest.Version version = manifest.getVersion(options.minecraftVersion());
+
+		identity.ifPresent(id -> store.store(NAMESPACE_VERSIONS_MANIFEST, id, options.minecraftVersion(),
+				version != null ? LoomGradlePlugin.GSON.toJson(version) : ""));
+
+		return version;
 	}
 
 	private MinecraftVersionMeta readVersionMeta() throws IOException {

@@ -75,14 +75,15 @@ public final class MigrateMappingsService extends Service<MigrateMappingsService
 		ConfigurableFileCollection classpath = project.getObjects().fileCollection();
 		classpath.from(project.getConfigurations().named(JavaPlugin.COMPILE_CLASSPATH_CONFIGURATION_NAME));
 		// Question: why are both of these needed?
-		classpath.from(extension.getMinecraftJars(MappingsNamespace.INTERMEDIARY));
-		classpath.from(extension.getMinecraftJars(MappingsNamespace.NAMED));
+		// 走 getMinecraftJarsCollection：登记了任务产出时它会携带产出任务，裸 Path 列表不会
+		classpath.from(extension.getMinecraftJarsCollection(MappingsNamespace.INTERMEDIARY));
+		classpath.from(extension.getMinecraftJarsCollection(MappingsNamespace.NAMED));
 
 		// Architectury: Same question as above.
 		if (extension.isForge()) {
-			classpath.from(extension.getMinecraftJars(MappingsNamespace.SRG));
+			classpath.from(extension.getMinecraftJarsCollection(MappingsNamespace.SRG));
 		} else if (extension.isNeoForge()) {
-			classpath.from(extension.getMinecraftJars(MappingsNamespace.MOJANG));
+			classpath.from(extension.getMinecraftJarsCollection(MappingsNamespace.MOJANG));
 		}
 
 		return TYPE.create(project, (o) -> {
