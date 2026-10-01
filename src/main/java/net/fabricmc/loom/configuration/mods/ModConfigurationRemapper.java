@@ -78,6 +78,7 @@ import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.ExceptionUtil;
 import net.fabricmc.loom.util.ModPlatform;
 import net.fabricmc.loom.util.SourceRemapper;
+import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.gradle.SourceSetHelper;
 import net.fabricmc.loom.util.service.ServiceFactory;
 
@@ -88,6 +89,7 @@ public class ModConfigurationRemapper {
 	public static final String MISSING_GROUP = "unspecified";
 
 	private static final Logger LOGGER = LoggerFactory.getLogger(ModConfigurationRemapper.class);
+	private static final String ARTIFACT_METADATA_CACHE = "artifactMetadata";
 
 	public static void supplyModConfigurations(Project project, ServiceFactory serviceFactory, String mappingsSuffix, LoomGradleExtension extension, SourceRemapper sourceRemapper) {
 		final DependencyHandler dependencies = project.getDependencies();
@@ -160,7 +162,7 @@ public class ModConfigurationRemapper {
 		// the installer data. The installer data has to be added before
 		// any mods are remapped since remapping needs the dependencies provided by that data.
 		final Map<Provider<? extends Configuration>, List<ModDependency>> dependenciesBySourceConfig = new HashMap<>();
-		AsyncCache<ArtifactMetadata> metaCache = new AsyncCache<>();
+		AsyncCache<ArtifactMetadata> metaCache = getSharedMetaCache(project);
 		configsToRemap.forEach((sourceConfig, remappedConfig) -> {
 			/*
 			sourceConfig - The source configuration where the intermediary named artifacts come from. i.e "modApi"
@@ -234,6 +236,16 @@ public class ModConfigurationRemapper {
 				}
 			}
 		});
+	}
+
+	/**
+	 * 返回当前 Loom classloader 服务内的跨子项目共享 {@link AsyncCache}.
+	 *
+	 * <p>缓存仅存活于 Gradle build service 生命周期内，不会跨 daemon 构建泄漏；多个子项目
+	 * 解析同一个 mod jar 时可复用同一个 future，同时不会跨 classloader 共享强类型对象。
+	 */
+	private static AsyncCache<ArtifactMetadata> getSharedMetaCache(Project project) {
+		return LoomCacheService.get(project).get().getAsyncCache(ARTIFACT_METADATA_CACHE);
 	}
 
 	private static Map<ArtifactRef, ArtifactMetadata> getMetadata(List<ArtifactRef> artifacts, AsyncCache<ArtifactMetadata> cache, @Nullable Project project, ModPlatform platform, ArtifactMetadata.MixinRemapType defaultMixinRemapType) {
