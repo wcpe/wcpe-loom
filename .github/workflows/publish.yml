@@ -22,15 +22,18 @@ on:
 
 permissions:
   contents: read
+  # 正式版运行需要取消同一提交上仍在进行的开发版构建
+  actions: write
 
 # 同一次推送若同时涉及分支与 tag（先推代码、再打正式版 tag 是标准流程），
 # 两个事件会各触发一次完整构建，等于把同一个提交构建两遍。
-# 这里按提交 SHA 归并：后到的正式版运行会取消先到的开发版运行；
-# 而正式版自身不可被取消（cancel-in-progress 仅在分支推送上为真），
-# 避免正式发布的运行被随后到来的分支事件打断。
+# 注意：不能靠按提交 SHA 归并并发组来解决——cancel-in-progress 由「后进入的运行」决定，
+# 正式版运行若设为不取消他人，就只能排队等开发版构建跑完（实测会白白多等一整轮）。
+# 因此这里按 ref 分组：同一分支的连续推送互相取代，正式版各占一组，永不被分支事件取消或阻塞；
+# 跨 ref 的去重改由正式版运行主动取消同一提交的其它运行（见下一步）。
 concurrency:
-  group: publish-${{ github.sha }}
-  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+  group: publish-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -84,6 +87,24 @@ jobs:
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: 取消同一提交上仍在进行的其它运行
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 先推代码、再打 tag 是标准流程：分支推送会先启动一次开发版构建，
+          # 正式版运行在这里取消它，避免同一个提交被完整构建两遍。
+          # 反向顺序（tag 先到、分支事件后到）由上一步「已是正式版」的判断兜底。
+          for id in $(gh run list --repo "$GITHUB_REPOSITORY" \
+              --commit "$GITHUB_SHA" --status in_progress \
+              --json databaseId --jq '.[].databaseId'); do
+            if [ "$id" != "$GITHUB_RUN_ID" ]; then
+              echo "取消同一提交的其它运行: $id"
+              gh run cancel "$id" --repo "$GITHUB_REPOSITORY" || true
+            fi
+          done
 
       - name: 验证重映射缓存回归
         if: steps.guard.outputs.skip != 'true'
