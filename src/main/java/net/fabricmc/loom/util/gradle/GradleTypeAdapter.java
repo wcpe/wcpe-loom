@@ -78,7 +78,11 @@ public class GradleTypeAdapter implements TypeAdapterFactory {
 
 		@Override
 		public void write(JsonWriter out, T property) throws IOException {
-			if (!property.isPresent()) {
+			// Gson 不会替自定义适配器挡掉 null：字段本身为 null 时它照样把 null 传进来。
+			// 而本适配器代表的是「可能未设置的属性」，null 与 isPresent()==false 语义相同——
+			// 都表示没有值，序列化结果也应当一致。少这一层会让整条序列化以 NPE 失败：
+			// 实测 AccessTransformerTest 的 AT 处理器在执行期算 options 缓存键时因此挂掉。
+			if (property == null || !property.isPresent()) {
 				out.nullValue();
 				return;
 			}
