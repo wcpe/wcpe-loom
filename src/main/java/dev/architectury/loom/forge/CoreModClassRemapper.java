@@ -44,6 +44,7 @@ import com.google.gson.JsonObject;
 import dev.architectury.loom.util.collection.CollectionUtil;
 import org.gradle.api.Project;
 import org.gradle.api.logging.Logger;
+import org.gradle.api.logging.Logging;
 
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.util.FileSystemUtil;
@@ -56,9 +57,18 @@ public final class CoreModClassRemapper {
 	private static final Pattern CLASS_NAME_PATTERN = Pattern.compile("^(.*')((?:com\\.mojang\\.|net\\.minecraft\\.)[A-Za-z0-9.-_$]+)('.*)$");
 	private static final Pattern REDIRECT_FIELD_TO_METHOD_PATTERN = Pattern.compile("^(.*\\w+\\s*\\.\\s*redirectFieldToMethod\\s*\\(\\s*\\w+\\s*,\\s*')(\\w*)('\\s*,(?:\\s*'(\\w+)'\\s*|.*)\\).*)$");
 
-	public static void remapJar(Project project, boolean isRuntimeMojang, Path jar, MappingTree mappings) throws IOException {
-		final Logger logger = project.getLogger();
-		final String sourceNamespace = LoomGradleExtension.get(project).getProductionNamespace().get();
+	private static final Logger LOGGER = Logging.getLogger(CoreModClassRemapper.class);
+
+	/**
+	 * 重映射 jar 内 CoreMod 清单条目的类名.
+	 *
+	 * <p>不依赖 {@link Project}：源命名空间由调用方给出，日志走静态 logger。
+	 * 项目模型版本委托到此，二者共用同一份实现。
+	 *
+	 * @param sourceNamespace CoreMod 条目当前所处的命名空间
+	 */
+	public static void remapJar(boolean isRuntimeMojang, Path jar, MappingTree mappings, String sourceNamespace) throws IOException {
+		final Logger logger = LOGGER;
 
 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar, false)) {
 			Path coremodsJsonPath = fs.getPath("META-INF", "coremods.json");
@@ -140,5 +150,9 @@ public final class CoreModClassRemapper {
 				writer.write(String.join("\n", output));
 			}
 		}
+	}
+
+	public static void remapJar(Project project, boolean isRuntimeMojang, Path jar, MappingTree mappings) throws IOException {
+		remapJar(isRuntimeMojang, jar, mappings, LoomGradleExtension.get(project).getProductionNamespace().get());
 	}
 }

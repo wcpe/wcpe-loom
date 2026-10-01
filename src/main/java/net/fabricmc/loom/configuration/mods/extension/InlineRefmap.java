@@ -29,7 +29,6 @@ import java.nio.file.Path;
 import java.util.function.Predicate;
 
 import net.fabricmc.loom.configuration.mods.ArtifactMetadata;
-import net.fabricmc.loom.configuration.mods.dependency.ModDependency;
 import net.fabricmc.loom.configuration.mods.dependency.refmap.MixinReferenceRemapper;
 import net.fabricmc.loom.configuration.mods.dependency.refmap.MixinRefmapInliner;
 import net.fabricmc.loom.configuration.mods.dependency.refmap.MixinRefmapInlinerApplyVisitorProvider;
@@ -43,18 +42,18 @@ final class InlineRefmap implements ModProcessorExtension {
 	}
 
 	@Override
-	public boolean appliesTo(ModDependency modDependency) {
-		return modDependency.getOptions().getInlineRefmap().get()
-				&& modDependency.getMetadata().mixinRemapType() == ArtifactMetadata.MixinRemapType.MIXIN;
+	public boolean appliesTo(ModInfo mod) {
+		return mod.inlineRefmap()
+				&& mod.mixinRemapType() == ArtifactMetadata.MixinRemapType.MIXIN;
 	}
 
 	@Override
 	public TinyRemapper.Extension createExtension(Context ctx, Predicate<InputTag> applyPredicate) throws IOException {
-		MixinReferenceRemapper refmapRemapper = MixinRefmapInliner.createRemapper(ctx.from(), ctx.to(), ctx.mods());
+		MixinReferenceRemapper refmapRemapper = MixinRefmapInliner.createFromModJars(ctx.from(), ctx.to(), ctx.mixinModJars());
 		return new MixinRefmapInlinerApplyVisitorProvider(refmapRemapper, applyPredicate);
 	}
 
 	@Override
-	public void finalise(ModDependency modDependency, Path path) throws IOException {
+	public void finalise(ModInfo mod, Path path) throws IOException {
 	}
 }

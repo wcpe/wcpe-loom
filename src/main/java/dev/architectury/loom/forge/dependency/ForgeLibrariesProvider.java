@@ -271,7 +271,10 @@ public class ForgeLibrariesProvider {
 			});
 
 			// Copy sources when not running under CI.
-			if (!ModConfigurationRemapper.isCIBuild()) {
+			// 与 ModConfigurationRemapper.scheduleSourcesRemapping 同理：sources 只服务于 IDE
+			// 附加源码，配置阶段写出它会让配置缓存记下「文件被创建」并在下次构建失效，
+			// 故仅在 IDE 同步或显式开启时才加工。
+			if (!ModConfigurationRemapper.isCIBuild() && ModConfigurationRemapper.shouldRemapSourcesInConfigurationPhase(project)) {
 				final Map<ResolvedArtifact, Path> sourcesByArtifact = ModConfigurationRemapper.downloadAllSources(project, Set.of(artifact));
 				final Path sourcesJar = sourcesByArtifact.get(artifact);
 

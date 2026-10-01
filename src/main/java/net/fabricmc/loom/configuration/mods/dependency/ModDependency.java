@@ -26,6 +26,7 @@ package net.fabricmc.loom.configuration.mods.dependency;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.List;
 
 import org.gradle.api.Project;
 import org.gradle.api.artifacts.component.ComponentIdentifier;
@@ -67,9 +68,29 @@ public abstract sealed class ModDependency permits SplitModDependency, SimpleMod
 	public abstract void copyToCache(Project project, Path path, @Nullable String variant) throws IOException;
 
 	/**
-	 * Apply the dependency to the project.
+	 * 把本依赖注入目标配置.
+	 *
+	 * @param artifacts 本批 remapped mod 产物各自的生产位置（见 {@link RemappedModArtifacts}）；
+	 *         产出方未必是本项目的任务，故不传任务实例而传「按路径查生产者」的解析器
 	 */
-	public abstract void applyToProject(Project project);
+	public abstract void applyToProject(Project project, RemappedModArtifacts artifacts);
+
+	/**
+	 * {@return 本依赖的重映射产物落在共享仓库里的**全部**路径}.
+	 *
+	 * <p>与消费方找产物走的是同一处计算（{@link #createMavenHelper}），因为 L3 任务按这些路径写出、
+	 * 消费方按这些路径读取：两处各自算一遍布局，会在快照版本这类「目录名与文件名不同源」的用例上分叉成
+	 * 「任务写一条、消费方读另一条」的静默缺失。
+	 *
+	 * <p>返回列表而不是单条路径，是因为依赖的产物数不止一条：拆分依赖（{@link SplitModDependency}）
+	 * 会产出 common/client 两条各自落位的变体（见 override）。生产与消费都按**这一处**结果走，
+	 * 「谁产出某条路径」才不会漏掉其中一条。
+	 *
+	 * @param project 所在项目（决定共享仓库根）
+	 */
+	public List<Path> getCacheArtifactPaths(Project project) {
+		return List.of(createMavenHelper(project, null).getOutputFile(null));
+	}
 
 	/**
 	 * Create a maven helper for the local cache.
@@ -102,16 +123,26 @@ public abstract sealed class ModDependency permits SplitModDependency, SimpleMod
 		return metadata;
 	}
 
-	protected String getName() {
+	/**
+	 * 产出坐标名（含 cache key）；L3 任务据此定位产出路径，故为 public（见架构 §5.1.1）.
+	 */
+	public String getName() {
 		return "%s-%s".formatted(name, options.getCacheKey());
 	}
 
-	protected String getGroup() {
+	/** 产出坐标组；同上. */
+	public String getGroup() {
 		return "remapped.%s".formatted(group);
 	}
 
-	protected String getVersion() {
+	/** 产出坐标版本；同上. */
+	public String getVersion() {
 		return version;
+	}
+
+	/** 产出坐标分类器；同上. */
+	public @Nullable String getClassifier() {
+		return classifier;
 	}
 
 	public Path getInputFile() {
