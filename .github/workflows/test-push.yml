@@ -86,6 +86,8 @@ jobs:
 
     strategy:
       fail-fast: false
+      # TestKit 各矩阵任务共享外部 Maven 仓库，限制并发以降低集中下载触发 403/runner 失联的概率。
+      max-parallel: 6
       matrix:
         test: ${{ fromJson(needs.prepare_test_matrix.outputs.matrix) }}
 
@@ -93,6 +95,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+      # TestKit 使用 .gradle/test-files/integration/gradle_home，不是 runner 默认 Gradle User Home。
+      - name: 缓存 TestKit Gradle 依赖
+        uses: actions/cache@v6
+        with:
+          path: |
+            .gradle/test-files/integration/gradle_home/caches/modules-2
+            .gradle/test-files/integration/gradle_home/wrapper/dists
+          key: ${{ runner.os }}-testkit-gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', '**/*.gradle', '**/*.gradle.kts', 'src/test/**') }}
+          restore-keys: |
+            ${{ runner.os }}-testkit-gradle-
       # Forge 自带的 ForgeFlower 反编译器不支持 JDK 25，需为 forge 系列测试准备 JDK 21（放在 25 之前，避免顶掉 JAVA_HOME）
       - name: setup jdk 21 (Forge tooling)
         uses: actions/setup-java@v5
@@ -154,7 +166,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: ${{ failure() }}
         with:
-          name: ${{ steps.test.outputs.test }} (${{ matrix.java }}) Results (Windows)
+          name: ${{ steps.test.outputs.test }} Results (Windows)
           path: build/reports/
       - uses: actions/upload-artifact@v7
         if: ${{ failure() }}

@@ -110,8 +110,24 @@ jobs:
         # --generate-notes 由 GitHub 按 .github/release.yml 的分组配置自动生成
         # What's Changed（逐 PR 列出作者与编号）、New Contributors 与 Full Changelog；
         # 要求该版本的改动经由 PR 合入默认分支（直接 push 的提交不会单独列出）。
+        # 重跑或重复推送同一 tag 时保留现有 Release，避免 gh release create 返回 422。
         run: |
-          gh release create "$TAG_NAME" \
+          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::Release $TAG_NAME 已存在，跳过重复创建"
+            exit 0
+          fi
+
+          if gh release create "$TAG_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "wcpe-loom $TAG_NAME" \
-            --generate-notes
+            --generate-notes; then
+            exit 0
+          fi
+
+          # 并发运行可能在检查后、创建前由另一运行先创建；仅在确认 Release 已存在时视为成功。
+          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::Release $TAG_NAME 已由并发运行创建"
+            exit 0
+          fi
+
+          exit 1
