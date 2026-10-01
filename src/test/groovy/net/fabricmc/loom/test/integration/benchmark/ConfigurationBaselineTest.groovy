@@ -67,13 +67,13 @@ class ConfigurationBaselineTest extends Specification implements GradleProjectTe
 		def reused = gradle.run(task: task)
 
 		println("========== [${label}] task=${task} ==========")
-		println("cold   : cc-stored=${contains(cold.output, 'Configuration cache entry stored')} " +
-				"cc-reused=${contains(cold.output, 'Configuration cache entry reused')} " +
-				"problem=${contains(cold.output, 'Configuration cache problems found')}")
-		println("warm   : cc-reused=${contains(warm.output, 'Configuration cache entry reused')} " +
-				"problem=${contains(warm.output, 'Configuration cache problems found')}")
-		println("reused : cc-reused=${contains(reused.output, 'Configuration cache entry reused')} " +
-				"problem=${contains(reused.output, 'Configuration cache problems found')}")
+		println("cold   : cc-stored=${cold.output.contains('Configuration cache entry stored')} " +
+				"cc-reused=${cold.output.contains('Configuration cache entry reused')} " +
+				"problem=${cold.output.contains('Configuration cache problems found')}")
+		println("warm   : cc-reused=${warm.output.contains('Configuration cache entry reused')} " +
+				"problem=${warm.output.contains('Configuration cache problems found')}")
+		println("reused : cc-reused=${reused.output.contains('Configuration cache entry reused')} " +
+				"problem=${reused.output.contains('Configuration cache problems found')}")
 
 		// 记录失效原因（若存在），这是后续改造要逐条消灭的清单
 		[
@@ -89,10 +89,6 @@ class ConfigurationBaselineTest extends Specification implements GradleProjectTe
 			}
 		}
 		println("================================================")
-	}
-
-	private static boolean contains(String output, String text) {
-		return output.contains(text)
 	}
 
 	/**
@@ -131,8 +127,8 @@ class ConfigurationBaselineTest extends Specification implements GradleProjectTe
 		].each { name, pair ->
 			def result = pair[1]
 			println("  ${name.padRight(26)} ${String.format('%6d', pair[0])}ms  " +
-					"reused=${contains(result, 'Configuration cache entry reused')} " +
-					"stored=${contains(result, 'Configuration cache entry stored')}")
+					"reused=${result.output.contains('Configuration cache entry reused')} " +
+					"stored=${result.output.contains('Configuration cache entry stored')}")
 		}
 
 		// 配置期是否仍在做环境供给：这是后续改造的核心验收点。
