@@ -347,7 +347,12 @@ public class MappingConfiguration {
 
 	private static void mergeSrg(Project project, Path source, Path target) throws IOException {
 		Stopwatch stopwatch = Stopwatch.createStarted();
-		ForgeMappingsMerger.ExtraMappings extraMappings = ForgeMappingsMerger.ExtraMappings.ofMojmapTsrg(getMojmapSrgFileIfPossible(project));
+		LoomGradleExtension extension = LoomGradleExtension.get(project);
+
+		// FIXME why is this special case necessary?
+		ForgeMappingsMerger.ExtraMappings extraMappings = extension.isLegacyForge()
+				? null
+				: ForgeMappingsMerger.ExtraMappings.ofMojmapTsrg(getMojmapSrgFileIfPossible(project));
 
 		try (Tiny2FileWriter writer = new Tiny2FileWriter(Files.newBufferedWriter(target, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING), false)) {
 			ForgeMappingsMerger.mergeSrg(getRawSrgFile(project), source, extraMappings, true).accept(writer);

@@ -32,6 +32,7 @@ public final class ModMetadataFiles {
 			QuiltModJson.FILE_NAME, QuiltModJson::of,
 			QuiltModJson.JSON5_FILE_NAME, convertJson5ToJson(QuiltModJson::of),
 			ArchitecturyCommonJson.FILE_NAME, ArchitecturyCommonJson::of,
+			McmodInfo.FILE_PATH, onError(McmodInfo::of, "Could not load mcmod.info", () -> new ErroringModMetadataFile("mcmod.info")),
 			ModsToml.FILE_PATH, onError(ModsToml::of, "Could not load mods.toml", () -> new ErroringModMetadataFile("mods.toml")),
 			ModsToml.NEOFORGE_FILE_PATH, onError(ModsToml::of, "Could not load neoforge.mods.toml", () -> new ErroringModMetadataFile("neoforge.mods.toml"))
 	);
