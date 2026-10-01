@@ -67,7 +67,12 @@ public abstract class ValidateAccessWidenerTask extends DefaultTask {
 		final LoomGradleExtension extension = LoomGradleExtension.get(getProject());
 
 		getAccessWidener().convention(extension.getAccessWidenerPath()).finalizeValueOnRead();
-		getTargetJars().from(extension.getMinecraftJarsCollection(MappingsNamespace.NAMED)).finalizeValueOnRead();
+		// 刻意不对 getTargetJars() 调 finalizeValueOnRead()：实测（Gradle 9.x）finalize 会把嵌套文件集合
+		// 展平成「解析出的文件列表」，随之丢掉它们的任务依赖——于是本任务不会等产出 MC jar 的任务跑完，
+		// 冷缓存下直接读到一个还不存在的 jar 并抛 NoSuchFileException。成员 jar 现在由任务产出
+		// （见 LoomGradleExtension#setMinecraftJarsTaskOutputs），这份依赖必须留着。
+		// 该集合只在执行期被读一次，放弃 finalize 的代价可以忽略。
+		getTargetJars().from(extension.getMinecraftJarsCollection(MappingsNamespace.NAMED));
 
 		// Ignore outputs for up-to-date checks as there aren't any (so only inputs are checked)
 		getOutputs().upToDateWhen(task -> true);

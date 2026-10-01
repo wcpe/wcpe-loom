@@ -36,13 +36,22 @@ import java.util.Optional;
 
 import org.gradle.api.Project;
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import net.fabricmc.loom.LoomGradleExtension;
+import net.fabricmc.loom.LoomGradlePlugin;
+import net.fabricmc.loom.spec.SpecStore;
 import net.fabricmc.loom.util.AttributeHelper;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.cache.AtomicFiles;
 
 public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String mainClass) {
+	/** L2 规格层命名空间：服务端 bundle 元数据缓存. */
+	private static final String NAMESPACE_BUNDLE_METADATA = "bundle-metadata";
+
+	private static final Logger LOGGER = LoggerFactory.getLogger(BundleMetadata.class);
+
 	private static final String LIBRARIES_LIST_PATH = "META-INF/libraries.list";
 	private static final String VERSIONS_LIST_PATH = "META-INF/versions.list";
 	private static final String MAINCLASS_PATH = "META-INF/main-class";
@@ -65,6 +74,53 @@ public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String
 		}
 
 		return new BundleMetadata(libraries, versions, mainClass);
+	}
+
+	/**
+	 * 读取服务端制品的 bundle 元数据，结果按制品的 {@code sha1} 落盘复用.
+	 *
+	 * <p>本方法存在的理由是一个配置期约束：服务端库的注入（
+	 * {@code MinecraftLibraryProvider.provideServerLibraries}）依赖这里读出的库列表，
+	 * 而库注入只能在配置期做，因此配置期**必须**拿到 bundle 元数据。
+	 *
+	 * <p>但元数据本身是「下载 url + sha1」的纯函数——这两个值来自 version json，
+	 * 不需要碰磁盘。于是把结果按 {@code sha1} 缓存后，后续构建可以完全跳过「打开服务端 jar
+	 * 读内部清单」这一步，配置期也就不再观察该 jar。这是把服务端下载搬到执行期的**先决条件**。
+	 *
+	 * <p>首次构建仍须真实读取（此时无缓存），并因此付出一次配置期文件观察；
+	 * 之后稳定命中。
+	 *
+	 * @param store L2 规格存储
+	 * @param jar 服务端 jar
+	 * @param artifactSha1 该制品在 version json 中声明的 sha1，作为缓存身份
+	 * @return bundle 元数据；非 bundler 的旧版服务端 jar 返回空
+	 */
+	public static @Nullable BundleMetadata fromJarCached(SpecStore store, Path jar, @Nullable String artifactSha1) throws IOException {
+		if (artifactSha1 == null) {
+			// 没有稳定身份就无法安全复用，退回直接读取
+			return fromJar(jar);
+		}
+
+		final Optional<String> cached = store.load(NAMESPACE_BUNDLE_METADATA, artifactSha1, "server-bundle");
+
+		if (cached.isPresent()) {
+			// 空内容表示「上次已判定为旧版 jar（无 bundle）」，是结论而非缺失
+			if (cached.get().isEmpty()) {
+				return null;
+			}
+
+			try {
+				return LoomGradlePlugin.GSON.fromJson(cached.get(), BundleMetadata.class);
+			} catch (RuntimeException e) {
+				LOGGER.debug("Corrupt bundle metadata cache for sha1 {}, re-reading jar", artifactSha1, e);
+			}
+		}
+
+		final BundleMetadata metadata = fromJar(jar);
+		store.store(NAMESPACE_BUNDLE_METADATA, artifactSha1, "server-bundle",
+				metadata != null ? LoomGradlePlugin.GSON.toJson(metadata) : "");
+
+		return metadata;
 	}
 
 	private static List<Entry> readEntries(String content, String pathPrefix) {

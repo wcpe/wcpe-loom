@@ -139,7 +139,9 @@ public class UnpickService extends Service<UnpickService.Options> {
 			options.getUnpickClasspath().setFrom(configurations.named(Constants.Configurations.MINECRAFT_COMPILE_LIBRARIES));
 			options.getUnpickClasspath().from(configurations.named(Constants.Configurations.MOD_COMPILE_CLASSPATH_MAPPED));
 			options.getLenient().set(unpickMetadata instanceof UnpickMetadata.V1);
-			extension.getMinecraftJars(MappingsNamespace.NAMED).forEach(options.getUnpickClasspath()::from);
+			// 走 getMinecraftJarsCollection：登记了任务产出时它会携带产出任务；
+			// 逐个 from(Path) 注入的是裸文件，消费侧看不到「谁产出它」
+			options.getUnpickClasspath().from(extension.getMinecraftJarsCollection(MappingsNamespace.NAMED));
 			return true;
 		});
 	}

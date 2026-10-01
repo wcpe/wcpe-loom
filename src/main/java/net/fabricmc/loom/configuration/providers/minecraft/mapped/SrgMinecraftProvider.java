@@ -97,6 +97,28 @@ public abstract sealed class SrgMinecraftProvider<M extends MinecraftProvider> e
 				tinyRemapperBuilder.extraPostApplyVisitor(SidedClassVisitor.CLIENT);
 			}
 		}
+
+		// 声明为「空操作」：本覆写的判据恒为 false，实际什么也不挂，因此任务侧 injectClientSidedVisitor = false
+		// 就是精确复现配置期行为，可以放行投影（此前它被归入「未知覆写」而整 provider 被拒）。
+		//
+		// 判据恒假的证据链：
+		// 1. MinecraftJar 未覆写 equals/hashCode，即按身份相等；
+		// 2. Split.getClientOnlyJar() 是每次调用都新建实例的默认实现（new MinecraftJar.ClientOnly(...)），
+		//    且本类没有覆写它；
+		// 3. 故 remappedJars.outputJar() 与这里重新取到的 getClientOnlyJar() 不可能是同一个对象——
+		//    实测「同路径同类型」时为 pathEqual=true 但 jarEquals=false。
+		// 于是 if 块永不进入，覆写体等价于空实现（疑似 MinecraftJar 从按值相等改为身份相等后遗留的失效条件）。
+		//
+		// 也不能反过来声明为 SPLIT_CLIENT_VISITOR_ONLY：那会让任务给 client-only jar 挂上配置期没有的
+		// @Environment(CLIENT)，产物因此分叉——本声明要复现的是现状，不是纠正现状。
+		//
+		// 失效条件：本声明依赖上面第 1、2 条同时成立。若将来 MinecraftJar 引入按值相等（或
+		// getClientOnlyJar() 改为复用同一个实例），该 if 就会真的挂上 visitor，本声明随之失效、必须重新评估；
+		// 届时「这个覆写到底该不该挂 visitor」是产品决策，本声明不替它做决定。
+		@Override
+		protected RemapperHookKind remapperHookKind() {
+			return RemapperHookKind.NO_OP;
+		}
 	}
 
 	public static final class SingleJarImpl extends SrgMinecraftProvider<SingleJarMinecraftProvider> implements SingleJar {

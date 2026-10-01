@@ -27,7 +27,6 @@ package net.fabricmc.loom.task.launch;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -64,9 +63,9 @@ public abstract class GenerateRemapClasspathTask extends AbstractLoomTask {
 				.map(configurations::named)
 				.forEach(getRemapClasspath()::from);
 
-		for (Path minecraftJar : getExtension().getMinecraftJars(getExtension().getProductionNamespaceEnum().get())) {
-			getRemapClasspath().from(minecraftJar.toFile());
-		}
+		// 走 getMinecraftJarsCollection：登记了任务产出时它会携带产出任务；
+		// 直接遍历 getMinecraftJars 再 from(File) 得到的是裸文件，不携带任务依赖。
+		getRemapClasspath().from(getExtension().getMinecraftJarsCollection(getExtension().getProductionNamespaceEnum().get()));
 
 		getRemapClasspathFile().set(getExtension().getFiles().getRemapClasspathFile());
 	}
