@@ -86,11 +86,10 @@ public class MergedMinecraftProvider extends MinecraftProvider {
 					try {
 						mergeJars();
 					} catch (Throwable e) {
-						Files.deleteIfExists(getMinecraftClientJar().toPath());
-						Files.deleteIfExists(getMinecraftServerJar().toPath());
-						Files.deleteIfExists(minecraftMergedJar);
-
-						getProject().getLogger().error("Could not merge JARs! Deleting source JARs - please re-run the command and move on.", e);
+						// 失败路径不删除共享产物：client/server 输入 jar 与合并产物都在跨进程共享的 <userCache>/<mcVersion> 下，
+						// 删掉会破坏其它进程（或其它工作树）正在读的文件，并引发无谓的重新下载与重建。
+						// 合并的中间结果只存在于同目录临时文件里，由 AtomicFiles.publish 在失败时清理。
+						getProject().getLogger().error("合并 JAR 失败！已保留原有产物，请重新运行命令以重试。", e);
 						throw e;
 					}
 				}

@@ -27,9 +27,11 @@ package dev.architectury.loom.mcpconfig;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -39,6 +41,7 @@ import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Set;
 import java.util.SortedSet;
+import java.util.concurrent.TimeUnit;
 
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -74,6 +77,14 @@ import net.fabricmc.loom.util.service.Service;
  * and enqueued steps.
  */
 public final class McpExecutorBuilder {
+	/**
+	 * 解包目录被写入方替换时，读方等待其「回到原位」的预算.
+	 *
+	 * <p>窗口本身只有两次 rename 的时长（毫秒级），这里给足余量，以覆盖写方在替换前后做清理的时间。
+	 */
+	private static final long UNPACKED_SWAP_WAIT_MILLIS = 5_000;
+	private static final long UNPACKED_SWAP_POLL_MILLIS = 25;
+
 	private final Project project;
 	private final MinecraftProvider minecraftProvider;
 	private final Path cache;
@@ -136,18 +147,72 @@ public final class McpExecutorBuilder {
 		}
 	}
 
+	/**
+	 * 把 MCP 配置声明的输入文件加入执行参数.
+	 *
+	 * <p>解包目录位于跨 daemon 共享的 userCache，写入方替换整棵目录时（旧目录 rename 走、新目录 rename 就位）
+	 * 存在一个「目录不在原位」的窗口。此处先短暂重试等待写方完成，超时仍不可见即抛出带路径与原因的错误。
+	 *
+	 * <p>不能像以前那样在文件缺失时静默跳过：撞上窗口会少传 {@code --data/--mappings} 等输入而构建照常成功，
+	 * 产出的 patched jar 还会被 manifest 标记为最新并长期复用，正是要消灭的那种静默损坏。
+	 */
 	private void addDefaultFile(McpConfigProvider provider, String key, String value) {
-		Path path = provider.getUnpackedZip().resolve(value).toAbsolutePath();
+		final Path unpacked = provider.getUnpackedZip().toAbsolutePath();
+		Path path = unpacked.resolve(value).toAbsolutePath();
 
-		if (!path.startsWith(provider.getUnpackedZip().toAbsolutePath())) {
+		if (!path.startsWith(unpacked)) {
 			// This is probably not what we're looking for since it falls outside the directory.
-			return;
-		} else if (Files.notExists(path)) {
-			// Not a real file, let's continue.
 			return;
 		}
 
+		awaitUnpackedInput(unpacked, path, key);
 		addConfig(key, path.toString());
+	}
+
+	/**
+	 * 等待解包目录与其声明的输入文件就位.
+	 *
+	 * @param unpacked 解包目录
+	 * @param path     配置声明的输入文件
+	 * @param key      配置键，仅用于日志与错误信息
+	 */
+	private void awaitUnpackedInput(Path unpacked, Path path, String key) {
+		final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(UNPACKED_SWAP_WAIT_MILLIS);
+		boolean loggedWait = false;
+
+		while (Files.notExists(path)) {
+			if (System.nanoTime() >= deadline) {
+				throw missingUnpackedInput(unpacked, path, key);
+			}
+
+			if (!loggedWait) {
+				loggedWait = true;
+				project.getLogger().info("MCPConfig 输入 {}（配置项 {}）暂不可见，等待解包目录 {} 替换完成", path, key, unpacked);
+			}
+
+			try {
+				Thread.sleep(UNPACKED_SWAP_POLL_MILLIS);
+			} catch (InterruptedException e) {
+				// 保留中断状态：这里已经不可能继续等下去，直接把缺失输入报出去
+				Thread.currentThread().interrupt();
+				throw missingUnpackedInput(unpacked, path, key);
+			}
+		}
+	}
+
+	/**
+	 * {@return 「解包目录未就位」的错误，带路径与原因}.
+	 *
+	 * <p>区分两种成因，便于定位是并发替换（稍后重试即可）还是缓存本身不完整（需要重建缓存）。
+	 */
+	private static UncheckedIOException missingUnpackedInput(Path unpacked, Path path, String key) {
+		final String reason = Files.notExists(unpacked)
+				? "解包目录不在原位（很可能正被其它进程替换）"
+				: "解包目录存在，但其中没有该输入（缓存不完整）";
+
+		return new UncheckedIOException(new NoSuchFileException(path.toString(), unpacked.toString(),
+				"MCPConfig 配置项 %s 指向的输入在等待 %d 毫秒后仍不可用：%s；缺少该输入会让 MCP 执行链静默少传 --data/--mappings"
+						.formatted(key, UNPACKED_SWAP_WAIT_MILLIS, reason)));
 	}
 
 	public void addConfig(String key, String value) {

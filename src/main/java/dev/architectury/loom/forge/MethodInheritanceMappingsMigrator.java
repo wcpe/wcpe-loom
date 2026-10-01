@@ -55,6 +55,7 @@ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.Pair;
+import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.mappingio.MappingReader;
 import net.fabricmc.mappingio.adapter.MappingSourceNsSwitch;
 import net.fabricmc.mappingio.format.tiny.Tiny2FileWriter;
@@ -80,12 +81,15 @@ public final class MethodInheritanceMappingsMigrator implements MappingsMigrator
 				methodsToRemove = new HashSet<>(list);
 			}
 		} else {
-			Files.deleteIfExists(cacheFile);
 			LoomGradleExtension extension = LoomGradleExtension.get(project);
-			Path patchedIntermediateJar = MinecraftPatchedProvider.get(project).getMinecraftPatchedIntermediateJar();
+			// 共享缓存可能正被其它进程重建（或其它工作树仍在用会删除整组产物的旧版本 loom）：
+			// 用 getOrProduce... 在产物缺失时先按件补齐，避免直接读取抛 NoSuchFileException
+			Path patchedIntermediateJar = MinecraftPatchedProvider.get(project).getOrProduceMinecraftPatchedIntermediateJar();
 			List<Path> jars = List.of(patchedIntermediateJar, extension.getForgeUniversalProvider().getForge().toPath(), extension.getForgeUserdevProvider().getUserdevJar().toPath());
 			methodsToRemove = prepareCache(project.getLogger(), rawMappings, jars, hasSrg, hasMojang);
-			Files.writeString(cacheFile, new Gson().toJson(methodsToRemove.stream().sorted(Comparator.comparing(p -> p.left() + "|" + p.right())).toList()), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+			// 原子发布：缓存位于跨 daemon 共享的 forge 缓存目录（不按项目隔离），旧写法先删除再就地写入，
+			// 读方会看到内容缺失或半截
+			AtomicFiles.publish(cacheFile, tmp -> Files.writeString(tmp, new Gson().toJson(methodsToRemove.stream().sorted(Comparator.comparing(p -> p.left() + "|" + p.right())).toList())));
 		}
 
 		return methodsToRemove.hashCode();
