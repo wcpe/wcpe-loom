@@ -615,9 +615,9 @@ public abstract class LoomGradleExtensionApiImpl implements LoomGradleExtensionA
 
 	@Override
 	public FileCollection getNamedMinecraftJars() {
-		final ConfigurableFileCollection jars = getProject().getObjects().fileCollection();
-		jars.from(getProject().provider(() -> LoomGradleExtension.get(getProject()).getMinecraftJars(MappingsNamespace.NAMED)));
-		return jars;
+		// 走 getMinecraftJarsCollection：登记了任务产出时它会携带产出任务，而直接包一个
+		// Provider<List<Path>> 的集合不携带任务依赖。
+		return LoomGradleExtension.get(getProject()).getMinecraftJarsCollection(MappingsNamespace.NAMED);
 	}
 
 	@Override
