@@ -126,14 +126,19 @@ jobs:
           # 生成 Release Notes 需要完整历史：--generate-notes 要对比上一版 tag，
           # fetch-depth=1 拿不到上一版 tag 会导致 What's Changed / Contributors 缺失
           fetch-depth: 0
+          # 推导上一版 tag 需要本地有 wcpe-v* 标签
+          fetch-tags: true
 
       - name: 创建 GitHub Release（自动生成贡献者与变更清单）
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
         # --generate-notes 由 GitHub 按 .github/release.yml 的分组配置自动生成
-        # What's Changed（逐 PR 列出作者与编号）、New Contributors 与 Full Changelog；
-        # 要求该版本的改动经由 PR 合入默认分支（直接 push 的提交不会单独列出）。
+        # What's Changed（逐 PR 列出作者与编号）、New Contributors 与 Full Changelog。
+        # 基点必须显式指定：GitHub 自动判定曾在 v1.17.5 已发布的情况下仍回退到 v1.17.4，
+        # 导致上一版的内容被重复列出、Full Changelog 从更早的版本起算。
+        # 另外 --generate-notes 只统计 PR 合入的改动，直推默认分支的提交不会出现，
+        # 故在其后追加一节列出这类提交，避免正式发布的实际内容缺失说明。
         # 重跑或重复推送同一 tag 时保留现有 Release，避免 gh release create 返回 422。
         run: |
           if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -141,17 +146,30 @@ jobs:
             exit 0
           fi
 
+          # 上一个 wcpe-v* 正式版 tag，作为变更区间的起点
+          PREV_TAG="$(git describe --tags --abbrev=0 --match 'wcpe-v*' "${TAG_NAME}^")"
+          echo "变更区间: ${PREV_TAG}..${TAG_NAME}"
+
           if gh release create "$TAG_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "wcpe-loom $TAG_NAME" \
+            --notes-start-tag "$PREV_TAG" \
             --generate-notes; then
-            exit 0
-          fi
-
-          # 并发运行可能在检查后、创建前由另一运行先创建；仅在确认 Release 已存在时视为成功。
-          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            :
+          elif gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # 并发运行可能在检查后、创建前由另一运行先创建；仅在确认 Release 已存在时视为成功。
             echo "::notice::Release $TAG_NAME 已由并发运行创建"
             exit 0
+          else
+            exit 1
           fi
 
-          exit 1
+          # 追加未走 PR 的直接提交（--generate-notes 不统计它们）
+          DIRECT_COMMITS="$(git log --no-merges --pretty='* %s (%h)' \
+            --invert-grep --grep='(#[0-9]*)' "${PREV_TAG}..${TAG_NAME}")"
+
+          if [ -n "${DIRECT_COMMITS}" ]; then
+            NEW_NOTES="$(gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --json body --jq '.body')"
+            NEW_NOTES="${NEW_NOTES}"$'\n\n### 直推提交（未走 PR）\n\n'"${DIRECT_COMMITS}"
+            gh release edit "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --notes "${NEW_NOTES}"
+          fi
