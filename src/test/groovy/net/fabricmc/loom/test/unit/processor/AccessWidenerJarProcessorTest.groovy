@@ -30,6 +30,7 @@ import net.fabricmc.loom.api.processor.SpecContext
 import net.fabricmc.loom.configuration.accesswidener.AccessWidenerJarProcessor
 import net.fabricmc.loom.test.util.GradleTestUtil
 import net.fabricmc.loom.util.fmj.FabricModJson
+import net.fabricmc.loom.util.fmj.FabricModJsonSource
 import net.fabricmc.loom.util.fmj.ModEnvironment
 
 class AccessWidenerJarProcessorTest extends Specification {
@@ -56,10 +57,14 @@ class AccessWidenerJarProcessorTest extends Specification {
 		def mod1 = Mock(FabricModJson.Mockable)
 		mod1.getClassTweakers() >> ["test.accesswidener": ModEnvironment.UNIVERSAL]
 		mod1.getId() >> "modid1"
+		// 规则文件内容在**建条目时**就取出来（条目要能进配置缓存，不能再带着 FabricModJson，
+		// 理由见 ModAccessWidenerEntry 的注释），所以这里必须给出可读的来源。
+		mod1.getSource() >> ({ String path -> "accessWidener\tv2\tnamed\n".getBytes() } as FabricModJsonSource)
 
 		def mod2 = Mock(FabricModJson.Mockable)
 		mod2.getClassTweakers() >> ["test2.accesswidener": ModEnvironment.UNIVERSAL]
 		mod2.getId() >> "modid2"
+		mod2.getSource() >> ({ String path -> "accessWidener\tv2\tnamed\n".getBytes() } as FabricModJsonSource)
 
 		specContext.modDependenciesCompileRuntime() >> [mod1, mod2].shuffled()
 

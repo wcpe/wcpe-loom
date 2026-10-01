@@ -96,7 +96,8 @@ public class AccessTransformerJarProcessor implements MinecraftJarProcessor<Acce
 			}
 
 			final String hash = Checksum.of(bytes).sha256().hex();
-			entries.add(new AccessTransformerEntry.Mod(localMod, hash));
+			// 规则内容随条目一起带走：mod 元数据的来源（源码集/jar）不能进任务状态，理由见 Mod 的注释
+			entries.add(new AccessTransformerEntry.Mod(localMod.getId(), localMod.getVersion(), bytes, hash));
 		}
 
 		return !entries.isEmpty() ? new Spec(entries) : null;

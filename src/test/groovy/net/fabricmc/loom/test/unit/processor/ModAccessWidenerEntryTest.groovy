@@ -28,13 +28,18 @@ import spock.lang.Specification
 
 import net.fabricmc.loom.configuration.accesswidener.ModAccessWidenerEntry
 import net.fabricmc.loom.util.fmj.FabricModJson
+import net.fabricmc.loom.util.fmj.FabricModJsonSource
 import net.fabricmc.loom.util.fmj.ModEnvironment
 
 class ModAccessWidenerEntryTest extends Specification {
 	def "read local mod"() {
 		given:
+		def aw = "accessWidener\tv2\tnamed\n"
 		def mod = Mock(FabricModJson.Mockable)
 		mod.getClassTweakers() >> ["test.accesswidener": ModEnvironment.UNIVERSAL]
+		// 规则文件内容在**建条目时**就取出来（条目要能进配置缓存，不能再带着 FabricModJson，
+		// 理由见 ModAccessWidenerEntry 的注释），所以这里必须给出可读的来源。
+		mod.getSource() >> ({ String path -> aw.getBytes() } as FabricModJsonSource)
 
 		when:
 		def entries = ModAccessWidenerEntry.readAll(mod, true)
@@ -45,6 +50,12 @@ class ModAccessWidenerEntryTest extends Specification {
 		entry.path() == "test.accesswidener"
 		entry.environment() == ModEnvironment.UNIVERSAL
 		entry.transitiveOnly()
+		entry.modId() == null
+		// 身份判据：这个哈希是 spec 指纹，产物路径与缓存值（getJarHash）由它派生，所以条目不再持有
+		// FabricModJson 之后它必须逐位不变。改造前它来自 record 自动生成的实现
+		// （对 [FabricModJson.hashCode(), path, environment, transitiveOnly] 做「从 0 开始」的 31 折），
+		// 本次改造把它显式写出来复现。
+		// 注意别用 Objects.hash(...) 去复现：「从 1 开始」的写法会得到 -1218057875，与本期望值不同。
 		entry.hashCode() == -1218981396
 	}
 }
