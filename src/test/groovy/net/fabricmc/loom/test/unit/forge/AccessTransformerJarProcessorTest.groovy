@@ -29,6 +29,7 @@ import java.nio.file.Path
 
 import dev.architectury.loom.accesstransformer.AccessTransformerJarProcessor
 import org.gradle.api.Project
+import org.gradle.api.model.ObjectFactory
 import spock.lang.Specification
 import spock.lang.TempDir
 
@@ -54,7 +55,9 @@ class AccessTransformerJarProcessorTest extends Specification {
 		ZipUtils.pack(modDir, jarPath)
 
 		// Create processor and context
-		def processor = new AccessTransformerJarProcessor('at', Mock(Project), [])
+		// 配置期构造器自执行期重建支持以来多了一个 ObjectFactory 参数（buildSpec 用不到它，给个 mock 即可），
+		// 少传参数的写法在本次改造前就已经对不上构造器签名了。
+		def processor = new AccessTransformerJarProcessor('at', Mock(Project), [], Mock(ObjectFactory))
 		def modJson = FabricModJsonFactory.createFromZip(jarPath)
 		def context = Mock(SpecContext)
 		context.localMods() >> [modJson]
