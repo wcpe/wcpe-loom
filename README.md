@@ -50,7 +50,7 @@ plugins {
 | 正式版 | 打 tag 并推送（`git tag wcpe-v1.17.2 && git push origin wcpe-v1.17.2`） | `1.17.2`（取自 tag），并自动创建 GitHub Release |
 | 日常推送 | 推送到 `dev/1.17-wcpe` | `1.17.<运行号>`（自动递增、不可覆盖） |
 
-产物坐标：`net.fabricmc:architectury-loom:<版本>`，仓库 `maven.wcpe.top/repository/maven-releases/`。
+产物坐标：`dev.architectury:architectury-loom:<版本>`（Gradle 插件标记为 `top.wcpe.loom:top.wcpe.loom.gradle.plugin`），仓库 `maven.wcpe.top/repository/maven-releases/`。
 
 支持的 Minecraft 版本：Fabric 全线；Forge/NeoForge 含 1.8–1.16 的 legacy 链路（1.12.2 端到端测试覆盖）。
 
