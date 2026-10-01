@@ -41,6 +41,7 @@ import javax.inject.Inject;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import org.gradle.api.model.ObjectFactory;
 import org.jetbrains.annotations.Contract;
 import org.jspecify.annotations.Nullable;
 import org.objectweb.asm.ClassReader;
@@ -88,6 +89,11 @@ public abstract class InterfaceInjectionProcessor implements MinecraftJarProcess
 	}
 
 	@Override
+	public Descriptor descriptor() {
+		return new Descriptor(name, fromDependencies);
+	}
+
+	@Override
 	public InterfaceInjectionProcessor.@Nullable Spec buildSpec(SpecContext context) {
 		List<InjectedInterface> injectedInterfaces = new ArrayList<>();
 
@@ -111,6 +117,21 @@ public abstract class InterfaceInjectionProcessor implements MinecraftJarProcess
 	}
 
 	public record Spec(List<InjectedInterface> injectedInterfaces, Set<String> clientOnlyModIds) implements MinecraftJarProcessor.Spec {
+	}
+
+	/**
+	 * 用于在执行期重建 {@link InterfaceInjectionProcessor} 的描述符.
+	 *
+	 * @param name processor 名称
+	 * @param fromDependencies 是否读取编译期与运行期都存在的依赖 mod 注入的接口
+	 */
+	public record Descriptor(String name, boolean fromDependencies)
+			implements MinecraftJarProcessor.ProcessorDescriptor<InterfaceInjectionProcessor> {
+		@Override
+		public InterfaceInjectionProcessor createProcessor(ObjectFactory objectFactory) {
+			// 本类是抽象类，交由 Gradle 生成子类实例，因此必须经由 ObjectFactory 而不是 new
+			return objectFactory.newInstance(InterfaceInjectionProcessor.class, name, fromDependencies);
+		}
 	}
 
 	@Override

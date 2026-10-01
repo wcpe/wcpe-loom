@@ -29,6 +29,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.function.Predicate;
 
+import net.fabricmc.loom.configuration.mods.ArtifactMetadata;
 import net.fabricmc.loom.configuration.mods.dependency.ModDependency;
 import net.fabricmc.tinyremapper.InputTag;
 import net.fabricmc.tinyremapper.TinyRemapper;
@@ -45,17 +46,38 @@ public interface ModProcessorExtension {
 	/**
 	 * Return true if the extension applies to the given mod dependency.
 	 */
-	boolean appliesTo(ModDependency modDependency);
+	boolean appliesTo(ModInfo mod);
 
 	/**
 	 * Create a TinyRemapper extension that uses the predicate to only apply to mods that match appliesTo.
 	 */
 	TinyRemapper.Extension createExtension(Context ctx, Predicate<InputTag> applyPredicate) throws IOException;
 
-	void finalise(ModDependency modDependency, Path path) throws IOException;
+	void finalise(ModInfo mod, Path path) throws IOException;
 
+	/**
+	 * 一个 mod 在「是否 / 如何套用扩展」这件事上被用到的全部事实.
+	 *
+	 * <p>取代原先直接传 {@link ModDependency}：扩展本来就只用到输入 jar 路径与
+	 * mixin 重映射类型、是否内联 refmap 这三项，其中前两项由 jar 内容派生、第三项是
+	 * 声明的选项。收窄成纯数据后，配置期与执行期（L3 任务）都能满足同一份契约，
+	 * 而不需要把依赖对象带进任务。
+	 *
+	 * @param inputJar 原始 mod jar
+	 * @param mixinRemapType 由 jar 内容派生的 mixin 重映射类型
+	 * @param inlineRefmap 声明的 refmap 内联选项
+	 */
+	record ModInfo(Path inputJar, ArtifactMetadata.MixinRemapType mixinRemapType, boolean inlineRefmap) { }
+
+	/**
+	 * 扩展装配上下文.
+	 *
+	 * @param from 源命名空间
+	 * @param to 目标命名空间
+	 * @param mixinModJars 本批次中 mixin 重映射类型为 MIXIN 的输入 jar（refmap 内联器需要）
+	 */
 	record Context(
 			String from,
 			String to,
-			List<ModDependency> mods) { }
+			List<Path> mixinModJars) { }
 }

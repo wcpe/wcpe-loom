@@ -32,14 +32,18 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
+import dev.architectury.loom.mappings.MappingOption;
 import org.gradle.api.NamedDomainObjectProvider;
 import org.gradle.api.Project;
 import org.gradle.api.artifacts.Configuration;
@@ -67,11 +71,17 @@ import org.slf4j.LoggerFactory;
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.LoomGradlePlugin;
 import net.fabricmc.loom.api.RemapConfigurationSettings;
+import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.RemapConfigurations;
 import net.fabricmc.loom.configuration.mods.dependency.ModDependency;
 import net.fabricmc.loom.configuration.mods.dependency.ModDependencyFactory;
 import net.fabricmc.loom.configuration.mods.dependency.ModDependencyOptions;
+import net.fabricmc.loom.configuration.mods.dependency.RemappedModArtifacts;
+import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftSourceSets;
+import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
+import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry.Producer;
+import net.fabricmc.loom.pipeline.RemapModsTask;
 import net.fabricmc.loom.util.AsyncCache;
 import net.fabricmc.loom.util.Checksum;
 import net.fabricmc.loom.util.Constants;
@@ -80,6 +90,7 @@ import net.fabricmc.loom.util.ModPlatform;
 import net.fabricmc.loom.util.SourceRemapper;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.gradle.SourceSetHelper;
+import net.fabricmc.loom.util.kotlin.KotlinClasspathService;
 import net.fabricmc.loom.util.service.ServiceFactory;
 
 @SuppressWarnings("UnstableApiUsage")
@@ -211,24 +222,20 @@ public class ModConfigurationRemapper {
 			}
 
 			final NamedDomainObjectProvider<? extends Configuration> clientRemappedConfig = clientConfigsToRemap.get(sourceConfig);
-			final boolean refreshDeps = LoomGradleExtension.get(project).refreshDeps();
-			// TODO: With the same artifacts being considered multiple times for their different
-			//   usage attributes, this should probably not process them multiple times even with refreshDeps.
-			final List<ModDependency> toRemap = modDependencies.stream()
-					.filter(dependency -> refreshDeps || dependency.isCacheInvalid(project, null))
-					.toList();
 
-			if (!toRemap.isEmpty()) {
-				try {
-					new ModProcessor(project, sourceConfig, serviceFactory).processMods(toRemap);
-				} catch (IOException e) {
-					throw new UncheckedIOException("Failed to remap mods", e);
-				}
-			}
+			// 任务接管**整批**依赖，而非仅「缓存失效的那些」：任务拥有产出目录，未纳入本批的产出
+			// 不会被写出，消费方的文件依赖就会悬空。产物有效性改由 Gradle 的 up-to-date 与构建
+			// 缓存判定，isCacheInvalid / refreshDeps 这套手写判据随之退休（见架构 §5.1）。
+			//
+			// 性能影响**未测**：曾有一次 AllinCore 对照（2m01s→14m14s）看似回退，但随后发现
+			// 该机同时有 8 个 Gradle daemon 并发、同一指标在 41s~28m51s 间飘，故那次对照无效。
+			// 需在安静机器或 CI 上做 A/B 才能定论。
+			final RemappedModArtifacts remappedArtifacts = registerRemapTask(
+					project, sourceConfig.get().getName(), modDependencies, extension.getMappingConfiguration());
 
 			// Add all of the remapped mods onto the config
 			for (ModDependency info : modDependencies) {
-				info.applyToProject(project);
+				info.applyToProject(project, remappedArtifacts);
 				createConstraints(info.getInputArtifact(), remappedConfig, sourceConfig, dependencies);
 
 				if (clientRemappedConfig != null) {
@@ -236,6 +243,177 @@ public class ModConfigurationRemapper {
 				}
 			}
 		});
+	}
+
+	/**
+	 * 为一批 mod 依赖注册 L3 重映射任务，返回「产物路径 → 生产位置」的解析器.
+	 *
+	 * <p>取代原先在配置期同步执行的 {@code ModProcessor.processMods}。三处刻意的不同：
+	 *
+	 * <ul>
+	 *   <li>接管**整批**依赖，而非「缓存失效的那些」。任务拥有产出目录，未纳入本批的产出不会
+	 *       被写出，消费方的文件依赖就会悬空；产物有效性的判据因此从 {@code isCacheInvalid}
+	 *       交给 Gradle 的 up-to-date 与构建缓存（见架构 §5.1）。</li>
+	 *   <li>依赖在此被投影成纯数据 {@link RemapModsTask.ModSpec}。任务输入里不含任何项目对象，
+	 *       才可能被配置缓存序列化——这正是本改造的目的。</li>
+	 *   <li>产物路径经 {@link RemapMinecraftTaskRegistry#claimAll} 逐条认领，任务只写出并声明自己
+	 *       认领到的那些：产物落在构建内所有项目共用的 {@code remapped_mods} 仓库，同一条路径上
+	 *       不能有两个生产者（见 {@link RemapModsTask}）。</li>
+	 * </ul>
+	 *
+	 * @return 本批每条产物的生产位置；消费方据此建依赖边，产出方未必是本项目的任务
+	 */
+	private static RemappedModArtifacts registerRemapTask(
+			Project project,
+			String configName,
+			List<ModDependency> modDependencies,
+			MappingConfiguration mappingConfiguration) {
+		final LoomGradleExtension extension = LoomGradleExtension.get(project);
+		final String sourceNamespace = extension.getProductionNamespaceEnum().get().toString();
+		final String targetNamespace = MappingsNamespace.NAMED.toString();
+
+		// classpath：其余 mod 的原始 jar 提供跨 mod 的类型上下文。
+		//
+		// 关键：这里的配置解析必须**惰性**。旧路径由 toRemap 过滤保护——processMods 只在存在
+		// 缓存失效依赖时才被调用，暖构建时整段不执行。改成任务后若无条件在配置期解析
+		// getSourceConfiguration().get().getFiles()，每次配置都要把所有 remap 配置连同其
+		// *Copy 变体解析一遍（实测 MPMT 41s→4m37s、AllinCore 2m01s→14m14s）。
+		// 用 provider 推迟到任务输入快照时刻：任务不执行（如 :help）就完全不解析。
+		final Set<File> inputsBeingRemapped = modDependencies.stream()
+				.map(dep -> dep.getInputFile().toFile())
+				.collect(Collectors.toSet());
+
+		// 已知 indy BSM：项目级声明 + 各 mod 元数据声明
+		final Set<String> knownIndyBsms = new HashSet<>(extension.getKnownIndyBsms().get());
+
+		for (ModDependency dep : modDependencies) {
+			knownIndyBsms.addAll(dep.getMetadata().knownIdyBsms());
+		}
+
+		final Provider<KotlinClasspathService.Options> kotlinOptions = KotlinClasspathService.createOptions(project);
+		final Map<String, String> identity = remapIdentity(extension, sourceNamespace, targetNamespace, knownIndyBsms, kotlinVersionOf(kotlinOptions));
+
+		// 产出路径与消费方同源：两处都按 LocalMavenHelper 算，任务写出的就是消费方要读的那条路径。
+		// 一条依赖的产物可能不止一条（拆分依赖是 common/client 两条），认领因此按**全部**落位进行：
+		// 只认领其中一条，另一条就没有生产者（消费方读到一条永不写出的路径，而构建不会报错）。
+		final List<Path> artifactPaths = new ArrayList<>();
+		final List<RemapModsTask.ModSpec> specs = new ArrayList<>();
+
+		for (ModDependency dependency : modDependencies) {
+			final List<Path> artifacts = dependency.getCacheArtifactPaths(project);
+			artifactPaths.addAll(artifacts);
+			specs.add(toModSpec(project, dependency, artifacts));
+		}
+
+		final Map<Path, Producer> producers = RemapMinecraftTaskRegistry.claimAll(project, artifactPaths, identity,
+				ownedArtifacts -> project.getTasks().register(taskName(configName), RemapModsTask.class, task -> {
+					task.setGroup("loom");
+					task.setDescription("Remaps the mods of '%s' to %s".formatted(configName, targetNamespace));
+
+					// 只声明认领到的产物；声明集合同时就是写出集合（见 RemapModsTask.getOutputJars）
+					task.getOutputJars().from(ownedArtifacts.stream().map(Path::toFile).toList());
+					task.getRemapClasspath().from(project.provider(() -> {
+						final List<File> remapConfigSourceFiles = new ArrayList<>();
+
+						for (RemapConfigurationSettings entry : extension.getRemapConfigurations()) {
+							remapConfigSourceFiles.addAll(entry.getSourceConfiguration().get().getFiles());
+						}
+
+						return RemapModsTask.collectRemapClasspath(remapConfigSourceFiles, inputsBeingRemapped);
+					}));
+					task.getMappingsServiceOptions().set(
+							mappingConfiguration.getMappingsServiceOptions(project, MappingOption.forPlatform(extension)));
+					task.getSourceNamespace().set(sourceNamespace);
+					task.getTargetNamespace().set(targetNamespace);
+					task.getPlatform().set(extension.getPlatform().get());
+					task.getForgeLike().set(extension.isForgeLike());
+					task.getNeoForge().set(extension.isNeoForge());
+					task.getRuntimeMojang().set(extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime());
+					task.getKnownIndyBsms().set(knownIndyBsms);
+					task.getKotlinOptions().set(kotlinOptions);
+
+					// 输入仍是**完整批次**：认领结果只决定写不写，不决定读什么（见 RemapModsTask 类注释）
+					task.getMods().set(List.copyOf(specs));
+				}));
+
+		return new RemappedModArtifacts(project, extension.getFiles().getRemappedModCache().toPath(), producers);
+	}
+
+	/**
+	 * {@return 本批 mod 重映射的输入指纹}（见 {@link RemapMinecraftTaskRegistry}）.
+	 *
+	 * <p>用来判定「两个项目请求同一条产物路径时，它们要的是不是同一个 jar」。产物路径里已经确定的量
+	 * **不重复**：坐标、映射标识与平台后缀都在 cache key 里（{@code ModDependencyOptions.getCacheKey()}），
+	 * 因此两条 MC 车道、两套映射必然算不出同一条路径，不会互相复用。这里列的只是路径**看不到**、
+	 * 却会改变产物字节的配置项：源/目标命名空间、平台、Forge 系的三个开关、扩展声明的 indy BSM 集合、
+	 * Kotlin 版本（影响 kotlin 元数据的重映射）。
+	 *
+	 * <p>值一律是字符串，且全部取自枚举、布尔与字符串本身：**不含任何对象身份**——把配置对象
+	 * （{@code RemapConfigurationSettings}、{@code Configuration} 之类）当指纹是本仓库已经踩过的坑，
+	 * 它们的 {@code toString} 里带工厂 lambda 的身份哈希，两个配置完全相同的项目也会算出不同的字符串，
+	 * 指纹于是变成假冲突（同类问题的处置见 {@code ProcessedNamedMinecraftProvider} 的
+	 * {@code JarConfigurationKind}）。
+	 *
+	 * <p>刻意**不**列入的是重映射 classpath（其它 mod 的原始 jar）：解析它必须惰性（否则每次配置都要
+	 * 把所有 remap 配置解析一遍，见 {@code registerRemapTask} 的性能记录），而且多模块工程里各模块的
+	 * mod 集合本就不同——把它纳入判定会让正常工程被判成冲突。按路径复用是既有语义
+	 * （配置期由 {@code LocalMavenHelper.isReusable} 决定），这里不改变它。
+	 *
+	 * @param extension 所在项目的 loom 扩展
+	 * @param sourceNamespace 源命名空间（项目的生产命名空间）
+	 * @param targetNamespace 目标命名空间
+	 * @param knownIndyBsms 本批已知的 indy BSM 集合
+	 * @param kotlinVersion 项目的 Kotlin 插件版本；不用 Kotlin 时为空串
+	 */
+	private static Map<String, String> remapIdentity(LoomGradleExtension extension, String sourceNamespace,
+			String targetNamespace, Set<String> knownIndyBsms, String kotlinVersion) {
+		final Map<String, String> identity = new LinkedHashMap<>();
+		identity.put("sourceNamespace", sourceNamespace);
+		identity.put("targetNamespace", targetNamespace);
+		identity.put("platform", extension.getPlatform().get().id());
+		identity.put("forgeLike", Boolean.toString(extension.isForgeLike()));
+		identity.put("neoForge", Boolean.toString(extension.isNeoForge()));
+		identity.put("runtimeMojang", Boolean.toString(extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime()));
+		identity.put("knownIndyBsms", knownIndyBsms.stream().sorted().collect(Collectors.joining("\n")));
+		identity.put("kotlinVersion", kotlinVersion);
+		return Map.copyOf(identity);
+	}
+
+	/** {@return 项目所用的 Kotlin 插件版本} 不用 Kotlin 时为空串；只读一个已设好的属性，不解析任何配置. */
+	private static String kotlinVersionOf(Provider<KotlinClasspathService.Options> kotlinOptions) {
+		final KotlinClasspathService.Options options = kotlinOptions.getOrNull();
+		return options == null ? "" : options.getKotlinVersion().getOrElse("");
+	}
+
+	/**
+	 * 把依赖投影成任务输入.
+	 *
+	 * <p>坐标必须与产出路径一致——消费方按坐标换算出文件依赖的相对路径，不一致就会指向
+	 * 一个任务永不写出的文件。
+	 *
+	 * @param artifacts 该依赖的产出路径，由 {@link ModDependency#getCacheArtifactPaths} 给出；
+	 *         两条时（拆分依赖的 common + client）第一条是 common 半，第二条是 client 半
+	 */
+	private static RemapModsTask.ModSpec toModSpec(Project project, ModDependency dependency, List<Path> artifacts) {
+		final RemapModsTask.ModSpec spec = project.getObjects().newInstance(RemapModsTask.ModSpec.class);
+		spec.getInputJar().set(dependency.getInputFile().toFile());
+		spec.getOutputJar().set(artifacts.get(0).toFile());
+
+		if (artifacts.size() > 1) {
+			spec.getSplitClientJar().set(artifacts.get(1).toFile());
+		}
+
+		spec.getGroup().set(dependency.getGroup());
+		spec.getName().set(dependency.getName());
+		spec.getVersion().set(dependency.getVersion());
+		spec.getClassifier().set(dependency.getClassifier());
+		spec.getMixinRemapType().set(dependency.getMetadata().mixinRemapType());
+		spec.getInlineRefmap().set(dependency.getOptions().getInlineRefmap());
+		return spec;
+	}
+
+	private static String taskName(String configName) {
+		return "remapMods" + configName.substring(0, 1).toUpperCase(Locale.ENGLISH) + configName.substring(1);
 	}
 
 	/**
@@ -291,7 +469,14 @@ public class ModConfigurationRemapper {
 		final List<ArtifactRef> artifacts = new ArrayList<>();
 
 		final Set<ResolvedArtifact> resolvedArtifacts = configuration.get().getResolvedConfiguration().getResolvedArtifacts();
-		Map<ResolvedArtifact, Path> sourcesMap = downloadAllSources(project, resolvedArtifacts);
+
+		// sources 解析只服务于 IDE 附加源码，且是一次真实的 ArtifactResolutionQuery
+		// （可能触发网络下载）。非 IDE 场景下其结果不会被消费，因此这里提前跳过，
+		// 避免在配置阶段为「用不到的东西」做一次完整制品解析。
+		// 守卫口径与 scheduleSourcesRemapping 保持一致。
+		final Map<ResolvedArtifact, Path> sourcesMap = shouldRemapSourcesInConfigurationPhase(project)
+				? downloadAllSources(project, resolvedArtifacts)
+				: Map.of();
 
 		for (ResolvedArtifact artifact : resolvedArtifacts) {
 			Path sources = sourcesMap.get(artifact);
@@ -371,6 +556,15 @@ public class ModConfigurationRemapper {
 			return;
 		}
 
+		// remapped sources 只被 IDE 附加源码消费，不参与编译与打包。
+		// 在配置阶段写出它是有害的：配置缓存会把「本次创建了该文件」记入指纹，
+		// 下一次构建读到「文件已存在」即判定失效，于是每个含 mod 依赖的项目
+		// 在产物落盘后都要多一轮完整重配置。故仅在真正需要时（IDE 同步，
+		// 或用户显式开启）才在配置期加工。
+		if (!shouldRemapSourcesInConfigurationPhase(project)) {
+			return;
+		}
+
 		final Path sourcesInput = dependency.getInputArtifact().sources();
 
 		if (sourcesInput == null || Files.notExists(sourcesInput)) {
@@ -405,5 +599,29 @@ public class ModConfigurationRemapper {
 
 		// CI seems to be set by most popular CI services
 		return System.getenv("CI") != null;
+	}
+
+	/**
+	 * {@return 是否在配置阶段加工依赖的 remapped sources}.
+	 *
+	 * <p>remapped sources 的唯一消费者是 IDE 附加源码；编译、测试、打包都不需要它。
+	 * 而配置阶段写出新文件会让配置缓存把「文件被创建」记入指纹，导致下一次构建
+	 * 因「文件系统条目已改变」而失效——表现为产物落盘后仍要完整重配置一轮。
+	 *
+	 * <p>因此默认只在 IDE 同步时加工（此时 IDE 确实要拿源码去索引），
+	 * 其余场景一律跳过。需要 sources 的非 IDE 场景可用
+	 * {@code -Dfabric.loom.remapSources=true} 显式开启。
+	 *
+	 * <p>注意：本判断只决定「是否加工」，不改变 IDE 同步时的行为，
+	 * 因此不影响既有 IDE 用例（见 IdeaDownloadSourcesHookTest）。
+	 */
+	public static boolean shouldRemapSourcesInConfigurationPhase(Project project) {
+		if (Boolean.parseBoolean(System.getProperty("fabric.loom.remapSources", "false"))) {
+			return true;
+		}
+
+		// 用与 SourceSetHelper 一致的 IDE 判定口径：IntelliJ 同步或 IDE 内运行。
+		// 只判 idea.sync.active 会漏掉「IDE 内直接触发 Gradle 构建」的场景。
+		return SourceSetHelper.isIdeDrivenBuild();
 	}
 }

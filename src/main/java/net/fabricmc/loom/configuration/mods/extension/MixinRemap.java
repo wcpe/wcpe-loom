@@ -29,7 +29,6 @@ import java.nio.file.Path;
 import java.util.function.Predicate;
 
 import net.fabricmc.loom.configuration.mods.ArtifactMetadata;
-import net.fabricmc.loom.configuration.mods.dependency.ModDependency;
 import net.fabricmc.loom.configuration.mods.dependency.refmap.MixinRefmapInliner;
 import net.fabricmc.tinyremapper.InputTag;
 import net.fabricmc.tinyremapper.TinyRemapper;
@@ -42,8 +41,8 @@ final class MixinRemap implements ModProcessorExtension {
 	}
 
 	@Override
-	public boolean appliesTo(ModDependency modDependency) {
-		return modDependency.getMetadata().mixinRemapType() == ArtifactMetadata.MixinRemapType.STATIC;
+	public boolean appliesTo(ModInfo mod) {
+		return mod.mixinRemapType() == ArtifactMetadata.MixinRemapType.STATIC;
 	}
 
 	@Override
@@ -52,7 +51,7 @@ final class MixinRemap implements ModProcessorExtension {
 	}
 
 	@Override
-	public void finalise(ModDependency modDependency, Path path) throws IOException {
-		MixinRefmapInliner.removeRefmap(modDependency, path);
+	public void finalise(ModInfo mod, Path path) throws IOException {
+		MixinRefmapInliner.removeRefmap(path);
 	}
 }

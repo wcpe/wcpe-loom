@@ -26,6 +26,7 @@ package net.fabricmc.loom.configuration.mods.dependency;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Objects;
 
 import org.gradle.api.NamedDomainObjectProvider;
@@ -105,31 +106,46 @@ public final class SplitModDependency extends ModDependency {
 		}
 	}
 
+	/**
+	 * {@return 本依赖在共享仓库里的全部落位}.
+	 *
+	 * <p>拆分依赖的产物名带 {@code -common} / {@code -client} 后缀（见 {@link #createMavenHelper}），
+	 * 消费方读的也是带后缀的那条——所以生产者要认领、要写出的同样是**带后缀**的路径，
+	 * 而不是无后缀的那条：后者既不在这里消费，写了也无人读。
+	 */
 	@Override
-	public void applyToProject(Project project) {
+	public List<Path> getCacheArtifactPaths(Project project) {
+		return switch (target) {
+		case COMMON_ONLY -> List.of(getCommonMaven().getOutputFile(null));
+		case CLIENT_ONLY -> List.of(getClientMaven().getOutputFile(null));
+		case SPLIT -> List.of(getCommonMaven().getOutputFile(null), getClientMaven().getOutputFile(null));
+		};
+	}
+
+	@Override
+	public void applyToProject(Project project, RemappedModArtifacts artifacts) {
 		if (target.common()) {
-			project.getDependencies().add(targetCommonConfig.getName(), getCommonMaven().getNotation());
+			project.getDependencies().add(targetCommonConfig.getName(),
+					artifacts.dependency(getCommonMaven().getRelativeArtifactPath(null)));
 		}
 
 		if (target.client()) {
-			project.getDependencies().add(targetClientConfig.getName(), getClientMaven().getNotation());
+			project.getDependencies().add(targetClientConfig.getName(),
+					artifacts.dependency(getClientMaven().getRelativeArtifactPath(null)));
 		}
 
 		if (target == JarSplitter.Target.SPLIT) {
-			createModGroup(
-					project,
-					getCommonMaven().getOutputFile(null),
-					getClientMaven().getOutputFile(null)
-			);
+			createModGroup(project, artifacts);
 		}
 	}
 
-	private void createModGroup(Project project, Path commonJar, Path clientJar) {
+	private void createModGroup(Project project, RemappedModArtifacts artifacts) {
 		LoomGradleExtension extension = LoomGradleExtension.get(project);
 		final ModSettings modSettings = extension.getMods().maybeCreate(String.format("%s-%s-%s", getGroup(), getName(), getVersion()));
+
 		modSettings.getModFiles().from(
-				commonJar.toFile(),
-				clientJar.toFile()
+				artifacts.dependency(getCommonMaven().getRelativeArtifactPath(null)),
+				artifacts.dependency(getClientMaven().getRelativeArtifactPath(null))
 		);
 	}
 
