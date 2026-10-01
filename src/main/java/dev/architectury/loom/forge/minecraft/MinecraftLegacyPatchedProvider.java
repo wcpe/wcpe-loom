@@ -34,8 +34,10 @@ import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
+import java.util.List;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.jar.Attributes;
@@ -160,13 +162,23 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 	}
 
 	protected Path[] getGlobalCaches() {
-		return new Path[] {
+		List<Path> files = new ArrayList<>(Arrays.asList(
 				minecraftClientPatchedJar,
 				minecraftServerPatchedJar,
 				minecraftMergedPatchedJar,
 				minecraftPatchedAtJar,
-				forgeJar,
-		};
+				forgeJar
+		));
+
+		// 与父类按 providesClientJar() 过滤 minecraftClientExtra 同一个道理：minecraftMergedPatchedJar
+		// 只在 type == MERGED 时生成（见 remapJar 与 minecraftPatchedAtJar 的 switch），
+		// 若它始终参与 needsWork()/checkCache() 判定，非 MERGED 配置下「该产物永远不存在」会让判定恒为真、
+		// 每轮都整链重建。当前唯一构造点始终传 MERGED，故这里是防御性对齐，不改变现有行为。
+		if (type != Type.MERGED) {
+			files.remove(minecraftMergedPatchedJar);
+		}
+
+		return files.toArray(Path[]::new);
 	}
 
 	@Override

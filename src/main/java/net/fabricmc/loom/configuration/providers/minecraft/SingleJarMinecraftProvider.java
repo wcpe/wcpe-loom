@@ -24,7 +24,6 @@
 
 package net.fabricmc.loom.configuration.providers.minecraft;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
@@ -33,6 +32,7 @@ import net.fabricmc.loom.configuration.ConfigContext;
 import net.fabricmc.loom.configuration.providers.BundleMetadata;
 import net.fabricmc.loom.util.TinyRemapperLoggerAdapter;
 import net.fabricmc.loom.util.cache.AtomicFiles;
+import net.fabricmc.loom.util.cache.JarReusability;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.tinyremapper.NonClassCopyMode;
 import net.fabricmc.tinyremapper.OutputConsumerPath;
@@ -89,8 +89,10 @@ public abstract class SingleJarMinecraftProvider extends MinecraftProvider {
 	}
 
 	protected void processJar() throws Exception {
-		// 无锁快路径：env-only jar 已就绪且未要求刷新时不获取文件锁
-		boolean requiresRefresh = getExtension().refreshDeps() || Files.notExists(minecraftEnvOnlyJar);
+		// 无锁快路径：env-only jar 已就绪（内容级判据，见 JarReusability.isReusable）且未要求刷新时不获取文件锁。
+		// 不能只判存在：产物落在跨 daemon／跨工作树共享的 <userCache>/<mcVersion> 下，remap 被中断会留下
+		// 0 字节或截断的 jar；PR #8 移除「残留锁 → 全量重建」兜底后，存在性判定会把它永久复用。
+		boolean requiresRefresh = getExtension().refreshDeps() || !JarReusability.isReusable(minecraftEnvOnlyJar);
 
 		if (!requiresRefresh) {
 			return;
@@ -101,7 +103,7 @@ public abstract class SingleJarMinecraftProvider extends MinecraftProvider {
 
 		cacheService.runExclusive(lockRoot, cacheKey(), LoomCacheService.defaultTimeout(), () -> {
 			// 锁内二次确认：可能已被他人在等锁期间生产完成
-			if (!getExtension().refreshDeps() && Files.exists(minecraftEnvOnlyJar)) {
+			if (!getExtension().refreshDeps() && JarReusability.isReusable(minecraftEnvOnlyJar)) {
 				return null;
 			}
 

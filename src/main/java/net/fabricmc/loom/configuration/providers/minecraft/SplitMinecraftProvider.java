@@ -32,6 +32,7 @@ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.ConfigContext;
 import net.fabricmc.loom.configuration.providers.BundleMetadata;
 import net.fabricmc.loom.util.cache.AtomicFiles;
+import net.fabricmc.loom.util.cache.JarReusability;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
 
 public final class SplitMinecraftProvider extends MinecraftProvider {
@@ -64,8 +65,11 @@ public final class SplitMinecraftProvider extends MinecraftProvider {
 	public void provide() throws Exception {
 		super.provide();
 
-		// 无锁快路径：拆分产物已就绪且未要求刷新时不获取文件锁
-		boolean requiresRefresh = getExtension().refreshDeps() || Files.notExists(minecraftClientOnlyJar) || Files.notExists(minecraftCommonJar);
+		// 无锁快路径：拆分产物已就绪（内容级判据，见 JarReusability.isReusable）且未要求刷新时不获取文件锁。
+		// 不能只判存在：两件产物都在跨 daemon／跨工作树共享的 <userCache>/<mcVersion> 下，被中断的就地写会留下
+		// 0 字节或截断的 jar；PR #8 移除「残留锁 → 全量重建」兜底后，存在性判定会把它永久复用。
+		boolean requiresRefresh = getExtension().refreshDeps() || !JarReusability.isReusable(minecraftClientOnlyJar)
+				|| !JarReusability.isReusable(minecraftCommonJar);
 
 		if (!requiresRefresh) {
 			return;
@@ -76,7 +80,8 @@ public final class SplitMinecraftProvider extends MinecraftProvider {
 
 		cacheService.runExclusive(lockRoot, cacheKey(), LoomCacheService.defaultTimeout(), () -> {
 			// 锁内二次确认：可能已被他人在等锁期间拆分完成
-			if (!getExtension().refreshDeps() && Files.exists(minecraftClientOnlyJar) && Files.exists(minecraftCommonJar)) {
+			if (!getExtension().refreshDeps() && JarReusability.isReusable(minecraftClientOnlyJar)
+					&& JarReusability.isReusable(minecraftCommonJar)) {
 				return null;
 			}
 

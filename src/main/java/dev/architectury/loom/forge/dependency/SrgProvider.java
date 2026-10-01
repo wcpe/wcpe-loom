@@ -95,8 +95,22 @@ public class SrgProvider extends DependencyProvider {
 		}
 
 		try (BufferedReader reader = Files.newBufferedReader(srg)) {
-			isTsrgV2 = reader.readLine().startsWith("tsrg2");
+			isTsrgV2 = isTsrg2FirstLine(reader.readLine());
 		}
+	}
+
+	/**
+	 * {@return 该 tsrg 的首行是否标识 tsrg2 形态}.
+	 *
+	 * <p>先判空：{@code srg.tsrg} 为空文件（或读到一半被替换）时 {@code readLine()} 返回 null，
+	 * 直接 {@code startsWith} 会抛 NPE 而不是走「按形态处理」的分支。
+	 * null（含空文件、只剩行终止符的残骸）一律按「非 tsrg2」处理——这与
+	 * {@link #needsSrgProduction()} 的口径一致，且是安全方向：
+	 * 形态未知时既不去凭空生产 merged mojmap 产物，也不宣称它存在；
+	 * 该空产物本身会被 {@link #isReusableTsrg(Path)} 拒绝，从而在下一轮触发重新生产。
+	 */
+	private static boolean isTsrg2FirstLine(@Nullable String firstLine) {
+		return firstLine != null && firstLine.startsWith("tsrg2");
 	}
 
 	/**
@@ -224,13 +238,22 @@ public class SrgProvider extends DependencyProvider {
 	}
 
 	private void produceMergedMojang(DependencyInfo dependency) throws IOException {
-		boolean tsrgV2;
+		final boolean tsrgV2;
 
 		try (BufferedReader reader = Files.newBufferedReader(srg)) {
-			tsrgV2 = reader.readLine().startsWith("tsrg2");
+			// 判空后再判形态：srg.tsrg 为空文件时 readLine() 返回 null，此处原先会抛 NPE，
+			// 使「按件重建」的路径根本走不到（详见 isTsrg2FirstLine 的说明）
+			tsrgV2 = isTsrg2FirstLine(reader.readLine());
 		}
 
 		if (!tsrgV2) {
+			// legacy srg 形态本就没有 merged mojmap 产物：形态未知（空文件）时同样按此处理，
+			// 避免凭空生产、也避免把不可读的产物当作依据
+			if (Files.size(srg) == 0) {
+				getProject().getLogger().warn("{} 是空文件，无法判断 srg 形态；本轮跳过 merged mojmap 产物的生产，"
+						+ "该文件会在下一次判定中按「不可复用」触发重建。", srg);
+			}
+
 			return;
 		}
 
@@ -395,7 +418,10 @@ public class SrgProvider extends DependencyProvider {
 
 		Path mojmapTsrg2 = extension.getMinecraftProvider().dir("forge").toPath().resolve("mojmap.tsrg2");
 
-		if (Files.notExists(mojmapTsrg2) || extension.refreshDeps()) {
+		// 就绪判据与同文件其它 tsrg 产物一致（见 isReusableTsrg）：mojmap.tsrg2 也是 tsrg2 文本，
+		// 由 MappingWriter(TSRG_2_FILE) 经 java.io.Writer 逐行写出。只判存在会让 0 字节或截断的残骸
+		// 进入 MERGE_MAPPING 的 --right 输入，静默产出缺少 mojmap 名字的 merged 映射。
+		if (!isReusableTsrg(mojmapTsrg2) || extension.refreshDeps()) {
 			// 该文件位于 userCache（不按项目隔离），同一 MC 版本的多个 daemon 会指向同一路径；
 			// 生成结果只取决于目标版本，故由首个取得锁的进程写入，其余进程等待后直接复用。
 			// 写入在临时文件上完成并原子替换，避免读取方看到半截内容。
@@ -412,7 +438,9 @@ public class SrgProvider extends DependencyProvider {
 
 		try {
 			CacheEntryLock.withLock(lockRoot, lockKey, LoomCacheService.defaultTimeout(), () -> {
-				if (Files.exists(mojmapTsrg2) && !extension.refreshDeps()) {
+				// 锁内二次确认：判据必须与锁外快路径一致（同为 isReusableTsrg），
+				// 否则残骸会被锁内判为「已产出」而直接复用，快路径每轮进锁却永远修不好它
+				if (isReusableTsrg(mojmapTsrg2) && !extension.refreshDeps()) {
 					return null;
 				}
 

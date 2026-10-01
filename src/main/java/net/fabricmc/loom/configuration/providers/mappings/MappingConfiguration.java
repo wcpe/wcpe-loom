@@ -39,7 +39,6 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.EnumMap;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -78,6 +77,7 @@ import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.ZipUtils;
 import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.loom.util.cache.CacheEntryLock;
+import net.fabricmc.loom.util.cache.JarReusability;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.service.ScopedServiceFactory;
 import net.fabricmc.loom.util.service.ServiceFactory;
@@ -173,7 +173,12 @@ public class MappingConfiguration {
 		this.unpickDefinitions = mappingsWorkingDir.resolve("mappings.unpick");
 		this.tinyMappingsWithSrg = mappingsWorkingDir.resolve("mappings-srg.tiny");
 		this.tinyMappingsWithMojang = mappingsWorkingDir.resolve("mappings-mojang.tiny");
-		this.mixinTinyMappings = new HashMap<>();
+		// 线程安全实现：本实例经 SHARED_INSTANCES 在 daemon 内跨项目共享，而 getReplacedTarget 由
+		// Mixin AP 的配置路径调用——两个项目并行配置时会同时向这张表 computeIfAbsent，普通 HashMap
+		// 在扩容/树化期间并发写会丢条目甚至自引用死循环。ConcurrentHashMap 的 computeIfAbsent 对同一 key
+		// 只允许一个线程执行映射函数、其余线程等其结果，正好满足「同一 namespace 只产出一份」的语义。
+		// 注意它禁止映射函数内部再改同一张表（会抛 IllegalStateException），本类的映射函数只做文件 I/O。
+		this.mixinTinyMappings = new ConcurrentHashMap<>();
 		this.srgToNamedSrg = mappingsWorkingDir.resolve("mappings-srg-named.srg");
 		this.mappingOptions = new EnumMap<>(MappingOption.class);
 		this.mappingOptions.put(MappingOption.DEFAULT, () -> this.tinyMappings);
@@ -346,13 +351,23 @@ public class MappingConfiguration {
 	// 产 mappings 文件：受 per-key 锁保护。注意 extractExtras 会在内存中填充字段，
 	// 但本方法仅在「冷/刷新」路径执行；暖路径的内存填充已在 setup 的无锁快路径中完成。
 	private void produceMappings(Project project, ServiceFactory serviceFactory, MinecraftProvider minecraftProvider, Path inputJar, boolean refresh) throws IOException {
+		// 标记为失效值 ⟹ 上一轮在两次发布之间失败（publish 抛异常、进程被杀），盘上就是「新的 mappings.tiny
+		// + 旧的 mappings.jar」这一被撕开的一对；而这两件产物在存在性判定下都「在」，若只看存在性就会直接
+		// 走到方法末尾把标记写回就绪值，把混合代次认证成「成对」。故这里强制重写两件产物（安全方向）。
+		// 注意与「标记缺失」区分：标记缺失只说明标记是本轮新增或被外部清理，产物本身可能完好，
+		// 沿用下面的补写标记路径即可，不必白白重建一次。
+		final boolean pairTorn = readPairMarkerState() == PairMarkerState.INVALIDATED;
+
 		// 刷新（--refresh-dependencies）不再靠删除共享产物实现：删除会制造「产物不存在」窗口，
 		// 锁外的存在性快路径会误判、并连带删掉其它进程正在读的文件。
 		// 改为「强制重建 + 原子替换」，读方始终看到旧的完整文件或新的完整文件。
-		final boolean writeTiny = Files.notExists(tinyMappings) || refresh;
+		// 就绪判据必须与锁外的 hasUsableMappingsPair 成对，且两件产物各用各的口径：
+		// 只判存在时，0 字节残骸会被锁外快路径判为未就绪（每轮进锁），却在锁内被判为「已有产物」而跳过重写，
+		// 于是残骸永远不会自愈；这里改成内容级判据后，「快路径判不可用」蕴含「锁内必然重写」。
+		final boolean writeTiny = refresh || pairTorn || !isReusableMappingsText(tinyMappings);
 		// mappings.jar 的内容派生自 mappings.tiny（把同一份 tiny 原样打进 zip），故本轮重写了 tiny 就必须
 		// 同轮重写 jar：否则「新的 mappings.tiny + 旧的 mappings.jar」同样会被后面的标记认证为成对就绪。
-		final boolean writeJar = writeTiny || Files.notExists(tinyMappingsJar);
+		final boolean writeJar = writeTiny || !JarReusability.isReusable(tinyMappingsJar);
 
 		// 只要本轮会写其中任一件，就先让成对标记失效：两件产物是两次独立发布，
 		// 若两次发布之间标记仍为就绪，读方会命中「新的 mappings.tiny + 旧的 mappings.jar」。
@@ -395,14 +410,54 @@ public class MappingConfiguration {
 	 *
 	 * <p>代价：标记是本次新增的，升级后第一次构建（或标记被外部清理时）暖路径会判为未就绪而进锁一次；
 	 * 锁内确认两件产物均已存在且未要求刷新后只会补写标记，不会重新提取 mappings。
+	 * 若标记停在失效值（上一轮两次发布之间失败），则不做这种「补写」——
+	 * 那种状态意味着盘上的一对可能已被撕开，{@link #produceMappings} 会强制重写两件产物。
+	 *
+	 * <p>标记就绪之外还要求两件产物「内容可用」：这对产物位于跨工作树/daemon 共享的 mappings 工作目录，
+	 * 被旧版本 loom 就地重建时可能留下 0 字节残骸。两者的判据不同，不能一刀切：
+	 * {@code mappings.tiny} 是纯文本，按 {@link #isReusableMappingsText(Path)} 判定；
+	 * {@code mappings.jar} 是 zip，按 {@link JarReusability#isReusable(Path)} 判定。
+	 * 判据与 {@link #produceMappings} 内的锁内确认成对（外层快路径判为未就绪 ⟹ 锁内必然重写该件），
+	 * 否则会出现「每轮都进锁、却永远修不好残骸」的无声循环。
 	 */
 	private boolean hasUsableMappingsPair() {
+		return readPairMarkerState() == PairMarkerState.READY
+				&& isReusableMappingsText(tinyMappings) && JarReusability.isReusable(tinyMappingsJar);
+	}
+
+	/**
+	 * 成对就绪标记的读取结果.
+	 *
+	 * <p>必须把「标记缺失」与「标记为失效值」分成两种状态：前者可安全沿用补写路径，后者表示存在被撕开的一对，
+	 * 必须强制重建。把两者都当作「不可用」会让 {@link #produceMappings} 无法区分该走哪条路。
+	 */
+	private enum PairMarkerState {
+		/** 标记为就绪值：两件产物已被提交为一对. */
+		READY,
+		/** 标记为失效值：上一轮正在（重新）生成这一对产物，且没有走完. */
+		INVALIDATED,
+		/** 标记缺失或内容不可读：升级后首次构建、被外部清理，或正被并发原子替换. */
+		UNKNOWN
+	}
+
+	/**
+	 * 读取成对就绪标记的状态.
+	 *
+	 * <p>读不到文件或读失败（例如正被并发原子替换）都归入 {@link PairMarkerState#UNKNOWN}：
+	 * 那是「无法判断」而非「已失效」，据此强制重建只会在升级后多重建一次，代价可接受但非必要。
+	 */
+	private PairMarkerState readPairMarkerState() {
 		try {
-			return Files.exists(tinyMappings) && Files.exists(tinyMappingsJar)
-					&& PAIR_MARKER_READY.equals(Files.readString(mappingsPairMarker, StandardCharsets.UTF_8));
+			final String content = Files.readString(mappingsPairMarker, StandardCharsets.UTF_8);
+
+			if (PAIR_MARKER_READY.equals(content)) {
+				return PairMarkerState.READY;
+			}
+
+			// 只有确认为失效值才返回 INVALIDATED：标记文件被外部写坏时按「无法判断」处理，避免无谓重建
+			return PAIR_MARKER_INVALID.equals(content) ? PairMarkerState.INVALIDATED : PairMarkerState.UNKNOWN;
 		} catch (IOException e) {
-			// 读标记失败（例如正被并发原子替换的瞬间）按「未就绪」处理：进锁重新确认，不影响正确性
-			return false;
+			return PairMarkerState.UNKNOWN;
 		}
 	}
 
@@ -437,8 +492,10 @@ public class MappingConfiguration {
 
 		// 无锁快路径：两件共享产物（mappings-mojang.tiny / mappings-srg.tiny）均已就绪且未要求刷新时，
 		// 本方法不含任何共享写入，故不取锁。
-		final boolean needsMojangMerge = extension.isNeoForge() && (refresh || Files.notExists(tinyMappingsWithMojang));
-		final boolean needsSrgMerge = extension.shouldGenerateSrgTiny() && (refresh || Files.notExists(tinyMappingsWithSrg));
+		// 就绪判据为内容级（见 isReusableMappingsText），不能只判存在：两件产物都在共享工作目录下被
+		// 多个工作树/daemon 交叉读写，被中断的就地写会留下 0 字节残骸，存在性判定会把它永久复用。
+		final boolean needsMojangMerge = extension.isNeoForge() && (refresh || !isReusableMappingsText(tinyMappingsWithMojang));
+		final boolean needsSrgMerge = extension.shouldGenerateSrgTiny() && (refresh || !isReusableMappingsText(tinyMappingsWithSrg));
 
 		if (needsMojangMerge || needsSrgMerge) {
 			// 一次写一组互相依赖的共享产物（mojang 合并结果 + srg 合并结果）时，整段包进同一把 mappings 锁：
@@ -446,12 +503,12 @@ public class MappingConfiguration {
 			runWithMappingsLock(project, "生成共享 mappings（mojang/srg 合并结果）失败", () -> {
 				// Generate the Mojmap-merged mappings if needed.
 				// Note that this needs to happen before manipulateMappings for FieldMigratedMappingConfiguration.
-				if (needsMojangMerge && (refresh || Files.notExists(tinyMappingsWithMojang))) {
+				if (needsMojangMerge && (refresh || !isReusableMappingsText(tinyMappingsWithMojang))) {
 					mergeMojangAtomic(project, tinyMappingsWithMojang);
 				}
 
 				// 锁内二次确认：等锁期间可能已被其它进程产出（refresh 时仍需强制重建）
-				if (needsSrgMerge && (refresh || Files.notExists(tinyMappingsWithSrg))) {
+				if (needsSrgMerge && (refresh || !isReusableMappingsText(tinyMappingsWithSrg))) {
 					mergeSrgAtomic(project, extension, tinyMappingsWithSrg);
 				}
 
@@ -507,13 +564,18 @@ public class MappingConfiguration {
 				throw new IllegalStateException("We have to generate srg tiny in a forge environment!");
 			}
 
-			if (Files.notExists(srgToNamedSrg) || extension.refreshDeps()) {
+			// 就绪判据为内容级（见 isReusableMappingsText）。该产物虽以 .srg 结尾，内容仍是纯文本：
+			// 它由 MappingWriter.create(tmp, MappingFormat.SRG_FILE) 经 java.io.Writer 逐行写出，
+			// 与 .tiny 同属文本映射而非 zip，故同样不能套用 JarReusability 的 zip 口径，取「存在且非空」。
+			// 只判存在的代价偏大：该文件是 dev 启动配置里 SRG→named 的映射来源，复用 0 字节残骸
+			// 会让开发环境静默地按错误映射启动，而不是报错。
+			if (!isReusableMappingsText(srgToNamedSrg) || extension.refreshDeps()) {
 				final boolean refresh = extension.refreshDeps();
 				// 该产物与 mappings-srg.tiny 同处共享工作目录且由它派生，故与 produceMappings / setupPost
 				// 共用同一把 mappings 锁，避免不同工作树/daemon 交叉生产这一组互相依赖的产物。
 				runWithMappingsLock(project, "生成 srg->named mappings 失败", () -> {
 					// 锁内二次确认：等锁期间可能已被其它进程产出（refresh 时仍需强制重建）
-					if (!refresh && Files.exists(srgToNamedSrg)) {
+					if (!refresh && isReusableMappingsText(srgToNamedSrg)) {
 						return null;
 					}
 
@@ -705,6 +767,51 @@ public class MappingConfiguration {
 	}
 
 	/**
+	 * {@return 该映射文本产物是否可作为输入复用}.
+	 *
+	 * <p>本类的多件共享产物——{@code intermediary-v2.tiny}、{@code mappings-mojang.tiny}、
+	 * {@code mappings-srg.tiny}、{@code mappings-srg-named.srg} 与 mixin 映射——都是纯文本映射，不是 jar，
+	 * 故一律不适用 {@link net.fabricmc.loom.util.cache.JarReusability#isReusable(Path)} 的 zip 口径：
+	 * 拿文本去开 zipfs 必然失败，会把正常产物永久判为不可用。它们的内容判据等价地取「存在且非空」：
+	 *
+	 * <ul>
+	 *     <li>正常产物恒非空——{@code .tiny} 至少含映射头，{@code .srg} 由 {@code MappingWriter} 经
+	 *     {@code java.io.Writer} 逐行写出（SRG 与 tiny 同为文本格式，不是 zip 也不是压缩流），
+	 *     二者都必然写出内容，故这条不会把正常产物拖进「每次构建都重建」；</li>
+	 *     <li>能拦下「先删后写」被中断、或旧版本 loom 就地重建时留下的 0 字节残骸。这类残骸正是本仓库
+	 *     实测过的形态，而被复用后会一路传到最终产物：下游 {@code MappingReader} 读到空映射，
+	 *     或 {@link #getReplacedTarget} 在改写首行时对空行表取下标而抛异常。</li>
+	 * </ul>
+	 *
+	 * <p>刻意不做逐行解析、首尾行或末尾换行等更严的校验：该判定位于每次构建的无锁快路径上，
+	 * 全量解析一份 stitch 产物是秒级开销，收益却只覆盖「截断到非 0 长度」这一小类残骸。
+	 *
+	 * @param mappingsFile 待判定的映射文本产物路径
+	 */
+	public static boolean isReusableMappingsText(Path mappingsFile) {
+		try {
+			return Files.size(mappingsFile) > 0;
+		} catch (IOException e) {
+			// 不存在（NoSuchFileException）或读不到元数据：按不可复用处理，交由调用方重新生成
+			return false;
+		}
+	}
+
+	/**
+	 * 诊断用：映射文本产物的大小.
+	 *
+	 * <p>「0 字节」与「文件不存在」在现象上都是「判据不通过」，但对排查者是完全不同的两种原因，
+	 * 故报错信息里必须带上大小。取不到元数据时只损失这一项诊断信息，不影响判定本身。
+	 */
+	private static String describeMappingsTextSize(Path mappingsFile) {
+		try {
+			return Files.size(mappingsFile) + " 字节";
+		} catch (IOException e) {
+			return "大小未知（文件不存在或读不到元数据）";
+		}
+	}
+
+	/**
 	 * 轻量预检：仅凭 zip 中央目录的条目名判断该 jar 是否带 extras，避免为「必然空跑」的
 	 * extractExtras 打开 zipfs（打开会建索引，是暖路径上的主要成本）.
 	 */
@@ -826,15 +933,49 @@ public class MappingConfiguration {
 		return signatureFixes;
 	}
 
+	/**
+	 * 取得 Mixin refmap 重映射所需的映射文件.
+	 *
+	 * <p>{@code intermediary} 命名空间直接返回平台映射文件（见 {@link #getPlatformMappingFile}），
+	 * 其余命名空间返回一份由它派生的、改写过首行的 {@code mappings-mixin-*.tiny}（见 {@link #writeReplacedTarget}）。
+	 * 两条路都以平台映射文件为输入，故这里先按共享产物的文本判据（见 {@link #isReusableMappingsText(Path)}）
+	 * 确认它可用：
+	 *
+	 * <ul>
+	 *     <li>直接返回的分支原先没有任何就绪判定，0 字节残骸会被原样交给 Mixin AP，
+	 *     让 refmap 静默地按空映射生成（直到运行时才以「找不到映射」的形式炸开）；</li>
+	 *     <li>派生分支读取该文件后立刻取首行（{@code lines.get(0)}），空行表会抛出无从诊断的
+	 *     {@link IndexOutOfBoundsException}。</li>
+	 * </ul>
+	 *
+	 * <p>这里只做「不可用即报错」，不尝试就地重建：平台映射文件由 mappings 阶段
+	 * （{@code setup} / {@code setupPost}）产出，本方法既拿不到 Project 也拿不到 ServiceFactory，
+	 * 无法重跑那条流水线；而唯一的调用方（Mixin AP 的参数装配）必然在 mappings 阶段之后执行，
+	 * 正常构建里该文件恒非空，故这条判定不会误报，只会在确有残骸时把静默错误换成可诊断的失败。
+	 *
+	 * @param loom      当前项目的 loom 扩展
+	 * @param namespace refmap 的目标命名空间
+	 */
 	public Path getReplacedTarget(LoomGradleExtension loom, String namespace) {
-		if (namespace.equals("intermediary")) return getPlatformMappingFile(loom);
+		final Path platformMappings = getPlatformMappingFile(loom);
+
+		if (!isReusableMappingsText(platformMappings)) {
+			throw new IllegalStateException(("平台映射文件不可用：%s（%s），无法为命名空间 %s 提供 Mixin 映射。"
+					+ "该文件由 mappings 阶段产出，正常构建中不应缺失或为空；若确认它是残骸，"
+					+ "请删除该文件后重新构建（或使用 --refresh-dependencies 强制重建）。")
+					.formatted(platformMappings, describeMappingsTextSize(platformMappings), namespace));
+		}
+
+		if (namespace.equals("intermediary")) return platformMappings;
 
 		return mixinTinyMappings.computeIfAbsent(namespace, k -> {
 			Path path = mappingsWorkingDir.resolve("mappings-mixin-" + namespace + ".tiny");
 
 			try {
-				// 无锁快路径：产物已在位且未要求刷新时直接返回，不取锁也不写文件
-				if (Files.notExists(path) || loom.refreshDeps()) {
+				// 无锁快路径：产物已在位且未要求刷新时直接返回，不取锁也不写文件。
+				// 就绪判据为内容级（见 isReusableMappingsText）：本文件内容源自 getPlatformMappingFile
+				// 的逐行拷贝，是纯文本 tiny；0 字节残骸被复用会让 Mixin AP 读到空映射。
+				if (!isReusableMappingsText(path) || loom.refreshDeps()) {
 					writeReplacedTarget(loom, namespace, path);
 				}
 
@@ -854,13 +995,18 @@ public class MappingConfiguration {
 	 * 不会读到半截内容，也不再「先删后写」制造产物不存在的窗口。
 	 */
 	private void writeReplacedTarget(LoomGradleExtension loom, String namespace, Path path) throws Exception {
-		// 此处拿不到 Project（无法用 LoomCacheService 的 JVM 内监视器），直接用同一 key 的跨进程锁；
-		// 同一 JVM 内的并发由 FileLock 的重叠检测 + 轮询等待串行化。
+		// 此处拿不到 Project（无法用 LoomCacheService 的 JVM 内监视器），直接用同一 key 的跨进程锁。
+		// 该锁不可重入：同一 JVM 内已有线程持有同一 key 时，CacheEntryLock.acquireFileLockWithTimeout
+		// 只在 OverlappingFileLockException 之后空等轮询，直到 LoomCacheService.defaultTimeout() 超时。
+		// 因此调用点必须保证不会在已持有该 key 的锁内再次进入（尤其是与 produceMappings 的重入）；
+		// 本方法自身不调用任何需要同一把锁的代码。
 		final Path lockRoot = loom.getFiles().getCacheLocks().toPath();
 
 		CacheEntryLock.withLock(lockRoot, mappingsLockKey(), LoomCacheService.defaultTimeout(), () -> {
-			// 锁内二次确认：等锁期间可能已被其它进程产出（refresh 时仍需强制重建）
-			if (!loom.refreshDeps() && Files.exists(path)) {
+			// 锁内二次确认：等锁期间可能已被其它进程产出（refresh 时仍需强制重建）。
+			// 判据必须与外层快路径一致，否则 0 字节残骸会在锁内被判为「已产出」而直接返回，
+			// 快路径每轮都进锁、却永远修不好该文件。
+			if (!loom.refreshDeps() && isReusableMappingsText(path)) {
 				return null;
 			}
 

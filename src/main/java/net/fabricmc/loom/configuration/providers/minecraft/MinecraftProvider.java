@@ -45,6 +45,7 @@ import net.fabricmc.loom.configuration.providers.minecraft.verify.MinecraftJarVe
 import net.fabricmc.loom.configuration.providers.minecraft.verify.SignatureVerificationFailure;
 import net.fabricmc.loom.util.Check;
 import net.fabricmc.loom.util.Constants;
+import net.fabricmc.loom.util.cache.JarReusability;
 import net.fabricmc.loom.util.download.DownloadExecutor;
 import net.fabricmc.loom.util.download.GradleDownloadProgressListener;
 import net.fabricmc.loom.util.gradle.GradleUtils;
@@ -143,25 +144,31 @@ public abstract class MinecraftProvider {
 		return "minecraft:" + minecraftVersion();
 	}
 
-	// 无锁存在性检查：判断下载/抽取产物是否需要生产。返回 false 即所有产物已就绪，可走无锁快路径。
+	// 无锁快路径：判断下载/抽取产物是否需要生产。返回 false 即所有产物已就绪，可走无锁快路径。
+	//
+	// 就绪判据含内容校验（见 JarReusability.isReusable）：这三件 jar 都落在跨进程共享的
+	// <userCache>/<mcVersion> 下，旧版本 loom 以最终路径为输出就地写，被中断会留下 0 字节或截断文件。
+	// PR #8 移除了「残留锁 → 全量重建」这条兜底后，只判存在就会把这类残骸当成已下载产物一路用下去。
+	// 判 true 进锁后由 downloadJars 按 sha1 兜底（sha1 不匹配即重新下载），不存在「每次都重建」的退化。
 	private boolean jarsRequireProduction() {
 		if (getExtension().refreshDeps()) {
 			return true;
 		}
 
-		if (provideClient() && !minecraftClientJar.exists()) {
+		if (provideClient() && !JarReusability.isReusable(minecraftClientJar.toPath())) {
 			return true;
 		}
 
 		if (provideServer()) {
-			if (!minecraftServerJar.exists()) {
+			if (!JarReusability.isReusable(minecraftServerJar.toPath())) {
 				return true;
 			}
 
-			// 该版本若使用 bundler，则抽取后的 server jar 也必须存在。
+			// 该版本若使用 bundler，则抽取后的 server jar 也必须存在且可复用。
 			// serverBundleMetadata 此时尚未读取，故直接读已下载的 server jar 判断是否为 bundler。
 			try {
-				if (BundleMetadata.fromJar(minecraftServerJar.toPath()) != null && !minecraftExtractedServerJar.exists()) {
+				if (BundleMetadata.fromJar(minecraftServerJar.toPath()) != null
+						&& !JarReusability.isReusable(minecraftExtractedServerJar.toPath())) {
 					return true;
 				}
 			} catch (IOException e) {
