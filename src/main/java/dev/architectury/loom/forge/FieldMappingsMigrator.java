@@ -184,7 +184,7 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
 		}
 
 		Visitor visitor = new Visitor(Constants.ASM_VERSION);
-		FileSystemUtil.Delegate system = FileSystemUtil.getJarFileSystem(patchedJar, false);
+		FileSystemUtil.Delegate system = FileSystemUtil.getReadOnlyJarFileSystem(patchedJar);
 		completer.onComplete(value -> system.close());
 
 		for (Path fsPath : (Iterable<? extends Path>) Files.walk(system.get().getPath("/"))::iterator) {

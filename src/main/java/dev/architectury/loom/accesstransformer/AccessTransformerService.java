@@ -87,7 +87,7 @@ public final class AccessTransformerService extends Service<AccessTransformerSer
 	private static List<String> extractAccessTransformers(Path jar, UserdevConfig.AccessTransformerLocation location, TempFiles tempFiles) throws IOException {
 		final List<String> extracted = new ArrayList<>();
 
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar)) {
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
 			for (Path atFile : getAccessTransformerPaths(fs, location)) {
 				byte[] atBytes;
 

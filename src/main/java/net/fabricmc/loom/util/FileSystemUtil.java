@@ -36,12 +36,35 @@ import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.function.Supplier;
+
+import org.jspecify.annotations.Nullable;
 
 import net.fabricmc.tinyremapper.FileSystemReference;
 
 public final class FileSystemUtil {
-	public record Delegate(FileSystemReference reference, URI uri) implements AutoCloseable, Supplier<FileSystem> {
+	public static final class Delegate implements AutoCloseable, Supplier<FileSystem> {
+		private final FileSystem fileSystem;
+		// 非 null 表示经 tiny-remapper 引用计数打开（写入路径），close 需归还引用。
+		// 为 null 表示独立文件系统（只读路径），close 直接关闭。
+		private final @Nullable FileSystemReference reference;
+		private final @Nullable URI uri;
+
+		Delegate(FileSystem fileSystem, @Nullable FileSystemReference reference, @Nullable URI uri) {
+			this.fileSystem = fileSystem;
+			this.reference = reference;
+			this.uri = uri;
+		}
+
+		public @Nullable FileSystemReference reference() {
+			return reference;
+		}
+
+		public @Nullable URI uri() {
+			return uri;
+		}
+
 		public Path getPath(String path, String... more) {
 			return get().getPath(path, more);
 		}
@@ -72,6 +95,12 @@ public final class FileSystemUtil {
 
 		@Override
 		public void close() throws IOException {
+			if (reference == null) {
+				// 独立文件系统未进入 JDK 进程级 filesystems 登记簿，不适用 JDK-8291712，直接关闭。
+				fileSystem.close();
+				return;
+			}
+
 			try {
 				reference.close();
 			} catch (IOException e) {
@@ -101,7 +130,7 @@ public final class FileSystemUtil {
 
 		@Override
 		public FileSystem get() {
-			return reference.getFs();
+			return fileSystem;
 		}
 
 		// TODO cleanup
@@ -113,20 +142,42 @@ public final class FileSystemUtil {
 	private FileSystemUtil() {
 	}
 
+	/**
+	 * 打开只读 jar 文件系统，走 JDK 的 {@code newFileSystem(Path, Map)} 重载.
+	 *
+	 * <p>与 {@link #getJarFileSystem(Path, boolean)} 的差别：该重载返回<b>独立</b>的文件系统实例，
+	 * 不进入 JDK 进程级的 {@code ZipFileSystemProvider.filesystems} 登记簿，因此既不产生
+	 * {@code FileSystemAlreadyExistsException}，也不与 tiny-remapper 的全局锁
+	 * {@code FileSystemReference.openFsMap} 发生交互。多个线程可同时打开同一 jar.
+	 *
+	 * <p>调用方须保证只读取、不写入：独立实例各自持有文件锁，对同一 jar 并发写入会失败
+	 * （{@code AccessDeniedException}）。需要写入时请用 {@link #getJarFileSystem(Path, boolean)}，
+	 * 它经由 tiny-remapper 引用计数共享同一文件系统.
+	 *
+	 * <p>文件不存在时抛 {@code NoSuchFileException}，与原有实现一致.
+	 */
+	public static Delegate getReadOnlyJarFileSystem(Path path) throws IOException {
+		return new Delegate(FileSystems.newFileSystem(path, Map.of()), null, null);
+	}
+
 	public static Delegate getJarFileSystem(File file, boolean create) throws IOException {
-		return new Delegate(FileSystemReference.openJar(file.toPath(), create), toJarUri(file.toPath()));
+		FileSystemReference reference = FileSystemReference.openJar(file.toPath(), create);
+		return new Delegate(reference.getFs(), reference, toJarUri(file.toPath()));
 	}
 
 	public static Delegate getJarFileSystem(Path path, boolean create) throws IOException {
-		return new Delegate(FileSystemReference.openJar(path, create), toJarUri(path));
+		FileSystemReference reference = FileSystemReference.openJar(path, create);
+		return new Delegate(reference.getFs(), reference, toJarUri(path));
 	}
 
 	public static Delegate getJarFileSystem(Path path) throws IOException {
-		return new Delegate(FileSystemReference.openJar(path), toJarUri(path));
+		FileSystemReference reference = FileSystemReference.openJar(path);
+		return new Delegate(reference.getFs(), reference, toJarUri(path));
 	}
 
 	public static Delegate getJarFileSystem(URI uri, boolean create) throws IOException {
-		return new Delegate(FileSystemReference.open(uri, create), uri);
+		FileSystemReference reference = FileSystemReference.open(uri, create);
+		return new Delegate(reference.getFs(), reference, uri);
 	}
 
 	private static URI toJarUri(Path path) {

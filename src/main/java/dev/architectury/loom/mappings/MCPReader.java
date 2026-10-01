@@ -192,7 +192,7 @@ public class MCPReader {
 			}
 		}
 
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(mcpJar, false)) {
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(mcpJar)) {
 			Path fields = fs.getPath("fields.csv");
 			Path methods = fs.getPath("methods.csv");
 			Path params = fs.getPath("params.csv");

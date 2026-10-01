@@ -63,7 +63,7 @@ public record JarPackageIndex(Map<String, List<String>> packages) {
 	}
 
 	private static List<String> getClasses(Path jar) throws IOException {
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar, false);
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(jar);
 				Stream<Path> walk = Files.walk(fs.getRoot())) {
 			return walk
 					.filter(Files::isRegularFile)

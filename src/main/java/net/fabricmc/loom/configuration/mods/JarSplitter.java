@@ -58,7 +58,7 @@ public class JarSplitter {
 
 	@Nullable
 	public Target analyseTarget() {
-		try (FileSystemUtil.Delegate input = FileSystemUtil.getJarFileSystem(inputJar)) {
+		try (FileSystemUtil.Delegate input = FileSystemUtil.getReadOnlyJarFileSystem(inputJar)) {
 			final Manifest manifest = input.fromInputStream(Manifest::new, Constants.Manifest.PATH);
 
 			if (!Boolean.parseBoolean(manifest.getMainAttributes().getValue(Constants.Manifest.SPLIT_ENV))) {
@@ -122,7 +122,7 @@ public class JarSplitter {
 		Files.deleteIfExists(commonOutputJar);
 		Files.deleteIfExists(clientOutputJar);
 
-		try (FileSystemUtil.Delegate input = FileSystemUtil.getJarFileSystem(inputJar)) {
+		try (FileSystemUtil.Delegate input = FileSystemUtil.getReadOnlyJarFileSystem(inputJar)) {
 			final Manifest manifest = input.fromInputStream(Manifest::new, Constants.Manifest.PATH);
 
 			if (!Boolean.parseBoolean(manifest.getMainAttributes().getValue(Constants.Manifest.SPLIT_ENV))) {

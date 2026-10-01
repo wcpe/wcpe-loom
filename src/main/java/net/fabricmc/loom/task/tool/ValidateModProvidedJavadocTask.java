@@ -183,7 +183,7 @@ public abstract class ValidateModProvidedJavadocTask extends AbstractLoomTask {
 			fileSystems = new ArrayList<>(files.size());
 
 			for (File file : files) {
-				fileSystems.add(FileSystemUtil.getJarFileSystem(file.toPath()));
+				fileSystems.add(FileSystemUtil.getReadOnlyJarFileSystem(file.toPath()));
 			}
 		}
 

@@ -66,7 +66,7 @@ public final class JarWalker {
 	}
 
 	public static List<ClassEntry> findClasses(Path jar) throws IOException {
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar)) {
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
 			return findClasses(fs);
 		}
 	}

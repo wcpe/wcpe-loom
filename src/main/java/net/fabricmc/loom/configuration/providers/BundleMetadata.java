@@ -53,7 +53,7 @@ public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String
 		final List<Entry> versions;
 		final String mainClass;
 
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar)) {
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
 			if (!Files.exists(fs.get().getPath(VERSIONS_LIST_PATH))) {
 				// Legacy jar
 				return null;
@@ -103,7 +103,7 @@ public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String
 			// 原子发布：先抽取到同目录唯一临时文件并写入 hash 标记，完整后再原子 move 到 dest。
 			// 避免跨进程的无锁存在性检查在抽取期间看到半写的 server jar 误判就绪。
 			AtomicFiles.publish(dest, tmp -> {
-				try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar)) {
+				try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
 					Files.copy(fs.get().getPath(path()), tmp, StandardCopyOption.REPLACE_EXISTING);
 				}
 

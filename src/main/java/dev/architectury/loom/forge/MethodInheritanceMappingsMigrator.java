@@ -185,7 +185,7 @@ public final class MethodInheritanceMappingsMigrator implements MappingsMigrator
 		Visitor visitor = new Visitor(Constants.ASM_VERSION, classInheritanceMap, methods);
 
 		for (Path jar : jars) {
-			try (FileSystemUtil.Delegate system = FileSystemUtil.getJarFileSystem(jar, false)) {
+			try (FileSystemUtil.Delegate system = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
 				for (Path fsPath : (Iterable<? extends Path>) Files.walk(system.get().getPath("/"))::iterator) {
 					if (Files.isRegularFile(fsPath) && fsPath.toString().endsWith(".class")) {
 						new ClassReader(Files.readAllBytes(fsPath)).accept(visitor, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);

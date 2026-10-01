@@ -231,7 +231,7 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
 
 		int[] failedToRemap = {0};
 
-		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(tmpOutput, false)) {
+		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getReadOnlyJarFileSystem(tmpOutput)) {
 			ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter();
 
 			for (Map.Entry<String, byte[]> entry : new HashSet<>(sources.entrySet())) {
@@ -261,7 +261,7 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
 		ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter();
 
 		for (Path path : forgeInstallerSources) {
-			FileSystemUtil.Delegate system = FileSystemUtil.getJarFileSystem(path, false);
+			FileSystemUtil.Delegate system = FileSystemUtil.getReadOnlyJarFileSystem(path);
 			taskCompleter.onComplete(stopwatch -> system.close());
 
 			for (Path filePath : (Iterable<? extends Path>) Files.walk(system.get().getPath("/"))::iterator) {

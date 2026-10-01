@@ -87,7 +87,7 @@ public final class TinyMappingsService extends Service<TinyMappingsService.Optio
 		Path mappings = getOptions().getMappings().getAsFile().get().toPath();
 
 		if (getOptions().getZipEntryPath().isPresent()) {
-			try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(mappings)) {
+			try (FileSystemUtil.Delegate delegate = FileSystemUtil.getReadOnlyJarFileSystem(mappings)) {
 				return readMappings(delegate.fs().getPath(getOptions().getZipEntryPath().get()));
 			} catch (IOException e) {
 				throw new UncheckedIOException("Failed to read mappings from zip", e);

@@ -141,7 +141,7 @@ public final class MigrateClassTweakerMappingsService extends Service<MigrateCla
 		final Path mappingFile = targetOptions.getMappings().get().getAsFile().toPath();
 
 		if (targetOptions.getZipEntryPath().isPresent()) {
-			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(mappingFile)) {
+			try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(mappingFile)) {
 				MappingReader.read(fs.getPath(targetOptions.getZipEntryPath().get()), renamer);
 			}
 		} else {

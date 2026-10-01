@@ -246,7 +246,7 @@ public class UnpickService extends Service<UnpickService.Options> {
 			var fileSystems = new ArrayList<FileSystemUtil.Delegate>();
 
 			for (Path path : classpath) {
-				FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(path, false);
+				FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(path);
 				fileSystems.add(fs);
 			}
 
