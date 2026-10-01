@@ -226,10 +226,15 @@ public abstract class ProcessedNamedMinecraftProvider<M extends MinecraftProvide
 		identity.put("requiresBackupJars", Boolean.toString(requiresBackupJars()));
 		identity.put("processors", processors.stream().map(MinecraftJarProcessor::getName).toList().toString());
 		identity.put("specFingerprints", specs.stream().map(spec -> Integer.toString(spec.hashCode())).toList().toString());
-		// remapper 的 classpath 与配置期 ContextImplHelper.createRemapper 同源（源命名空间的 MC jar）；
-		// 取配置路径而不是集合内容：后者要求文件已落位，冷缓存下配置期还取不到
-		identity.put("remapClasspath", extension.getMinecraftJars(extension.getProductionNamespaceEnum().get()).stream()
-				.map(path -> path.toAbsolutePath().normalize().toString())
+		// remapper 的 classpath 与配置期 ContextImplHelper.createRemapper 同源：都是「被处理的这批
+		// MC jar」，也就是父 provider 的 jar。取配置路径而不是集合内容：后者要求文件已落位，
+		// 冷缓存下配置期还取不到。
+		//
+		// 必须走父 provider 而不是 extension.getMinecraftJars(productionNamespace)：后者在 Forge 上
+		// 会取 SRG 命名空间，而本方法跑在 provide() 的锁内、srg provider 尚未 setup，会直接 NPE
+		// （实测：Forge 的 AccessTransformerTest 因此挂在 setupMinecraft）。
+		identity.put("remapClasspath", parentMinecraftProvider.getMinecraftJars().stream()
+				.map(jar -> jar.getPath().toAbsolutePath().normalize().toString())
 				.sorted()
 				.collect(Collectors.joining("\n")));
 		return identity;
