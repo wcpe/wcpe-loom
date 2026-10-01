@@ -1,0 +1,44 @@
+# GitHub 自动生成 Release Notes 的分组配置（gh release create --generate-notes 读取）。
+# 前提：版本的改动经由 PR 合入默认分支；直推提交不会进入 What's Changed。
+# 命中越靠前的 category 优先级越高；不带 label 的 PR 落入「其他变更」。
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+    authors:
+      - dependabot
+      - github-actions
+  categories:
+    - title: ⚡ 性能与并发
+      labels:
+        - performance
+        - perf
+        - concurrency
+    - title: 🐛 缺陷修复
+      labels:
+        - bug
+        - fix
+    - title: ✨ 新功能
+      labels:
+        - enhancement
+        - feature
+        - feat
+    - title: 🔨 Forge / NeoForge 支持
+      labels:
+        - forge
+        - neoforge
+        - legacy
+    - title: 🧹 重构
+      labels:
+        - refactor
+        - cleanup
+    - title: 📄 文档
+      labels:
+        - documentation
+        - docs
+    - title: 🧪 测试
+      labels:
+        - test
+        - tests
+    - title: 其他变更
+      labels: []

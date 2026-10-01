@@ -216,7 +216,32 @@ public class MinecraftPatchedProvider {
 
 	public void provide() throws Exception {
 		initPatchedFiles();
+
+		// 无锁快路径：产物齐备且补丁版本最新时，本次仅做内存配置，不触碰共享缓存，不取锁
+		if (!needsWork()) {
+			this.dirty = false;
+			return;
+		}
+
 		withPatchedLock(this::providePatched);
+	}
+
+	/**
+	 * {@return 是否需要重建 patched jar}.
+	 *
+	 * <p>产物缺失或 Loom 补丁版本过期即需要工作。manifest 读取遇到损坏文件（多进程并发下
+	 * 的半截产物）时按需要工作处理，进入锁内走完整判定。
+	 */
+	private boolean needsWork() {
+		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(Files::notExists)) {
+			return true;
+		}
+
+		try {
+			return !isPatchedJarUpToDate(minecraftPatchedJar);
+		} catch (IOException e) {
+			return true;
+		}
 	}
 
 	private Void providePatched() throws Exception {
@@ -244,6 +269,12 @@ public class MinecraftPatchedProvider {
 	}
 
 	public void remapJar(ServiceFactory serviceFactory) throws Exception {
+		// 无锁快路径：provide 已判定无需重建（dirty=false）时，此处仅注册依赖（纯内存操作），不取锁
+		if (!dirty) {
+			registerExtraDependencies();
+			return;
+		}
+
 		withPatchedLock(() -> remapPatchedJarWithDirty(serviceFactory));
 	}
 
@@ -261,6 +292,11 @@ public class MinecraftPatchedProvider {
 			}
 		}
 
+		registerExtraDependencies();
+		return null;
+	}
+
+	private void registerExtraDependencies() {
 		if (getExtension().isUnobfuscatedForge()) {
 			DependencyProvider.addDependency(project, getForgeJar(), Constants.Configurations.FORGE_EXTRA);
 		}
@@ -268,8 +304,6 @@ public class MinecraftPatchedProvider {
 		if (providesClientJar()) {
 			DependencyProvider.addDependency(project, minecraftClientExtra, Constants.Configurations.FORGE_EXTRA);
 		}
-
-		return null;
 	}
 
 	/**

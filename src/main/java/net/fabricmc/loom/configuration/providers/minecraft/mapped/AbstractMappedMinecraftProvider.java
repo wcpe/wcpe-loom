@@ -240,6 +240,16 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		return "net.minecraft:%s:%s".formatted(getName(type), getVersion());
 	}
 
+	/**
+	 * {@return 产物是否已就绪（无需重建）}.
+	 *
+	 * <p>供外部（如 {@code minecraft-provision} 事务锁的无锁快路径）在锁外做只读判定；
+	 * 实现即 {@link #shouldRefreshOutputs} 的取反，同样仅做文件存在性与脏标志检查。
+	 */
+	public boolean isUpToDate(ProvideContext context) {
+		return !shouldRefreshOutputs(context);
+	}
+
 	protected boolean shouldRefreshOutputs(ProvideContext context) {
 		if (context.refreshOutputs()) {
 			LOGGER.info("Refreshing outputs for mapped jar, as refresh outputs was requested");

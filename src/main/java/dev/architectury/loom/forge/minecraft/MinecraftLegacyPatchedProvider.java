@@ -89,25 +89,49 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 
 	@Override
 	public void provide() throws Exception {
+		String forgeVersion = getExtension().getForgeProvider().getVersion().getCombined();
+		Path forgeWorkingDir = ForgeProvider.getForgeCache(project);
+		String patchId = "forge-" + forgeVersion + "-";
+
+		minecraftProvider.setJarPrefix(patchId);
+
+		minecraftClientPatchedJar = forgeWorkingDir.resolve("client-patched.jar");
+		minecraftServerPatchedJar = forgeWorkingDir.resolve("server-patched.jar");
+		minecraftMergedPatchedJar = forgeWorkingDir.resolve("merged-patched.jar");
+		minecraftPatchedAtJar = forgeWorkingDir.resolve(type.id + "-at-patched.jar");
+		forgeJar = forgeWorkingDir.resolve("forge.jar");
+
+		// 无锁快路径：产物齐备且补丁版本最新时，本次仅做内存配置，不触碰共享缓存，不取锁
+		if (!needsWork()) {
+			dirty = false;
+			return;
+		}
+
 		withPatchedLock(() -> {
-			String forgeVersion = getExtension().getForgeProvider().getVersion().getCombined();
-			Path forgeWorkingDir = ForgeProvider.getForgeCache(project);
-			String patchId = "forge-" + forgeVersion + "-";
-
-			minecraftProvider.setJarPrefix(patchId);
-
-			minecraftClientPatchedJar = forgeWorkingDir.resolve("client-patched.jar");
-			minecraftServerPatchedJar = forgeWorkingDir.resolve("server-patched.jar");
-			minecraftMergedPatchedJar = forgeWorkingDir.resolve("merged-patched.jar");
-			minecraftPatchedAtJar = forgeWorkingDir.resolve(type.id + "-at-patched.jar");
-			forgeJar = forgeWorkingDir.resolve("forge.jar");
-
 			// 锁内判定：等锁期间其它进程可能已完成生产，checkCache 的 notExists 判定即为二次确认
 			checkCache();
 
 			dirty = false;
 			return null;
 		});
+	}
+
+	/**
+	 * {@return 是否需要重建 legacy patched jar}.
+	 *
+	 * <p>产物缺失或 Loom 补丁版本过期即需要工作。manifest 读取遇到损坏文件（多进程并发下的
+	 * 半截产物）时按需要工作处理，进入锁内走完整判定。
+	 */
+	private boolean needsWork() {
+		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(Files::notExists)) {
+			return true;
+		}
+
+		try {
+			return !isPatchedJarUpToDate(minecraftPatchedAtJar) || !isPatchedJarUpToDate(forgeJar);
+		} catch (IOException e) {
+			return true;
+		}
 	}
 
 	protected void cleanAllCache() throws IOException {
@@ -135,8 +159,17 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 
 	@Override
 	public void remapJar(ServiceFactory serviceFactory) throws Exception {
-		// 锁内判定：等锁期间其它进程可能已完成生产，notExists 判定即为二次确认
+		// 无锁快路径：provide 已判定产物齐备（needsWork=false → dirty=false）时，本方法的全链
+		// notExists 判定都会短路，无需取锁；仅当 provide 判定需要工作（dirty 或产物缺失）才进锁
+		if (Stream.of(forgeJar, minecraftClientPatchedJar, minecraftServerPatchedJar).allMatch(Files::exists)
+				&& (type != Type.MERGED || Files.exists(minecraftMergedPatchedJar))
+				&& Files.exists(minecraftPatchedAtJar)) {
+			dirty = false;
+			return;
+		}
+
 		withPatchedLock(() -> {
+			// 锁内判定：等锁期间其它进程可能已完成生产，notExists 判定即为二次确认
 			if (Files.notExists(forgeJar)) {
 				dirty = true;
 				patchForge();
