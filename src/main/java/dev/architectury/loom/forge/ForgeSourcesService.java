@@ -11,6 +11,8 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.StringJoiner;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
@@ -42,6 +44,7 @@ import net.fabricmc.loom.task.ExtractArchiveFilesTask;
 import net.fabricmc.loom.task.GenerateSourcesTask;
 import net.fabricmc.loom.task.service.MappingsService;
 import net.fabricmc.loom.task.service.SourceRemapperService;
+import net.fabricmc.loom.util.Checksum;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.LoomVersions;
@@ -55,6 +58,15 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
 	public static ServiceType<Options, ForgeSourcesService> TYPE = new ServiceType<>(Options.class, ForgeSourcesService.class);
 
 	private static final Logger LOGGER = Logging.getLogger(ForgeSourcesService.class);
+
+	/**
+	 * 「配置期 Forge 源码注入因 named MC jar 未就位而整批跳过」的日志前缀.
+	 *
+	 * <p>公开是为了让测试按同一份字面量断言：跳过是「输入尚未产出」时的**预期行为**
+	 * （见 {@link #addForgeSourcesDuringProjectConfiguration(Project, ServiceFactory)}），
+	 * 但它是静默损坏的反面——必须能从构建日志里确认它确实发生了。
+	 */
+	public static final String SKIPPED_LOG_MARKER = "Skipping configuration-phase forge sources injection";
 
 	public interface Options extends Service.Options {
 		/**
@@ -121,7 +133,8 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
 					));
 					sro.getJavaCompileRelease().set(SourceRemapperService.getJavaCompileRelease(project));
 					sro.getClasspath().from(DependencyDownloader.download(project, LoomVersions.JETBRAINS_ANNOTATIONS.mavenNotation()));
-					sro.getClasspath().from(extension.getMinecraftJars(sourceNamespace));
+					// 走 getMinecraftJarsCollection：登记了任务产出时它会携带产出任务，裸 Path 列表不会
+					sro.getClasspath().from(extension.getMinecraftJarsCollection(sourceNamespace));
 					sro.getClasspath().from(project.getConfigurations().getByName(Constants.Configurations.MINECRAFT_COMPILE_LIBRARIES));
 
 					TinyRemapperHelper.JSR_TO_JETBRAINS.forEach((from, to) -> {
@@ -157,6 +170,29 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
 
 		Path sourcesJar = GenerateSourcesTask.getJarFileWithSuffix("-sources.jar", minecraftJar).toPath();
 
+		// ── 冷缓存闸门：named MC jar 还没落位时整批跳过，一个文件都不写 ──
+		// 本方法在**配置期**被调用，而它要读 named MC jar 的**内容**做类过滤（见 addForgeSources：
+		// 源码是否保留取决于同名 class 是否存在于该 jar）。改造后 named MC jar 由
+		// RemapMinecraftTask / ProcessMinecraftJarTask 在**执行期**落位，
+		// 配置期只保证「产出任务已登记」，产物本身要等任务跑完。
+		//
+		// 为什么不能像原来那样直接往下走：拿不到输入 jar 时这条路径会写出「一个不包含任何 Forge 源码，
+		// 或只包含错误子集」的 *-sources.jar，而下面的 Files.exists(sourcesJar) 守卫会让后续每次构建都
+		// 认为「已经注入过」而不再重试——错误产物就长期留在那里，正是静默损坏。
+		//
+		// 跳过不会丢功能：注入 Forge 源码在执行期还有一条路径，且那条路径的输入是任务输入
+		// （genSources 在 runDecompileJob 里用 classes jar 调 addForgeSources，见 GenerateSourcesTask）。
+		// 本次不写任何产物，产物就位后的下一次配置期调用会自动重做。
+		if (Files.notExists(minecraftJar)) {
+			LOGGER.warn(SKIPPED_LOG_MARKER + ": minecraft jar {} is not available yet, so the forge sources cannot be "
+					+ "filtered by its classes. These jars are produced by tasks at execution time "
+					+ "(RemapMinecraftTask / ProcessMinecraftJarTask) and cannot be read while configuring. "
+					+ "Nothing is written to {} this time; the sources jar is populated by genSources at execution "
+					+ "time instead, and this step reruns automatically once the jar exists.",
+					minecraftJar, sourcesJar);
+			return;
+		}
+
 		if (!Files.exists(sourcesJar)) {
 			final ForgeSourcesService service = serviceFactory.get(createOptions(project));
 			// 配置期必须走归档路径：此时 extractForgeSources 还没有在本构建执行过（它是 genSources 的依赖），
@@ -164,6 +200,89 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
 			// 直接消费它会把旧版本的源码静默写进新生成的 *-sources.jar。
 			service.addForgeSources(minecraftJar, sourcesJar, false);
 		}
+	}
+
+	/**
+	 * {@return 注入输入（Forge 源码包、预解压目录与源码重映射用的映射文件）的指纹，供反编译缓存键覆盖注入}
+	 *
+	 * <p>注入发生在缓存条目写出<strong>之前</strong>，也就是说缓存条目里存的是**注入后**的源码；
+	 * 缓存键因此必须覆盖注入的输入。否则「换了 Forge 源码、而类字节没变」时缓存会全命中：
+	 * 任务因输入变化确实重跑了，产物却与改动前逐字节相同，新源码被静默忽略。
+	 *
+	 * <p>三类输入都要计入：执行期优先读 {@link Options#getForgeSourceDirectories()}（声明式解压的产物），
+	 * 目录不存在或为空时才回退到 {@link Options#getForgeSourceJars()}；两者都可能单独变化，
+	 * 只记一个就会让另一个的变更失效。第三类是 {@link Options#getSourceRemapperService()} 用的映射
+	 * （生产命名空间 → named，Forge 下即 srg → named）：注入的是**重映射之后**的源码文本，
+	 * 同一份 Forge 源文件在这份映射变化后就是另一段文本。
+	 *
+	 * <p>映射同样只按**内容**入键（见 {@link #remapMappingsFingerprint()}），路径与文件名都不进键。
+	 */
+	public String getSourcesCacheKey() {
+		final StringJoiner joiner = new StringJoiner(",");
+
+		for (File file : getOptions().getForgeSourceJars()) {
+			if (file.isFile()) {
+				joiner.add(file.getName() + "=" + Checksum.of(file).sha256().hex());
+			}
+		}
+
+		for (File directory : getOptions().getForgeSourceDirectories()) {
+			if (directory.isDirectory()) {
+				joiner.add(directory.getName() + "=" + fingerprint(directory.toPath()));
+			}
+		}
+
+		joiner.add("remapMappings=" + remapMappingsFingerprint());
+
+		return joiner.toString();
+	}
+
+	/**
+	 * {@return 注入的 Forge 源码在重映射时所用映射文件的**内容**指纹}.
+	 *
+	 * <p>两类情况都返回空串：不做重映射（{@link Options#getSourceRemapperService()} 为空，即 unobfuscated 形态），
+	 * 以及拿不到该文件。前者本来就没有这份输入；后者在真正重映射时会以「读映射失败」显式报错
+	 * （{@code MappingsService} 读该文件），不会静默产出，因此让两者共用同一个空分量不引入静默失效。
+	 * 空分量**仍然占位**：这样「本来要重映射、后来不重映射」（以及反向变化）都会改键，
+	 * 而不是让按另一种语义写出的缓存条目继续被复用。
+	 *
+	 * <p>只取内容、不取路径：映射文件落在按 mappings 标识分目录的共享工作目录里，
+	 * 路径变化（换 daemon、换工作树）不该让缓存失效，内容变化则必须让缓存失效。
+	 */
+	private String remapMappingsFingerprint() {
+		if (getOptions().getSourceRemapperService().isPresent()) {
+			final File mappings = getOptions().getSourceRemapperService().get()
+					.getMappings().get().getMappingsFile().get().getAsFile();
+
+			if (mappings.isFile()) {
+				return Checksum.of(mappings).sha256().hex();
+			}
+		}
+
+		return "";
+	}
+
+	/** {@return 目录内容的指纹：按相对路径排序后逐个取内容哈希，与绝对路径无关}. */
+	private static String fingerprint(Path directory) {
+		final TreeMap<String, String> hashes = new TreeMap<>();
+
+		try (Stream<Path> stream = Files.walk(directory)) {
+			for (Path path : (Iterable<? extends Path>) stream::iterator) {
+				if (!Files.isRegularFile(path)) {
+					continue;
+				}
+
+				final String relative = directory.relativize(path).toString().replace(File.separatorChar, '/');
+				hashes.put(relative, Checksum.of(path).sha256().hex());
+			}
+		} catch (IOException e) {
+			// 读不出输入就**不能**退化成「指纹为空」：那等于让缓存键看不见这份输入，正是要修的静默失效。
+			throw new UncheckedIOException("Failed to fingerprint forge sources directory: " + directory, e);
+		}
+
+		final StringJoiner joiner = new StringJoiner(",");
+		hashes.forEach((relative, hash) -> joiner.add(relative + "=" + hash));
+		return Checksum.of(joiner.toString()).sha256().hex();
 	}
 
 	/**
@@ -188,7 +307,12 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
 	 * @throws IOException 读写源码包失败
 	 */
 	public void addForgeSources(@Nullable Path minecraftJar, Path sourcesJar, boolean usePreExtractedSources) throws IOException {
-		try (FileSystemUtil.Delegate inputFs = minecraftJar == null ? null : FileSystemUtil.getJarFileSystem(minecraftJar, true);
+		// 输入 jar 只读打开：它只被用来查「同名 class 是否存在」。原来用 create=true 打开会在输入缺失时
+		// **就地造出一个空 jar**——若那个路径正好是 maven 构件路径（配置期调用就是这样），
+		// 就会凭空留下一份坏产物，且它看起来「存在」，足以骗过后续的存在性判定；同时过滤会因
+		// 「所有 class 都不存在」而丢掉全部 Forge 源码，写出一份内容错误的源码包且不报错。
+		// 只读打开在文件缺失时直接抛 NoSuchFileException，失败是可见的。
+		try (FileSystemUtil.Delegate inputFs = minecraftJar == null ? null : FileSystemUtil.getReadOnlyJarFileSystem(minecraftJar);
 				FileSystemUtil.Delegate outputFs = FileSystemUtil.getJarFileSystem(sourcesJar, true)) {
 			// best-effort：目标是给 IDE 看的源码包，个别文件写不进去只会少一个源文件，
 			// 不应该让整个 genSources 失败（与下面 failedToRemap 的处理保持一致）。
