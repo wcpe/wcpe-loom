@@ -206,10 +206,14 @@ class AtomicFilesTest extends Specification {
 		}
 	}
 
-	/** publish 消费者：把临时文件当作新 zip 创建并写入内容（方法引用形式规避 groovy formatter 缺陷） */
+	/** publish 消费者：把临时文件当作新 zip 创建并写入内容（try/finally 形式规避 groovy formatter 缺陷） */
 	private static void writeHelloJar(Path tmp) {
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(tmp, true)) {
+		def fs = FileSystemUtil.getJarFileSystem(tmp, true)
+
+		try {
 			Files.writeString(fs.getRoot().resolve("hello.txt"), "hi", StandardCharsets.UTF_8)
+		} finally {
+			fs.close()
 		}
 	}
 }

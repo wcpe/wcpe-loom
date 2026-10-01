@@ -22,10 +22,35 @@
  * SOFTWARE.
  */
 
-package net.fabricmc.loom.test.integration.buildSrc.loomClasspath
+package net.fabricmc.loom.test.integration.forge.legacy
 
-import org.gradle.api.services.BuildService
-import org.gradle.api.services.BuildServiceParameters
+import spock.lang.Specification
+import spock.lang.Unroll
 
-abstract class ForeignCacheService implements BuildService<BuildServiceParameters.None> {
+import net.fabricmc.loom.test.util.GradleProjectTestTrait
+
+import static net.fabricmc.loom.test.LoomTestConstants.STANDARD_TEST_VERSIONS
+import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
+
+/**
+ * legacy Forge（FG2 时代，MC 1.12.2）的端到端构建验证。
+ *
+ * <p>覆盖 MinecraftLegacyPatchedProvider 的完整链路：FG2 manifest 生成、
+ * pack200/binpatches 解包、access transform 与最终产物。
+ */
+class LegacyForgeExternalModDependencyTest extends Specification implements GradleProjectTestTrait {
+	@Unroll
+	def "build (gradle #version)"() {
+		setup:
+		def gradle = gradleProject(project: "forge/legacy/externalModDependency")
+
+		when:
+		def result = gradle.run(task: "build")
+
+		then:
+		result.task(":build").outcome == SUCCESS
+
+		where:
+		version << STANDARD_TEST_VERSIONS
+	}
 }

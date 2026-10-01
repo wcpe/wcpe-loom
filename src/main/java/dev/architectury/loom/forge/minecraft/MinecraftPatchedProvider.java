@@ -110,10 +110,11 @@ public class MinecraftPatchedProvider {
 	// The version where the bug was fixed.
 	private static final String MAX_NEOFORGE_MANUAL_CLEAN_JAR_CREATION_VERSION = "21.10.64";
 
-	private final Project project;
-	private final Logger logger;
-	private final MinecraftProvider minecraftProvider;
-	private final Type type;
+	// 对子类开放：legacy Forge（1.8-1.16）支持的 MinecraftLegacyPatchedProvider 需要访问这些成员
+	protected final Project project;
+	protected final Logger logger;
+	protected final MinecraftProvider minecraftProvider;
+	protected final Type type;
 
 	// Step 1: Remap Minecraft to intermediate mappings, merge if needed
 	private Path minecraftIntermediateJar;
@@ -167,13 +168,13 @@ public class MinecraftPatchedProvider {
 		minecraftClientExtra = forgeWorkingDir.resolve("client-extra.jar");
 	}
 
-	private void cleanAllCache() throws IOException {
+	protected void cleanAllCache() throws IOException {
 		for (Path path : getGlobalCaches()) {
 			Files.deleteIfExists(path);
 		}
 	}
 
-	private Path[] getGlobalCaches() {
+	protected Path[] getGlobalCaches() {
 		Path[] files = {
 				minecraftIntermediateJar,
 				minecraftPatchedIntermediateJar,
@@ -185,7 +186,7 @@ public class MinecraftPatchedProvider {
 		return files;
 	}
 
-	private void checkCache() throws IOException {
+	protected void checkCache() throws IOException {
 		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(Files::notExists)
 				|| !isPatchedJarUpToDate(minecraftPatchedJar)) {
 			cleanAllCache();
@@ -502,7 +503,7 @@ public class MinecraftPatchedProvider {
 		return getExtension().getForgeUserdevProvider().getUserdevJar();
 	}
 
-	private boolean isPatchedJarUpToDate(Path jar) throws IOException {
+	protected boolean isPatchedJarUpToDate(Path jar) throws IOException {
 		if (Files.notExists(jar)) return false;
 
 		byte[] manifestBytes = ZipUtils.unpackNullable(jar, "META-INF/MANIFEST.MF");
@@ -523,9 +524,18 @@ public class MinecraftPatchedProvider {
 		}
 	}
 
-	private void accessTransformForge() throws IOException {
-		Path input = minecraftPatchedIntermediateJar;
-		Path target = minecraftPatchedIntermediateAtJar;
+	protected void accessTransformForge() throws IOException {
+		accessTransform(minecraftPatchedIntermediateJar, minecraftPatchedIntermediateAtJar);
+	}
+
+	/**
+	 * 对给定 jar 执行 Forge 的 access transform.
+	 *
+	 * <p>现代 Forge 走 {@link #accessTransformForge()}（中间产物路径）；legacy Forge 的补丁
+	 * 流程在 FG2 自己的工作目录下产出 jar（client/server/merged-patched.jar），必须显式指定
+	 * 输入输出，否则会写错产物，令后续的 walkFileSystems / applyLoomPatchVersion 拿到陈旧文件。
+	 */
+	protected void accessTransform(Path input, Path target) throws IOException {
 		Stopwatch stopwatch = Stopwatch.createStarted();
 		logger.lifecycle(":access transforming minecraft");
 
@@ -592,7 +602,7 @@ public class MinecraftPatchedProvider {
 		logger.lifecycle(":patched jars in " + stopwatch.stop());
 	}
 
-	private void patchJars(Path clean, Path output, Path patches) {
+	protected void patchJars(Path clean, Path output, Path patches) throws Exception {
 		ForgeToolValueSource.exec(project, spec -> {
 			UserdevConfig.BinaryPatcherConfig config = getExtension().getForgeUserdevProvider().getConfig().binpatcher();
 			final FileCollection download = DependencyDownloader.download(project, config.dependency());
@@ -675,11 +685,11 @@ public class MinecraftPatchedProvider {
 		}
 	}
 
-	private void walkFileSystems(Path source, Path target, Predicate<Path> filter, FsPathConsumer action) throws IOException {
+	protected void walkFileSystems(Path source, Path target, Predicate<Path> filter, FsPathConsumer action) throws IOException {
 		walkFileSystems(source, target, filter, FileSystem::getRootDirectories, action);
 	}
 
-	private void copyMissingClasses(Path source, Path target) throws IOException {
+	protected void copyMissingClasses(Path source, Path target) throws IOException {
 		walkFileSystems(source, target, it -> it.toString().endsWith(".class"), (sourceFs, targetFs, sourcePath, targetPath) -> {
 			if (Files.exists(targetPath)) return;
 			Path parent = targetPath.getParent();
@@ -701,7 +711,7 @@ public class MinecraftPatchedProvider {
 		walkFileSystems(source, target, filter, this::copyReplacing);
 	}
 
-	private void copyReplacing(FileSystem sourceFs, FileSystem targetFs, Path sourcePath, Path targetPath) throws IOException {
+	protected void copyReplacing(FileSystem sourceFs, FileSystem targetFs, Path sourcePath, Path targetPath) throws IOException {
 		Path parent = targetPath.getParent();
 
 		if (parent != null) {
@@ -793,9 +803,10 @@ public class MinecraftPatchedProvider {
 		SERVER_ONLY("server", "server", (patch, userdev) -> patch.extractServerPatches()),
 		MERGED("merged", "joined", (patch, userdev) -> userdev.getJoinedPatches());
 
-		private final String id;
-		private final String mcpId;
-		private final BiFunction<PatchProvider, ForgeUserdevProvider, Path> patches;
+		// 对子类开放：legacy 实现需要按 type 区分产物命名
+		protected final String id;
+		protected final String mcpId;
+		protected final BiFunction<PatchProvider, ForgeUserdevProvider, Path> patches;
 
 		Type(String id, String mcpId, BiFunction<PatchProvider, ForgeUserdevProvider, Path> patches) {
 			this.id = id;

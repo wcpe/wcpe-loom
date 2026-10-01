@@ -47,10 +47,9 @@ class LoomCacheServiceTest extends Specification {
 	// BuildService 是 abstract 类，无法直接 new，使用匿名子类绕过 Gradle 实例化；
 	// runExclusive 不会用到 getParameters，故返回 None 占位即可
 	LoomCacheService service = new LoomCacheService() {
-		@Override
-		BuildServiceParameters.None getParameters() {
-			return null
-		}
+		// 以 Groovy 属性形式声明：自动生成的 getParameters() 满足 BuildService 抽象方法，
+		// 同时避开 codenarc GetterMethodCouldBeProperty
+		final BuildServiceParameters.None parameters = null
 	}
 
 	def setup() {

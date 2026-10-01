@@ -1,7 +1,7 @@
 /*
  * This file is part of fabric-loom, licensed under the MIT License (MIT).
  *
- * Copyright (c) 2026 WCPE
+ * Copyright (c) 2026 FabricMC
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,12 +24,15 @@
 
 package net.fabricmc.loom.test.unit
 
+import org.gradle.api.provider.Property
 import spock.lang.Specification
 
 import net.fabricmc.loom.LoomGradleExtension
-import net.fabricmc.loom.configuration.ide.RunConfig
+import net.fabricmc.loom.api.RunConfiguration
+import net.fabricmc.loom.configuration.ide.RuntimeLibraries
 import net.fabricmc.loom.test.util.GradleTestUtil
 
+import static org.mockito.Mockito.mock
 import static org.mockito.Mockito.when
 
 class RuntimeLibrariesTest extends Specification {
@@ -38,9 +41,15 @@ class RuntimeLibrariesTest extends Specification {
 		def project = GradleTestUtil.mockProject()
 		def extension = LoomGradleExtension.get(project)
 		when(extension.disableObfuscation()).thenReturn(true)
-		def runConfig = new RunConfig(environment: "server")
+
+		Property<String> runtimeEnvironment = project.objects.property(String)
+		runtimeEnvironment.set("server")
+
+		def runConfiguration = mock(RunConfiguration)
+		when(runConfiguration.getRuntimeEnvironment()).thenReturn(runtimeEnvironment)
 
 		expect:
-		runConfig.getExcludedLibraryPaths(project).empty
+		// 无混淆时不排除 client-only 库，保证 ForgeBootstrap 的 JPMS 模块图完整
+		RuntimeLibraries.getExcludedLibraryPaths(project, runConfiguration).isEmpty()
 	}
 }

@@ -1,7 +1,7 @@
 /*
  * This file is part of fabric-loom, licensed under the MIT License (MIT).
  *
- * Copyright (c) 2026 WCPE
+ * Copyright (c) 2026 FabricMC
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -112,7 +112,10 @@ class RemapTaskCacheTest extends Specification implements GradleProjectTestTrait
 		outputJars(gradle).every { manifestValue(it, "Fabric-Minecraft-Version") == "manifest-one" }
 
 		when:
-		def changed = gradle.run(tasks: tasks, args: ["--build-cache", "-PcacheTestManifestVersion=manifest-two"])
+		def changed = gradle.run(tasks: tasks, args: [
+			"--build-cache",
+			"-PcacheTestManifestVersion=manifest-two"
+		])
 
 		then:
 		tasks.every { changed.task(":$it").outcome == SUCCESS }
@@ -121,7 +124,11 @@ class RemapTaskCacheTest extends Specification implements GradleProjectTestTrait
 		manifestValue(gradle.getOutputFile("fabric-example-mod-1.0.0.jar"), "Fabric-Mixin-Group") == "custom-group"
 
 		when:
-		def reproducible = gradle.run(tasks: tasks, args: ["--build-cache", "-PcacheTestManifestVersion=manifest-two", "-Dloom.test.reproducible=true"])
+		def reproducible = gradle.run(tasks: tasks, args: [
+			"--build-cache",
+			"-PcacheTestManifestVersion=manifest-two",
+			"-Dloom.test.reproducible=true"
+		])
 
 		then:
 		tasks.every { reproducible.task(":$it").outcome == SUCCESS }
@@ -139,7 +146,10 @@ class RemapTaskCacheTest extends Specification implements GradleProjectTestTrait
 		gradle.run(task: "remapJar", args: ["--build-cache"])
 
 		when:
-		def failed = gradle.run(task: "remapJar", args: ["--build-cache", "-PcacheTestNamespace=missing"], expectFailure: true)
+		def failed = gradle.run(task: "remapJar", args: [
+			"--build-cache",
+			"-PcacheTestNamespace=missing"
+		], expectFailure: true)
 
 		then:
 		failed.task(":remapJar").outcome == FAILED
@@ -177,12 +187,20 @@ class RemapTaskCacheTest extends Specification implements GradleProjectTestTrait
 	}
 
 	private static List<File> outputJars(GradleProject gradle) {
-		return [gradle.getOutputFile("fabric-example-mod-1.0.0.jar"), gradle.getOutputFile("fabric-example-mod-1.0.0-sources.jar")]
+		return [
+			gradle.getOutputFile("fabric-example-mod-1.0.0.jar"),
+			gradle.getOutputFile("fabric-example-mod-1.0.0-sources.jar")
+		]
 	}
 
+	/** 读取 Manifest 属性（try/finally 形式规避 groovy formatter 缺陷） */
 	private static String manifestValue(File file, String name) {
-		try (def jar = new JarFile(file)) {
+		def jar = new JarFile(file)
+
+		try {
 			return jar.manifest.mainAttributes.getValue(name)
+		} finally {
+			jar.close()
 		}
 	}
 }

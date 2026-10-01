@@ -1,7 +1,7 @@
 /*
  * This file is part of fabric-loom, licensed under the MIT License (MIT).
  *
- * Copyright (c) 2026 WCPE
+ * Copyright (c) 2026 FabricMC
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -33,21 +33,30 @@ import static org.gradle.testkit.runner.TaskOutcome.UP_TO_DATE
 
 class MultiProjectDirectPluginTest extends Specification implements GradleProjectTestTrait {
 	def "multiple subprojects can apply Loom directly in one Gradle root"() {
-	setup:
+		setup:
 		def gradle = gradleProject(project: "multiProjectDirectLoom", version: "9.5.0")
 		gradle.buildSrc("loomClasspath")
 
 		when:
 		def result = gradle.run(
-				tasks: [":one:configureClientLaunch", ":two:configureClientLaunch"],
+				tasks: [
+					":one:configureClientLaunch",
+					":two:configureClientLaunch"
+				],
 				isloatedProjects: true)
 		// 首次执行会创建运行配置输出，isolated-projects 会因此使下一次重新存储；
 		// 输出稳定后第三次必须真正复用同一配置缓存条目。
 		def warm = gradle.run(
-				tasks: [":one:configureClientLaunch", ":two:configureClientLaunch"],
+				tasks: [
+					":one:configureClientLaunch",
+					":two:configureClientLaunch"
+				],
 				isloatedProjects: true)
 		def reused = gradle.run(
-				tasks: [":one:configureClientLaunch", ":two:configureClientLaunch"],
+				tasks: [
+					":one:configureClientLaunch",
+					":two:configureClientLaunch"
+				],
 				isloatedProjects: true)
 
 		then:
