@@ -77,6 +77,7 @@ import org.gradle.api.Project;
 import org.gradle.api.file.ConfigurableFileCollection;
 import org.gradle.api.file.FileCollection;
 import org.gradle.api.logging.Logger;
+import org.gradle.api.provider.Provider;
 import org.jspecify.annotations.Nullable;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
@@ -869,13 +870,40 @@ public class MinecraftPatchedProvider {
 		}
 
 		try (var tempFiles = new TempFiles(); var serviceFactory = new ScopedServiceFactory()) {
-			McpExecutorBuilder builder = createMcpExecutor(tempFiles.directory("loom-mcp"));
-			builder.enqueue("rename");
-			McpExecutor executor = serviceFactory.get(builder.build());
-			Path result = executor.execute();
-			// output 是本次独占的临时文件，写完后由调用方原子落位到共享缓存
-			Files.copy(result, output);
+			runMcpExecutor(createPrePatchJarMcpOptions(tempFiles), output, serviceFactory);
 		}
+	}
+
+	/**
+	 * {@return 「跑 rename 步」的 MCP 执行器声明（配置期只接线、不执行）}.
+	 *
+	 * <p>与改造前那段内联代码的唯一区别是「不再顺带执行」：{@link McpExecutorBuilder#build()} 返回的是惰性
+	 * provider，步进逻辑选项、工具 jar 的坐标解析、以及 {@code ConstantLogic} 里 {@code downloadClient} 的
+	 * 输出路径读取都推迟到它被取值时。因此本方法既能在配置期路径里调用，也能把返回值挂成任务的
+	 * {@code @Nested} 输入，由任务在执行期发起同一次调用。
+	 *
+	 * <p>{@code tempFiles} 必须活到那次调用结束：MCP 执行链的步进缓存落在它管理的临时目录里。
+	 */
+	public Provider<McpExecutor.Options> createPrePatchJarMcpOptions(TempFiles tempFiles) throws IOException {
+		McpExecutorBuilder builder = createMcpExecutor(tempFiles.directory("loom-mcp"));
+		builder.enqueue("rename");
+		return builder.build();
+	}
+
+	/**
+	 * 执行期求值：只认选项、本次落位路径与服务工厂，不读项目模型.
+	 *
+	 * <p>把 pre-patch jar 的生产搬进任务之后，执行期这一侧就是本方法；它与配置期路径
+	 * 共用 {@link McpExecutor#execute} 这一处实现，因此两条路径的 MCP 步进集合、命令行与产物不会分叉。
+	 *
+	 * @param options 配置期接好的 MCP 执行器选项
+	 * @param output MCP 最后一步产物的落位路径（调用方负责原子落位）
+	 */
+	public static void runMcpExecutor(Provider<McpExecutor.Options> options, Path output, ServiceFactory serviceFactory) throws IOException {
+		McpExecutor executor = serviceFactory.get(options);
+		Path result = executor.execute();
+		// output 是本次独占的临时文件，写完后由调用方原子落位到共享缓存
+		Files.copy(result, output);
 	}
 
 	private void createUnobfuscatedPrePatchJar(Path output) throws IOException {
@@ -1180,12 +1208,42 @@ public class MinecraftPatchedProvider {
 		logger.lifecycle(":access transforming minecraft");
 
 		try (var tempFiles = new TempFiles(); var serviceFactory = new ScopedServiceFactory()) {
-			AccessTransformerService service = serviceFactory.get(AccessTransformerService.createOptionsForLoaderAts(project, tempFiles));
-			Files.deleteIfExists(target);
-			service.execute(input, target);
+			runAccessTransformer(createAccessTransformerOptions(tempFiles), input, target, serviceFactory);
 		}
 
 		logger.lifecycle(":access transformed minecraft in " + stopwatch.stop());
+	}
+
+	/**
+	 * {@return AT 工具的声明式选项（工具 classpath、主类与待应用的 AT 文件）}.
+	 *
+	 * <p>配置期只接线、不求值：{@link AccessTransformerService#createOptionsForLoaderAts} 返回的是惰性
+	 * provider——依赖解析（{@code DependencyDownloader} 只建 detached configuration）与「把 AT 文件从
+	 * userdev jar 里抽出来」都推迟到 {@link #runAccessTransformer} 真正取值的那一刻。因此本方法既能在
+	 * 配置期路径里调用，也能把返回值挂成任务的 {@code @Nested} 输入，由任务在执行期发起同一次调用。
+	 *
+	 * <p>{@code tempFiles} 必须活到那次调用结束：AT 文件抽取到它管理的临时目录里。
+	 */
+	public Provider<AccessTransformerService.Options> createAccessTransformerOptions(TempFiles tempFiles) {
+		return AccessTransformerService.createOptionsForLoaderAts(project, tempFiles);
+	}
+
+	/**
+	 * 执行期求值：只认选项、本次调用的输入输出与服务工厂，不读项目模型.
+	 *
+	 * <p>与 {@link #createAccessTransformerOptions} 配对，让配置期路径与「把 {@code provide()} 链搬进任务」
+	 * 之后的路径共用同一份实现：AT 的实际参数仍只由 {@link AccessTransformerService#execute} 构造一处，
+	 * 因此两条路径跑出来的命令行不会分叉。
+	 *
+	 * @param options 配置期接好的 AT 选项
+	 * @param input 待执行 AT 的 jar
+	 * @param target AT 结果落位路径（调用方负责原子落位；本方法先删除它，与改造前逐字一致）
+	 */
+	public static void runAccessTransformer(Provider<AccessTransformerService.Options> options, Path input, Path target,
+			ServiceFactory serviceFactory) throws IOException {
+		final AccessTransformerService service = serviceFactory.get(options);
+		Files.deleteIfExists(target);
+		service.execute(input, target);
 	}
 
 	private static void remapPatchedJar(ProductionOptions options, Path mcOutput, Consumer<String> lifecycle) throws Exception {

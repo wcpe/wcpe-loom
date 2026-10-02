@@ -39,15 +39,17 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
-import dev.architectury.loom.forge.tool.ForgeToolValueSource;
+import dev.architectury.loom.forge.tool.ForgeExternalToolService;
 import dev.architectury.loom.util.DependencyDownloader;
 import dev.architectury.loom.util.Stopwatch;
 import org.cadixdev.lorenz.io.srg.SrgReader;
 import org.cadixdev.lorenz.io.srg.tsrg.TSrgWriter;
 import org.gradle.api.Project;
+import org.gradle.api.file.FileCollection;
 import org.jspecify.annotations.Nullable;
 
 import net.fabricmc.loom.LoomGradleExtension;
@@ -62,6 +64,8 @@ import net.fabricmc.loom.util.ZipUtils;
 import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.loom.util.cache.CacheEntryLock;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
+import net.fabricmc.loom.util.service.ScopedServiceFactory;
+import net.fabricmc.loom.util.service.ServiceFactory;
 import net.fabricmc.mappingio.MappingReader;
 import net.fabricmc.mappingio.MappingVisitor;
 import net.fabricmc.mappingio.MappingWriter;
@@ -291,30 +295,59 @@ public class SrgProvider extends DependencyProvider {
 	 * 成功后再原子落位，读方不会看到半截产物，也不再需要先删除既有产物。
 	 */
 	private void produceMergedMojangRaw() throws IOException {
-		Path mojmapTsrg2 = getMojmapTsrg2(getProject(), getExtension());
 		final Path temp = AtomicFiles.tempSibling(mergedMojangRaw);
 
-		try {
-			ForgeToolValueSource.exec(getProject(), settings -> {
-				settings.classpath(DependencyDownloader.download(getProject(), LoomVersions.FORGE_INSTALLER_TOOLS.mavenNotation()));
-				settings.getMainClass().set(INSTALLER_TOOLS_MAIN_CLASS);
-				settings.args(
-						"--task",
-						"MERGE_MAPPING",
-						"--left",
-						getSrg().toAbsolutePath().toString(),
-						"--right",
-						mojmapTsrg2.toAbsolutePath().toString(),
-						"--classes",
-						"--output",
-						temp.toAbsolutePath().toString()
-				);
-			});
-
+		try (var serviceFactory = new ScopedServiceFactory()) {
+			runMergeMapping(createMergeMappingTool(), temp, serviceFactory);
 			AtomicFiles.move(temp, mergedMojangRaw);
 		} finally {
 			Files.deleteIfExists(temp);
 		}
+	}
+
+	/**
+	 * {@return InstallerTools 的 {@code MERGE_MAPPING} 调用声明（工具 classpath、主类与参数模板）}.
+	 *
+	 * <p>配置期只接线：依赖坐标与参数模板都是从项目状态读来的纯值，工具 classpath 是一个惰性的
+	 * {@code FileCollection}（{@code DependencyDownloader} 只建 detached configuration，不解析）。
+	 * 因此本方法既不解析依赖、也不发起进程，返回值可以挂成任务的 {@code @Nested} 输入。
+	 *
+	 * <p>参数模板里的取值分两类，口径与 {@code createNeoForgeInstallerTools} 一致：
+	 * <ul>
+	 *   <li><b>配置期就确定的纯值</b>——{@code --task}/{@code --left}/{@code --right}/{@code --classes}
+	 *       ——就地定死在模板里，于是这条链搬进任务后不需要在执行期回读项目模型；</li>
+	 *   <li><b>只有调用时才知道的路径</b>——{@code {output}}（本次调用的目标 tsrg）——留作占位符。</li>
+	 * </ul>
+	 *
+	 * <p>参数顺序与改造前那串 {@code settings.args(...)} 逐条一致。
+	 */
+	public ForgeExternalToolService.Options createMergeMappingTool() throws IOException {
+		final FileCollection classpath = DependencyDownloader.download(getProject(), LoomVersions.FORGE_INSTALLER_TOOLS.mavenNotation());
+		final ForgeExternalToolService.Options tool = ForgeExternalToolService
+				.createOptions(getProject(), classpath, INSTALLER_TOOLS_MAIN_CLASS).get();
+		tool.getArgsTemplate().set(List.of(
+				"--task",
+				"MERGE_MAPPING",
+				"--left",
+				getSrg().toAbsolutePath().toString(),
+				"--right",
+				getMojmapTsrg2(getProject(), getExtension()).toAbsolutePath().toString(),
+				"--classes",
+				"--output",
+				"{output}"
+		));
+		return tool;
+	}
+
+	/**
+	 * 执行期求值：只认选项、本次调用的目标路径与服务工厂，不读项目模型.
+	 *
+	 * <p>与 {@link #createMergeMappingTool()} 配对，让配置期路径与「把这段搬进任务」之后的路径共用同一份
+	 * 调用声明：实际命令行仍只由 {@link ForgeExternalToolService#settingsFor} 构造一处。
+	 */
+	public static void runMergeMapping(ForgeExternalToolService.Options tool, Path output, ServiceFactory serviceFactory) {
+		final ForgeExternalToolService installerTools = serviceFactory.get(tool);
+		installerTools.exec(Map.of("{output}", output.toAbsolutePath().toString()));
 	}
 
 	/**
