@@ -117,6 +117,7 @@ jobs:
             --tests net.fabricmc.loom.test.integration.forge.AccessTransformerTest \
             --tests net.fabricmc.loom.test.integration.forge.PatchedDecompileTest \
             --tests net.fabricmc.loom.test.integration.forge.legacy.LegacyForgeExternalModDependencyTest \
+            --tests net.fabricmc.loom.test.integration.pipeline.* \
             --tests net.fabricmc.loom.test.unit.AsyncCacheTest \
             --tests net.fabricmc.loom.test.unit.AsyncZipProcessorTest \
             --tests net.fabricmc.loom.test.unit.cache.AtomicFilesTest \
