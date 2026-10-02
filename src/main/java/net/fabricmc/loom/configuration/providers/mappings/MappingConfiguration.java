@@ -71,6 +71,8 @@ import net.fabricmc.loom.configuration.providers.mappings.tiny.MappingsMerger;
 import net.fabricmc.loom.configuration.providers.mappings.tiny.TinyJarInfo;
 import net.fabricmc.loom.configuration.providers.mappings.unpick.UnpickMetadata;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+import net.fabricmc.loom.pipeline.GenerateSrgNamedMappingsTask;
+import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
 import net.fabricmc.loom.util.Checksum;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
@@ -89,6 +91,7 @@ import net.fabricmc.mappingio.adapter.MappingSourceNsSwitch;
 import net.fabricmc.mappingio.format.MappingFormat;
 import net.fabricmc.mappingio.format.tiny.Tiny2FileWriter;
 import net.fabricmc.mappingio.tree.MappingTree;
+import net.fabricmc.mappingio.tree.MemoryMappingTree;
 import net.fabricmc.stitch.Command;
 import net.fabricmc.stitch.commands.CommandProposeFieldNames;
 
@@ -155,6 +158,17 @@ public class MappingConfiguration {
 	private final Path unpickDefinitions;
 	// mappings.tiny 与 mappings.jar 的成对就绪标记：与两件产物同处共享工作目录，跨工作树/daemon 共享
 	private final Path mappingsPairMarker;
+
+	/**
+	 * srg→named 产物的产出任务路径；未投影（整批回退配置期）时为 {@code null}.
+	 *
+	 * <p>它承载消费侧接线：消费方（{@code GenerateDLIConfigTask}）只把产物**路径**当字符串写进 DLI 配置，
+	 * Gradle 看不见这条输入依赖，故由消费方在任务图上显式声明（见
+	 * {@link #projectSrgNamedToTasks(Project, LoomGradleExtension)}）。按路径而不是任务实例传递：
+	 * 产出方可能由另一份 Loom classloader 配置。
+	 */
+	@Nullable
+	private String srgNamedTaskPath;
 
 	private List<AnnotationsData> annotationsData = List.of();
 
@@ -274,6 +288,17 @@ public class MappingConfiguration {
 		}
 
 		return Objects.requireNonNull(mappingsSupplier.get());
+	}
+
+	/**
+	 * {@return srg→named 产物的产出任务路径；未投影（整批回退配置期）时为 {@code null}}.
+	 *
+	 * <p>供消费方把「我的输入就是你的产出」表达成任务依赖。返回值是任务**路径**而不是任务实例：产出方
+	 * 可能由另一份 Loom classloader 配置（约定插件/included build 各自带一份 Loom），把对方的任务实例
+	 * 交给本 classloader 的任务会在使用处抛 {@link ClassCastException}。
+	 */
+	public @Nullable String getSrgNamedTaskPath() {
+		return srgNamedTaskPath;
 	}
 
 	public Provider<TinyMappingsService.Options> getMappingsServiceOptions(Project project) {
@@ -564,39 +589,178 @@ public class MappingConfiguration {
 				throw new IllegalStateException("We have to generate srg tiny in a forge environment!");
 			}
 
-			// 就绪判据为内容级（见 isReusableMappingsText）。该产物虽以 .srg 结尾，内容仍是纯文本：
-			// 它由 MappingWriter.create(tmp, MappingFormat.SRG_FILE) 经 java.io.Writer 逐行写出，
-			// 与 .tiny 同属文本映射而非 zip，故同样不能套用 JarReusability 的 zip 口径，取「存在且非空」。
-			// 只判存在的代价偏大：该文件是 dev 启动配置里 SRG→named 的映射来源，复用 0 字节残骸
-			// 会让开发环境静默地按错误映射启动，而不是报错。
-			if (!isReusableMappingsText(srgToNamedSrg) || extension.refreshDeps()) {
-				final boolean refresh = extension.refreshDeps();
-				// 该产物与 mappings-srg.tiny 同处共享工作目录且由它派生，故与 produceMappings / setupPost
-				// 共用同一把 mappings 锁，避免不同工作树/daemon 交叉生产这一组互相依赖的产物。
-				runWithMappingsLock(project, "生成 srg->named mappings 失败", () -> {
-					// 锁内二次确认：等锁期间可能已被其它进程产出（refresh 时仍需强制重建）
-					if (!refresh && isReusableMappingsText(srgToNamedSrg)) {
-						return null;
-					}
+			final String blocker = srgNamedProjectionBlocker();
 
-					try (var serviceFactory = new ScopedServiceFactory()) {
-						TinyMappingsService mappingsService = getMappingsService(project, serviceFactory, MappingOption.WITH_SRG);
-
-						// 原子发布：先在临时文件上写完整份 srg 文本，再原子 move 落位
-						AtomicFiles.publish(srgToNamedSrg, tmp -> {
-							try (MappingWriter writer = MappingWriter.create(tmp, MappingFormat.SRG_FILE)) {
-								MappingVisitor visitor = new MappingSourceNsSwitch(new MappingDstNsReorder(writer, "named"), "srg");
-								mappingsService.getMappingTree().accept(visitor);
-							}
-						});
-					}
-
-					return null;
-				});
+			if (blocker == null) {
+				projectSrgNamedToTasks(project, extension);
+			} else {
+				// 整批回退：配置期路径逐字保留（含它自己的就绪判据、跨进程锁与原子发布）
+				generateSrgNamedInConfiguration(project, extension, blocker);
 			}
 		}
 
 		project.getDependencies().add(Constants.Configurations.MAPPINGS_FINAL, project.files(tinyMappingsJar.toFile()));
+	}
+
+	/**
+	 * {@return 不能把 srg→named 的生成投影成执行期任务的原因；可以投影时为 {@code null}}.
+	 *
+	 * <p>本产物的消费面很窄，全仓库只有一处读它：{@code GenerateDLIConfigTask} 把它的**路径**写进
+	 * DLI 配置的 {@code net.minecraftforge.gradle.GradleStart.srg.srg-mcp}
+	 * （见 {@code GenerateDLIConfigTask.ForgeInputs}），真正的读取发生在游戏启动时（ForgeGradle 的
+	 * {@code GradleStart} 按那个属性打开文件）。既然唯一的消费方是一个任务、而它的依赖可以接线
+	 * （见 {@link #projectSrgNamedToTasks}），判据就只剩一类「配置期必须真读/真写该产物」的形态。
+	 *
+	 * <p><b>任何新增的配置期读者都必须在这里补一条判据</b>：回退必须可见，不能是静默的——新增读者
+	 * 读到的是「产出任务还没跑」的文件。
+	 *
+	 * <ul>
+	 *   <li><b>映射树来源不可用</b>：srg 命名空间的映射树（Forge 下即 {@code mappings-srg-migrated.tiny}）
+	 *       缺失或为空时投影对双方都没有好处：任务拿到的是不可读的输入（必然失败），而配置期那条路径
+	 *       会以它自己的判据处理这一轮——产物可用就直接复用、不碰输入。这类残骸形态本仓库实测出现过
+	 *       （见 {@link #isReusableMappingsText(Path)}），故整批回退，让改造前的路径去处理。</li>
+	 * </ul>
+	 */
+	private @Nullable String srgNamedProjectionBlocker() {
+		final Path source = srgNamedMappingsPath();
+
+		if (source == null) {
+			return "srg 命名空间的映射树来源未登记（" + MappingOption.WITH_SRG + "）：产出任务没有可读的输入";
+		}
+
+		if (!isReusableMappingsText(source)) {
+			return "srg 命名空间的映射树不可用（" + describeMappingsTextSize(source) + "）：产出任务没有可读的输入";
+		}
+
+		return null;
+	}
+
+	/**
+	 * {@return srg 命名空间的映射树路径；该选项未登记时为 {@code null}}.
+	 *
+	 * <p>与 {@link #getMappingsPath(MappingOption)} 的区别只有一个：不因「文件不存在」抛异常。投影前的
+	 * 判定本身就要能看见并描述这种形态（见 {@link #srgNamedProjectionBlocker()}），否则判定会退化成一个
+	 * 没人接得住的异常。
+	 */
+	private @Nullable Path srgNamedMappingsPath() {
+		final Supplier<Path> mappingsSupplier = mappingOptions.get(MappingOption.WITH_SRG);
+		return mappingsSupplier == null ? null : mappingsSupplier.get();
+	}
+
+	/**
+	 * 把 srg→named 的生成投影成执行期任务.
+	 *
+	 * <p>配置期只做「配置期已知量 → 任务输入」的映射，不写产物文件：产物有效性交给 Gradle 的 up-to-date
+	 * 判定与构建缓存，并发保护交给任务图。产物路径沿用既有位置（{@code <userCache>/<mappingsIdentifier>/}），
+	 * 否则 {@code GenerateDLIConfigTask} 写进 DLI 配置的那条路径会悬空。
+	 *
+	 * <p>输入取 {@code MappingOption.WITH_SRG} 指向的 tiny 文件——与旧路径经 {@code TinyMappingsService}
+	 * 读的是同一份文件；该文件由 mappings 阶段（{@code setupPost} / {@code manipulateMappings}）产出，
+	 * 因此本任务的输入在配置期结束时必定已落位（这也是本次不把整棵映射树推迟到执行期的原因）。
+	 *
+	 * <p><b>消费侧接线</b>：{@link #srgNamedTaskPath} 登记给消费方（{@code GenerateDLIConfigTask}），
+	 * 由它在任务图上建依赖。按任务**路径**而不是任务实例登记：产出方可能由另一份 Loom classloader
+	 * 配置（约定插件/included build 各自带一份 Loom），把对方的任务实例交过来会在使用处抛
+	 * {@link ClassCastException}。
+	 */
+	private void projectSrgNamedToTasks(Project project, LoomGradleExtension extension) {
+		final Path source = Objects.requireNonNull(srgNamedMappingsPath(), "投影前已由判据保证输入可用");
+		final Path output = srgToNamedSrg;
+		final boolean refresh = extension.refreshDeps();
+
+		// 同一产物路径在本构建内只能有一个生产者：同一构建内的多个同构项目会算出同一条路径。
+		// 指纹只放**决定内容**的量。刻意不放 refreshDeps：它只影响「这轮要不要重建」，
+		// 不改变字节，而它按项目设置（loom.refreshDeps），放进指纹会让「只有其中一个项目刷新」
+		// 变成整批共享失败。
+		srgNamedTaskPath = RemapMinecraftTaskRegistry.claim(project, output, Map.of(
+				"stage", "srg-named",
+				"mappings", source.toAbsolutePath().normalize().toString()
+		), () -> project.getTasks().register("generateSrgNamedMappings", GenerateSrgNamedMappingsTask.class, task -> {
+			task.setGroup(Constants.TaskGroup.FABRIC);
+			task.setDescription("Generates the srg -> named mappings for %s".formatted(mappingsIdentifier));
+			task.getMappings().set(source.toFile());
+			task.getRefreshDeps().set(refresh);
+			task.getSrgFile().set(output.toFile());
+		})).taskPath();
+
+		// 用 Gradle 的 lifecycle 而不是 SLF4J 的 info：默认控制台级别是 LIFECYCLE，
+		// 「本次到底走哪条生产路径」必须默认可见，否则回退是静默的
+		project.getLogger().lifecycle("srg→named 映射的生成由执行期任务承担：{}", srgNamedTaskPath);
+	}
+
+	/**
+	 * 配置期生成 srg→named 的旧路径（整批回退时使用）.
+	 *
+	 * <p>本方法就是改造前 {@code applyToProject} 里的那一段，逐字保留：判据、跨进程锁、锁内二次确认、
+	 * 原子发布都不动。回退路径与投影路径产出的是同一件产物、同一条路径，因此它必须一直可用
+	 * （也是「投影判据必须与回退原因同处」的意义所在）。
+	 *
+	 * @param blocker 回退原因，只用于留痕
+	 */
+	private void generateSrgNamedInConfiguration(Project project, LoomGradleExtension extension, String blocker) throws IOException {
+		project.getLogger().lifecycle("srg→named 映射的生成整批回退到配置期：{}", blocker);
+
+		// 就绪判据为内容级（见 isReusableMappingsText）。该产物虽以 .srg 结尾，内容仍是纯文本：
+		// 它由 MappingWriter.create(tmp, MappingFormat.SRG_FILE) 经 java.io.Writer 逐行写出，
+		// 与 .tiny 同属文本映射而非 zip，故同样不能套用 JarReusability 的 zip 口径，取「存在且非空」。
+		// 只判存在的代价偏大：该文件是 dev 启动配置里 SRG→named 的映射来源，复用 0 字节残骸
+		// 会让开发环境静默地按错误映射启动，而不是报错。
+		if (!isReusableMappingsText(srgToNamedSrg) || extension.refreshDeps()) {
+			final boolean refresh = extension.refreshDeps();
+			// 该产物与 mappings-srg.tiny 同处共享工作目录且由它派生，故与 produceMappings / setupPost
+			// 共用同一把 mappings 锁，避免不同工作树/daemon 交叉生产这一组互相依赖的产物。
+			runWithMappingsLock(project, "生成 srg->named mappings 失败", () -> {
+				// 锁内二次确认：等锁期间可能已被其它进程产出（refresh 时仍需强制重建）
+				if (!refresh && isReusableMappingsText(srgToNamedSrg)) {
+					return null;
+				}
+
+				// 原子发布：先在临时文件上写完整份 srg 文本，再原子 move 落位
+				AtomicFiles.publish(srgToNamedSrg, tmp -> writeSrgNamedMappings(srgNamedTree(project), tmp));
+				return null;
+			});
+		}
+	}
+
+	/** {@return 配置期读到的 srg 命名空间映射树} 走 {@code TinyMappingsService}，与改造前同一来源. */
+	private MemoryMappingTree srgNamedTree(Project project) throws IOException {
+		try (var serviceFactory = new ScopedServiceFactory()) {
+			TinyMappingsService mappingsService = getMappingsService(project, serviceFactory, MappingOption.WITH_SRG);
+			return mappingsService.getMappingTree();
+		}
+	}
+
+	/**
+	 * 把 {@code srg → named} 的映射整份写成 SRG 文本.
+	 *
+	 * <p>两条路径共用这一份实现：读写方式、命名空间切换与目标命名空间必须逐字一致，否则同一件产物在
+	 * 「投影」与「回退」下会不一样。本流水线的其余环节（合并/拆分/重映射）同样按「同一份实现被两条路径
+	 * 共用」处置。
+	 *
+	 * @param source 输入的 tiny 映射（srg 命名空间的映射树）
+	 * @param target 输出路径；必须是**尚不存在**的路径（调用方负责原子发布，见 {@code AtomicFiles}）
+	 */
+	public static void writeSrgNamedMappings(Path source, Path target) throws IOException {
+		final MemoryMappingTree mappingTree = new MemoryMappingTree();
+		MappingReader.read(source, mappingTree);
+		writeSrgNamedMappings(mappingTree, target);
+	}
+
+	/**
+	 * 把 {@code srg → named} 的映射整份写成 SRG 文本.
+	 *
+	 * <p>与 {@link #writeSrgNamedMappings(Path, Path)} 的差别只有「映射树从哪来」：执行期路径直接读
+	 * {@code MappingOption.WITH_SRG} 指向的文件，配置期回退路径读 {@code TinyMappingsService} 的树
+	 * （同一份文件、同一个读法）。写法本身共用，避免两套转换逻辑产出不等价的 srg 文本。
+	 *
+	 * @param mappingTree srg 命名空间的映射树
+	 * @param target      输出路径；必须是**尚不存在**的路径（调用方负责原子发布，见 {@code AtomicFiles}）
+	 */
+	public static void writeSrgNamedMappings(MappingTree mappingTree, Path target) throws IOException {
+		try (MappingWriter writer = MappingWriter.create(target, MappingFormat.SRG_FILE)) {
+			MappingVisitor visitor = new MappingSourceNsSwitch(new MappingDstNsReorder(writer, "named"), "srg");
+			mappingTree.accept(visitor);
+		}
 	}
 
 	public static Path getRawSrgFile(Project project) throws IOException {

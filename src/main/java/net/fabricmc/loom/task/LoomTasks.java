@@ -25,6 +25,7 @@
 package net.fabricmc.loom.task;
 
 import java.io.File;
+import java.util.List;
 import java.util.Objects;
 
 import javax.inject.Inject;
@@ -95,6 +96,20 @@ public abstract class LoomTasks implements Runnable {
 				GenerateRemapClasspathTask remapClasspath = Objects.requireNonNull(generateRemapClasspathTask.get());
 				t.getRemapClasspathFile().set(remapClasspath.getRemapClasspathFile());
 			}
+
+			// srg→named 的产出任务：本任务只把它的**路径**当字符串写进 DLI 配置
+			// （见 GenerateDLIConfigTask.ForgeInputs 的 net.minecraftforge.gradle.GradleStart.srg.srg-mcp），
+			// Gradle 看不见这条输入依赖，故显式声明——否则 runClient / IDE 同步可能在产出任务之前跑完，
+			// 而游戏启动时按该路径打开 srg 文件会失败。
+			// 用 Provider 延迟取值：产出任务在 afterEvaluate（映射阶段）才登记，本注册块在插件 apply 时就跑。
+			t.dependsOn(getProject().provider(() -> {
+				if (extension.disableObfuscation() || !extension.isForge()) {
+					return List.of();
+				}
+
+				final String srgTask = extension.getMappingConfiguration().getSrgNamedTaskPath();
+				return srgTask == null ? List.of() : List.of(srgTask);
+			}));
 		});
 
 		getTasks().register("configureLaunch", task -> {
