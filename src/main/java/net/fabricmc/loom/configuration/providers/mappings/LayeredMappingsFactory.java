@@ -66,6 +66,17 @@ public record LayeredMappingsFactory(LayeredMappingSpec spec) {
 	private static final String MODULE = "mappings";
 	private static final Logger LOGGER = LoggerFactory.getLogger(LayeredMappingsFactory.class);
 
+	/**
+	 * {@return 该坐标是否为本工厂产出的分层映射依赖}.
+	 *
+	 * <p>本工厂恒以 {@link Tiny2FileWriter} 写出映射，故分层映射**必为 tiny v2**。判据需要这一点：
+	 * 分层映射的坐标没有 classifier，只看 classifier 会把它误判成「可能不是 v2」而整批回退——
+	 * 而 {@code loom.officialMojangMappings()} 等全部走分层映射，漏掉它等于让绝大多数真实工程白退。
+	 */
+	public static boolean isLayeredMappingsDependency(String group, String name) {
+		return GROUP.equals(group) && MODULE.equals(name);
+	}
+
 	/*
 	As we no longer have SelfResolvingDependency we now always create the mappings file after evaluation.
 	This works in a similar way to how remapped mods are handled.

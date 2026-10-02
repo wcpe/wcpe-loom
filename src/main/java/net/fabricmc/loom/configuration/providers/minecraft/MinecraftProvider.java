@@ -49,6 +49,7 @@ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.ConfigContext;
 import net.fabricmc.loom.configuration.DependencyInfo;
 import net.fabricmc.loom.configuration.providers.BundleMetadata;
+import net.fabricmc.loom.configuration.providers.mappings.LayeredMappingsFactory;
 import net.fabricmc.loom.configuration.providers.minecraft.verify.MinecraftJarVerification;
 import net.fabricmc.loom.configuration.providers.minecraft.verify.SignatureVerificationFailure;
 import net.fabricmc.loom.pipeline.DownloadArtifactTask;
@@ -198,9 +199,18 @@ public abstract class MinecraftProvider {
 	 *
 	 * <p>配置期读到 V1 映射时，{@code MappingConfiguration.storeMappings} 会打开 merged jar 补字段名，
 	 * 因此「这次用的到底是 V1 还是 V2」必须在投影**之前**就有答案。映射 jar 的内容要等解析、抽取之后
-	 * 才知道（那时产物早已按任务路径声明），所以这里用声明处的 classifier 作为判据：`...:v2` 是 tiny v2
-	 * 变体，其余（无 classifier、未知层、非模块依赖）一律保守地当作「可能不是 v2」，退回配置期生产。
-	 * 判据偏保守只影响「迁移覆盖范围」，不影响行为——判错的代价是这次构建仍按改造前的路径跑。
+	 * 才知道（那时产物早已按任务路径声明），所以这里只看声明处能拿到的信息：
+	 *
+	 * <ul>
+	 *   <li><b>分层映射</b>（{@code loom:mappings:…}，见
+	 *       {@link net.fabricmc.loom.configuration.providers.mappings.LayeredMappingsFactory}）恒为
+	 *       tiny v2，但其坐标没有 classifier，必须按坐标单独认——{@code officialMojangMappings()} 等
+	 *       全部走这条路，漏掉它会让绝大多数真实工程整批回退。</li>
+	 *   <li><b>{@code …:v2} classifier</b>是 tiny v2 变体，认。</li>
+	 *   <li>其余（无 classifier、未知层、非模块依赖）保守地当作「可能不是 v2」，退回配置期生产。</li>
+	 * </ul>
+	 *
+	 * <p>判据偏保守只影响「迁移覆盖范围」，不影响行为——判错的代价是这次构建仍按改造前的路径跑。
 	 */
 	private boolean mappingsAreDeclaredV2() {
 		final Configuration mappings = getProject().getConfigurations().findByName(Constants.Configurations.MAPPINGS);
@@ -211,6 +221,11 @@ public abstract class MinecraftProvider {
 		}
 
 		final Dependency dependency = mappings.getDependencies().iterator().next();
+
+		if (LayeredMappingsFactory.isLayeredMappingsDependency(dependency.getGroup(), dependency.getName())) {
+			return true;
+		}
+
 		return "v2".equals(DependencyInfo.create(getProject(), dependency, mappings).getDeclaredClassifier());
 	}
 
