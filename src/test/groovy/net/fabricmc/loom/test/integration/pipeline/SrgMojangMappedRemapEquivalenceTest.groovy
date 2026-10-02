@@ -443,6 +443,11 @@ project.afterEvaluate {
 		def output = new File(probeDir, outputName)
 
 		project.tasks.register(perturbationTask, net.fabricmc.loom.pipeline.RemapMinecraftTask) { task ->
+			// 输入 jar（Forge 打过补丁的官方 jar）现在由执行期任务产出：被测任务通过
+			// getMinecraftJarsCollection(OFFICIAL) 拿到那个依赖，本探针是手工注册的，必须自己接上，
+			// 否则 Gradle 的隐式依赖校验会直接拒绝它（"uses this output ... without declaring ..."）。
+			task.dependsOn(net.fabricmc.loom.LoomGradleExtension.get(project)
+					.getMinecraftJarsCollection(net.fabricmc.loom.api.mappings.layered.MappingsNamespace.OFFICIAL))
 			task.getInputJar().set(realTask.getInputJar())
 			task.getRemapClasspath().from(realTask.getRemapClasspath())
 			task.getMappingsServiceOptions().set(realTask.getMappingsServiceOptions())

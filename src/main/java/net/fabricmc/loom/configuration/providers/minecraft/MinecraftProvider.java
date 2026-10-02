@@ -313,6 +313,26 @@ public abstract class MinecraftProvider {
 		getExtension().setMinecraftJarsTaskOutputs(getOfficialNamespace(), outputs);
 	}
 
+	/**
+	 * 登记一个由**本 provider 之外的接线方**（Forge 的 patch 链）产出的最终 jar.
+	 *
+	 * <p>这些 jar 同样出现在 {@link #getMinecraftJars()} 里，因此必须走同一条登记路径：
+	 * 消费侧（{@code getMinecraftJarsCollection(OFFICIAL)}、mapped provider 的重映射任务）靠这里拿到
+	 * 「我的输入由哪个任务产出」的任务依赖。只把产物当成路径交给它们，冷缓存下消费方就会在产物落位前开跑。
+	 *
+	 * <p>只能在 {@link #provide()} 之后调用：那时 {@link #getMinecraftJars()} 才有意义，
+	 * 且首次 {@link #registerJarOutputs()} 已经把命名空间下的集合实例发出去，这里的重复登记是「并进」语义。
+	 *
+	 * @param artifact 产物路径（绝对规范化）
+	 * @param producer 该产物的生产者（携带任务路径）
+	 */
+	public void registerTaskProducedArtifact(Path artifact, Producer producer) {
+		final Map<Path, Producer> merged = new LinkedHashMap<>(jarProducers);
+		merged.put(normalize(artifact), producer);
+		jarProducers = Map.copyOf(merged);
+		registerJarOutputs();
+	}
+
 	/** {@return 本批登记中该产物的生产者；未登记时为 {@code null}} 供子 provider 建任务依赖用. */
 	protected static @Nullable Producer producerOf(Map<Path, Producer> producers, Path artifact) {
 		return producers.get(normalize(artifact));

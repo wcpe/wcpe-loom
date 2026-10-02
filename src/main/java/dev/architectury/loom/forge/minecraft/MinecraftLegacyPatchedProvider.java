@@ -232,7 +232,7 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 				// AT、Forge 文件复制与补丁版本标记全部在临时文件上完成，最后原子落位
 				publishAtomically(minecraftPatchedAtJar, output -> {
 					accessTransform(minecraftPatchedJar, output);
-					walkFileSystems(forgeJar, output, (path) -> true, this::copyReplacing);
+					walkFileSystems(forgeJar, output, (path) -> true, MinecraftPatchedProvider::copyReplacing);
 					applyLoomPatchVersion(output);
 				});
 			}
@@ -306,7 +306,7 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 				.orElse(null);
 		if (log4jBeta9 != null) {
 			Predicate<Path> isHelper = path -> path.startsWith("/org/apache/logging/log4j/core/helpers");
-			walkFileSystems(log4jBeta9, output, isHelper, this::copyReplacing);
+			walkFileSystems(log4jBeta9, output, isHelper, MinecraftPatchedProvider::copyReplacing);
 		}
 
 		// While Forge will discover mods on the classpath, it won't do the same for ATs, coremods or tweakers.
@@ -348,7 +348,7 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 
 		// Patching only preserves affected classes, everything else we need to copy manually
 		copyMissingClasses(clean, output);
-		walkFileSystems(clean, output, file -> !file.toString().endsWith(".class"), this::copyReplacing);
+		walkFileSystems(clean, output, file -> !file.toString().endsWith(".class"), MinecraftPatchedProvider::copyReplacing);
 
 		// Workaround Forge patches apparently violating the JVM spec (see ParameterAnnotationsFixer for details)
 		modifyClasses(output, ParameterAnnotationsFixer::new);
