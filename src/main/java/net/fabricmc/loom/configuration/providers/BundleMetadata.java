@@ -143,44 +143,96 @@ public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String
 		return Collections.unmodifiableList(entries);
 	}
 
+	/**
+	 * {@return 该制品是否已有 bundle 元数据缓存}.
+	 *
+	 * <p>命中判定只看缓存条目是否存在：条目里的空内容表示「上次已判定为旧版 jar（无 bundle）」，
+	 * 那是**结论**而不是缺失，同样算命中。本方法不打开 jar，因此可以安全地在配置期用于判定
+	 * 「元数据是否已可无 jar 读取地拿到」——这正是 {@code MinecraftProvider} 决定能否把下载搬到
+	 * 执行期任务的判据（见 {@link #fromJarCached}）。
+	 *
+	 * @param store L2 规格存储
+	 * @param artifactSha1 该制品在 version json 中声明的 sha1，作为缓存身份；为空时必然未命中
+	 */
+	public static boolean isCached(SpecStore store, @Nullable String artifactSha1) {
+		if (artifactSha1 == null) {
+			return false;
+		}
+
+		final Optional<String> cached = store.load(NAMESPACE_BUNDLE_METADATA, artifactSha1, "server-bundle");
+
+		if (cached.isEmpty() || cached.get().isEmpty()) {
+			// 未命中，或命中「已判定为非 bundler」的结论——两者都不需要打开 jar
+			return cached.isPresent();
+		}
+
+		try {
+			LoomGradlePlugin.GSON.fromJson(cached.get(), BundleMetadata.class);
+			return true;
+		} catch (RuntimeException e) {
+			// 条目损坏：缓存不可用，让调用方回退到「读 jar」的那条路径（它会顺带覆盖成正确内容）
+			LOGGER.debug("Corrupt bundle metadata cache for sha1 {}, treating as cache miss", artifactSha1, e);
+			return false;
+		}
+	}
+
+	/**
+	 * 从 bootstrap jar 中抽取一个内嵌条目到目标位置.
+	 *
+	 * <p>抽取规则（原子发布 + 目标文件上的 {@code LoomHash} 标记）由这里唯一持有：配置期路径
+	 * （{@link Entry#unpackEntry(Path, Path, Project)}）与执行期任务
+	 * （{@code ExtractMinecraftServerJarTask}）都走本方法，避免出现第二套抽取逻辑——
+	 * 两套逻辑产出的 jar 只要差一点，「任务产物」与「配置期产物」就会在同一个共享目录里互相判为不可复用。
+	 *
+	 * @param jar 内嵌条目所在的 bootstrap jar
+	 * @param dest 抽取目标
+	 * @param path 条目在 jar 中的路径
+	 * @param sha1 条目声明的 sha1，作为「已抽取」标记写入目标文件
+	 * @param refreshDeps 为真时忽略既有目标、强制重新抽取
+	 */
+	public static void unpackEntry(Path jar, Path dest, String path, String sha1, boolean refreshDeps) throws IOException {
+		if (!refreshDeps && Files.exists(dest)) {
+			final String hash = readHash(dest).orElse("");
+
+			if (hash.equals(sha1)) {
+				// File exists with expected hash
+				return;
+			}
+		}
+
+		// 原子发布：先抽取到同目录唯一临时文件并写入 hash 标记，完整后再原子 move 到 dest。
+		// 避免跨进程的无锁存在性检查在抽取期间看到半写的 server jar 误判就绪。
+		AtomicFiles.publish(dest, tmp -> {
+			try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
+				Files.copy(fs.get().getPath(path), tmp, StandardCopyOption.REPLACE_EXISTING);
+			}
+
+			writeHash(tmp, sha1);
+		});
+	}
+
+	/** {@return 目标文件上记录的 hash 标记} 读取失败时为空（视为「标记不可用」，不打断构建）. */
+	private static Optional<String> readHash(Path output) {
+		try {
+			return AttributeHelper.readAttribute(output, "LoomHash");
+		} catch (IOException e) {
+			return Optional.empty();
+		}
+	}
+
+	/** 把 sha1 写进目标文件的 {@code LoomHash} 标记，供下次抽取时判定「已抽取且内容正确」. */
+	private static void writeHash(Path output, String eTag) {
+		try {
+			AttributeHelper.writeAttribute(output, "LoomHash", eTag);
+		} catch (IOException e) {
+			throw new UncheckedIOException("Failed to write hash to (%s)".formatted(output), e);
+		}
+	}
+
 	public record Entry(String sha1, String name, String path) {
 		public void unpackEntry(Path jar, Path dest, Project project) throws IOException {
 			final LoomGradleExtension extension = LoomGradleExtension.get(project);
-
-			if (!extension.refreshDeps() && Files.exists(dest)) {
-				final String hash = readHash(dest).orElse("");
-
-				if (hash.equals(sha1)) {
-					// File exists with expected hash
-					return;
-				}
-			}
-
-			// 原子发布：先抽取到同目录唯一临时文件并写入 hash 标记，完整后再原子 move 到 dest。
-			// 避免跨进程的无锁存在性检查在抽取期间看到半写的 server jar 误判就绪。
-			AtomicFiles.publish(dest, tmp -> {
-				try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
-					Files.copy(fs.get().getPath(path()), tmp, StandardCopyOption.REPLACE_EXISTING);
-				}
-
-				writeHash(tmp, sha1);
-			});
-		}
-
-		private Optional<String> readHash(Path output) {
-			try {
-				return AttributeHelper.readAttribute(output, "LoomHash");
-			} catch (IOException e) {
-				return Optional.empty();
-			}
-		}
-
-		private void writeHash(Path output, String eTag) {
-			try {
-				AttributeHelper.writeAttribute(output, "LoomHash", eTag);
-			} catch (IOException e) {
-				throw new UncheckedIOException("Failed to write hash to (%s)".formatted(output), e);
-			}
+			BundleMetadata.unpackEntry(jar, dest, path, sha1, extension.refreshDeps());
 		}
 	}
 }

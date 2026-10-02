@@ -445,6 +445,11 @@ project.afterEvaluate {
 	def perturb = { String perturbationTask, File output, def realTask, Closure mutate ->
 		project.tasks.register(perturbationTask, net.fabricmc.loom.pipeline.RemapMinecraftTask) { task ->
 			task.getInputJar().set(realTask.getInputJar())
+			// MC 侧输入（common / client-only jar）现在由 loom 的任务产出（download → extract → split），
+			// 探针沿用被测任务的输入，因此也必须沿用它的任务依赖。漏登记时 Gradle 的配置校验会直接失败，
+			// 且错误点名的是**本探针**而不是 loom 自己的任务——后者已由接线侧按产物路径登记了 dependsOn。
+			// 这里用 loom 给消费方的正式通道（登记过产出的命名空间集合），而不是硬编码任务名。
+			task.dependsOn(loomExt.getMinecraftJarsCollection(net.fabricmc.loom.api.mappings.layered.MappingsNamespace.OFFICIAL))
 			task.getRemapClasspath().from(realTask.getRemapClasspath())
 			task.getMappingsServiceOptions().set(realTask.getMappingsServiceOptions())
 			task.getFromNamespace().set(realTask.getFromNamespace())

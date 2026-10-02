@@ -43,6 +43,7 @@ import org.gradle.work.DisableCachingByDefault;
 import org.jetbrains.annotations.ApiStatus;
 
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.Platform;
 import net.fabricmc.loom.util.XVFBExistsValueSource;
@@ -104,7 +105,10 @@ public abstract non-sealed class ClientProductionRunTask extends AbstractProduct
 		getAssetsDir().set(new File(getExtension().getFiles().getUserCache(), "assets"));
 		getMainClass().convention("net.fabricmc.loader.impl.launch.knot.KnotClient");
 
-		getClasspath().from(getExtension().getMinecraftProvider().getMinecraftClientJar());
+		// 客户端 jar 在投影形态下由任务产出：按「携带产出任务依赖」的文件集合注入 classpath，
+		// 否则冷缓存下本任务会在 jar 生成之前读到不存在的条目（配置期旧路径里它早已落盘）
+		final MinecraftProvider minecraftProvider = getExtension().getMinecraftProvider();
+		getClasspath().from(minecraftProvider.outputForTasks(minecraftProvider.getMinecraftClientJar().toPath()));
 		getClasspath().from(detachedConfigurationProvider("net.fabricmc:fabric-loader:%s", getProjectLoaderVersion()));
 
 		if (getExtension().getProductionNamespaceEnum().get() == MappingsNamespace.INTERMEDIARY) {

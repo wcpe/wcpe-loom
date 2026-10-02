@@ -27,12 +27,19 @@ package net.fabricmc.loom.configuration.providers.minecraft;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.gradle.api.JavaVersion;
 import org.gradle.api.Project;
+import org.gradle.api.Task;
+import org.gradle.api.artifacts.Configuration;
+import org.gradle.api.artifacts.Dependency;
+import org.gradle.api.file.ConfigurableFileCollection;
+import org.gradle.api.file.FileCollection;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,9 +47,14 @@ import org.slf4j.LoggerFactory;
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.ConfigContext;
+import net.fabricmc.loom.configuration.DependencyInfo;
 import net.fabricmc.loom.configuration.providers.BundleMetadata;
 import net.fabricmc.loom.configuration.providers.minecraft.verify.MinecraftJarVerification;
 import net.fabricmc.loom.configuration.providers.minecraft.verify.SignatureVerificationFailure;
+import net.fabricmc.loom.pipeline.DownloadArtifactTask;
+import net.fabricmc.loom.pipeline.ExtractMinecraftServerJarTask;
+import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
+import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry.Producer;
 import net.fabricmc.loom.util.Check;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.cache.JarReusability;
@@ -68,6 +80,23 @@ public abstract class MinecraftProvider {
 
 	private final ConfigContext configContext;
 
+	/**
+	 * 本次是否把产物生产（下载/抽取，子类再含合并/拆分）交给执行期任务.
+	 *
+	 * <p>只有 {@link #projectionBlocker()} 为 {@code null} 时才为真；为假时全部产物沿用改造前的
+	 * 配置期路径。判定**按 provider 整批**：半批投影会留下「一部分产物由任务生产、一部分由配置期生产」
+	 * 的混合状态，同一份共享缓存里出现两种就绪判据——正是本次改造要消灭的东西。
+	 */
+	private boolean taskProduction;
+
+	/**
+	 * 本次登记给执行期任务的生产产物：产物路径（绝对规范化）→ 生产者.
+	 *
+	 * <p>未投影时为空。消费方（mapped provider 的重映射任务、生产环境客户端任务）据此把
+	 * 「我的输入就是你的产出」表达成任务依赖：输入若只按路径声明，Gradle 无从知道要先跑产出任务。
+	 */
+	private Map<Path, Producer> jarProducers = Map.of();
+
 	public MinecraftProvider(MinecraftMetadataProvider metadataProvider, ConfigContext configContext) {
 		this.metadataProvider = metadataProvider;
 		this.configContext = configContext;
@@ -90,6 +119,330 @@ public abstract class MinecraftProvider {
 		initFiles();
 
 		verifyJavaVersion();
+
+		// 可投影则把产物生产交给执行期任务，否则整批沿用改造前的配置期路径（含留痕，见 projectionBlocker）
+		if (canProjectToTasks()) {
+			projectToTasks();
+		} else {
+			produceJarsInConfiguration();
+		}
+
+		// 内存配置：libraryProvider 每次都必须执行
+		final MinecraftLibraryProvider libraryProvider = new MinecraftLibraryProvider(this, configContext.project());
+		libraryProvider.provide();
+	}
+
+	/**
+	 * {@return 本 provider 能否把产物生产投影成执行期任务}.
+	 *
+	 * <p>覆写点只有 {@link #projectionBlocker()} 一个：判定与「为什么不能投影」必须在同一处，
+	 * 否则回退会变成静默的（看不到被拒的具体原因）。
+	 */
+	protected final boolean canProjectToTasks() {
+		return taskProduction || projectionBlocker() == null;
+	}
+
+	/** {@return 本次是否已把产物生产交给执行期任务} 子 provider（合并/拆分）据此决定自己怎么生产. */
+	protected final boolean isTaskProduction() {
+		return taskProduction;
+	}
+
+	/**
+	 * {@return 不能把产物生产投影成执行期任务的原因；可以投影时为 {@code null}}.
+	 *
+	 * <p>每一条都是一个「配置期必须真读产物 jar（或必须由配置期落盘）」的形态。投影后产物只在执行期落位，
+	 * 这些配置期读者会读到不存在（或上一代）的文件，因此必须整批退回配置期生产——那个路径与改造前逐字一致。
+	 *
+	 * <ul>
+	 *   <li><b>Forge 系</b>：patch 流程、MCP 映射合并、内部类名集合（
+	 *       {@code InnerClassRemapper.readClassNames}）都在配置期读 vanilla jar。</li>
+	 *   <li><b>disableObfuscation</b>：mapped 阶段自身整批回退到配置期生产，配置期会按路径读 vanilla jar。</li>
+	 *   <li><b>签名校验开启</b>：校验要打开 jar 读签名与内容，本次未随链迁移（见
+	 *       {@link #verificationEnabled()}）。</li>
+	 *   <li><b>映射可能不是 tiny v2</b>：V1 映射的字段名补全在配置期读 merged jar，且只支持单 jar 形态。</li>
+	 *   <li><b>bundle 元数据未进 L2 规格缓存</b>：服务端库的注入是配置期事实，元数据没有缓存就必须先
+	 *       下载并打开 server jar——那正是本次要移出配置期的动作。</li>
+	 * </ul>
+	 */
+	protected @Nullable String projectionBlocker() {
+		if (getExtension().isForgeLike()) {
+			return "Forge 系的 vanilla jar 在配置期就被真读（patch 流程、MCP 映射合并、内部类名集合）";
+		}
+
+		if (getExtension().disableObfuscation()) {
+			return "disableObfuscation 下 mapped 阶段整批回退到配置期生产，配置期会按路径读 vanilla jar";
+		}
+
+		if (verificationEnabled()) {
+			return "Minecraft jar 签名校验已启用（" + Constants.Properties.ENABLE_MINECRAFT_VERIFICATION + "），校验在配置期读 jar 内容";
+		}
+
+		if (!mappingsAreDeclaredV2()) {
+			return "映射依赖未声明为 tiny v2（V1 映射的字段名补全在配置期读 merged jar）";
+		}
+
+		if (provideServer() && !isServerBundleMetadataCached()) {
+			return "server bundle 元数据未命中 L2 规格缓存：服务端库注入是配置期事实，未缓存就必须先下载并读 server jar";
+		}
+
+		return null;
+	}
+
+	/** {@return 是否开启了 Minecraft jar 签名校验} 判据与 {@link #verifyJars()} 一致. */
+	private boolean verificationEnabled() {
+		return GradleUtils.getBooleanProperty(getProject(), Constants.Properties.ENABLE_MINECRAFT_VERIFICATION);
+	}
+
+	/**
+	 * {@return 映射依赖是否可确认为 tiny v2}.
+	 *
+	 * <p>配置期读到 V1 映射时，{@code MappingConfiguration.storeMappings} 会打开 merged jar 补字段名，
+	 * 因此「这次用的到底是 V1 还是 V2」必须在投影**之前**就有答案。映射 jar 的内容要等解析、抽取之后
+	 * 才知道（那时产物早已按任务路径声明），所以这里用声明处的 classifier 作为判据：`...:v2` 是 tiny v2
+	 * 变体，其余（无 classifier、未知层、非模块依赖）一律保守地当作「可能不是 v2」，退回配置期生产。
+	 * 判据偏保守只影响「迁移覆盖范围」，不影响行为——判错的代价是这次构建仍按改造前的路径跑。
+	 */
+	private boolean mappingsAreDeclaredV2() {
+		final Configuration mappings = getProject().getConfigurations().findByName(Constants.Configurations.MAPPINGS);
+
+		if (mappings == null || mappings.getDependencies().size() != 1) {
+			// 无映射依赖（无需映射的配置）或形态未知（多层映射由别处展开）：保守回退
+			return false;
+		}
+
+		final Dependency dependency = mappings.getDependencies().iterator().next();
+		return "v2".equals(DependencyInfo.create(getProject(), dependency, mappings).getDeclaredClassifier());
+	}
+
+	/** {@return server bundle 元数据是否已能在配置期无 jar 读取地拿到} 见 {@link BundleMetadata#isCached}. */
+	private boolean isServerBundleMetadataCached() {
+		final MinecraftVersionMeta.Download serverDownload = getVersionInfo().download("server");
+		final String sha1 = serverDownload != null ? serverDownload.sha1() : null;
+		final var store = new net.fabricmc.loom.spec.SpecStore(getExtension().getFiles().getUserCache().toPath());
+		return BundleMetadata.isCached(store, sha1);
+	}
+
+	/**
+	 * 把本 provider 的产物投影成执行期任务.
+	 *
+	 * <p>这里只做「配置期已知量 → 任务输入」的映射，不写任何产物文件：产物有效性交给 Gradle 的
+	 * up-to-date 判定与构建缓存，并发保护交给任务图，残骸恢复交给构建缓存。产物路径一律沿用既有位置
+	 * （{@code <userCache>/<mcVersion>/}），否则消费侧按路径找产物的地方会全部悬空。
+	 *
+	 * <p>同一产物路径在本构建内只能有一个生产者，因此逐产物走
+	 * {@link RemapMinecraftTaskRegistry#claim}：同一构建内两个配置相同的子项目不会各自建一个任务写同一个文件。
+	 */
+	private void projectToTasks() throws IOException {
+		final Map<Path, Producer> producers = new LinkedHashMap<>();
+
+		// bundle 元数据已由 projectionBlocker 保证命中 L2 缓存：这里读它不会打开 server jar
+		if (provideServer()) {
+			serverBundleMetadata = readServerBundleMetadata();
+		}
+
+		if (provideClient()) {
+			registerDownloadTask(producers, "downloadMinecraftClientJar", "client", getVersionInfo().download("client"), minecraftClientJar);
+		}
+
+		if (provideServer()) {
+			registerDownloadTask(producers, "downloadMinecraftServerJar", "server", getVersionInfo().download("server"), minecraftServerJar);
+
+			if (serverBundleMetadata != null) {
+				registerExtractTask(producers);
+			}
+		}
+
+		// 子 provider 追加自己的产物（合并/拆分）：它们把「我的输入就是你的产出」登记成任务依赖，
+		// 因此必须在下载/抽取登记之后、整张表冻结之前执行
+		registerProviderTasks(producers);
+
+		jarProducers = Map.copyOf(producers);
+		taskProduction = true;
+		// 登记任务产出：消费侧（重映射任务、生产环境客户端）据此拿到携带任务依赖的文件集合
+		registerJarOutputs();
+		// 用 Gradle 的 lifecycle 而不是 SLF4J 的 info：默认控制台级别是 LIFECYCLE，
+		// 「本次到底走哪条生产路径」必须默认可见，否则回退是静默的
+		getProject().getLogger().lifecycle("Minecraft {} 的 jar 生产由执行期任务承担：{}", minecraftVersion(),
+				producers.values().stream().map(Producer::taskPath).distinct().toList());
+	}
+
+	/**
+	 * 子 provider 在此注册自己的产物（合并/拆分），并把它们的输入登记成任务依赖.
+	 *
+	 * <p>默认什么也不做：产物就是下载/抽取出来的那些 jar。
+	 *
+	 * @param producers 本次已登记的产物（可写）：键是产物的绝对规范化路径
+	 */
+	protected void registerProviderTasks(Map<Path, Producer> producers) {
+	}
+
+	/**
+	 * 把本 provider 的最终产物（{@link #getMinecraftJars()}）登记给消费侧.
+	 *
+	 * <p>登记的是**最终产物**而不是中间件（client/server/抽取产物）：配置期回退路径下
+	 * {@code LoomGradleExtension.getMinecraftJars(OFFICIAL)} 给的也是最终产物，两者必须一致，
+	 * 否则消费侧的文件集合会随「投影与否」变化。
+	 */
+	private void registerJarOutputs() {
+		final ConfigurableFileCollection outputs = getProject().getObjects().fileCollection();
+
+		for (Path jar : getMinecraftJars()) {
+			outputs.from(jar.toFile());
+			final String taskPath = productionTaskPath(jar);
+
+			if (taskPath != null) {
+				outputs.builtBy(taskPath);
+			}
+		}
+
+		getExtension().setMinecraftJarsTaskOutputs(getOfficialNamespace(), outputs);
+	}
+
+	/** {@return 本批登记中该产物的生产者；未登记时为 {@code null}} 供子 provider 建任务依赖用. */
+	protected static @Nullable Producer producerOf(Map<Path, Producer> producers, Path artifact) {
+		return producers.get(normalize(artifact));
+	}
+
+	/**
+	 * 把生产者登记成任务依赖；未投影（无任务）时什么也不做.
+	 *
+	 * <p>{@code dependsOn}/{@code builtBy} 都接受任务路径：产出方可能由另一份 Loom classloader 配置，
+	 * 把对方的任务实例交过来会在使用处抛 {@code ClassCastException}。
+	 */
+	protected static void dependOn(Task task, @Nullable Producer producer) {
+		final String taskPath = taskPathOf(producer);
+
+		if (taskPath != null) {
+			task.dependsOn(taskPath);
+		}
+	}
+
+	/**
+	 * 注册单个下载任务.
+	 *
+	 * <p>输入与配置期的 {@code extension.download(url)} 逐项同源：url、严格 sha1 校验、离线、
+	 * 强制刷新。{@code useDefaultCache} 恒为假——配置期那条路径用的是 {@code sha1(...)} 而不是
+	 * {@code defaultCache()}，两者的失效策略不同。
+	 */
+	private void registerDownloadTask(Map<Path, Producer> producers, String taskName, String label,
+			MinecraftVersionMeta.Download download, File target) {
+		final Project project = getProject();
+		final boolean offline = project.getGradle().getStartParameter().isOffline();
+		final boolean forceDownload = getExtension().manualRefreshDeps();
+
+		producers.put(normalize(target.toPath()), RemapMinecraftTaskRegistry.claim(project, target.toPath(), Map.of(
+				"stage", "download",
+				"url", download.url(),
+				"sha1", download.sha1(),
+				"offline", Boolean.toString(offline),
+				"forceDownload", Boolean.toString(forceDownload)
+		), () -> project.getTasks().register(taskName, DownloadArtifactTask.class, task -> {
+			task.setGroup(Constants.TaskGroup.FABRIC);
+			task.setDescription("Downloads the Minecraft %s jar for %s".formatted(label, minecraftVersion()));
+			task.getUrl().set(download.url());
+			task.getSha1().set(download.sha1());
+			task.getOffline().set(offline);
+			task.getForceDownload().set(forceDownload);
+			task.getUseDefaultCache().set(false);
+			task.getOutputFile().set(target);
+		})));
+	}
+
+	/**
+	 * 注册从 bootstrap server jar 抽取内嵌 server jar 的任务.
+	 *
+	 * <p>抽取判据与配置期 {@link #extractBundledServerJar()} 逐项一致（条目数必须为 1、条目路径与
+	 * sha1 取自 bundle 元数据），产出位置也一致：抽取产物是合并/拆分的输入，换路径会让下游读不到它。
+	 */
+	private void registerExtractTask(Map<Path, Producer> producers) {
+		final BundleMetadata metadata = Objects.requireNonNull(serverBundleMetadata, "没有 bundle 元数据就没有可抽取的 server jar");
+
+		if (metadata.versions().size() != 1) {
+			throw new UnsupportedOperationException("Expected only 1 version in META-INF/versions.list, but got %d".formatted(metadata.versions().size()));
+		}
+
+		final Project project = getProject();
+		final BundleMetadata.Entry entry = metadata.versions().get(0);
+		final Path output = normalize(getMinecraftExtractedServerJar().toPath());
+		final boolean refreshDeps = getExtension().refreshDeps();
+		final Producer serverJarProducer = producers.get(normalize(minecraftServerJar.toPath()));
+
+		producers.put(output, RemapMinecraftTaskRegistry.claim(project, output, Map.of(
+				"stage", "extract-server-jar",
+				"serverJar", normalize(minecraftServerJar.toPath()).toString(),
+				"entryPath", entry.path(),
+				"entrySha1", entry.sha1(),
+				"refreshDeps", Boolean.toString(refreshDeps)
+		), () -> project.getTasks().register("extractMinecraftServerJar", ExtractMinecraftServerJarTask.class, task -> {
+			task.setGroup(Constants.TaskGroup.FABRIC);
+			task.setDescription("Extracts the Minecraft server jar for %s from the bootstrap jar".formatted(minecraftVersion()));
+			task.getServerJar().set(minecraftServerJar);
+			task.getEntryPath().set(entry.path());
+			task.getEntrySha1().set(entry.sha1());
+			task.getRefreshDeps().set(refreshDeps);
+			task.getOutputJar().set(output.toFile());
+			// 输入 jar 由下载任务产出：按任务路径建依赖（产出方可能来自另一份 Loom classloader）
+			dependOn(task, serverJarProducer);
+		})));
+	}
+
+	/**
+	 * {@return 产出该产物的任务路径；未投影时为 {@code null}}.
+	 *
+	 * <p>交给 {@code dependsOn}/{@code builtBy} 用的是任务**路径**而不是任务实例：产出方可能由另一份
+	 * Loom classloader 配置（约定插件/included build 各自带一份 Loom），把对方的任务实例交过来会在
+	 * 使用处抛 {@code ClassCastException}。
+	 */
+	private static @Nullable String taskPathOf(@Nullable Producer producer) {
+		return producer == null ? null : producer.taskPath();
+	}
+
+	/**
+	 * {@return 该产物的产出任务路径；本 provider 未投影或该路径不由本 provider 产出时为 {@code null}}.
+	 *
+	 * <p>供消费方把「我的输入就是你的产出」表达成任务依赖。
+	 */
+	public @Nullable String productionTaskPath(Path artifact) {
+		return taskPathOf(jarProducers.get(normalize(artifact)));
+	}
+
+	/**
+	 * {@return 该产物「按路径声明 + 携带产出任务依赖」的单文件集合}.
+	 *
+	 * <p>未投影时是裸文件，与改造前的语义一致（消费侧只需路径，产物早已在配置期落盘）。
+	 */
+	public FileCollection outputForTasks(Path artifact) {
+		final ConfigurableFileCollection files = getProject().files(artifact.toFile());
+		final String taskPath = taskPathOf(jarProducers.get(normalize(artifact)));
+
+		if (taskPath != null) {
+			files.builtBy(taskPath);
+		}
+
+		return files;
+	}
+
+	/** 把「本任务以该产物为输入」表达成任务依赖；未投影时什么也不做. */
+	public void addProducerDependency(Task task, Path artifact) {
+		dependOn(task, jarProducers.get(normalize(artifact)));
+	}
+
+	/** {@return 路径的绝对规范化形式} 生产者的键一律用它，避免「同一文件两种写法」查不到生产者. */
+	protected static Path normalize(Path path) {
+		return path.toAbsolutePath().normalize();
+	}
+
+	/**
+	 * 配置期生产：本次改造前的路径，只对「无法安全投影」的形态保留.
+	 *
+	 * <p>整段语义与改造前逐字一致——无锁快路径、跨进程互斥、锁内二次确认、抽取、签名校验。
+	 */
+	private void produceJarsInConfiguration() throws Exception {
+		final String blocker = projectionBlocker();
+
+		if (blocker != null) {
+			getProject().getLogger().lifecycle("Minecraft {} 的 jar 保持配置期生产：{}", minecraftVersion(), blocker);
+		}
 
 		// 无锁快路径：未要求刷新且所有产物已就绪时，不获取任何文件锁
 		if (jarsRequireProduction()) {
@@ -128,10 +481,6 @@ public abstract class MinecraftProvider {
 		if (provideServer() && serverBundleMetadata == null) {
 			serverBundleMetadata = readServerBundleMetadata();
 		}
-
-		// 内存配置：libraryProvider 每次都必须执行
-		final MinecraftLibraryProvider libraryProvider = new MinecraftLibraryProvider(this, configContext.project());
-		libraryProvider.provide();
 	}
 
 	/**

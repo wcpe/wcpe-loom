@@ -788,6 +788,14 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 						task.getRemapClasspath().from(path);
 					}
 
+					// 输入 jar 与 classpath 里的 vanilla 产物可能由 vanilla 链的任务产出：按路径声明不带任务依赖，
+					// 冷缓存下重映射会在产物落位前开跑（配置期旧路径里产物早已落盘，故此前不需要这条）
+					minecraftProvider.addProducerDependency(task, remappedJars.inputJar());
+
+					for (Path path : remappedJars.remapClasspath()) {
+						minecraftProvider.addProducerDependency(task, path);
+					}
+
 					task.getMappingsServiceOptions().set(mappingConfiguration.getMappingsServiceOptions(project, MappingOption.forPlatform(extension)));
 					task.getFromNamespace().set(fromNamespace);
 					task.getToNamespace().set(toNamespace);

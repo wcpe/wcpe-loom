@@ -27,6 +27,8 @@ package net.fabricmc.loom.configuration.providers.minecraft;
 import java.nio.file.Path;
 import java.util.List;
 
+import org.jspecify.annotations.Nullable;
+
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.ConfigContext;
 import net.fabricmc.loom.configuration.providers.BundleMetadata;
@@ -74,6 +76,20 @@ public abstract class SingleJarMinecraftProvider extends MinecraftProvider {
 	@Override
 	public List<Path> getMinecraftJars() {
 		return List.of(minecraftEnvOnlyJar);
+	}
+
+	/**
+	 * env-only jar 的生产留在配置期，因此 vanilla 链也必须留在配置期.
+	 *
+	 * <p>{@link #processJar()} 在配置期把 vanilla jar 过一遍 TinyRemapper（{@code readInputs} 会读它的
+	 * 全部类），产物才是本 provider 的 jar。若把下载/抽取搬到执行期，配置期就没有可读的输入。
+	 * 「env-only 生产任务化」不在本次范围内（它是一次独立的重映射型任务，和 mapped 阶段同批更合适）。
+	 *
+	 * <p>legacy merged（MC 1.3 之前）经两个本类实例委托生产，因此同样被这条判据覆盖。
+	 */
+	@Override
+	protected @Nullable String projectionBlocker() {
+		return "env-only jar（clientOnly/serverOnly 形态）在配置期读 vanilla jar 做 TinyRemapper 透传";
 	}
 
 	@Override

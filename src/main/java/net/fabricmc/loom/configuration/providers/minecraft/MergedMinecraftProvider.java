@@ -28,13 +28,19 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
+import org.gradle.api.Project;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.ConfigContext;
+import net.fabricmc.loom.pipeline.MergeMinecraftJarsTask;
+import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
+import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry.Producer;
+import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.loom.util.cache.JarReusability;
 import net.fabricmc.loom.util.gradle.LoomCacheService;
@@ -75,6 +81,11 @@ public class MergedMinecraftProvider extends MinecraftProvider {
 			throw new UnsupportedOperationException("This version does not provide both the client and server jars - please select the client-only or server-only jar configuration!");
 		}
 
+		if (isTaskProduction()) {
+			// 产物已由 mergeMinecraftJars 任务承担（在 super.provide() 里登记），这里不再写任何产物
+			return;
+		}
+
 		// 无锁快路径：merged jar 已就绪（内容级判据，见 JarReusability.isReusable）且未要求刷新时不获取文件锁。
 		// 不能只判存在：该产物落在跨 daemon／跨工作树共享的 <userCache>/<mcVersion> 下，被中断就地写会留下
 		// 0 字节或截断的 merged jar，PR #8 移除「残留锁 → 全量重建」兜底后，存在性判定会把它永久复用。
@@ -101,16 +112,50 @@ public class MergedMinecraftProvider extends MinecraftProvider {
 		}
 	}
 
-	protected void mergeJars() throws IOException {
-		File minecraftClientJar = getMinecraftClientJar();
-		File minecraftServerJar = getMinecraftServerJar();
+	/**
+	 * 注册合并任务：产物生产交给执行期任务，产物路径与配置期一致.
+	 *
+	 * <p>server 侧输入按配置期同一判据选好：该版本使用 bootstrap jar 时取抽取产物，否则取下载下来的
+	 * server jar。判据来自 L2 规格缓存（不打开 jar），因此这一步不需要产物已存在。
+	 */
+	@Override
+	protected void registerProviderTasks(Map<Path, Producer> producers) {
+		final Project project = getProject();
+		final Path clientJar = normalize(getMinecraftClientJar().toPath());
+		final Path serverJar = normalize(getServerJarToMerge().toPath());
+		final Path mergedJar = normalize(minecraftMergedJar);
 
+		producers.put(mergedJar, RemapMinecraftTaskRegistry.claim(project, mergedJar, Map.of(
+				"stage", "merge-jars",
+				"clientJar", clientJar.toString(),
+				"serverJar", serverJar.toString()
+		), () -> project.getTasks().register("mergeMinecraftJars", MergeMinecraftJarsTask.class, task -> {
+			task.setGroup(Constants.TaskGroup.FABRIC);
+			task.setDescription("Merges the Minecraft client and server jar for %s".formatted(minecraftVersion()));
+			// 产物位置与配置期一致：消费侧（重映射任务、genSources）按这个路径找 merged jar
+			task.getClientJar().set(clientJar.toFile());
+			task.getServerJar().set(serverJar.toFile());
+			task.getMergedJar().set(mergedJar.toFile());
+			// 两个输入都由 vanilla 链的任务产出：按任务路径建依赖，冷缓存下才不会在输入落位前开跑
+			dependOn(task, producerOf(producers, clientJar));
+			dependOn(task, producerOf(producers, serverJar));
+		})));
+	}
+
+	/** {@return 本次该拿哪个 server jar 参与合并} 与配置期 {@link #mergeJars()} 同一判据. */
+	private File getServerJarToMerge() {
 		if (getServerBundleMetadata() != null) {
-			minecraftServerJar = getMinecraftExtractedServerJar();
+			// bootstrap 版本：真身在抽取产物里
+			return getMinecraftExtractedServerJar();
 		}
 
+		return getMinecraftServerJar();
+	}
+
+	protected void mergeJars() throws IOException {
+		File minecraftClientJar = getMinecraftClientJar();
+		final File serverJar = getServerJarToMerge();
 		final File clientJar = minecraftClientJar;
-		final File serverJar = minecraftServerJar;
 		// 原子发布：合并写到同目录唯一临时 jar，完整后再原子 move 到 minecraftMergedJar
 		AtomicFiles.publish(minecraftMergedJar, tmpJar -> mergeJars(clientJar, serverJar, tmpJar.toFile()));
 	}
