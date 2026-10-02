@@ -61,7 +61,7 @@ import dev.architectury.loom.forge.dependency.DependencyProvider;
 import dev.architectury.loom.forge.dependency.ForgeProvider;
 import dev.architectury.loom.forge.dependency.ForgeUserdevProvider;
 import dev.architectury.loom.forge.dependency.PatchProvider;
-import dev.architectury.loom.forge.tool.ForgeToolValueSource;
+import dev.architectury.loom.forge.tool.ForgeExternalToolService;
 import dev.architectury.loom.mappings.MappingOption;
 import dev.architectury.loom.mcpconfig.McpConfigProvider;
 import dev.architectury.loom.mcpconfig.McpExecutor;
@@ -889,34 +889,70 @@ public class MinecraftPatchedProvider {
 	}
 
 	private void createNeoForgeInstallerToolsPrePatchJar(Path output) throws IOException {
-		try (var tempFiles = new TempFiles()) {
+		try (var tempFiles = new TempFiles(); var serviceFactory = new ScopedServiceFactory()) {
 			final Path mappings = tempFiles.file("mappings", ".txt");
 
 			getExtension().download(minecraftProvider.getVersionInfo().download("client_mappings").url())
 					.downloadPath(mappings);
 
-			ForgeToolValueSource.exec(project, settings -> {
-				// todo: does it work without fatjar
-				settings.getExecClasspath().from(DependencyDownloader.download(project, LoomVersions.NEOFORGE_INSTALLER_TOOLS.mavenNotation() + ":fatjar"));
-				settings.getMainClass().set("net.neoforged.installertools.ConsoleTool");
-				settings.args("--task", "PROCESS_MINECRAFT_JAR");
-
-				switch (type) {
-				case CLIENT_ONLY -> settings.args("--input", minecraftProvider.getMinecraftClientJar().getAbsolutePath());
-				case SERVER_ONLY -> settings.args("--input", minecraftProvider.getMinecraftServerJar().getAbsolutePath());
-
-				case MERGED -> {
-					settings.args("--input", minecraftProvider.getMinecraftClientJar().getAbsolutePath());
-					settings.args("--input", minecraftProvider.getMinecraftServerJar().getAbsolutePath());
-				}
-				}
-
-				settings.args("--input-mappings", mappings.toAbsolutePath().toString());
-				// 外部工具自行创建该文件：指向本次独占的临时文件，避免锁外读方看到半截产物
-				settings.args("--output", output.toAbsolutePath().toString());
-				settings.args("--neoform-data", getExtension().getMcpConfigProvider().getMcp().toAbsolutePath().toString());
-			});
+			final ForgeExternalToolService installerTools = serviceFactory.get(createNeoForgeInstallerTools());
+			installerTools.exec(Map.of(
+					"{mappings}", mappings.toAbsolutePath().toString(),
+					"{output}", output.toAbsolutePath().toString()
+			));
 		}
+	}
+
+	/**
+	 * {@return NeoForge installer-tools 的声明式选项（工具 classpath、主类与参数模板）}.
+	 *
+	 * <p>参数模板里的取值分两类：
+	 * <ul>
+	 *   <li><b>配置期就确定的纯值</b>——{@code --task}、输入 jar 与 {@code --neoform-data}——就地定死在模板里，
+	 *       于是这条链搬进任务后不需要在执行期回读项目模型；</li>
+	 *   <li><b>只有调用时才知道的路径</b>——{@code {mappings}}（本次下载的 client 映射）与
+	 *       {@code {output}}（本次调用的目标 jar）——留作占位符。</li>
+	 * </ul>
+	 *
+	 * <p>参数顺序与改造前那串 {@code settings.args(...)} 逐条一致。
+	 *
+	 * <p>与 {@link #createBinpatcherTool()} 同理，供任务侧把同一条调用搬进执行期：把返回值挂成任务的
+	 * {@code @Nested} 输入即可。
+	 */
+	public ForgeExternalToolService.Options createNeoForgeInstallerTools() {
+		// todo: does it work without fatjar
+		final FileCollection classpath = DependencyDownloader.download(project, LoomVersions.NEOFORGE_INSTALLER_TOOLS.mavenNotation() + ":fatjar");
+		final ForgeExternalToolService.Options tool = ForgeExternalToolService
+				.createOptions(project, classpath, "net.neoforged.installertools.ConsoleTool").get();
+		final List<String> args = new ArrayList<>();
+		args.add("--task");
+		args.add("PROCESS_MINECRAFT_JAR");
+
+		switch (type) {
+		case CLIENT_ONLY -> addInputArg(args, minecraftProvider.getMinecraftClientJar());
+		case SERVER_ONLY -> addInputArg(args, minecraftProvider.getMinecraftServerJar());
+
+		case MERGED -> {
+			addInputArg(args, minecraftProvider.getMinecraftClientJar());
+			addInputArg(args, minecraftProvider.getMinecraftServerJar());
+		}
+		}
+
+		args.add("--input-mappings");
+		args.add("{mappings}");
+		// 外部工具自行创建该文件：指向本次独占的临时文件，避免锁外读方看到半截产物
+		args.add("--output");
+		args.add("{output}");
+		args.add("--neoform-data");
+		args.add(getExtension().getMcpConfigProvider().getMcp().toAbsolutePath().toString());
+
+		tool.getArgsTemplate().set(args);
+		return tool;
+	}
+
+	private static void addInputArg(List<String> args, File input) {
+		args.add("--input");
+		args.add(input.getAbsolutePath());
 	}
 
 	private static void fillClientExtraJar(ProductionOptions options, Path output) throws IOException {
@@ -1207,62 +1243,58 @@ public class MinecraftPatchedProvider {
 		logger.lifecycle(":patched jars in " + stopwatch.stop());
 	}
 
+	/**
+	 * 对给定 jar 执行 Forge 的 binary patch.
+	 *
+	 * <p>工具的 classpath、主类与参数模板都由 {@link ForgeExternalToolService.Options} 声明：
+	 * classpath 是惰性的（配置期只接线，取值推迟到真正执行时），发起调用也只依赖 {@link ServiceFactory}。
+	 * 因此本方法既能在配置期路径里调用，也能在把它连同调用点搬进任务之后于执行期调用——
+	 * 那条路径上不再有任何需要 {@code Project} 的同步求值。
+	 */
 	protected void patchJars(Path clean, Path output, Path patches) throws Exception {
-		ForgeToolValueSource.exec(project, spec -> {
-			UserdevConfig.BinaryPatcherConfig config = getExtension().getForgeUserdevProvider().getConfig().binpatcher();
-			final FileCollection download = DependencyDownloader.download(project, config.dependency());
-			spec.classpath(download);
-			spec.getMainClass().set(getMainClass(download));
-
-			for (String arg : config.args()) {
-				String actual = switch (arg) {
-				case "{clean}" -> clean.toAbsolutePath().toString();
-				case "{output}" -> output.toAbsolutePath().toString();
-				case "{patch}" -> patches.toAbsolutePath().toString();
-				default -> arg;
-				};
-				spec.args(actual);
-			}
-		});
+		try (var serviceFactory = new ScopedServiceFactory()) {
+			runBinpatcher(createBinpatcherTool(), clean, output, patches, serviceFactory);
+		}
 	}
 
-	private static String getMainClass(final Iterable<File> files) {
-		String mainClass = null;
-		IOException ex = null;
+	/**
+	 * {@return binpatcher 工具的声明式选项}.
+	 *
+	 * <p>配置期调用：只做接线。依赖坐标与参数模板都是从 userdev 配置读来的纯值，工具 classpath 是一个
+	 * 惰性的 {@code FileCollection}（{@code DependencyDownloader} 只建 detached configuration，
+	 * 不解析），主类由工具 jar 清单派生也是惰性的。因此这里既不解析依赖、也不发起进程。
+	 *
+	 * <p>任务侧要用同一份声明时，把返回值挂成任务的 {@code @Nested} 输入即可。
+	 */
+	public ForgeExternalToolService.Options createBinpatcherTool() {
+		final UserdevConfig.BinaryPatcherConfig config = getExtension().getForgeUserdevProvider().getConfig().binpatcher();
+		final FileCollection classpath = DependencyDownloader.download(project, config.dependency());
+		final ForgeExternalToolService.Options tool = ForgeExternalToolService
+				.createOptionsFromManifest(project, classpath).get();
+		tool.getArgsTemplate().set(config.args());
+		return tool;
+	}
 
-		for (File file : files) {
-			if (file.getName().endsWith(".jar")) {
-				try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(file.toPath())) {
-					final Path mfPath = fs.getPath("META-INF/MANIFEST.MF");
-
-					if (Files.exists(mfPath)) {
-						try (InputStream in = Files.newInputStream(mfPath)) {
-							mainClass = new Manifest(in).getMainAttributes().getValue("Main-Class");
-						}
-					}
-				} catch (final IOException e) {
-					if (ex == null) {
-						ex = e;
-					} else {
-						ex.addSuppressed(e);
-					}
-				}
-
-				if (mainClass != null) {
-					break;
-				}
-			}
-		}
-
-		if (mainClass == null) {
-			if (ex != null) {
-				throw new UncheckedIOException(ex);
-			} else {
-				throw new RuntimeException("Failed to find main class");
-			}
-		}
-
-		return mainClass;
+	/**
+	 * 执行 binpatcher：把参数模板里的 {@code {clean}}／{@code {output}}／{@code {patch}} 按本次调用的
+	 * 路径展开后交给工具服务.
+	 *
+	 * <p>静态：任务侧（执行期）不持有 provider，也要能用同一份实现发起这次调用，故只认选项与服务工厂。
+	 *
+	 * @param tool binpatcher 的声明式选项（见 {@link #createBinpatcherTool()}）
+	 * @param clean 待打补丁的 Minecraft jar
+	 * @param output 本次调用的目标 jar
+	 * @param patches 补丁 jar
+	 * @param serviceFactory 服务工厂
+	 */
+	public static void runBinpatcher(ForgeExternalToolService.Options tool, Path clean, Path output, Path patches,
+			ServiceFactory serviceFactory) {
+		final ForgeExternalToolService binpatcher = serviceFactory.get(tool);
+		binpatcher.exec(Map.of(
+				"{clean}", clean.toAbsolutePath().toString(),
+				"{output}", output.toAbsolutePath().toString(),
+				"{patch}", patches.toAbsolutePath().toString()
+		));
 	}
 
 	static void walkFileSystems(Path source, Path target, Predicate<Path> filter, Function<FileSystem, Iterable<Path>> toWalk, FsPathConsumer action)
