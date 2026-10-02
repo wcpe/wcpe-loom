@@ -321,6 +321,12 @@ public class ModConfigurationRemapper {
 
 						return RemapModsTask.collectRemapClasspath(remapConfigSourceFiles, inputsBeingRemapped);
 					}));
+					// MC jar 必须在重映射 classpath 上：覆写链的方法重命名靠它做类型层级解析。
+					// 旧 ModProcessor 在配置期显式 readClassPath(getMinecraftJars(productionNamespace))，
+					// 迁移到任务时漏了这一路，导致覆写传播的方法名（如 reload）保持源命名空间原名。
+					// 取源命名空间的集合：已登记任务产出时携带任务依赖（同时保证 MC 先产出），
+					// 未登记时回退为配置期文件，与旧语义一致。
+					task.getRemapClasspath().from(extension.getMinecraftJarsCollection(extension.getProductionNamespaceEnum().get()));
 					task.getMappingsServiceOptions().set(
 							mappingConfiguration.getMappingsServiceOptions(project, MappingOption.forPlatform(extension)));
 					task.getSourceNamespace().set(sourceNamespace);
