@@ -30,6 +30,7 @@ import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
 import org.gradle.api.Project;
 
 import net.fabricmc.loom.LoomGradleExtension;
+import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJar;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
 import net.fabricmc.loom.configuration.providers.minecraft.mapped.MappedMinecraftProvider;
@@ -83,6 +84,14 @@ public class SingleJarDecompileConfiguration extends DecompileConfiguration<Mapp
 
 				task.getInputJar().set(MinecraftPatchedProvider.get(project).getMinecraftIntermediateJar().toFile());
 				task.getRuntimeJar().set(minecraftJar.toFile());
+				// runtimeJar 是 named 命名空间的 MC jar，即 mapped provider 的产物；生产链迁移后它只在执行期
+				// 由重映射任务（RemapMinecraftTask / ProcessMinecraftJarTask）落位，而上面那行只是按**裸路径**
+				// 声明输入，不携带产出方——冷缓存下 Gradle 会在输入校验处以
+				// 「property 'runtimeJar' specifies file ... which doesn't exist」直接失败（实测 Forge 1.19.2），
+				// 因为没有任何任务被要求先产出它。故显式接上该命名空间的产出任务依赖：登记过任务产出时
+				// 这份集合由产出任务派生（见 LoomGradleExtension#setMinecraftJarsTaskOutputs），
+				// 未登记（配置期回退）时是纯文件集合，dependsOn 无副作用，与改造前语义一致。
+				task.dependsOn(extension.getMinecraftJarsCollection(MappingsNamespace.NAMED));
 			});
 		}
 	}
