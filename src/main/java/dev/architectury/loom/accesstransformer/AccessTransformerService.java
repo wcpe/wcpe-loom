@@ -179,6 +179,20 @@ public final class AccessTransformerService extends Service<AccessTransformerSer
 		return createOptions(project, atFiles);
 	}
 
+	/**
+	 * 把 loader 的 AT 文件从 userdev jar 里抽到本次调用的临时目录，返回抽出的文件路径.
+	 *
+	 * <p>与 {@link #createOptionsForLoaderAts(Project, TempFiles)} 共用这一处实现：配置期路径在选项被求值时
+	 * 抽取，执行期任务在自己的临时目录里抽取，因此两条路径的 {@code --atFile} 集合与顺序不会分叉。
+	 *
+	 * @param jar userdev jar
+	 * @param location AT 文件在 jar 里的位置声明（{@code UserdevConfig.ats}）
+	 * @param tempFiles 抽出文件的临时目录；必须活到 AT 工具执行结束
+	 */
+	public static List<String> extractLoaderAts(Path jar, UserdevConfig.AccessTransformerLocation location, TempFiles tempFiles) throws IOException {
+		return extractAccessTransformers(jar, location, tempFiles);
+	}
+
 	private static List<String> extractAccessTransformers(Path jar, UserdevConfig.AccessTransformerLocation location, TempFiles tempFiles) throws IOException {
 		final List<String> extracted = new ArrayList<>();
 

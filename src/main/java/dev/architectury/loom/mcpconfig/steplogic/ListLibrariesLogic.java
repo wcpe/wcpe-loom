@@ -32,6 +32,8 @@ import java.nio.file.Files;
 import org.gradle.api.file.ConfigurableFileCollection;
 import org.gradle.api.provider.Provider;
 import org.gradle.api.tasks.InputFiles;
+import org.gradle.api.tasks.PathSensitive;
+import org.gradle.api.tasks.PathSensitivity;
 
 import net.fabricmc.loom.util.service.Service;
 import net.fabricmc.loom.util.service.ServiceFactory;
@@ -44,7 +46,10 @@ public final class ListLibrariesLogic extends StepLogic<ListLibrariesLogic.Optio
 	public static final ServiceType<Options, ListLibrariesLogic> TYPE = new ServiceType<>(Options.class, ListLibrariesLogic.class);
 
 	public interface Options extends Service.Options {
+		// 归一化策略必须声明（选项现在会作为任务的 @Nested 输入参与 up-to-date 判定），且必须是 ABSOLUTE：
+		// 本步骤把库的**绝对路径**写进 libraries.txt，路径换了产物就换了，故不能按相对路径归一化。
 		@InputFiles
+		@PathSensitive(PathSensitivity.ABSOLUTE)
 		ConfigurableFileCollection getMinecraftLibraries();
 	}
 

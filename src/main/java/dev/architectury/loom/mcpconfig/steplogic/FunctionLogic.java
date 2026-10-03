@@ -36,6 +36,8 @@ import org.gradle.api.provider.Property;
 import org.gradle.api.provider.Provider;
 import org.gradle.api.tasks.Input;
 import org.gradle.api.tasks.InputFile;
+import org.gradle.api.tasks.PathSensitive;
+import org.gradle.api.tasks.PathSensitivity;
 
 import net.fabricmc.loom.util.Lazy;
 import net.fabricmc.loom.util.service.Service;
@@ -52,7 +54,10 @@ public final class FunctionLogic extends StepLogic<FunctionLogic.Options> {
 		@Input
 		Property<McpConfigFunction> getFunction();
 
+		// 归一化策略必须声明：这些选项现在会作为任务的 @Nested 输入参与 up-to-date 判定，
+		// 而 Gradle 对「缺归一化策略的 @InputFile」会直接让任务失败。工具 jar 只按内容参与判定，故用 NONE。
 		@InputFile
+		@PathSensitive(PathSensitivity.NONE)
 		RegularFileProperty getToolJar();
 	}
 

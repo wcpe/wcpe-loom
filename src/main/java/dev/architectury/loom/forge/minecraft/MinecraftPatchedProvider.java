@@ -55,6 +55,7 @@ import java.util.stream.Stream;
 import de.oceanlabs.mcp.mcinjector.adaptors.ParameterAnnotationFixer;
 import dev.architectury.loom.accesstransformer.AccessTransformerService;
 import dev.architectury.loom.forge.CoreModClassRemapper;
+import dev.architectury.loom.forge.ForgeMigratedMappingConfiguration;
 import dev.architectury.loom.forge.InnerClassRemapper;
 import dev.architectury.loom.forge.config.UserdevConfig;
 import dev.architectury.loom.forge.dependency.DependencyProvider;
@@ -74,6 +75,7 @@ import dev.architectury.loom.util.ThreadingUtils;
 import dev.architectury.loom.util.Version;
 import dev.architectury.loom.util.function.FsPathConsumer;
 import org.gradle.api.Project;
+import org.gradle.api.Task;
 import org.gradle.api.file.ConfigurableFileCollection;
 import org.gradle.api.file.FileCollection;
 import org.gradle.api.logging.Logger;
@@ -91,7 +93,10 @@ import net.fabricmc.loom.build.IntermediaryNamespaces;
 import net.fabricmc.loom.configuration.providers.mappings.TinyMappingsService;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+import net.fabricmc.loom.pipeline.AccessTransformForgeJarTask;
+import net.fabricmc.loom.pipeline.GenerateForgePatchedIntermediateJarTask;
 import net.fabricmc.loom.pipeline.GenerateForgePatchedJarTask;
+import net.fabricmc.loom.pipeline.GenerateForgePrePatchJarTask;
 import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
 import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry.Producer;
 import net.fabricmc.loom.util.Check;
@@ -142,6 +147,11 @@ public class MinecraftPatchedProvider {
 
 	// 对子类开放：legacy Forge 子类需要读写该标志，且 isDirty() 必须能反映子类的重建状态
 	protected boolean dirty = false;
+
+	// pre-patch jar 的产出方：投影成任务时非空（见 registerPatchedChainTasks），配置期生产时为 null
+	private @Nullable Producer prePatchJarProducer;
+	// 三级产物是否已投影成执行期任务：决定 provide() 与按件补齐各走哪条路径
+	private boolean taskBasedChain = false;
 
 	public static MinecraftPatchedProvider get(Project project) {
 		MinecraftProvider provider = LoomGradleExtension.get(project).getMinecraftProvider();
@@ -266,6 +276,17 @@ public class MinecraftPatchedProvider {
 	public void provide() throws Exception {
 		initPatchedFiles();
 
+		// 可投影则把三级产物（pre-patch / intermediate / at-patched）的生产交给执行期任务，
+		// 否则整批沿用改造前的配置期路径（含留痕，见 provideProjectionBlocker）
+		final String blocker = provideProjectionBlocker();
+
+		if (blocker == null) {
+			registerPatchedChainTasks();
+			return;
+		}
+
+		logger.lifecycle("Forge 的 patched 中间产物保持配置期生产：{}", blocker);
+
 		// 无锁快路径：产物齐备且补丁版本最新时，本次仅做内存配置，不触碰共享缓存，不取锁
 		if (!needsWork()) {
 			this.dirty = false;
@@ -273,6 +294,172 @@ public class MinecraftPatchedProvider {
 		}
 
 		withPatchedLock(this::providePatched);
+	}
+
+	/**
+	 * {@return 不能把三级 patched 产物的生产投影成执行期任务的原因；可以投影时为 {@code null}}.
+	 *
+	 * <p>与 {@code MinecraftProvider.projectionBlocker()} 同一风格：每一条都是一个「本形态的生产链不在本阶段
+	 * 定义之内」或「配置期有确定的读者会按路径读这些 jar」的形态，命中即整段退回配置期路径
+	 * （那条路径与改造前逐字一致），并留下 lifecycle 留痕。
+	 *
+	 * <ul>
+	 *   <li><b>legacy Forge（1.8-1.16）</b>：{@link MinecraftLegacyPatchedProvider#provide()} 覆写了本方法，
+	 *       走的是 FG2 工作目录下的一组产物，形态与 modern 不同。</li>
+	 *   <li><b>disableObfuscation / unobfuscated Forge</b>：pre-patch jar 走
+	 *       {@code createUnobfuscatedPrePatchJar}（userdev 合并分支），且 {@code remapJar} 也在配置期生产
+	 *       最终 jar 并读 at-patched jar——两处都不在本次迁移的形态之内。</li>
+	 *   <li><b>mappings 迁移器缓存未命中</b>：{@code ForgeMigratedMappingConfiguration.manipulateMappings}
+	 *       在配置期调用两个迁移器，它们在各自缓存未命中时会按路径读 intermediate jar
+	 *       （见 {@link #getOrProduceMinecraftPatchedIntermediateJar()}）。投影后那件产物只在执行期落位，
+	 *       配置期读者会拿到不存在的文件——因此该情形整批回退。迁移器自身任务化之后这一条应当删除。</li>
+	 * </ul>
+	 */
+	protected @Nullable String provideProjectionBlocker() {
+		if (getExtension().disableObfuscation()) {
+			return "disableObfuscation / unobfuscated Forge 的 pre-patch jar 与最终 jar 都走 userdev 合并分支，形态不同";
+		}
+
+		if (ForgeMigratedMappingConfiguration.needsPatchedIntermediateJar(ForgeProvider.getForgeCache(project),
+				getExtension().refreshDeps(), getExtension().shouldGenerateSrgTiny(), getExtension().isNeoForge())) {
+			return "mappings 迁移器（FieldMappingsMigrator / MethodInheritanceMappingsMigrator）缓存未命中，"
+					+ "配置期会按路径读 patched 中间产物";
+		}
+
+		return null;
+	}
+
+	/**
+	 * 把三级 patched 产物的生产登记成执行期任务.
+	 *
+	 * <p>三级各一个任务、各一条产物路径，逐级以前一级的产物为输入（任务依赖逐级建立）；
+	 * 产物路径一律沿用既有位置，否则消费侧（{@code getMinecraftJars()}、{@code genForgePatchedSources}）
+	 * 按路径找产物的地方会全部悬空。
+	 *
+	 * <p>同一产物路径在本构建内只能有一个生产者，因此逐产物走
+	 * {@link RemapMinecraftTaskRegistry#claim}：同一构建内两个配置相同的子项目不会各自建一个任务写同一个文件。
+	 */
+	private void registerPatchedChainTasks() {
+		final var extension = getExtension();
+		final Path prePatchJar = minecraftIntermediateJar.toAbsolutePath().normalize();
+		final Path patchedIntermediate = minecraftPatchedIntermediateJar.toAbsolutePath().normalize();
+		final Path atPatched = minecraftPatchedIntermediateAtJar.toAbsolutePath().normalize();
+
+		// 分支判据与配置期 createPrePatchJar 逐字一致（unobfuscated 已由 provideProjectionBlocker 排除）
+		final boolean installerTools = shouldUseNeoForgeInstallerToolsToCreatePrePatchJar();
+		// MCP 执行链的工作目录：配置期路径用随机临时目录，任务路径用项目内的固定目录，两者都「本次执行即用即删」
+		final Path mcpWorkDir = project.getLayout().getBuildDirectory()
+				.dir("tmp/" + GenerateForgePrePatchJarTask.NAME + "/" + type.id).get().getAsFile().toPath();
+
+		final Producer prePatchProducer = RemapMinecraftTaskRegistry.claim(project, prePatchJar, Map.of(
+				"stage", "forge-pre-patch-jar",
+				"mcVersion", extension.getMinecraftProvider().minecraftVersion(),
+				"forgeVersion", extension.getForgeProvider().getVersion().getCombined(),
+				"type", type.id,
+				"branch", installerTools ? GenerateForgePrePatchJarTask.BRANCH_NEOFORGE_INSTALLER_TOOLS
+						: GenerateForgePrePatchJarTask.BRANCH_MCP_RENAME
+		), () -> project.getTasks().register(GenerateForgePrePatchJarTask.NAME, GenerateForgePrePatchJarTask.class, task -> {
+			task.setGroup(Constants.TaskGroup.FABRIC);
+			task.setDescription("Produces the pre-patch Minecraft jar for %s".formatted(
+					extension.getMinecraftProvider().minecraftVersion()));
+			task.getOutputJar().set(prePatchJar.toFile());
+			task.getOffline().set(project.getGradle().getStartParameter().isOffline());
+			task.getManualRefreshDeps().set(extension.manualRefreshDeps());
+			task.getMcpWorkDir().set(mcpWorkDir.toFile());
+
+			if (installerTools) {
+				task.getBranch().set(GenerateForgePrePatchJarTask.BRANCH_NEOFORGE_INSTALLER_TOOLS);
+				task.getInstallerTools().set(createNeoForgeInstallerTools());
+				task.getClientMappingsUrl().set(Objects.requireNonNull(
+						minecraftProvider.getVersionInfo().download("client_mappings"),
+						"client_mappings download is not available for this Minecraft version").url());
+			} else {
+				task.getBranch().set(GenerateForgePrePatchJarTask.BRANCH_MCP_RENAME);
+
+				try {
+					task.getMcpOptions().set(createPrePatchJarMcpOptions(mcpWorkDir));
+				} catch (IOException e) {
+					throw new UncheckedIOException("无法声明 pre-patch jar 的 MCP 执行器选项", e);
+				}
+			}
+		}));
+
+		final Producer patchedProducer = RemapMinecraftTaskRegistry.claim(project, patchedIntermediate, Map.of(
+				"stage", "forge-patched-intermediate-jar",
+				"mcVersion", extension.getMinecraftProvider().minecraftVersion(),
+				"forgeVersion", extension.getForgeProvider().getVersion().getCombined(),
+				"type", type.id
+		), () -> project.getTasks().register(GenerateForgePatchedIntermediateJarTask.NAME,
+				GenerateForgePatchedIntermediateJarTask.class, task -> {
+					task.setGroup(Constants.TaskGroup.FABRIC);
+					task.setDescription("Produces the patched intermediate Minecraft jar for %s".formatted(
+							extension.getMinecraftProvider().minecraftVersion()));
+					task.getOutputJar().set(patchedIntermediate.toFile());
+					task.getPrePatchJar().set(prePatchJar.toFile());
+					// 补丁与工具声明都是配置期读项目模型得到的纯值/惰性声明（见 type.patches 与 createBinpatcherTool）
+					task.getPatches().set(type.patches.apply(extension.getPatchProvider(), extension.getForgeUserdevProvider()).toFile());
+					task.getBinpatcherTool().set(createBinpatcherTool());
+					task.getFixParameterAnnotations().set(extension.isForgeLikeAndNotOfficial() && !extension.isUnobfuscatedForge());
+					dependsOnProducer(task, prePatchProducer);
+				}));
+
+		final Producer atPatchedProducer = RemapMinecraftTaskRegistry.claim(project, atPatched, Map.of(
+				"stage", "forge-at-patched-jar",
+				"mcVersion", extension.getMinecraftProvider().minecraftVersion(),
+				"forgeVersion", extension.getForgeProvider().getVersion().getCombined(),
+				"type", type.id
+		), () -> project.getTasks().register(AccessTransformForgeJarTask.NAME, AccessTransformForgeJarTask.class, task -> {
+			task.setGroup(Constants.TaskGroup.FABRIC);
+			task.setDescription("Access transforms the patched Minecraft jar for %s".formatted(
+					extension.getMinecraftProvider().minecraftVersion()));
+			task.getOutputJar().set(atPatched.toFile());
+			task.getPatchedIntermediateJar().set(patchedIntermediate.toFile());
+			task.getForgeUserdevJar().set(getForgeUserdevJar());
+			// AT 工具信息只能在配置期解析（依赖解析 + Java 工具链），故解析成纯值后声明成任务输入
+			final AccessTransformerService.Tool atTool = AccessTransformerService.resolveTool(project);
+			task.getAtMainClass().set(atTool.mainClass());
+			task.getAtClasspath().from(atTool.classpath());
+			task.getAtJavaExecutable().set(atTool.javaExecutable());
+			task.getAtVerboseStdout().set(atTool.verboseStdout());
+			task.getAtVerboseStderr().set(atTool.verboseStderr());
+
+			// AT 文件的位置声明与配置期读的 UserdevConfig.ats 同源；文件本身在执行期抽到临时目录
+			extension.getForgeUserdevProvider().getConfig().ats().visit(directory -> {
+				task.getAtDirectory().set(directory);
+				return null;
+			}, paths -> {
+				task.getAtPaths().set(paths);
+				return null;
+			});
+
+			dependsOnProducer(task, patchedProducer);
+		}));
+
+		// at-patched jar 的产出方必须让 registerPatchedJarTask 找得到：那里的
+		// minecraftProvider.addProducerDependency(task, atPatched) 正是从这张表里取任务依赖
+		minecraftProvider.registerTaskProducedArtifact(atPatched, atPatchedProducer);
+		this.prePatchJarProducer = prePatchProducer;
+		this.taskBasedChain = true;
+
+		logger.lifecycle("Forge 的 patched 三级产物由执行期任务承担：{}",
+				List.of(prePatchProducer.taskPath(), patchedProducer.taskPath(), atPatchedProducer.taskPath()));
+	}
+
+	/**
+	 * {@return pre-patch jar 的产出任务路径；未投影（配置期生产）时为 {@code null}}.
+	 *
+	 * <p>供「按裸路径声明该产物为输入」的消费方（{@code genForgePatchedSources}）建任务依赖：
+	 * 它注册得比 {@link #provide()} 更早，故只能把这次查询做成惰性 provider。
+	 */
+	public @Nullable String getPrePatchJarProducerTaskPath() {
+		return prePatchJarProducer != null ? prePatchJarProducer.taskPath() : null;
+	}
+
+	/** 把上一级产物的产出方登记成任务依赖；未建任务（已有其它生产者）时什么也不做. */
+	private static void dependsOnProducer(Task task, Producer producer) {
+		if (producer.taskPath() != null) {
+			task.dependsOn(producer.taskPath());
+		}
 	}
 
 	/**
@@ -380,9 +567,21 @@ public class MinecraftPatchedProvider {
 	 *
 	 * <p>默认实现调用 {@link #provide()}；legacy 链的产物在 {@link #remapJar(ServiceFactory)}
 	 * 阶段生成（{@code provide()} 只做判定），由子类覆盖补齐。
+	 *
+	 * <p>任务路径下不能走 {@code provide()}：那条路径只做接线、不写产物。本方法只被**配置期读者**调用
+	 * （{@code getOrProduceMinecraftPatchedIntermediateJar} 的两个迁移器），而它们在缓存未命中时会
+	 * 让 {@link #provideProjectionBlocker()} 整批回退——也就是说走到这里时任务路径本不该生效。
+	 * 真走到这里只可能是：产物在「缓存命中」之后被外部（其它工作树 / 仍会删除整组产物的旧版本 loom）
+	 * 删掉或写坏。配置期无法等执行期任务，故按件补齐退回配置期实现——语义与改造前逐字一致
+	 * （取跨进程锁 → 锁内二次确认 → 只重建缺失或不可复用的那几件 → 原子落位）。
 	 */
 	protected void produceIntermediateJarIfMissing() throws Exception {
-		provide();
+		if (!taskBasedChain) {
+			provide();
+			return;
+		}
+
+		withPatchedLock(this::providePatched);
 	}
 
 	/**
@@ -813,7 +1012,7 @@ public class MinecraftPatchedProvider {
 	 * @param target   最终落位路径（位于跨 daemon 共享的缓存目录）
 	 * @param producer 内容生产者，接收本次独占的临时文件路径
 	 */
-	protected static void publishAtomically(Path target, ThrowingProducer producer) throws IOException {
+	public static void publishAtomically(Path target, ThrowingProducer producer) throws IOException {
 		AtomicFiles.publish(target, tmp -> {
 			try {
 				producer.accept(tmp);
@@ -829,7 +1028,7 @@ public class MinecraftPatchedProvider {
 	 * 允许抛出任意受检异常的生产回调（{@link AtomicFiles.IOConsumer} 只允许 {@link IOException}）.
 	 */
 	@FunctionalInterface
-	protected interface ThrowingProducer {
+	public interface ThrowingProducer {
 		void accept(Path output) throws Exception;
 	}
 
@@ -885,7 +1084,20 @@ public class MinecraftPatchedProvider {
 	 * <p>{@code tempFiles} 必须活到那次调用结束：MCP 执行链的步进缓存落在它管理的临时目录里。
 	 */
 	public Provider<McpExecutor.Options> createPrePatchJarMcpOptions(TempFiles tempFiles) throws IOException {
-		McpExecutorBuilder builder = createMcpExecutor(tempFiles.directory("loom-mcp"));
+		return createPrePatchJarMcpOptions(tempFiles.directory("loom-mcp"));
+	}
+
+	/**
+	 * {@return 「跑 rename 步」的 MCP 执行器声明，工作目录由调用方给出}.
+	 *
+	 * <p>与 {@link #createPrePatchJarMcpOptions(TempFiles)} 等价，区别只在于工作目录的来源：配置期路径用
+	 * {@code TempFiles}（本次调用结束即删），执行期任务用它自己的目录（见 {@code GenerateForgePrePatchJarTask}）。
+	 * 两条路径的步进集合、初始配置与工具声明都取自同一处，因此不会分叉。
+	 *
+	 * @param mcpCache MCP 执行链的工作目录（由调用方负责创建与清理）
+	 */
+	public Provider<McpExecutor.Options> createPrePatchJarMcpOptions(Path mcpCache) throws IOException {
+		McpExecutorBuilder builder = createMcpExecutor(mcpCache);
 		builder.enqueue("rename");
 		return builder.build();
 	}
@@ -1059,8 +1271,14 @@ public class MinecraftPatchedProvider {
 		return builder.build();
 	}
 
-	private void fixParameterAnnotation(Path jarFile) throws Exception {
-		logger.info(":fixing parameter annotations for " + jarFile.toAbsolutePath());
+	/**
+	 * 修补参数注解.
+	 *
+	 * <p>静态：执行期任务不持有 provider（见 {@link ProductionOptions} 的同类说明），
+	 * 配置期路径与任务路径共用这一处实现，日志出口由调用方给出。
+	 */
+	static void fixParameterAnnotation(Path jarFile, Consumer<String> info) throws Exception {
+		info.accept(":fixing parameter annotations for " + jarFile.toAbsolutePath());
 		Stopwatch stopwatch = Stopwatch.createStarted();
 
 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jarFile, false)) {
@@ -1092,11 +1310,16 @@ public class MinecraftPatchedProvider {
 			completer.completeToleratingFailures("parameter annotation fixes in " + jarFile.toAbsolutePath());
 		}
 
-		logger.info(":fixed parameter annotations for " + jarFile.toAbsolutePath() + " in " + stopwatch.stop());
+		info.accept(":fixed parameter annotations for " + jarFile.toAbsolutePath() + " in " + stopwatch.stop());
 	}
 
-	private void deleteParameterNames(Path jarFile) throws Exception {
-		logger.info(":deleting parameter names for " + jarFile.toAbsolutePath());
+	/**
+	 * 删除 vignette 参数名.
+	 *
+	 * <p>静态：理由同 {@link #fixParameterAnnotation(Path, Consumer)}。
+	 */
+	static void deleteParameterNames(Path jarFile, Consumer<String> info) throws Exception {
+		info.accept(":deleting parameter names for " + jarFile.toAbsolutePath());
 		Stopwatch stopwatch = Stopwatch.createStarted();
 
 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jarFile, false)) {
@@ -1147,7 +1370,7 @@ public class MinecraftPatchedProvider {
 			completer.completeToleratingFailures("parameter name removals in " + jarFile.toAbsolutePath());
 		}
 
-		logger.info(":deleted parameter names for " + jarFile.toAbsolutePath() + " in " + stopwatch.stop());
+		info.accept(":deleted parameter names for " + jarFile.toAbsolutePath() + " in " + stopwatch.stop());
 	}
 
 	private File getForgeJar() {
@@ -1287,18 +1510,53 @@ public class MinecraftPatchedProvider {
 	 * 完整生成后才由调用方原子落位到共享缓存路径。
 	 */
 	private void producePatchedIntermediate(Path output) throws Exception {
+		producePatchedIntermediateForTask(
+				minecraftIntermediateJar,
+				output,
+				type.patches.apply(getExtension().getPatchProvider(), getExtension().getForgeUserdevProvider()),
+				createBinpatcherTool(),
+				getExtension().isForgeLikeAndNotOfficial() && !getExtension().isUnobfuscatedForge(),
+				logger::lifecycle,
+				logger::info);
+	}
+
+	/**
+	 * 打补丁后的中间产物的生产实现（配置期路径与执行期任务共用）.
+	 *
+	 * <p>顺序与改造前逐字一致：binpatcher 打补丁 → 补出 pre-patch jar 里存在而补丁结果里缺失的类
+	 * → 删除 vignette 参数名 → （非 official 的 Forge 系）修补参数注解。
+	 *
+	 * <p>静态：任务对象要能被配置缓存序列化，因此生产不能经由 provider 实例（见 {@link ProductionOptions}）。
+	 *
+	 * <p>{@code output} 是调用方给的落位路径（配置期与任务路径都是「本次独占的临时文件」），
+	 * 本方法不做原子落位——落位由调用方负责。
+	 *
+	 * @param prePatchJar pre-patch jar，即 binpatcher 的 {@code {clean}} 与补出缺失类的来源
+	 * @param output 本次落位路径
+	 * @param patches 补丁 jar，即 binpatcher 的 {@code {patch}}
+	 * @param binpatcherTool binpatcher 的声明式选项
+	 * @param fixParameterAnnotations 是否修补参数注解
+	 * @param lifecycle lifecycle 日志出口（配置期是项目 logger，执行期是任务 logger）
+	 * @param info info 日志出口（同上）
+	 */
+	public static void producePatchedIntermediateForTask(Path prePatchJar, Path output, Path patches,
+			ForgeExternalToolService.Options binpatcherTool, boolean fixParameterAnnotations,
+			Consumer<String> lifecycle, Consumer<String> info) throws Exception {
 		Stopwatch stopwatch = Stopwatch.createStarted();
-		logger.lifecycle(":patching jars");
-		patchJars(minecraftIntermediateJar, output, type.patches.apply(getExtension().getPatchProvider(), getExtension().getForgeUserdevProvider()));
+		lifecycle.accept(":patching jars");
 
-		copyMissingClasses(minecraftIntermediateJar, output);
-		deleteParameterNames(output);
-
-		if (getExtension().isForgeLikeAndNotOfficial() && !getExtension().isUnobfuscatedForge()) {
-			fixParameterAnnotation(output);
+		try (var serviceFactory = new ScopedServiceFactory()) {
+			runBinpatcher(binpatcherTool, prePatchJar, output, patches, serviceFactory);
 		}
 
-		logger.lifecycle(":patched jars in " + stopwatch.stop());
+		copyMissingClassesStatic(prePatchJar, output);
+		deleteParameterNames(output, info);
+
+		if (fixParameterAnnotations) {
+			fixParameterAnnotation(output, info);
+		}
+
+		lifecycle.accept(":patched jars in " + stopwatch.stop());
 	}
 
 	/**
@@ -1385,6 +1643,11 @@ public class MinecraftPatchedProvider {
 	}
 
 	protected void copyMissingClasses(Path source, Path target) throws IOException {
+		copyMissingClassesStatic(source, target);
+	}
+
+	/** 与 {@link #copyMissingClasses(Path, Path)} 同一处实现；静态供执行期任务复用. */
+	static void copyMissingClassesStatic(Path source, Path target) throws IOException {
 		walkFileSystems(source, target, it -> it.toString().endsWith(".class"), (sourceFs, targetFs, sourcePath, targetPath) -> {
 			if (Files.exists(targetPath)) return;
 			Path parent = targetPath.getParent();
@@ -1480,6 +1743,10 @@ public class MinecraftPatchedProvider {
 
 	public Path getMinecraftPatchedIntermediateJar() {
 		return minecraftPatchedIntermediateJar;
+	}
+
+	public Path getMinecraftPatchedIntermediateAtJar() {
+		return minecraftPatchedIntermediateAtJar;
 	}
 
 	public Path getMinecraftPatchedJar() {

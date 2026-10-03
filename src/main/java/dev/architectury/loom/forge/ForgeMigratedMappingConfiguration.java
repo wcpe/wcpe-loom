@@ -61,6 +61,27 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
 		super(mappingsIdentifier, mappingsWorkingDir);
 	}
 
+	/**
+	 * {@return 本次配置期是否会按路径读 patched 中间产物}.
+	 *
+	 * <p>{@link #manipulateMappings} 在配置期调用 {@link #migrators}，而两个迁移器在各自缓存未命中时都会
+	 * 按路径读那件产物（见 {@code MinecraftPatchedProvider#getOrProduceMinecraftPatchedIntermediateJar}）。
+	 * 判据必须与迁移器 {@code setup} 里的分支逐字对应——否则「判定为不需要读」而实际读了，
+	 * 配置期就会拿到执行期才产出的文件。
+	 *
+	 * <p>这是「把 patched 中间产物投影成执行期任务」的**前置阻碍**：迁移器自身任务化之后，
+	 * 本方法与 {@code MinecraftPatchedProvider.provideProjectionBlocker()} 里对应的那一条应当一并删除。
+	 *
+	 * @param forgeCache 迁移器缓存所在的 forge 缓存目录（与 {@code migrator.setup} 的 {@code cache} 同一个）
+	 * @param refreshDeps 是否显式要求刷新（刷新时迁移器一律走重建分支）
+	 * @param hasSrg 本配置是否生成 srg 命名空间的映射
+	 * @param hasMojang 本配置是否为 NeoForge（生成 mojang 命名空间的映射）
+	 */
+	public static boolean needsPatchedIntermediateJar(Path forgeCache, boolean refreshDeps, boolean hasSrg, boolean hasMojang) {
+		return FieldMappingsMigrator.needsPatchedIntermediateJar(forgeCache, refreshDeps, hasSrg, hasMojang)
+				|| MethodInheritanceMappingsMigrator.needsPatchedIntermediateJar(forgeCache, refreshDeps);
+	}
+
 	@Override
 	protected void manipulateMappings(Project project, Path mappingsJar) throws IOException {
 		LoomGradleExtension extension = LoomGradleExtension.get(project);

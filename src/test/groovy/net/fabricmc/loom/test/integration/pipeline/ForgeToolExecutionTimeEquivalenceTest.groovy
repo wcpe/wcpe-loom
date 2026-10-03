@@ -24,7 +24,6 @@
 
 package net.fabricmc.loom.test.integration.pipeline
 
-import java.nio.file.Path
 import java.security.MessageDigest
 import java.util.zip.ZipFile
 
@@ -105,7 +104,10 @@ class ForgeToolExecutionTimeEquivalenceTest extends Specification implements Gra
 		when: "跑消费方；三个执行期探针任务必须真的被执行到"
 		// 探针在配置期要读项目模型（共享缓存路径、provider 状态），故显式关掉配置缓存；
 		// 同时关掉构建缓存：本用例要断言探针任务真的执行了，而不是从缓存里恢复产物
-		def result = gradle.run(task: "remapJar", configurationCache: false, args: ["--console=plain", "--no-build-cache"])
+		def result = gradle.run(task: "remapJar", configurationCache: false, args: [
+			"--console=plain",
+			"--no-build-cache"
+		])
 		def report = parseReport(new File(gradle.projectDir, "probe-report.properties"))
 		printEvidence(report)
 

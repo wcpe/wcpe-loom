@@ -69,6 +69,20 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
 	private List<Map.Entry<FieldMember, String>> migratedFields = new ArrayList<>();
 	public Path migratedFieldsCache;
 
+	/**
+	 * {@return 本次 {@code setup} 是否会按路径读 patched 中间产物}.
+	 *
+	 * <p>判据与 {@link #setup} 里的分支逐字对应：缓存命中且未要求刷新时读缓存，否则在 hasSrg/hasMojang 时
+	 * 读那件产物。供「能否把该产物投影成执行期任务」的前置判定使用。
+	 */
+	public static boolean needsPatchedIntermediateJar(Path cache, boolean refreshDeps, boolean hasSrg, boolean hasMojang) {
+		if (!hasSrg && !hasMojang) {
+			return false;
+		}
+
+		return refreshDeps || !Files.exists(cache.resolve("migrated-fields.json"));
+	}
+
 	@Override
 	public long setup(Project project, MinecraftProvider minecraftProvider, Path cache, Path rawMappings, boolean hasSrg, boolean hasMojang) throws IOException {
 		migratedFieldsCache = cache.resolve("migrated-fields.json");

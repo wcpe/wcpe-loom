@@ -83,6 +83,10 @@ public class SingleJarDecompileConfiguration extends DecompileConfiguration<Mapp
 				task.setGroup(Constants.TaskGroup.FABRIC);
 
 				task.getInputJar().set(MinecraftPatchedProvider.get(project).getMinecraftIntermediateJar().toFile());
+				// inputJar 是 Forge 的 pre-patch jar：投影成任务后它只在执行期落位，而上面那行只是按**裸路径**
+				// 声明输入，不携带产出方。故显式接上产出任务依赖（惰性查询：本方法注册得比 provide() 更早，
+				// 未投影时该 provider 无值，Gradle 会忽略它，与改造前语义一致）。
+				task.dependsOn(project.provider(() -> MinecraftPatchedProvider.get(project).getPrePatchJarProducerTaskPath()));
 				task.getRuntimeJar().set(minecraftJar.toFile());
 				// runtimeJar 是 named 命名空间的 MC jar，即 mapped provider 的产物；生产链迁移后它只在执行期
 				// 由重映射任务（RemapMinecraftTask / ProcessMinecraftJarTask）落位，而上面那行只是按**裸路径**
