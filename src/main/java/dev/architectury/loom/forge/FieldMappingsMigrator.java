@@ -35,15 +35,17 @@ import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
-import com.google.gson.Gson;
-import com.google.gson.reflect.TypeToken;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
 import dev.architectury.loom.util.Stopwatch;
 import dev.architectury.loom.util.ThreadingUtils;
+import org.jspecify.annotations.Nullable;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.FieldVisitor;
@@ -53,7 +55,6 @@ import org.slf4j.LoggerFactory;
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
-import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.mappingio.MappingReader;
 import net.fabricmc.mappingio.format.tiny.Tiny2FileWriter;
 import net.fabricmc.mappingio.tree.MappingTree;
@@ -71,16 +72,18 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
 		migratedFieldsCache = inputs.cache().resolve("migrated-fields.json");
 		migratedFields.clear();
 
-		if (!inputs.refreshDeps() && Files.exists(migratedFieldsCache)) {
-			try (BufferedReader reader = Files.newBufferedReader(migratedFieldsCache)) {
-				Map<String, String> map = new Gson().fromJson(reader, new TypeToken<Map<String, String>>() {
-				});
-				migratedFields = new ArrayList<>();
-				map.forEach((key, newDescriptor) -> {
-					String[] split = key.split("#");
-					migratedFields.add(new AbstractMap.SimpleEntry<>(new FieldMember(split[0], split[1]), newDescriptor));
-				});
-			}
+		// 本代输入的内容键：命名空间开关 + 冷分支会读的两个文件（原始 mappings、patched 中间产物）。
+		// 只用路径存在性判断缓存是否可用会让「同一份声明输入对应两种产物」——见 MappingsMigratorCache。
+		final String key = MappingsMigratorCache.identity(inputs.hasSrg(), inputs.hasMojang(),
+				List.of(inputs.rawMappings(), inputs.patchedIntermediateJar()));
+		final Map<String, String> cached = inputs.refreshDeps() ? null : readCache(key);
+
+		if (cached != null) {
+			migratedFields = new ArrayList<>();
+			cached.forEach((ownerAndField, newDescriptor) -> {
+				String[] split = ownerAndField.split("#");
+				migratedFields.add(new AbstractMap.SimpleEntry<>(new FieldMember(split[0], split[1]), newDescriptor));
+			});
 		} else {
 			migratedFields.clear();
 
@@ -94,13 +97,33 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
 			migratedFields.forEach(entry -> {
 				map.put(entry.getKey().owner + "#" + entry.getKey().field, entry.getValue());
 			});
-			// 原子发布：缓存位于跨 daemon 共享的 forge 缓存目录（不按项目隔离），旧写法先删除再就地写入，
-			// 读方会看到内容缺失或半截
-			AtomicFiles.publish(migratedFieldsCache, tmp -> Files.writeString(tmp, new Gson().toJson(map)));
+			final JsonObject entries = new JsonObject();
+			map.forEach(entries::addProperty);
+			MappingsMigratorCache.publish(migratedFieldsCache, key, entries);
 		}
 
 		this.migratedFields.sort(Comparator.comparing(entry -> entry.getKey().owner + "#" + entry.getKey().field));
 		return migratedFields.hashCode();
+	}
+
+	/**
+	 * 读缓存里的字段迁移表；内容键与本代输入不符（或缺键、旧格式、半截内容）时返回 {@code null}.
+	 */
+	private @Nullable Map<String, String> readCache(String expectedKey) throws IOException {
+		final JsonElement cached = MappingsMigratorCache.read(migratedFieldsCache, expectedKey, LOGGER);
+
+		if (cached == null || !cached.isJsonObject()) {
+			// entries 形状不符（例如被写成了数组）同样不可信：要么是别的东西写进来的，要么是半截内容
+			if (cached != null) {
+				LOGGER.info("迁移器缓存的内容不是字段表（{}），按未命中处理", migratedFieldsCache);
+			}
+
+			return null;
+		}
+
+		final Map<String, String> map = new LinkedHashMap<>();
+		cached.getAsJsonObject().asMap().forEach((ownerAndField, newDescriptor) -> map.put(ownerAndField, newDescriptor.getAsString()));
+		return map;
 	}
 
 	@Override

@@ -39,19 +39,22 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.stream.Stream;
 
-import com.google.gson.Gson;
-import com.google.gson.reflect.TypeToken;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import dev.architectury.loom.util.collection.Multimap;
+import org.jspecify.annotations.Nullable;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.MethodVisitor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.Pair;
-import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.mappingio.MappingReader;
 import net.fabricmc.mappingio.adapter.MappingSourceNsSwitch;
 import net.fabricmc.mappingio.format.tiny.Tiny2FileWriter;
@@ -64,27 +67,69 @@ import net.fabricmc.mappingio.tree.MemoryMappingTree;
  * see if there are different names for the same method in the mappings, and remove them.
  */
 public final class MethodInheritanceMappingsMigrator implements MappingsMigrator {
+	private static final Logger LOGGER = LoggerFactory.getLogger(MethodInheritanceMappingsMigrator.class);
+
 	private Set<Pair<String, String>> methodsToRemove;
 
 	@Override
 	public long setup(Inputs inputs) throws IOException {
 		Path cacheFile = inputs.cache().resolve("method-inheritance-migrator.json");
+		List<Path> jars = List.of(inputs.patchedIntermediateJar(), inputs.forgeJar(), inputs.userdevJar());
+		// 本代输入的内容键：命名空间开关 + 原始 mappings + 冷分支会读的三个 jar。
+		// 只用路径存在性判断缓存是否可用会让「同一份声明输入对应两种产物」——见 MappingsMigratorCache。
+		final String key = MappingsMigratorCache.identity(inputs.hasSrg(), inputs.hasMojang(),
+				Stream.concat(Stream.of(inputs.rawMappings()), jars.stream()).toList());
+		final Set<Pair<String, String>> cached = inputs.refreshDeps() ? null : readCache(cacheFile, key);
 
-		if (!inputs.refreshDeps() && Files.exists(cacheFile)) {
-			try (BufferedReader reader = Files.newBufferedReader(cacheFile)) {
-				List<Pair<String, String>> list = new Gson().fromJson(reader, new TypeToken<List<Pair<String, String>>>() {
-				});
-				methodsToRemove = new HashSet<>(list);
-			}
+		if (cached != null) {
+			methodsToRemove = cached;
 		} else {
-			List<Path> jars = List.of(inputs.patchedIntermediateJar(), inputs.forgeJar(), inputs.userdevJar());
 			methodsToRemove = prepareCache(inputs.info(), inputs.rawMappings(), jars, inputs.hasSrg(), inputs.hasMojang());
-			// 原子发布：缓存位于跨 daemon 共享的 forge 缓存目录（不按项目隔离），旧写法先删除再就地写入，
-			// 读方会看到内容缺失或半截
-			AtomicFiles.publish(cacheFile, tmp -> Files.writeString(tmp, new Gson().toJson(methodsToRemove.stream().sorted(Comparator.comparing(p -> p.left() + "|" + p.right())).toList())));
+			final JsonArray entries = new JsonArray();
+
+			// 每条用 [名字, 描述符] 两元数组：缓存是「输入决定的中间数据」，形状越简单越不容易在改字段名时静默失配
+			for (Pair<String, String> pair : methodsToRemove.stream()
+					.sorted(Comparator.comparing(p -> p.left() + "|" + p.right())).toList()) {
+				final JsonArray entry = new JsonArray();
+				entry.add(pair.left());
+				entry.add(pair.right());
+				entries.add(entry);
+			}
+
+			MappingsMigratorCache.publish(cacheFile, key, entries);
 		}
 
 		return methodsToRemove.hashCode();
+	}
+
+	/**
+	 * 读缓存里「要删除的方法」集合；内容键与本代输入不符（或缺键、旧格式、半截内容）时返回 {@code null}.
+	 */
+	private @Nullable Set<Pair<String, String>> readCache(Path cacheFile, String expectedKey) throws IOException {
+		final JsonElement cached = MappingsMigratorCache.read(cacheFile, expectedKey, LOGGER);
+
+		if (cached != null && !cached.isJsonArray()) {
+			// entries 形状不符（例如被写成了对象）同样不可信：要么是别的东西写进来的，要么是半截内容
+			LOGGER.info("迁移器缓存的内容不是方法表（{}），按未命中处理", cacheFile);
+			return null;
+		}
+
+		if (cached == null) {
+			return null;
+		}
+
+		final Set<Pair<String, String>> methods = new HashSet<>();
+
+		for (JsonElement entry : cached.getAsJsonArray()) {
+			if (!entry.isJsonArray() || entry.getAsJsonArray().size() != 2) {
+				LOGGER.info("迁移器缓存的条目形状不符（{}），按未命中处理", cacheFile);
+				return null;
+			}
+
+			methods.add(new Pair<>(entry.getAsJsonArray().get(0).getAsString(), entry.getAsJsonArray().get(1).getAsString()));
+		}
+
+		return methods;
 	}
 
 	@Override

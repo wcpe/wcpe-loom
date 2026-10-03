@@ -145,6 +145,19 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
 	protected void manipulateMappings(Project project, Path mappingsJar) throws IOException {
 		LoomGradleExtension extension = LoomGradleExtension.get(project);
 
+		// 产出任务路径必须按**本次调用**重新判定，先清空：
+		//
+		// 本实例经 {@code MappingConfiguration.SHARED_INSTANCES} / {@code SHARED_EARLY} 在 daemon 内跨项目、
+		// 跨构建复用（见 {@code MappingConfiguration.create}：命中时直接返回实例、不再调用 {@code setup}，
+		// 但调用方随后仍会对它调用 {@code setupPost} → 本方法），而复用的键里**不含**决定「能不能投影」的量
+		// （{@code isLegacyForge()} 与 {@code mixin.useLegacyMixinAp}）。于是同一个实例可能先以可投影的形态
+		// 注册了任务、再被一个不可投影的项目复用：那条路径在下面**提前 return**，不会重新赋值。
+		// 旧值一旦留下，{@code mappingsProducerTaskPath()} 就会把上一次的产出任务报给本次的消费方——
+		// 跨构建复用时那个任务在本构建里**并不存在**，消费方的 {@code dependsOn} 会以「找不到任务」失败；
+		// {@code isTaskProducedMappings()} 还会连带跳过映射文件的存在性校验。清空后两条路径各自给出自己的答案：
+		// 可投影时在下面重新登记（同一构建内重复调用会由 claim 返回同一个任务路径，幂等），不可投影时为 null。
+		this.manipulateTaskPath = null;
+
 		if (extension.isLegacyForge()) {
 			// Legacy forge patches are in official namespace, so if the type of a field is changed by them, then that
 			// is effectively a new field and not traceable to any mapping. Therefore this does not apply to it.
