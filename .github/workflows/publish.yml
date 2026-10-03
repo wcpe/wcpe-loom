@@ -113,7 +113,9 @@ jobs:
             --tests net.fabricmc.loom.test.integration.RemapTaskCacheTest \
             --tests net.fabricmc.loom.test.integration.ConfigurationCacheTest \
             --tests net.fabricmc.loom.test.integration.forge.ForgeRunConfigTest \
+            --tests net.fabricmc.loom.test.integration.forge.ForgeTest \
             --tests net.fabricmc.loom.test.integration.forge.AccessTransformerTest \
+            --tests net.fabricmc.loom.test.integration.forge.PatchedDecompileTest \
             --tests net.fabricmc.loom.test.integration.forge.legacy.LegacyForgeExternalModDependencyTest \
             --tests net.fabricmc.loom.test.unit.AsyncCacheTest \
             --tests net.fabricmc.loom.test.unit.AsyncZipProcessorTest \

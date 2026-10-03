@@ -643,6 +643,15 @@ abstract class WriteActionsTestMatrix extends DefaultTask {
 
 				if (it.name.endsWith("FabricAPITest.groovy")) {
 					// Arch: Disabled as it hangs
+					//
+					// 维持禁用的决策（2026-10 复核，勿反复讨论）：它构建整条真实 fabric-api
+					// （nightly Gradle、git clone 无 --depth、含真实起服，@Timeout 30 分钟 ×2 迭代），
+					// 单类最坏 60 分钟，且超时后残留子进程会表现为"任务迟迟不结束"而非失败。
+					//
+					// 它过去是唯一能覆盖「mod jar 重映射的覆写传播」的用例（1.17.11 的 P0 回归正是
+					// 漏在这一处），但该覆盖面已由针对性用例接管：
+					// pipeline/RemapModsTaskEquivalenceTest（覆写方法名 + 负对照）。
+					// 即：真正的洞已被更便宜、更精确的用例堵住，不必用这个重型用例来兜。
 					return
 				}
 
