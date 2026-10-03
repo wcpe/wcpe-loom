@@ -150,8 +150,6 @@ public class MinecraftPatchedProvider {
 
 	// pre-patch jar 的产出方：投影成任务时非空（见 registerPatchedChainTasks），配置期生产时为 null
 	private @Nullable Producer prePatchJarProducer;
-	// 三级产物是否已投影成执行期任务：决定 provide() 与按件补齐各走哪条路径
-	private boolean taskBasedChain = false;
 
 	public static MinecraftPatchedProvider get(Project project) {
 		MinecraftProvider provider = LoomGradleExtension.get(project).getMinecraftProvider();
@@ -309,10 +307,12 @@ public class MinecraftPatchedProvider {
 	 *   <li><b>disableObfuscation / unobfuscated Forge</b>：pre-patch jar 走
 	 *       {@code createUnobfuscatedPrePatchJar}（userdev 合并分支），且 {@code remapJar} 也在配置期生产
 	 *       最终 jar 并读 at-patched jar——两处都不在本次迁移的形态之内。</li>
-	 *   <li><b>mappings 迁移器缓存未命中</b>：{@code ForgeMigratedMappingConfiguration.manipulateMappings}
-	 *       在配置期调用两个迁移器，它们在各自缓存未命中时会按路径读 intermediate jar
+	 *   <li><b>mappings 迁移留在配置期</b>：{@code ForgeMigratedMappingConfiguration.manipulateMappings}
+	 *       在配置期生产迁移产物时，要按路径读 intermediate jar
 	 *       （见 {@link #getOrProduceMinecraftPatchedIntermediateJar()}）。投影后那件产物只在执行期落位，
-	 *       配置期读者会拿到不存在的文件——因此该情形整批回退。迁移器自身任务化之后这一条应当删除。</li>
+	 *       配置期读者会拿到不存在的文件——因此该情形整批回退。迁移本身同样任务化之后，剩下的阻碍
+	 *       只有「配置期有别的读者要真读迁移产物」，判据统一放在
+	 *       {@link ForgeMigratedMappingConfiguration#mappingsMigrationProjectionBlocker}。</li>
 	 * </ul>
 	 */
 	protected @Nullable String provideProjectionBlocker() {
@@ -320,10 +320,10 @@ public class MinecraftPatchedProvider {
 			return "disableObfuscation / unobfuscated Forge 的 pre-patch jar 与最终 jar 都走 userdev 合并分支，形态不同";
 		}
 
-		if (ForgeMigratedMappingConfiguration.needsPatchedIntermediateJar(ForgeProvider.getForgeCache(project),
-				getExtension().refreshDeps(), getExtension().shouldGenerateSrgTiny(), getExtension().isNeoForge())) {
-			return "mappings 迁移器（FieldMappingsMigrator / MethodInheritanceMappingsMigrator）缓存未命中，"
-					+ "配置期会按路径读 patched 中间产物";
+		final String migrationBlocker = ForgeMigratedMappingConfiguration.mappingsMigrationProjectionBlocker(getExtension());
+
+		if (migrationBlocker != null) {
+			return "mappings 迁移留在配置期（" + migrationBlocker + "），它要按路径读 patched 中间产物";
 		}
 
 		return null;
@@ -438,8 +438,10 @@ public class MinecraftPatchedProvider {
 		// at-patched jar 的产出方必须让 registerPatchedJarTask 找得到：那里的
 		// minecraftProvider.addProducerDependency(task, atPatched) 正是从这张表里取任务依赖
 		minecraftProvider.registerTaskProducedArtifact(atPatched, atPatchedProducer);
+		// 中间产物的产出方同样要登记：mappings 迁移任务把它声明成 @InputFile（迁移器缓存未命中时读它），
+		// 只按路径声明输入不会带任务依赖，Gradle 的隐式依赖校验会直接拒绝构建
+		minecraftProvider.registerTaskProducedArtifact(patchedIntermediate, patchedProducer);
 		this.prePatchJarProducer = prePatchProducer;
-		this.taskBasedChain = true;
 
 		logger.lifecycle("Forge 的 patched 三级产物由执行期任务承担：{}",
 				List.of(prePatchProducer.taskPath(), patchedProducer.taskPath(), atPatchedProducer.taskPath()));
@@ -569,19 +571,14 @@ public class MinecraftPatchedProvider {
 	 * 阶段生成（{@code provide()} 只做判定），由子类覆盖补齐。
 	 *
 	 * <p>任务路径下不能走 {@code provide()}：那条路径只做接线、不写产物。本方法只被**配置期读者**调用
-	 * （{@code getOrProduceMinecraftPatchedIntermediateJar} 的两个迁移器），而它们在缓存未命中时会
-	 * 让 {@link #provideProjectionBlocker()} 整批回退——也就是说走到这里时任务路径本不该生效。
-	 * 真走到这里只可能是：产物在「缓存命中」之后被外部（其它工作树 / 仍会删除整组产物的旧版本 loom）
-	 * 删掉或写坏。配置期无法等执行期任务，故按件补齐退回配置期实现——语义与改造前逐字一致
-	 * （取跨进程锁 → 锁内二次确认 → 只重建缺失或不可复用的那几件 → 原子落位）。
+	 * （{@code getOrProduceMinecraftPatchedIntermediateJar} 的调用方：mappings 迁移的配置期回退路径），
+	 * 而那个读者与 {@link #provideProjectionBlocker()} 用的是同一个判据——走到这里时任务路径本不该生效。
+	 * 真走到这里（产物在判定之后被其它工作树删掉或写坏）时，{@code provide()} 只做接线，
+	 * 随后 {@code getOrProduceMinecraftPatchedIntermediateJar} 的可复用性复检会以明确异常报出，
+	 * 而不是把不存在的路径交给迁移器去读。
 	 */
 	protected void produceIntermediateJarIfMissing() throws Exception {
-		if (!taskBasedChain) {
-			provide();
-			return;
-		}
-
-		withPatchedLock(this::providePatched);
+		provide();
 	}
 
 	/**
@@ -671,6 +668,8 @@ public class MinecraftPatchedProvider {
 			task.getForgeJar().set(getForgeJar());
 			task.getForgeUserdevJar().set(getForgeUserdevJar());
 			task.getMappingsServiceOptions().set(mappingsOptions);
+			// 映射树取自迁移产物：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
+			mappingConfiguration.addMappingsProducerDependency(task);
 			task.getClientExtraEnabled().set(providesClientJar());
 			task.getPatchVersion().set(CURRENT_LOOM_PATCH_VERSION);
 			task.getNeoForge().set(extension.isNeoForge());

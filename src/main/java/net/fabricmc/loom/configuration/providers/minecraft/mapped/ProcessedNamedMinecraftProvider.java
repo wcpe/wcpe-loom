@@ -581,6 +581,8 @@ public abstract class ProcessedNamedMinecraftProvider<M extends MinecraftProvide
 					task.getProductionNamespace().set(productionNamespace);
 					task.getIntermediaryNamespace().set(IntermediaryNamespaces.intermediaryNamespace(project));
 					task.getMappingsServiceOptions().set(extension.getMappingConfiguration().getMappingsServiceOptions(project, MappingOption.forPlatform(extension)));
+					// 映射树取自迁移产物：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
+					extension.getMappingConfiguration().addMappingsProducerDependency(task);
 					task.getRemapperServiceOptions().set(TinyRemapperService.createSimple(project,
 							project.provider(() -> productionNamespace.toString()),
 							project.provider(() -> targetNamespace.toString()),

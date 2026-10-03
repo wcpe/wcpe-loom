@@ -170,6 +170,8 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
 			getPlatformMappingFile().set(getProject().getLayout().file(getProject().provider(() -> getExtension().getPlatformMappingFile().toFile())));
 			getPlatformMappingFile().finalizeValue();
 			getMappingJars().from(getProject().getConfigurations().getByName(Constants.Configurations.MAPPINGS_FINAL));
+			// 该文件是 @InputFile（Forge 下即迁移产物）：投影时它由迁移任务产出，必须显式接线
+			getExtension().addPlatformMappingsDependency(this);
 		}
 
 		if (getExtension().isForgeLike()) {

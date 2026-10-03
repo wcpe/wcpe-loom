@@ -62,6 +62,8 @@ public abstract class MigrateMappingsTask extends AbstractMigrateMappingsTask {
 		getInputDir().convention(getProject().getLayout().getProjectDirectory().dir("src/main/java"));
 		getOutputDir().convention(getProject().getLayout().getProjectDirectory().dir("remappedSrc"));
 		getMigrationServiceOptions().set(MigrateSourceCodeMappingsService.createOptions(getProject(), getMappings(), getInputDir(), getOutputDir()));
+		// 迁移的源映射取自平台映射文件（Forge 下是迁移产物）：投影时它由迁移任务产出，必须显式接线
+		getExtension().addPlatformMappingsDependency(this);
 	}
 
 	@TaskAction

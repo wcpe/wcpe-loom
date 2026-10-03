@@ -46,6 +46,7 @@ import org.gradle.api.file.FileCollection;
 import org.gradle.api.provider.ListProperty;
 import org.gradle.api.provider.Property;
 import org.gradle.api.provider.Provider;
+import org.jspecify.annotations.Nullable;
 
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.LoomNoRemapGradlePlugin;
@@ -214,6 +215,11 @@ public abstract class LoomGradleExtensionImpl extends LoomGradleExtensionApiImpl
 		}
 
 		return Objects.requireNonNull(mappingConfiguration, "Cannot get MappingsProvider before it has been setup");
+	}
+
+	@Override
+	public @Nullable MappingConfiguration findMappingConfiguration() {
+		return mappingConfiguration;
 	}
 
 	@Override

@@ -329,6 +329,8 @@ public class ModConfigurationRemapper {
 					task.getRemapClasspath().from(extension.getMinecraftJarsCollection(extension.getProductionNamespaceEnum().get()));
 					task.getMappingsServiceOptions().set(
 							mappingConfiguration.getMappingsServiceOptions(project, MappingOption.forPlatform(extension)));
+					// 映射树取自迁移产物：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
+					mappingConfiguration.addMappingsProducerDependency(task);
 					task.getSourceNamespace().set(sourceNamespace);
 					task.getTargetNamespace().set(targetNamespace);
 					task.getPlatform().set(extension.getPlatform().get());

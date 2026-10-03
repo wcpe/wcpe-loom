@@ -802,6 +802,8 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 					}
 
 					task.getMappingsServiceOptions().set(mappingConfiguration.getMappingsServiceOptions(project, MappingOption.forPlatform(extension)));
+					// 映射树取自迁移产物：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
+					mappingConfiguration.addMappingsProducerDependency(task);
 					task.getFromNamespace().set(fromNamespace);
 					task.getToNamespace().set(toNamespace);
 					task.getFixRecords().set(fixRecords);

@@ -38,22 +38,19 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
-import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
 import dev.architectury.loom.util.Stopwatch;
 import dev.architectury.loom.util.ThreadingUtils;
-import org.gradle.api.Project;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.FieldVisitor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
-import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.cache.AtomicFiles;
@@ -69,26 +66,12 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
 	private List<Map.Entry<FieldMember, String>> migratedFields = new ArrayList<>();
 	public Path migratedFieldsCache;
 
-	/**
-	 * {@return 本次 {@code setup} 是否会按路径读 patched 中间产物}.
-	 *
-	 * <p>判据与 {@link #setup} 里的分支逐字对应：缓存命中且未要求刷新时读缓存，否则在 hasSrg/hasMojang 时
-	 * 读那件产物。供「能否把该产物投影成执行期任务」的前置判定使用。
-	 */
-	public static boolean needsPatchedIntermediateJar(Path cache, boolean refreshDeps, boolean hasSrg, boolean hasMojang) {
-		if (!hasSrg && !hasMojang) {
-			return false;
-		}
-
-		return refreshDeps || !Files.exists(cache.resolve("migrated-fields.json"));
-	}
-
 	@Override
-	public long setup(Project project, MinecraftProvider minecraftProvider, Path cache, Path rawMappings, boolean hasSrg, boolean hasMojang) throws IOException {
-		migratedFieldsCache = cache.resolve("migrated-fields.json");
+	public long setup(Inputs inputs) throws IOException {
+		migratedFieldsCache = inputs.cache().resolve("migrated-fields.json");
 		migratedFields.clear();
 
-		if (!minecraftProvider.refreshDeps() && Files.exists(migratedFieldsCache)) {
+		if (!inputs.refreshDeps() && Files.exists(migratedFieldsCache)) {
 			try (BufferedReader reader = Files.newBufferedReader(migratedFieldsCache)) {
 				Map<String, String> map = new Gson().fromJson(reader, new TypeToken<Map<String, String>>() {
 				});
@@ -101,12 +84,10 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
 		} else {
 			migratedFields.clear();
 
-			if (hasSrg) {
-				// 共享缓存可能正被其它进程重建（或其它工作树仍在用会删除整组产物的旧版本 loom）：
-				// 用 getOrProduce... 在产物缺失时先按件补齐，避免直接读取抛 NoSuchFileException
-				migratedFields.addAll(generateNewFieldMigration(MinecraftPatchedProvider.get(project).getOrProduceMinecraftPatchedIntermediateJar(), MappingsNamespace.SRG.toString(), rawMappings).entrySet());
-			} else if (hasMojang) {
-				migratedFields.addAll(generateNewFieldMigration(MinecraftPatchedProvider.get(project).getOrProduceMinecraftPatchedIntermediateJar(), MappingsNamespace.MOJANG.toString(), rawMappings).entrySet());
+			if (inputs.hasSrg()) {
+				migratedFields.addAll(generateNewFieldMigration(inputs.patchedIntermediateJar(), MappingsNamespace.SRG.toString(), inputs.rawMappings()).entrySet());
+			} else if (inputs.hasMojang()) {
+				migratedFields.addAll(generateNewFieldMigration(inputs.patchedIntermediateJar(), MappingsNamespace.MOJANG.toString(), inputs.rawMappings()).entrySet());
 			}
 
 			Map<String, String> map = new HashMap<>();
@@ -123,20 +104,19 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
 	}
 
 	@Override
-	public void migrate(Project project, List<MappingsEntry> entries) {
+	public void migrate(List<MappingsEntry> entries, Consumer<String> info) {
 		Stopwatch stopwatch = Stopwatch.createStarted();
-		LoomGradleExtension extension = LoomGradleExtension.get(project);
 
 		try {
-			updateFieldMigration(project, entries);
+			updateFieldMigration(entries, info);
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);
 		}
 
-		LOGGER.info(":migrated {} fields in {}", extension.getPlatform().get().id(), stopwatch.stop());
+		LOGGER.info(":migrated fields in {}", stopwatch.stop());
 	}
 
-	public void updateFieldMigration(Project project, List<MappingsEntry> entries) throws IOException {
+	public void updateFieldMigration(List<MappingsEntry> entries, Consumer<String> info) throws IOException {
 		// A map of class name -> field name -> actual descriptor
 		final Map<String, Map<String, String>> fieldDescriptorMap = new HashMap<>();
 
@@ -146,11 +126,11 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
 		}
 
 		for (MappingsEntry entry : entries) {
-			injectMigration(project, fieldDescriptorMap, entry.path());
+			injectMigration(info, fieldDescriptorMap, entry.path());
 		}
 	}
 
-	private static void injectMigration(Project project, Map<String, Map<String, String>> fieldDescriptorMap, Path path) throws IOException {
+	private static void injectMigration(Consumer<String> info, Map<String, Map<String, String>> fieldDescriptorMap, Path path) throws IOException {
 		MemoryMappingTree mappings = new MemoryMappingTree();
 
 		try (BufferedReader reader = Files.newBufferedReader(path)) {
@@ -167,7 +147,7 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
 					if (newDescriptor != null) {
 						String prev = fieldDef.getDesc(MappingsNamespace.INTERMEDIARY.toString());
 						fieldDef.setSrcDesc(mappings.mapDesc(newDescriptor, mappings.getNamespaceId(MappingsNamespace.INTERMEDIARY.toString()), MappingTreeView.SRC_NAMESPACE_ID));
-						project.getLogger().info("Migrated field descriptor of field {}#{} from {} to {}", classDef.getName(MappingsNamespace.INTERMEDIARY.toString()), fieldDef.getName(MappingsNamespace.INTERMEDIARY.toString()), prev, newDescriptor);
+						info.accept("Migrated field descriptor of field %s#%s from %s to %s".formatted(classDef.getName(MappingsNamespace.INTERMEDIARY.toString()), fieldDef.getName(MappingsNamespace.INTERMEDIARY.toString()), prev, newDescriptor));
 					}
 				}
 			}

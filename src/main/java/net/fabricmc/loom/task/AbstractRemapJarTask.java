@@ -164,6 +164,12 @@ public abstract class AbstractRemapJarTask extends Jar {
 		});
 
 		getModPlatform().value(LoomGradleExtension.get(getProject()).getPlatform()).finalizeValue();
+
+		// 重映射的映射树取自平台映射文件（Forge 下是迁移产物）：投影时它由迁移任务产出，
+		// 按路径声明输入不带任务依赖，必须显式接线。
+		// 这里只能接线、不能立刻查询映射配置：remapJar 由 RemapTaskConfiguration 在插件 apply 期
+		// 就 eager 创建，那时 mappings 阶段还没跑（addPlatformMappingsDependency 因此把查询做成惰性 Provider）。
+		LoomGradleExtension.get(getProject()).addPlatformMappingsDependency(this);
 	}
 
 	public final <P extends AbstractRemapParams> void submitWork(Class<? extends AbstractRemapAction<P>> workAction, Action<P> action) {

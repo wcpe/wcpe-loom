@@ -38,20 +38,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Consumer;
 
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
-import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
 import dev.architectury.loom.util.collection.Multimap;
-import org.gradle.api.Project;
-import org.gradle.api.logging.Logger;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.MethodVisitor;
 
-import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
-import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.Pair;
@@ -70,34 +66,19 @@ import net.fabricmc.mappingio.tree.MemoryMappingTree;
 public final class MethodInheritanceMappingsMigrator implements MappingsMigrator {
 	private Set<Pair<String, String>> methodsToRemove;
 
-	/**
-	 * {@return 本次 {@code setup} 是否会按路径读 patched 中间产物}.
-	 *
-	 * <p>判据与 {@link #setup} 里的分支逐字对应：缓存命中且未要求刷新时读缓存，否则读那件产物
-	 * （本迁移器与命名空间无关，故没有 hasSrg/hasMojang 这个条件）。
-	 * 供「能否把该产物投影成执行期任务」的前置判定使用。
-	 */
-	public static boolean needsPatchedIntermediateJar(Path cache, boolean refreshDeps) {
-		return refreshDeps || !Files.exists(cache.resolve("method-inheritance-migrator.json"));
-	}
-
 	@Override
-	public long setup(Project project, MinecraftProvider minecraftProvider, Path cache, Path rawMappings, boolean hasSrg, boolean hasMojang) throws IOException {
-		Path cacheFile = cache.resolve("method-inheritance-migrator.json");
+	public long setup(Inputs inputs) throws IOException {
+		Path cacheFile = inputs.cache().resolve("method-inheritance-migrator.json");
 
-		if (!minecraftProvider.refreshDeps() && Files.exists(cacheFile)) {
+		if (!inputs.refreshDeps() && Files.exists(cacheFile)) {
 			try (BufferedReader reader = Files.newBufferedReader(cacheFile)) {
 				List<Pair<String, String>> list = new Gson().fromJson(reader, new TypeToken<List<Pair<String, String>>>() {
 				});
 				methodsToRemove = new HashSet<>(list);
 			}
 		} else {
-			LoomGradleExtension extension = LoomGradleExtension.get(project);
-			// 共享缓存可能正被其它进程重建（或其它工作树仍在用会删除整组产物的旧版本 loom）：
-			// 用 getOrProduce... 在产物缺失时先按件补齐，避免直接读取抛 NoSuchFileException
-			Path patchedIntermediateJar = MinecraftPatchedProvider.get(project).getOrProduceMinecraftPatchedIntermediateJar();
-			List<Path> jars = List.of(patchedIntermediateJar, extension.getForgeUniversalProvider().getForge().toPath(), extension.getForgeUserdevProvider().getUserdevJar().toPath());
-			methodsToRemove = prepareCache(project.getLogger(), rawMappings, jars, hasSrg, hasMojang);
+			List<Path> jars = List.of(inputs.patchedIntermediateJar(), inputs.forgeJar(), inputs.userdevJar());
+			methodsToRemove = prepareCache(inputs.info(), inputs.rawMappings(), jars, inputs.hasSrg(), inputs.hasMojang());
 			// 原子发布：缓存位于跨 daemon 共享的 forge 缓存目录（不按项目隔离），旧写法先删除再就地写入，
 			// 读方会看到内容缺失或半截
 			AtomicFiles.publish(cacheFile, tmp -> Files.writeString(tmp, new Gson().toJson(methodsToRemove.stream().sorted(Comparator.comparing(p -> p.left() + "|" + p.right())).toList())));
@@ -107,7 +88,7 @@ public final class MethodInheritanceMappingsMigrator implements MappingsMigrator
 	}
 
 	@Override
-	public void migrate(Project project, List<MappingsEntry> entries) throws IOException {
+	public void migrate(List<MappingsEntry> entries, Consumer<String> info) throws IOException {
 		for (MappingsEntry entry : entries) {
 			MemoryMappingTree mappings = new MemoryMappingTree();
 
@@ -132,7 +113,7 @@ public final class MethodInheritanceMappingsMigrator implements MappingsMigrator
 		}
 	}
 
-	private Set<Pair<String, String>> prepareCache(Logger logger, Path rawMappings, List<Path> jars, boolean hasSrg, boolean hasMojang) throws IOException {
+	private Set<Pair<String, String>> prepareCache(Consumer<String> logger, Path rawMappings, List<Path> jars, boolean hasSrg, boolean hasMojang) throws IOException {
 		MemoryMappingTree mappings = new MemoryMappingTree();
 		String patchedNs = hasSrg ? MappingsNamespace.SRG.toString() : MappingsNamespace.MOJANG.toString();
 
@@ -163,9 +144,9 @@ public final class MethodInheritanceMappingsMigrator implements MappingsMigrator
 					MappingTree.ClassMapping sClass = mappings.getClass(superClass);
 
 					if (sClass == null) {
-						logger.info("Method {}.{}{} is inherited from a class {} that is not in the mappings, removing it if there are more than one", method.className(), method.name(), method.descriptor(), superClass);
+						logger.accept("Method %s.%s%s is inherited from a class %s that is not in the mappings, removing it if there are more than one".formatted(method.className(), method.name(), method.descriptor(), superClass));
 					} else if (sClass.getMethod(method.name(), method.descriptor()) == null) {
-						logger.info("Method {}.{}{} is inheriting a method in {} that is not in the mappings, removing it if there are more than one", method.className(), method.name(), method.descriptor(), superClass);
+						logger.accept("Method %s.%s%s is inheriting a method in %s that is not in the mappings, removing it if there are more than one".formatted(method.className(), method.name(), method.descriptor(), superClass));
 					} else {
 						continue;
 					}
@@ -186,7 +167,7 @@ public final class MethodInheritanceMappingsMigrator implements MappingsMigrator
 				// as the particular method is inherited by multiple different intermediary names
 				for (MethodKey methodKey : entry.getValue()) {
 					methodsToRemove.add(new Pair<>(methodKey.name(), methodKey.descriptor()));
-					logger.info("Removing method {}{} from the mappings", methodKey.name(), methodKey.descriptor());
+					logger.accept("Removing method %s%s from the mappings".formatted(methodKey.name(), methodKey.descriptor()));
 				}
 			}
 		}

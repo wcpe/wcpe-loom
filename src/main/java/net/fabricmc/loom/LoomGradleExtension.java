@@ -38,11 +38,13 @@ import dev.architectury.loom.forge.dependency.SrgProvider;
 import dev.architectury.loom.mcpconfig.McpConfigProvider;
 import org.gradle.api.GradleException;
 import org.gradle.api.Project;
+import org.gradle.api.Task;
 import org.gradle.api.file.ConfigurableFileCollection;
 import org.gradle.api.file.FileCollection;
 import org.gradle.api.provider.ListProperty;
 import org.gradle.api.provider.Provider;
 import org.jetbrains.annotations.ApiStatus;
+import org.jspecify.annotations.Nullable;
 
 import net.fabricmc.loom.api.LoomGradleExtensionAPI;
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
@@ -114,7 +116,45 @@ public interface LoomGradleExtension extends LoomGradleExtensionAPI {
 
 	MappingConfiguration getMappingConfiguration();
 
+	/**
+	 * {@return 已建立的映射配置；本工程不使用映射（{@code disableObfuscation} / unobfuscated Forge）
+	 * 或尚未 setup 时为 {@code null}}.
+	 *
+	 * <p>与 {@link #getMappingConfiguration()} 的差别只有一个：不抛异常。任务侧需要「有就接线、没有就跳过」
+	 * 的语义（见 {@link #addPlatformMappingsDependency(Task)}），在那里抛异常会把一个可选的接线点变成崩溃点。
+	 */
+	@Nullable
+	MappingConfiguration findMappingConfiguration();
+
 	void setMappingConfiguration(MappingConfiguration mappingConfiguration);
+
+	/**
+	 * 把「本任务以平台映射文件为输入」表达成任务依赖.
+	 *
+	 * <p>平台映射文件（Forge 下是迁移产物 {@code mappings-srg-migrated.tiny} / {@code mappings-mojang-migrated.tiny}）
+	 * 在投影后只在执行期落位。它的消费者散布在各个任务里（{@code remapJar}、{@code remapSourcesJar}、
+	 * {@code genSources}、{@code genForgePatchedSources}、{@code generateDLIConfig}……），
+	 * 而它作为 {@code @InputFile} 只按路径声明、不带任务依赖，因此每一处都必须显式接线：
+	 * 漏接一处 = 任务在产物落位前开跑，随后以「输入文件不存在」失败。
+	 *
+	 * <p>映射由配置期产出、或本工程根本不使用映射时，本方法什么也不做。
+	 */
+	default void addPlatformMappingsDependency(Task task) {
+		// 依赖边必须**惰性**求值，不能用「构造期立刻查询映射配置」的写法：
+		// remapJar 由 RemapTaskConfiguration 在插件 apply 期就 eager 创建，那时 mappings 阶段还没跑
+		// （映射配置为 null），立刻查询会静默地接不上。Gradle 在任务图计算时才解析 dependsOn 的 Provider，
+		// 那时映射配置必定已建立。
+		task.dependsOn(task.getProject().provider(() -> {
+			final MappingConfiguration mappings = findMappingConfiguration();
+
+			if (mappings == null) {
+				return List.of();
+			}
+
+			final String taskPath = mappings.mappingsProducerTaskPath();
+			return taskPath == null ? List.of() : List.of(taskPath);
+		}));
+	}
 
 	NamedMinecraftProvider<?> getNamedMinecraftProvider();
 

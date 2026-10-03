@@ -190,6 +190,9 @@ public abstract class GenerateForgePatchedSourcesTask extends AbstractLoomTask {
 			sro.getJavaCompileRelease().set(SourceRemapperService.getJavaCompileRelease(getProject()));
 			sro.getClasspath().from(getProject().getConfigurations().getByName(Constants.Configurations.MINECRAFT_COMPILE_LIBRARIES));
 		}));
+
+		// 源码重映射的映射树取自平台映射文件（迁移产物）：投影时它由迁移任务产出，必须显式接线
+		getExtension().addPlatformMappingsDependency(this);
 	}
 
 	@TaskAction

@@ -167,6 +167,11 @@ public abstract class MinecraftProvider {
 	 */
 	protected @Nullable String projectionBlocker() {
 		if (getExtension().isForgeLike()) {
+			// 这一条**不能**细化成「legacy Forge 才回退」：本方法执行得比 setupDependencyProviders 早得多
+			// （{@code CompileConfiguration.setupMinecraft} 里 minecraftProvider.provide() 在
+			// setupDependencyProviders 之前），而 isLegacyForge() 要读 ForgeUserdevProvider，
+			// 那时 getDependencyProviders() 仍是 null，判据会以 NPE 打断配置。
+			// 真要细化，必须先让依赖 provider 早于本方法建立、或把 vanilla jar 的生产决策整体推迟到那之后。
 			return "Forge 系的 vanilla jar 在配置期就被真读（patch 流程、MCP 映射合并、内部类名集合）";
 		}
 

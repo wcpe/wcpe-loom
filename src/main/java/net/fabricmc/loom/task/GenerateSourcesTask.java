@@ -253,6 +253,8 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
 		getResetCache().convention(getExtension().refreshDeps());
 
 		getMappings().set(SourceMappingsService.create(getProject()));
+		// 源码映射派生自平台映射文件（Forge 下是迁移产物）：投影时它由迁移任务产出，必须显式接线
+		LoomGradleExtension.get(getProject()).addPlatformMappingsDependency(this);
 
 		if (!LoomGradleExtension.get(getProject()).disableObfuscation()) {
 			getUnpickOptions().set(UnpickService.createOptions(this));

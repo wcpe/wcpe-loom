@@ -55,6 +55,7 @@ import dev.architectury.loom.mappings.MappingOption;
 import dev.architectury.loom.util.Stopwatch;
 import org.apache.tools.ant.util.StringUtils;
 import org.gradle.api.Project;
+import org.gradle.api.Task;
 import org.gradle.api.artifacts.Configuration;
 import org.gradle.api.provider.Provider;
 import org.jspecify.annotations.Nullable;
@@ -278,16 +279,65 @@ public class MappingConfiguration {
 		return mappingProvider;
 	}
 
+	/**
+	 * {@return 该映射选项指向的映射文件}.
+	 *
+	 * <p>存在性校验对**执行期产出**的映射放宽：Forge 的迁移后 mappings 由执行期任务产出
+	 * （见 {@code ForgeMigratedMappingConfiguration.manipulateMappings}），配置期它们必然还不存在，
+	 * 而调用点（任务的 {@code @InputFile} 接线、运行配置里的路径字符串）只需要路径。
+	 * 这类路径的就绪由任务依赖保证——每个消费任务都必须经
+	 * {@code ForgeMigratedMappingConfiguration.addMappingsProducerDependency} 声明依赖，
+	 * 否则 Gradle 会在执行期以「输入文件不存在」失败（而不是静默读到空映射）。
+	 *
+	 * <p>放宽的只有**迁移产物**这一族；其余选项（原始 mappings、mixin 派生映射）仍按存在性拒绝，
+	 * 因为那些文件在配置期结束时必定已由本类的 setup/setupPost 落位，缺失说明配置流程本身出了问题。
+	 */
 	public Path getMappingsPath(MappingOption mappingOption) {
 		Supplier<Path> mappingsSupplier = this.mappingOptions.get(mappingOption);
 
 		if (mappingsSupplier == null) {
 			throw new UnsupportedOperationException("Unsupported mapping option: " + mappingOption + ", it is possible that this option is not supported by this project / platform!");
-		} else if (Files.notExists(mappingsSupplier.get())) {
+		} else if (Files.notExists(mappingsSupplier.get()) && !isTaskProducedMappings(mappingOption)) {
 			throw new UnsupportedOperationException("Mapping option " + mappingOption + " found but file does not exist!");
 		}
 
 		return Objects.requireNonNull(mappingsSupplier.get());
+	}
+
+	/**
+	 * {@return 该映射选项指向的文件是否由执行期任务产出（配置期允许它尚不存在）}.
+	 *
+	 * <p>默认恒为假：绝大多数平台（Fabric/Quilt）的映射文件都在配置期就绪，那条存在性校验仍然有效。
+	 * Forge 系覆写它，把「迁移产物」这一族标出来。
+	 */
+	protected boolean isTaskProducedMappings(MappingOption mappingOption) {
+		return false;
+	}
+
+	/**
+	 * {@return 本配置的映射文件的产出任务路径；映射由配置期产出时为 {@code null}}.
+	 *
+	 * <p>供消费方把「我的输入就是你的产出」表达成任务依赖。返回任务**路径**而不是任务实例：
+	 * 产出方可能由另一份 Loom classloader 配置（约定插件/included build 各自带一份 Loom），
+	 * 把对方的任务实例交过来会在使用处抛 {@link ClassCastException}。
+	 */
+	public @Nullable String mappingsProducerTaskPath() {
+		return null;
+	}
+
+	/**
+	 * 把「本任务以本配置的映射文件为输入」表达成任务依赖；映射由配置期产出时什么也不做.
+	 *
+	 * <p>映射文件在投影后只在执行期落位，而它的消费者遍布各个任务（重映射、处理链、mod 重映射、
+	 * srg→named、运行配置……）。任何一处漏接都会让任务在产物落位前开跑，随后以
+	 * 「{@code @InputFile} 不存在」失败。
+	 */
+	public void addMappingsProducerDependency(Task task) {
+		final String taskPath = mappingsProducerTaskPath();
+
+		if (taskPath != null) {
+			task.dependsOn(taskPath);
+		}
 	}
 
 	/**
@@ -628,7 +678,10 @@ public class MappingConfiguration {
 			return "srg 命名空间的映射树来源未登记（" + MappingOption.WITH_SRG + "）：产出任务没有可读的输入";
 		}
 
-		if (!isReusableMappingsText(source)) {
+		// 迁移产物由执行期任务产出时，配置期它必然还不存在——就绪由产出方任务保证（见 projectSrgNamedToTasks）。
+		// 这里刻意不把「不存在」判为阻碍：那会让绝大多数真实 Forge 工程整批退回配置期，
+		// 而配置期那条路径同样读不到文件（它读的是同一份迁移产物）。
+		if (!isTaskProducedMappings(MappingOption.WITH_SRG) && !isReusableMappingsText(source)) {
 			return "srg 命名空间的映射树不可用（" + describeMappingsTextSize(source) + "）：产出任务没有可读的输入";
 		}
 
@@ -681,6 +734,8 @@ public class MappingConfiguration {
 			task.getMappings().set(source.toFile());
 			task.getRefreshDeps().set(refresh);
 			task.getSrgFile().set(output.toFile());
+			// 输入是迁移后的 srg 映射树：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
+			addMappingsProducerDependency(task);
 		})).taskPath();
 
 		// 用 Gradle 的 lifecycle 而不是 SLF4J 的 info：默认控制台级别是 LIFECYCLE，

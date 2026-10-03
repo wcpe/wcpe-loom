@@ -65,6 +65,8 @@ public abstract class MigrateClassTweakerMappingsTask extends AbstractMigrateMap
 		getInputFile().convention(getExtension().getAccessWidenerPath());
 		getOutputFile().convention(getProject().getLayout().getProjectDirectory().file("remapped.accesswidener"));
 		getMigrationServiceOptions().set(MigrateClassTweakerMappingsService.createOptions(getProject(), getMappings()));
+		// 迁移的源映射取自平台映射文件（Forge 下是迁移产物）：投影时它由迁移任务产出，必须显式接线
+		getExtension().addPlatformMappingsDependency(this);
 	}
 
 	@TaskAction
