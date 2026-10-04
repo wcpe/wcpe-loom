@@ -26,6 +26,9 @@ package net.fabricmc.loom.test.integration.pipeline
 
 import java.security.MessageDigest
 
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import com.mojang.datafixers.util.Pair
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import spock.lang.Shared
@@ -231,6 +234,102 @@ class ForgeMigratorCacheIdentityTest extends Specification implements GradleProj
 	}
 
 	/**
+	 * 跨版本格式兼容：**新版写下的缓存必须仍能被旧版 loom 整份读下去**.
+	 *
+	 * <h2>被测缺陷</h2>
+	 *
+	 * <p>缓存文件位于跨版本共享的 forge 缓存目录，旧版 loom（1.17.11 及以前）把整份文件当扁平数据解析：
+	 * {@code migrated-fields.json} 是 {@code Map<String,String>}，{@code method-inheritance-migrator.json} 是
+	 * {@code List<Pair<String,String>>}。把键与内容包成 {@code {"key":…,"entries":…}} 信封后，旧版在
+	 * **配置期硬失败**（{@code JsonSyntaxException: Expected a string but was BEGIN_OBJECT}，报错列号正落在
+	 * {@code entries} 起点）——「把 loom 版本回退一档」这种正常运维动作会把仓库打瘫。容忍度是**不对称**的：
+	 * 新版能读旧格式（键缺失即重算），旧版读不了新格式，所以键必须挪到旧版不会去读的旁车文件里。
+	 *
+	 * <h2>三条断言</h2>
+	 *
+	 * <ul>
+	 *   <li><b>①旧版解析必须不报错</b>：直接用 1.17.11 那两个目标类型做 Gson 反序列化（判据是**真** Gson，
+	 *       不是形状的近似），且内容非空——否则断言会退化成「空文件当然能解析」。</li>
+	 *   <li><b>②内容键不在旧版读的那条路径上</b>：内容文件里没有 {@code entries} 信封的痕迹，
+	 *       键另存于 {@code <内容文件名>.key}。</li>
+	 *   <li><b>③旧版写下的缓存不被新版采信</b>：把旁车键删掉（内容仍是合法扁平形状，等价于旧版写方留下的
+	 *       那一份）后重跑任务，产物必须回到冷参照、且旁车键被重新写下——说明这一轮真的重算了，
+	 *       而不是「恰好读到了同一份内容」。</li>
+	 * </ul>
+	 */
+	def "④跨版本格式兼容：新版写出的缓存必须仍能被旧版 loom 整份读下去"() {
+		setup: "冷算一次，拿到新版写下的共享缓存（内容文件 + 旁车键）"
+		def reference = runTask("cold")
+		def referenceMigrated = lines(new File(reference.TASK_MIGRATED))
+		def referenceWithNs = lines(new File(reference.TASK_MIGRATED_WITH_NS))
+		def referenceHash = readHash(reference)
+		def fieldCache = new File(reference.FIELD_CACHE)
+		def methodCache = new File(reference.METHOD_CACHE)
+
+		expect: "①旧版 loom 的解析逻辑必须成功；字段表非空（本夹具的字段迁移确实有内容）"
+		def oldFields = oldVersionFieldParse(fieldCache)
+		def oldMethods = oldVersionMethodParse(methodCache)
+		println("旧版解析：字段表 ${oldFields.size()} 条 / 方法表 ${oldMethods.size()} 条")
+		oldFields.size() > 0
+
+		and: "①b 方法表：本夹具的继承迁移结果本就是空集，但形状仍必须是旧版认识的数组——"
+		// 信封形态（{"key":…,"entries":[]}）在这里会直接以 Expected BEGIN_ARRAY but was BEGIN_OBJECT 失败，
+		// 所以「空集」不影响本条断言的判别力；非空方法表的覆盖在单元用例
+		// MappingsMigratorCacheCompatTest「①方法表」里（那里带负对照）。
+		methodCache.text.trim().startsWith('[')
+		!methodCache.text.trim().startsWith('{')
+
+		and: "②内容键只在旁车文件里，内容文件里没有信封的任何痕迹"
+		sidecarOf(fieldCache).exists()
+		sidecarOf(methodCache).exists()
+		sidecarOf(fieldCache).name == "migrated-fields.json.key"
+		!fieldCache.text.contains('"entries"')
+		!methodCache.text.contains('"entries"')
+
+		when: "③模拟旧版写方：内容保持合法扁平形状，但旁车键不存在"
+		deleteSidecar(fieldCache)
+		deleteSidecar(methodCache)
+		def afterOldWrite = runTask("report")
+		def afterMigrated = lines(new File(afterOldWrite.TASK_MIGRATED))
+		def afterWithNs = lines(new File(afterOldWrite.TASK_MIGRATED_WITH_NS))
+
+		then: "任务不得失败，产物与就绪标记必须回到冷参照（没有键的扁平内容一律不被采信）"
+		def migratedDiff = diff(afterMigrated, referenceMigrated)
+		def withNsDiff = diff(afterWithNs, referenceWithNs)
+		explain(migratedDiff, new File(afterOldWrite.TASK_MIGRATED), new File(reference.TASK_MIGRATED))
+		explain(withNsDiff, new File(afterOldWrite.TASK_MIGRATED_WITH_NS), new File(reference.TASK_MIGRATED_WITH_NS))
+		migratedDiff.isEmpty()
+		withNsDiff.isEmpty()
+		readHash(afterOldWrite) == referenceHash
+
+		and: "旁车键被重新写下：这一轮真的重算了，而不是「恰好读到了同一份内容」"
+		sidecarOf(fieldCache).exists()
+		sidecarOf(methodCache).exists()
+	}
+
+	/**
+	 * 旧版 loom 的字段表读法，判据是**真** Gson：
+	 * {@code new Gson().fromJson(reader, new TypeToken<Map<String,String>>(){})}.
+	 *
+	 * <p>Groovy 捕获不了匿名 {@code TypeToken} 的泛型实参，故改用 {@code TypeToken.getParameterized}
+	 * 构造同一个目标类型——反序列化仍是 Gson 本人在做，不是形状的近似。
+	 */
+	private static Map<String, String> oldVersionFieldParse(File cache) {
+		def type = TypeToken.getParameterized(Map, String, String).getType()
+		return (Map<String, String>) new Gson().fromJson(cache.getText("UTF-8"), type)
+	}
+
+	/**
+	 * 旧版 loom 的方法表读法，判据同上：
+	 * {@code new Gson().fromJson(reader, new TypeToken<List<Pair<String,String>>>(){})}.
+	 */
+	private static List<Pair<String, String>> oldVersionMethodParse(File cache) {
+		def pairType = TypeToken.getParameterized(Pair, String, String).getType()
+		def type = TypeToken.getParameterized(List, pairType).getType()
+		return (List<Pair<String, String>>) new Gson().fromJson(cache.getText("UTF-8"), type)
+	}
+
+	/**
 	 * 一次「按模式准备共享缓存 → 重跑迁移任务」.
 	 *
 	 * <p>产物在本次运行前先删掉：任务因此必然执行（up-to-date 判定不会把「不重跑」伪装成「等价」），
@@ -259,11 +358,12 @@ class ForgeMigratorCacheIdentityTest extends Specification implements GradleProj
 	}
 
 	/**
-	 * 把两个缓存换成「改造前格式的垃圾内容」：外层没有内容键，内容也与本代输入无关.
+	 * 把两个缓存换成「旧版 loom 格式的垃圾内容」：内容文件是裸内容、且**没有旁车键**.
 	 *
-	 * <p>形态刻意沿用改造前那种「裸内容」写法（字段表是对象、方法表是 {@code [{left,right}]} 列表），
-	 * 因此对改造前的代码是**可解析且会被采信**的——它不会报错，只会静默换一套迁移结果。
-	 * 这正是「另一棵树/更旧版本在这个共享目录里留下的东西」会造成的后果，也是本条对照要钉住的点。
+	 * <p>形态刻意沿用旧版那种「裸内容」写法（字段表是对象、方法表是 {@code [{left,right}]} 列表），
+	 * 因此对旧版代码是**可解析且会被采信**的——它不会报错，只会静默换一套迁移结果。
+	 * 这正是「另一棵树/更旧版本在这个共享目录里留下的东西」会造成的后果，也是本条对照要钉住的点：
+	 * 新版读方只能靠旁车键判断内容出自哪一组输入，没有键就必须重算。
 	 *
 	 * <p>同时留一份到 {@code build/probe}：用例需要断言「被投毒的内容确实与本代真实内容不同」，
 	 * 否则整条对照可能是空转的。
@@ -271,6 +371,8 @@ class ForgeMigratorCacheIdentityTest extends Specification implements GradleProj
 	private void poisonCaches(Map<String, String> report) {
 		new File(report.FIELD_CACHE).text = '{}'
 		new File(report.METHOD_CACHE).text = '[{"left":"#poison","right":"()V"}]'
+		deleteSidecar(new File(report.FIELD_CACHE))
+		deleteSidecar(new File(report.METHOD_CACHE))
 		new File(probeDir(), "poison-field-cache.json").text = new File(report.FIELD_CACHE).text
 		new File(probeDir(), "poison-method-cache.json").text = new File(report.METHOD_CACHE).text
 	}
@@ -279,41 +381,49 @@ class ForgeMigratorCacheIdentityTest extends Specification implements GradleProj
 	 * 把缓存里的迁移结果清空，**保持内容键不变**：这是「键一致但内容被扰动」的形态，
 	 * 用来证明缓存内容真的被消费（产物与就绪标记必须随之变化）。
 	 *
-	 * <p>兼容两种信封：带 {@code key}/{@code entries} 的新格式，以及改造前的裸内容（那时没有键，
-	 * 读到什么用什么）。两种形态下都把「条目」清空。
+	 * <p>新版的内容键在旁车文件里，并且记着内容文件的摘要，因此「扰动」必须自洽地同时改两处：
+	 * 内容清空 + 旁车键里的摘要跟着更新。只改内容不改摘要会被判成「键与内容不同代」而按未命中重算，
+	 * 那样这条对照就退化成「什么都没验证」——它要钉的是「缓存内容流进了产物」，不是「读方拒绝坏数据」。
 	 */
 	private static void emptyCacheEntries(File cacheFile) {
-		def json = new JsonSlurper().parseText(cacheFile.text)
-
-		if (json instanceof Map && json.containsKey('key') && json.containsKey('entries')) {
-			def entries = json.entries
-
-			if (entries instanceof Map) {
-				cacheFile.text = JsonOutput.toJson([key: json.key, entries: [:]])
-			} else {
-				cacheFile.text = JsonOutput.toJson([key: json.key, entries: []])
-			}
-
-			return
-		}
-
-		cacheFile.text = json instanceof Map ? '{}' : '[]'
+		def keyFile = sidecarOf(cacheFile)
+		def keyJson = new JsonSlurper().parseText(keyFile.text)
+		def emptied = new JsonSlurper().parseText(cacheFile.text) instanceof Map ? [:] : []
+		def payload = JsonOutput.toJson(emptied)
+		cacheFile.text = payload
+		keyFile.text = JsonOutput.toJson([key: keyJson.key, entriesSha256: sha256Hex(payload)])
 	}
 
-	/** 取缓存里的「迁移条目」：带键信封取 entries，改造前的裸内容取它自己. */
+	/** 取内容文件对应的旁车键文件（{@code <内容文件名>.key}，与 {@code MappingsMigratorCache.keyFile} 同一规则）. */
+	private static File sidecarOf(File cacheFile) {
+		return new File(cacheFile.parentFile, cacheFile.name + '.key')
+	}
+
+	/** 删掉旁车键：模拟旧版 loom 的写方——它只知道内容文件，不会写也不会删键. */
+	private static void deleteSidecar(File cacheFile) {
+		sidecarOf(cacheFile).delete()
+	}
+
+	/** 与 {@code Checksum.of(String).sha256().hex()} 同口径（UTF-8 + SHA-256 十六进制小写）. */
+	private static String sha256Hex(String text) {
+		def digest = MessageDigest.getInstance("SHA-256")
+		digest.update(text.getBytes("UTF-8"))
+		return digest.digest().encodeHex().toString()
+	}
+
+	/** 取缓存里的「迁移条目」：内容文件本身就是迁移结果（旧版认识的扁平形状），键在旁车文件里. */
 	private static Map<Object, Object> entriesOf(File cacheFile) {
 		if (!cacheFile.exists()) {
 			return [:]
 		}
 
 		def json = new JsonSlurper().parseText(cacheFile.text)
-		def entries = json instanceof Map && json.containsKey('entries') ? json.entries : json
 		def result = [:]
 
-		if (entries instanceof Map) {
-			result.putAll(entries)
-		} else if (entries instanceof List) {
-			entries.eachWithIndex { entry, index -> result[index] = entry.toString() }
+		if (json instanceof Map) {
+			result.putAll(json)
+		} else if (json instanceof List) {
+			json.eachWithIndex { entry, index -> result[index] = entry.toString() }
 		}
 
 		return result
@@ -413,6 +523,10 @@ class ForgeMigratorCacheIdentityTest extends Specification implements GradleProj
 			} else if (mode == 'cold') {
 				java.nio.file.Files.deleteIfExists(fieldCache)
 				java.nio.file.Files.deleteIfExists(methodCache)
+				// 旁车键必须与内容同生共死：只删内容会留下「键在、内容不在」的形态，
+				// 那与本用例想构造的「缓存不存在」不是一回事
+				java.nio.file.Files.deleteIfExists(fieldCache.resolveSibling(fieldCache.fileName.toString() + '.key'))
+				java.nio.file.Files.deleteIfExists(methodCache.resolveSibling(methodCache.fileName.toString() + '.key'))
 			}
 
 			new File(probeDir, 'run-' + mode + '.properties').text = text

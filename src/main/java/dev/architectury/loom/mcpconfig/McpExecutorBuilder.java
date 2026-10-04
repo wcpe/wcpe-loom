@@ -26,10 +26,7 @@ package dev.architectury.loom.mcpconfig;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.UncheckedIOException;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
@@ -68,7 +65,6 @@ import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
 import net.fabricmc.loom.util.Checksum;
 import net.fabricmc.loom.util.Constants;
-import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.loom.util.Lazy;
 import net.fabricmc.loom.util.gradle.GradleUtils;
 import net.fabricmc.loom.util.service.Service;
@@ -92,7 +88,6 @@ public final class McpExecutorBuilder {
 	private final List<McpConfigStep> steps;
 	private final DependencySet dependencySet;
 	private final Map<String, McpConfigFunction> functions;
-	private final boolean manualRefreshDeps;
 	private final Map<String, String> config = new HashMap<>();
 	private final StepLogic.SetupContext setupContext = new SetupContextImpl();
 	private StepLogic.@Nullable StepLogicProvider stepLogicProvider = null;
@@ -103,7 +98,6 @@ public final class McpExecutorBuilder {
 		this.cache = cache;
 		this.steps = provider.getData().steps().get(environment);
 		this.functions = provider.getData().functions();
-		this.manualRefreshDeps = LoomGradleExtension.get(project).manualRefreshDeps();
 		this.dependencySet = new DependencySet(this.steps);
 		this.dependencySet.skip(step -> isNoOp(step.type()));
 
@@ -222,10 +216,15 @@ public final class McpExecutorBuilder {
 		config.put(key, value);
 	}
 
-	private Path getDownloadCache() throws IOException {
-		Path downloadCache = cache.resolve("downloads");
-		Files.createDirectories(downloadCache);
-		return downloadCache;
+	/**
+	 * {@return 该 URL 在下载缓存中的落位路径}.
+	 *
+	 * <p><b>刻意只算路径、不碰文件系统</b>：本方法在配置期（步进逻辑选项被配置缓存序列化时）被调用，
+	 * 任何存在性判断都会被配置缓存记成文件系统输入指纹，而下载缓存位于任务自有工作目录内、
+	 * 每次执行结束即删，其存在性逐次翻转，配置缓存将永久无法复用。目录与文件的落地都在执行期完成。
+	 */
+	private Path downloadCachePath(String url) {
+		return cache.resolve("downloads").resolve(Checksum.of(url).sha256().hex(24));
 	}
 
 	/**
@@ -336,38 +335,8 @@ public final class McpExecutorBuilder {
 		}
 
 		@Override
-		public Path downloadFile(String url) throws IOException {
-			Path path = getDownloadCache().resolve(Checksum.of(url).sha256().hex(24));
-
-			// 刷新依赖时明确绕过 MCP 下载缓存；否则只复用完整的缓存文件。
-			if (!manualRefreshDeps && Files.exists(path)) return path;
-
-			redirectAwareDownload(url, path);
-			return path;
-		}
-
-		// 这些文件可能仍链接到旧 Forge 仓库，需要跟随重定向到新地址。
-		private static void redirectAwareDownload(String urlString, Path path) throws IOException {
-			AtomicFiles.publish(path, temporary -> downloadRedirectAware(urlString, temporary));
-		}
-
-		private static void downloadRedirectAware(String urlString, Path path) throws IOException {
-			URL url = new URL(urlString);
-
-			if (url.getProtocol().equals("http")) {
-				url = new URL("https", url.getHost(), url.getPort(), url.getFile());
-			}
-
-			HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-			connection.connect();
-
-			if (connection.getResponseCode() == HttpURLConnection.HTTP_MOVED_PERM || connection.getResponseCode() == HttpURLConnection.HTTP_MOVED_TEMP) {
-				downloadRedirectAware(connection.getHeaderField("Location"), path);
-			} else {
-				try (InputStream in = connection.getInputStream()) {
-					Files.copy(in, path);
-				}
-			}
+		public Path downloadCachePath(String url) {
+			return McpExecutorBuilder.this.downloadCachePath(url);
 		}
 
 		@Override

@@ -67,6 +67,18 @@ public abstract class StepLogic<O extends Service.Options> extends Service<O> {
 		DownloadBuilder downloadBuilder(String url);
 		void javaexec(Action<? super ForgeToolExecutor.Settings> configurator);
 
+		/**
+		 * 把工具 jar 就位（缺失才下载）并返回其路径.
+		 *
+		 * <p>下载被刻意推迟到执行期：配置期对「下载缓存中的文件」做存在性判断会被配置缓存记成
+		 * 文件系统输入指纹，而该文件在任务结束时被清掉，下一次构建的存在性就与记录值相反——
+		 * 于是配置缓存永远无法复用。执行期（任务动作内）的文件系统观察不会被记录，因此不会污染指纹。
+		 *
+		 * @param target 配置期纯计算出的落位路径
+		 * @param url    下载地址
+		 */
+		Path ensureToolJar(Path target, String url) throws IOException;
+
 		default List<String> resolve(List<ConfigValue> configValues) {
 			return CollectionUtil.map(configValues, this::resolve);
 		}
@@ -74,7 +86,17 @@ public abstract class StepLogic<O extends Service.Options> extends Service<O> {
 
 	public interface SetupContext {
 		Project project();
-		Path downloadFile(String url) throws IOException;
+
+		/**
+		 * {@return 该 URL 在下载缓存中的落位路径}.
+		 *
+		 * <p><b>纯路径计算，不做任何文件系统访问</b>：本方法在配置期被调用，一旦在这里判断文件是否存在
+		 * （或顺手把文件下下来），配置缓存就会把该路径记成文件系统输入；而下载缓存位于任务自有工作目录内、
+		 * 每次执行结束即删，存在性逐次翻转，配置缓存将永久失效。真正的下载见
+		 * {@link ExecutionContext#ensureToolJar}。
+		 */
+		Path downloadCachePath(String url) throws IOException;
+
 		Path downloadDependency(String notation);
 		Provider<FileCollection> getMinecraftLibraries();
 	}

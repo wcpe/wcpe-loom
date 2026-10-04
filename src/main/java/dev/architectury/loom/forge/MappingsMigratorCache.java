@@ -24,7 +24,6 @@
 
 package dev.architectury.loom.forge;
 
-import java.io.BufferedReader;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -41,7 +40,7 @@ import net.fabricmc.loom.util.Checksum;
 import net.fabricmc.loom.util.cache.AtomicFiles;
 
 /**
- * 迁移器缓存的**内容键**与「键 + 内容」信封的读写.
+ * 迁移器缓存的**内容键**与「内容 + 旁车键」的读写.
  *
  * <h2>为什么需要内容键</h2>
  *
@@ -56,21 +55,40 @@ import net.fabricmc.loom.util.cache.AtomicFiles;
  *
  * <h2>怎么解决</h2>
  *
- * <p>缓存写成 {@code {"key": <内容键>, "entries": <迁移结果>}}，读方只在键**逐字相等**时才采信 {@code entries}，
- * 否则一律当作未命中、走冷分支重算。键由「决定迁移结果的量」构成（见 {@link #identity}）：
- * ns 开关 + 原始 mappings 的摘要 + 各 jar 的摘要。缺失键、旧格式、键不符三种情况都落到「重算」这一侧，
- * 方向是安全的——键不符最多多算一次，绝不会把别代的迁移结果当成本代结果。
+ * <p>读方只在内容键**逐字相等**时才采信内容文件，否则一律当作未命中、走冷分支重算。键由「决定迁移结果的量」
+ * 构成（见 {@link #identity}）：ns 开关 + 原始 mappings 的摘要 + 各 jar 的摘要。缺失键、键不符两种情况都落到
+ * 「重算」这一侧，方向是安全的——键不符最多多算一次，绝不会把别代的迁移结果当成本代结果。
  *
  * <p>代价是暖分支也要把输入读一遍算摘要（15-16MB 的 jar 在几十 ms 级），而冷分支要做的是「解开 jar、
  * 扫全部 class、解析整棵映射树」，高出一个数量级，因此这份开销换来「产物只由声明输入决定」是划算的。
+ *
+ * <h2>键为什么放在旁车文件，而不是内容文件里</h2>
+ *
+ * <p>内容文件（{@code migrated-fields.json} / {@code method-inheritance-migrator.json}）位于**跨版本共享**的
+ * 缓存目录，旧版 loom（1.17.11 及以前）会把它整份当作扁平数据解析：前者是 {@code Map<String,String>}，
+ * 后者是 {@code Pair} 数组。把键与内容包成 {@code {"key":…,"entries":…}} 信封会让旧版在**配置期硬失败**
+ * （{@code JsonSyntaxException: Expected a string but was BEGIN_OBJECT}），也就是「把 loom 版本回退一档」这种
+ * 正常运维动作会把仓库直接打瘫——新旧版对缓存格式的容忍度是**不对称**的：新版能读旧格式（键缺失即重算），
+ * 旧版读不了新格式。因此键改放独立的旁车文件 {@code <内容文件名>.key}：内容文件**永远保持旧版认识的扁平形状**，
+ * 旧版读它一切照旧（语义仍是旧的、有缺陷，但那是旧版自己的事）；新版靠旁车键决定命中与否，未命中即重算并
+ * 同时刷新两者。旧版写下的缓存没有旁车键 → 新版视为未命中 → 重算，方向同样安全。
+ *
+ * <p>旁车键里还记着内容文件的摘要：键与内容是两次独立的原子落位，跨 daemon 并发下可能读到「新键 + 旧内容」
+ * 的组合，摘要不符即判未命中，把这次竞态也挡在「重算」这一侧。
  */
 final class MappingsMigratorCache {
 	/**
 	 * 键的格式标记.
 	 *
-	 * <p>键的组成或信封语义一旦变化就递增它：旧缓存随即全部失效并自动重算，无需人工清理共享目录。
+	 * <p>键的组成或旁车语义一旦变化就递增它：旧缓存随即全部失效并自动重算，无需人工清理共享目录。
 	 */
 	private static final String FORMAT = "loom-forge-migrator-cache-v1";
+
+	/** 旁车键文件名后缀，追加在内容文件名之后（{@code migrated-fields.json} → {@code migrated-fields.json.key}）. */
+	private static final String KEY_SUFFIX = ".key";
+
+	private static final String KEY_FIELD = "key";
+	private static final String ENTRIES_SHA256_FIELD = "entriesSha256";
 
 	private MappingsMigratorCache() {
 	}
@@ -98,43 +116,56 @@ final class MappingsMigratorCache {
 		return builder.toString();
 	}
 
+	/** {@return 内容文件对应的旁车键文件路径}. */
+	static Path keyFile(Path cacheFile) {
+		return cacheFile.resolveSibling(cacheFile.getFileName() + KEY_SUFFIX);
+	}
+
 	/**
-	 * 读信封：只有键逐字相等时才返回 {@code entries}，其余情形一律返回 {@code null}（视为未命中，由调用方重算）.
+	 * 读缓存：旁车键与本代输入逐字相等、且内容摘要自洽时返回内容文件的根节点，其余情形一律返回 {@code null}
+	 * （视为未命中，由调用方重算）.
 	 *
-	 * <p>三种「不可信」都归到这里，且都留日志，避免「缓存被静默忽略」难以排查：
-	 * 文件无法解析或压根不是对象（半截内容、被别的写方换成了数组）、没有 {@code key} 字段（改造前写下的旧格式）、
-	 * 键与当前输入不符（别代内容）。
+	 * <p>每一种「不可信」都归到这里，且都留日志，避免「缓存被静默忽略」难以排查：内容文件或旁车键缺失、
+	 * 旁车键无法解析、键与当前输入不符、内容摘要与旁车键记录的不符（并发换代）、内容文件无法解析。
 	 *
-	 * @param cacheFile 缓存文件
+	 * @param cacheFile 内容文件（保持旧版认识的扁平形状）
 	 * @param expectedKey 当前输入算出的内容键
 	 * @param logger 日志出口（调用方自己的 logger，配置期与执行期各写各的）
-	 * @return 缓存里的迁移结果；{@code null} 表示未命中
+	 * @return 内容文件解析出的根节点；{@code null} 表示未命中
 	 */
 	static @Nullable JsonElement read(Path cacheFile, String expectedKey, Logger logger) throws IOException {
 		if (Files.notExists(cacheFile)) {
 			return null;
 		}
 
-		final JsonElement root;
+		final Path keyFile = keyFile(cacheFile);
 
-		try (BufferedReader reader = Files.newBufferedReader(cacheFile)) {
-			root = JsonParser.parseReader(reader);
+		if (Files.notExists(keyFile)) {
+			// 旧版 loom 写下的缓存没有旁车键：宁可重算，也不能把来源不明的内容当成本代结果
+			logger.info("迁移器缓存没有内容键旁车文件（{}），按未命中处理", keyFile);
+			return null;
+		}
+
+		final JsonObject keyRoot;
+
+		try {
+			final JsonElement parsed = JsonParser.parseString(Files.readString(keyFile));
+
+			if (parsed == null || !parsed.isJsonObject()) {
+				logger.info("迁移器缓存的内容键不是对象（{}），按未命中处理", keyFile);
+				return null;
+			}
+
+			keyRoot = parsed.getAsJsonObject();
 		} catch (JsonParseException | IllegalStateException e) {
-			logger.info("迁移器缓存无法解析（{}），按未命中处理", cacheFile);
+			logger.info("迁移器缓存的内容键无法解析（{}），按未命中处理", keyFile);
 			return null;
 		}
 
-		if (root == null || !root.isJsonObject()) {
-			logger.info("迁移器缓存不是「键 + 内容」信封（{}），按未命中处理", cacheFile);
-			return null;
-		}
+		final JsonElement key = keyRoot.get(KEY_FIELD);
 
-		final JsonObject envelope = root.getAsJsonObject();
-		final JsonElement key = envelope.get("key");
-		final JsonElement entries = envelope.get("entries");
-
-		if (key == null || !key.isJsonPrimitive() || entries == null) {
-			logger.info("迁移器缓存没有内容键（{}），按未命中处理", cacheFile);
+		if (key == null || !key.isJsonPrimitive() || !key.getAsJsonPrimitive().isString()) {
+			logger.info("迁移器缓存的内容键字段缺失或形状不符（{}），按未命中处理", keyFile);
 			return null;
 		}
 
@@ -143,22 +174,49 @@ final class MappingsMigratorCache {
 			return null;
 		}
 
-		return entries;
+		final JsonElement entriesSha256 = keyRoot.get(ENTRIES_SHA256_FIELD);
+
+		if (entriesSha256 == null || !entriesSha256.isJsonPrimitive() || !entriesSha256.getAsJsonPrimitive().isString()) {
+			logger.info("迁移器缓存的内容摘要字段缺失或形状不符（{}），按未命中处理", keyFile);
+			return null;
+		}
+
+		final String payload = Files.readString(cacheFile);
+
+		if (!Checksum.of(payload).sha256().matchesStr(entriesSha256.getAsString())) {
+			// 键与内容是两次独立的原子落位：跨 daemon 并发下可能读到「新键 + 旧内容」的组合
+			logger.info("迁移器缓存的内容与内容键不同代（{}），按未命中处理", cacheFile);
+			return null;
+		}
+
+		try {
+			return JsonParser.parseString(payload);
+		} catch (JsonParseException | IllegalStateException e) {
+			logger.info("迁移器缓存无法解析（{}），按未命中处理", cacheFile);
+			return null;
+		}
 	}
 
 	/**
-	 * 原子发布「内容键 + 迁移结果」.
+	 * 原子发布「内容 + 旁车键」.
 	 *
-	 * <p>缓存位于跨 daemon 共享目录，就地覆盖会让读方看到半截文件，故沿用既有的一次性临时文件 + 原子 move。
+	 * <p>缓存位于跨 daemon 共享目录，就地覆盖会让读方看到半截文件，故两份文件都沿用既有的
+	 * 「一次性临时文件 + 原子 move」。先落内容、后落键：键一旦就位就说明它描述的那份内容已经在盘上，
+	 * 剩下的并发窗口由旁车键里的内容摘要兜住。
 	 *
-	 * @param cacheFile 缓存文件
+	 * <p><b>内容文件写的是 {@code entries} 本身，不带任何信封</b>——旧版 loom 要能整份读它，见类注释。
+	 *
+	 * @param cacheFile 内容文件
 	 * @param key 写内容时用的内容键（下一次读它的人会重新算一遍并比对）
 	 * @param entries 迁移结果（字段迁移器是对象，方法迁移器是数组）
 	 */
 	static void publish(Path cacheFile, String key, JsonElement entries) throws IOException {
-		final JsonObject envelope = new JsonObject();
-		envelope.addProperty("key", key);
-		envelope.add("entries", entries);
-		AtomicFiles.publish(cacheFile, tmp -> Files.writeString(tmp, envelope.toString()));
+		final String payload = entries.toString();
+		AtomicFiles.publish(cacheFile, tmp -> Files.writeString(tmp, payload));
+
+		final JsonObject keyRoot = new JsonObject();
+		keyRoot.addProperty(KEY_FIELD, key);
+		keyRoot.addProperty(ENTRIES_SHA256_FIELD, Checksum.of(payload).sha256().hex());
+		AtomicFiles.publish(keyFile(cacheFile), tmp -> Files.writeString(tmp, keyRoot.toString()));
 	}
 }

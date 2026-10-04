@@ -52,15 +52,23 @@ public record McpConfigFunction(String version, List<ConfigValue> args, List<Con
 	private static final String JVM_ARGS_KEY = "jvmargs";
 	private static final String REPO_KEY = "repo";
 
-	public Path download(StepLogic.SetupContext executionContext) throws IOException {
+	/**
+	 * {@return 本函数的工具 jar 落位路径}.
+	 *
+	 * <p>两条来源都不下载：{@code repo} 非空时按 URL 在下载缓存里算路径（纯计算，见
+	 * {@link StepLogic.SetupContext#downloadCachePath}）；否则交给 Gradle 依赖解析（其缓存位置本就稳定）。
+	 * 下载由执行期的 {@link StepLogic.ExecutionContext#ensureToolJar} 完成。
+	 */
+	public Path resolvePath(StepLogic.SetupContext context) throws IOException {
 		if (repo != null) {
-			return executionContext.downloadFile(getDownloadUrl());
+			return context.downloadCachePath(getDownloadUrl());
 		} else {
-			return executionContext.downloadDependency(version);
+			return context.downloadDependency(version);
 		}
 	}
 
-	private String getDownloadUrl() {
+	/** {@return 工具 jar 的下载地址}；{@code repo} 为空时无意义. */
+	public String getDownloadUrl() {
 		String[] parts = version.split(":");
 		StringBuilder builder = new StringBuilder();
 		builder.append(repo);

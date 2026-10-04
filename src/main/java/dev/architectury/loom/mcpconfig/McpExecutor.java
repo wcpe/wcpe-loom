@@ -25,7 +25,10 @@
 package dev.architectury.loom.mcpconfig;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
 import java.net.URISyntaxException;
+import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
@@ -56,6 +59,7 @@ import org.gradle.api.tasks.PathSensitive;
 import org.gradle.api.tasks.PathSensitivity;
 import org.jspecify.annotations.Nullable;
 
+import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.loom.util.download.Download;
 import net.fabricmc.loom.util.download.DownloadBuilder;
 import net.fabricmc.loom.util.service.Service;
@@ -236,6 +240,19 @@ public final class McpExecutor extends Service<McpExecutor.Options> {
 		}
 
 		@Override
+		public Path ensureToolJar(Path target, String url) throws IOException {
+			// 刷新依赖时明确绕过 MCP 下载缓存；否则只复用完整的缓存文件。
+			// 这处存在性判断刻意留在执行期：任务动作内的文件系统观察不会被配置缓存记成输入指纹。
+			if (!getOptions().getManualRefreshDeps().get() && Files.exists(target)) {
+				return target;
+			}
+
+			Files.createDirectories(target.getParent());
+			redirectAwareDownload(url, target);
+			return target;
+		}
+
+		@Override
 		public DownloadBuilder downloadBuilder(String url) {
 			DownloadBuilder builder;
 
@@ -261,6 +278,35 @@ public final class McpExecutor extends Service<McpExecutor.Options> {
 		public void javaexec(Action<? super ForgeToolExecutor.Settings> configurator) {
 			final ForgeToolService toolService = getServiceFactory().get(getOptions().getToolServiceOptions());
 			toolService.exec(configurator);
+		}
+	}
+
+	/**
+	 * 原子地把 {@code url} 下载到 {@code path}.
+	 *
+	 * <p>这些文件可能仍链接到旧 Forge 仓库，需要跟随重定向到新地址。下载在临时文件里完成后原子落位，
+	 * 避免并发构建的读方看到半截 jar。
+	 */
+	private static void redirectAwareDownload(String urlString, Path path) throws IOException {
+		AtomicFiles.publish(path, temporary -> downloadRedirectAware(urlString, temporary));
+	}
+
+	private static void downloadRedirectAware(String urlString, Path path) throws IOException {
+		URL url = new URL(urlString);
+
+		if (url.getProtocol().equals("http")) {
+			url = new URL("https", url.getHost(), url.getPort(), url.getFile());
+		}
+
+		HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+		connection.connect();
+
+		if (connection.getResponseCode() == HttpURLConnection.HTTP_MOVED_PERM || connection.getResponseCode() == HttpURLConnection.HTTP_MOVED_TEMP) {
+			downloadRedirectAware(connection.getHeaderField("Location"), path);
+		} else {
+			try (InputStream in = connection.getInputStream()) {
+				Files.copy(in, path);
+			}
 		}
 	}
 }
