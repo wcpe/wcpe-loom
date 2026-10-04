@@ -49,9 +49,19 @@ import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
  * 本身，不是它的再实现。反射只是为了拿到 {@code protected} 的入口，参数与语义都取自被测 provider 自己的
  * {@code getRemappedJars()}。
  *
+ * <p>这次调用由**探针任务在执行期**发起（早先写在 {@code project.afterEvaluate} 里，即配置期）：那一处
+ * 调用点要读输入 jar（Forge 打过补丁的官方 jar），而输入 jar 在生产链迁到任务之后由执行期任务产出，
+ * 配置期它还不存在——冷缓存/CI 下配置期调用必以 {@code NoSuchFileException ... minecraft-merged-patched.jar}
+ * 失败，只有本机那种「产物早已落在共享 gradle home 里」的热缓存才掩盖得住。探针任务因此声明
+ * {@code dependsOn(被测任务)}：配置期调用点的输入是被测任务输入的真子集（同一个 {@code RemappedJars} 的
+ * {@code inputJar} / {@code remapClasspath}，以及同一处 {@code MappingOption} 拿到的映射树），
+ * 跟在被测任务之后就一次性拿到它们全部的任务依赖，探针里不必复刻那套生产接线。
+ * **被调用的调用点与比对口径一个字没有改**：搬的只是发起时机。
+ *
  * <p>参照的产出写在 {@code build/probe/configtime-<type>.jar}（用 {@code outputJar().forPath()} 把落位
  * 改到独立文件），因此**被测产物的路径上只有被测任务一个写入者**——不会出现「配置期先写一份、任务再覆盖」
- * 这类别名，否则「两者一致」可以由「读到了同一份文件」伪造出来。
+ * 这类别名，否则「两者一致」可以由「读到了同一份文件」伪造出来。探针改到执行期发起**不引入**这类别名：
+ * 对照仍写在上面那个独立文件上，被测产物路径始终只有被测任务一个写入者。
  *
  * <h2>比对口径</h2>
  * 解压后比**每一个 entry 的字节摘要**（SHA-256），entry 名集合也必须一致——不是整文件哈希：
@@ -78,7 +88,7 @@ import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
  *       {@code getRemappedJars()} 的源命名空间同为 {@code official}；</li>
  *   <li>{@code innerClassNames} **非空**：{@code isForgeLike()} 为真时它是输入 jar 的一列内部类名。
  *       接线侧登记的是**算法**而不是配置期算好的值（它要读输入 jar，而输入 jar 在生产链迁移后由执行期任务
- *       产出），故该输入在执行期才求值；本探针在配置期读它只是为了钉住「这个夹具确实有内部类」，
+ *       产出），故该输入在执行期才求值；本探针在执行期读它只是为了钉住「这个夹具确实有内部类」，
  *       那次读取不构成对被测实现求值时机的断言（fabric 的 Named 那条两者都是空集）；</li>
  *   <li>{@code objectHolder*} **非空**：{@code isForgeLikeAndOfficial()} 为真（本夹具的 mcp/neoform 配置
  *       都是 {@code official: true}），object holder 改写的类名与源命名空间都参与产物内容；</li>
@@ -140,6 +150,13 @@ class SrgMojangMappedRemapEquivalenceTest extends Specification implements Gradl
 	private static final String SRG_TASK = "remapMinecraftSrgMerged"
 	/** NeoForge 1.20.6 的 mojang merged jar 的任务名. */
 	private static final String MOJANG_TASK = "remapMinecraftMojangMerged"
+	/**
+	 * 探针任务名：在执行期调用配置期调用点，产出对照并写报告.
+	 *
+	 * <p>它必须在**执行期**跑：配置期调用点要读的输入 jar（Forge 打过补丁的官方 jar）现在由执行期任务产出，
+	 * 配置期读不到（冷缓存/CI 下必以 {@code NoSuchFileException} 失败）。
+	 */
+	private static final String PROBE_TASK = "equivalenceConfigTimeReferenceProbe"
 	/** 活性检查用的扰动任务名：打开 client visitor 注入. */
 	private static final String PERTURBED_VISITOR_TASK = "equivalencePerturbedClientVisitor"
 	/** 活性检查用的扰动任务名：替换目标命名空间. */
@@ -169,11 +186,14 @@ class SrgMojangMappedRemapEquivalenceTest extends Specification implements Gradl
 				.replace("PATCHES", "")
 		gradle.buildGradle << probeScript(providerGetter, taskName)
 
-		when: "一次构建里既跑被测任务，也跑两个扰动任务；对照来自探针在配置期调用的配置期调用点"
-		// 探针在配置期调用配置期调用点（它需要 Gradle 项目模型），故显式关掉配置缓存；
-		// 同时关掉构建缓存：本用例要断言被测任务**真的执行了**，而不是从缓存恢复了别的产物
+		when: "一次构建里既跑被测任务，也跑探针任务与两个扰动任务；对照来自探针任务在执行期调用的配置期调用点"
+		// 探针任务在执行期调用配置期调用点（它要读输入 jar，而输入 jar 由执行期的产出任务给出），
+		// 故探针排在所有被测任务之后；比较口径不变：仍是「任务产出 vs 配置期调用点产出」的全量逐条字节对比。
+		// 仍显式关掉配置缓存与构建缓存：探针任务读的是 Gradle 项目模型（关配置缓存），
+		// 而本用例要断言被测任务**真的执行了**，不是从缓存恢复了别的产物（关构建缓存）
 		def build = gradle.run(tasks: [
 			taskName,
+			PROBE_TASK,
 			PERTURBED_VISITOR_TASK,
 			PERTURBED_NAMESPACE_TASK
 		],
@@ -193,8 +213,11 @@ class SrgMojangMappedRemapEquivalenceTest extends Specification implements Gradl
 		def vsPerturbedNamespace = diff(subject, perturbedNamespace)
 		printEvidence(provider, report, subject, reference, input, perturbedVisitor, perturbedNamespace)
 
-		then: "被测任务执行了，且它产出的就是消费侧按坐标看到的那份产物"
+		then: "被测任务与探针任务都执行了（探针不执行就没有对照），且产物就是消费侧按坐标看到的那份"
+		// 探针任务不声明任何产物 ⇒ 永不 UP-TO-DATE；报告里的键全由它在执行期写出，
+		// 因此「报告读得到」本身也是它真跑过的证据，这条断言把它明写成断言而不是隐含前提。
 		build.task(":" + taskName).outcome == SUCCESS
+		build.task(":" + PROBE_TASK).outcome == SUCCESS
 		build.task(":" + PERTURBED_VISITOR_TASK).outcome == SUCCESS
 		build.task(":" + PERTURBED_NAMESPACE_TASK).outcome == SUCCESS
 		new File(report.SUBJECT_JAR).exists()
@@ -281,10 +304,15 @@ class SrgMojangMappedRemapEquivalenceTest extends Specification implements Gradl
 	}
 
 	/**
-	 * 探针脚本：在配置期调用配置期调用点，并把任务输入与对照路径写进报告.
+	 * 探针脚本：注册一个执行期的探针任务，在**执行期**调用配置期调用点，并把任务输入与对照路径写进报告.
+	 *
+	 * <p>为什么必须挂在执行期：配置期调用点要读输入 jar（Forge 打过补丁的官方 jar），而它现在由执行期任务
+	 * 产出——配置期（{@code project.afterEvaluate} 里）它还不存在，冷缓存下必以 {@code NoSuchFileException}
+	 * 失败。探针任务声明 {@code dependsOn(被测任务)} 来拿到它全部输入的任务依赖（见脚本里的说明）。
 	 *
 	 * <p>{@code remapJar} 的入口是 {@code protected}，这里用反射取到它以调用**同一段代码**；构造
 	 * {@code RemappedJars} 时只把落位换成探针自己的文件，输入、源命名空间与 classpath 都取自被测 provider。
+	 * 任务注册（探针任务与两个扰动任务）留在配置期——任务注册本来就不能发生在执行期。
 	 */
 	private static String probeScript(String providerGetter, String taskName) {
 		return '''
@@ -297,6 +325,14 @@ project.afterEvaluate {
 	def remappedJars = provider.getRemappedJars()
 	def probeDir = new File(project.layout.buildDirectory.get().asFile, 'probe')
 	probeDir.mkdirs()
+	// 执行期要用 Project 时只能走这个**配置期捕获的局部变量**：任务动作里直接写 `project` 会被解析成
+	// Task.getProject()，Gradle 8 起那是弃用 API（"Invocation of Task.project at execution time has been
+	// deprecated"），而内层构建以 --warning-mode fail 运行——弃用警告会把构建直接判失败。
+	def probeProject = project
+	// 被测任务与它的第一个 jar：报告里的接线字段、对照落位与探针任务的排序都要用它们
+	def realTask = project.tasks.getByName('@TASK_NAME@')
+	def first = remappedJars[0]
+	def referenceJar = new File(probeDir, 'configtime-' + first.type().toString() + '.jar')
 
 	// 「配置期那处调用点」本身：AbstractMappedMinecraftProvider.remapJar(RemappedJars, ConfigContext)。
 	// 只反射取 protected 入口，参数一律取自被测 provider，不另写一份语义。
@@ -348,49 +384,87 @@ project.afterEvaluate {
 	lines << 'PROVIDER_OVERRIDES_HOOK=' + overridesHook
 	lines << 'PROVIDER_DECLARED_HOOK_KIND=' + declaredHookKind
 
-	def first = remappedJars[0]
-	def referenceJar = new File(probeDir, 'configtime-' + first.type().toString() + '.jar')
+	// ==== 探针本体：必须挂在**执行期** ====
+	// 配置期调用点要读输入 jar（Forge 打过补丁的官方 jar），而它现在由执行期任务产出：冷缓存下
+	// 配置期它还不存在。这段原先直接写在 afterEvaluate 里（即配置期），于是必以
+	// NoSuchFileException .../minecraft-merged-patched.jar 失败——CI 上必现，
+	// 本机只是恰好共享 gradle home 里早就有那份 jar 才一直掩盖着这条路径。
+	//
+	// 搬进任务动作**不改变调用点本身**：仍是反射调 AbstractMappedMinecraftProvider.remapJar(
+	// RemappedJars, ConfigContext)，参数仍取自被测 provider 自己的 getRemappedJars()，只把落位换到
+	// 探针自己的文件。对照因此仍是「配置期调用点」的产出，不是它的再实现。
+	def probeAction = {
+		// 输入 jar 此刻必然在位：探针排在被测任务之后（见下面的接线）。读不到就直接失败，
+		// 而不是报一个 0 再由断言去兜。
+		def taskInputJar = realTask.getInputJar().get().asFile
 
-	// remapJar 末尾会写 pom，而 savePom 假设 maven 构件目录已存在——配置期路径里它是
-	// 「先把 jar 写进该目录」顺带建出来的。探针把落位改到独立文件后这个前提消失，必须显式补上。
-	// 取的是**被测任务真实产出**的 pom 父目录，而不是按 RemappedJars 反推：后者在配置期
-	// 拿不到（outputJar().forPath() 与 outputJar().getPath() 都会抛 NPE）。
-	// 少了这一步，暖缓存下会因共享 gradle home 里恰有该目录而侥幸通过，**冷缓存/CI 下必以
-	// NoSuchFileException ... .pom*.tmp 失败**——而 CI 不缓存 loom 产物目录。
-	def subjectPom = project.tasks.getByName('@TASK_NAME@').getOutputPom()
+		if (!taskInputJar.isFile()) {
+			throw new IllegalStateException('被测任务的输入 jar 不在位（本探针应排在被测任务之后）：' + taskInputJar)
+		}
 
-	if (subjectPom.isPresent()) {
-		subjectPom.get().asFile.parentFile.mkdirs()
+		// 内部类名集合不再是一个「配置期接线的输入」：它由任务在执行期从 (inputJar, forgeLike) 现算
+		// （见 RemapMinecraftTask.resolveInnerClassNames）。接线侧若给它挂惰性 provider，配置缓存写入
+		// 任务状态时会求值它，冷缓存下输入 jar 尚不存在，整次配置缓存写入直接失败；而若让它吞掉缺失
+		// 返回空集，序列化下来的就是与 jar 内容脱钩的陈旧值。故只能在执行期现算。
+		// 探针于是在执行期按同一条函数关系自行现算被断言的那个量——断言守的仍是同一件事：
+		// Forge 系的输入 jar 确实含内部类，Named 那条（forgeLike=false）不含。
+		def innerClassCount = 0
+
+		if (realTask.getForgeLike().get()) {
+			innerClassCount = dev.architectury.loom.forge.InnerClassRemapper
+					.readClassNames(taskInputJar.toPath())
+					.size()
+		}
+
+		lines << 'TASK_INNER_CLASS_COUNT=' + innerClassCount
+
+		// remapJar 末尾会写 pom，而 savePom 假设 maven 构件目录已存在——配置期路径里它是
+		// 「先把 jar 写进该目录」顺带建出来的。探针把落位改到独立文件后这个前提消失，必须显式补上。
+		// 取的是**被测任务真实产出**的 pom 父目录，而不是按 RemappedJars 反推：后者在配置期
+		// 拿不到（outputJar().forPath() 与 outputJar().getPath() 都会抛 NPE）。
+		def subjectPom = realTask.getOutputPom()
+
+		if (subjectPom.isPresent()) {
+			subjectPom.get().asFile.parentFile.mkdirs()
+		}
+
+		// 只改落位：输入、源命名空间与 classpath 都沿用被测 provider 自己声明的那一份
+		def ctorArgs = new Object[4]
+		ctorArgs[0] = first.inputJar()
+		ctorArgs[1] = first.outputJar().forPath(referenceJar.toPath())
+		ctorArgs[2] = first.sourceNamespace()
+		ctorArgs[3] = first.remapClasspath()
+		def referenceEntry = remappedJarsCtor.newInstance(ctorArgs)
+
+		def serviceFactory = new net.fabricmc.loom.util.service.ScopedServiceFactory()
+
+		try {
+			def callArgs = new Object[2]
+			callArgs[0] = referenceEntry
+			callArgs[1] = new net.fabricmc.loom.configuration.ConfigContextImpl(probeProject, serviceFactory, loomExt)
+			remapJarMethod.invoke(provider, callArgs)
+		} catch (java.lang.reflect.InvocationTargetException e) {
+			throw new RuntimeException('配置期对照的重映射失败', e.getTargetException())
+		} finally {
+			serviceFactory.close()
+		}
+
+		probeReportFile.text = lines.join(System.lineSeparator()) + System.lineSeparator()
 	}
 
-	// 已知隐患（未修，故意保留原状）：remapJar 末尾的 savePom 假设 maven 构件目录已存在
-	// （配置期路径里它是「先把 jar 写进该目录」顺带建出来的）；探针把落位改到独立文件后
-	// 这个前提消失。当前用例仅因共享 gradle home 里恰有该目录而通过，**冷缓存/CI 下可能以
-	// NoSuchFileException ... .pom*.tmp 失败**。修法见 FabricSplitRemapEquivalenceTest：
-	// 取被测任务真实产物的 pom 父目录 mkdirs。此处没有照搬是因为按 RemappedJars 反推路径
-	// 会拿到 null（试过 outputJar().forPath() 与 outputJar().getPath()，均在配置期抛 NPE）。
-
-	def ctorArgs = new Object[4]
-	ctorArgs[0] = first.inputJar()
-	ctorArgs[1] = first.outputJar().forPath(referenceJar.toPath())
-	ctorArgs[2] = first.sourceNamespace()
-	ctorArgs[3] = first.remapClasspath()
-	def referenceEntry = remappedJarsCtor.newInstance(ctorArgs)
-
-	def serviceFactory = new net.fabricmc.loom.util.service.ScopedServiceFactory()
-
-	try {
-		def callArgs = new Object[2]
-		callArgs[0] = referenceEntry
-		callArgs[1] = new net.fabricmc.loom.configuration.ConfigContextImpl(project, serviceFactory, loomExt)
-		remapJarMethod.invoke(provider, callArgs)
-	} catch (java.lang.reflect.InvocationTargetException e) {
-		throw new RuntimeException('配置期对照的重映射失败', e.getTargetException())
-	} finally {
-		serviceFactory.close()
+	// 探针任务：不声明任何产物 ⇒ 永不 UP-TO-DATE，每次构建都会把报告重写一遍
+	def equivalenceProbe = project.tasks.register('@PROBE_TASK@') { task ->
+		task.doLast(probeAction)
+		// 排在被测任务之后执行：配置期调用点要读的输入是被测任务输入的真子集（同一个 RemappedJars 的
+		// inputJar / remapClasspath，以及同一处 MappingOption 拿到的映射树），让探针跟在被测任务后面，
+		// 就按生产自己的接线一次性拿到它们全部的任务依赖。这里刻意不在探针里复刻一套接线：
+		// 生产接线一变，复刻的那份会静默失真。
+		task.dependsOn(realTask)
+		// 另外按生产消费方的通道（登记过任务产出的命名空间集合）补一条直接依赖，让「读的这份 jar
+		// 由谁产出」在 Gradle 的任务模型里是明写的，而不是只靠上面那条间接可达。
+		task.dependsOn(loomExt.getMinecraftJarsCollection(net.fabricmc.loom.api.mappings.layered.MappingsNamespace.OFFICIAL))
+		task.inputs.file(realTask.getInputJar())
 	}
-
-	def realTask = project.tasks.getByName('@TASK_NAME@')
 
 	lines << 'SOURCE_NAMESPACE=' + first.sourceNamespace().toString()
 	lines << 'INPUT_JAR=' + first.inputJar().toAbsolutePath().normalize().toString()
@@ -411,25 +485,6 @@ project.afterEvaluate {
 	lines << 'TASK_COPY_ONLY=' + realTask.getCopyOnly().get()
 	lines << 'TASK_FIX_RECORDS=' + realTask.getFixRecords().get()
 	lines << 'TASK_VALIDATE_TARGET_NAMESPACE=' + realTask.getValidateTargetNamespace().get()
-	// 内部类名集合不再是一个「配置期接线的输入」：它由任务在执行期从 (inputJar, forgeLike) 现算
-	// （见 RemapMinecraftTask.resolveInnerClassNames）。接线侧若给它挂惰性 provider，配置缓存写入
-	// 任务状态时会求值它，冷缓存下输入 jar 尚不存在，整次配置缓存写入直接失败；而若让它吞掉缺失
-	// 返回空集，序列化下来的就是与 jar 内容脱钩的陈旧值。故只能在执行期现算。
-	// 探针于是在配置期按同一条函数关系自行现算被断言的那个量——断言守的仍是同一件事：
-	// Forge 系的输入 jar 确实含内部类，Named 那条（forgeLike=false）不含。
-	def innerClassCount = 0
-
-	if (realTask.getForgeLike().get()) {
-		def taskInputJar = realTask.getInputJar().get().asFile
-
-		if (taskInputJar.isFile()) {
-			innerClassCount = dev.architectury.loom.forge.InnerClassRemapper
-					.readClassNames(taskInputJar.toPath())
-					.size()
-		}
-	}
-
-	lines << 'TASK_INNER_CLASS_COUNT=' + innerClassCount
 	lines << 'TASK_SIGNATURE_FIX_COUNT=' + realTask.getSignatureFixes().get().size()
 	lines << 'TASK_ANNOTATIONS_PRESENT=' + realTask.getAnnotationsJson().isPresent()
 	lines << 'TASK_OBJECT_HOLDER_CLASS=' + (realTask.getObjectHolderClassName().isPresent() ? realTask.getObjectHolderClassName().get() : '')
@@ -489,11 +544,11 @@ project.afterEvaluate {
 	lines << 'PERTURBED_VISITOR_JAR=' + perturbedVisitor.absolutePath
 	lines << 'PERTURBED_NAMESPACE_JAR=' + perturbedNamespace.absolutePath
 	lines << 'PERTURBED_TO_NAMESPACE=' + '@PERTURBED_NAMESPACE@'
-	probeReportFile.text = lines.join(System.lineSeparator()) + System.lineSeparator()
 }
 '''
 				.replace('@PROVIDER_GETTER@', providerGetter)
 				.replace('@TASK_NAME@', taskName)
+				.replace('@PROBE_TASK@', PROBE_TASK)
 				.replace('@PERTURBED_VISITOR_TASK@', PERTURBED_VISITOR_TASK)
 				.replace('@PERTURBED_NAMESPACE_TASK@', PERTURBED_NAMESPACE_TASK)
 				.replace('@PERTURBED_NAMESPACE@', PERTURBED_NAMESPACE)

@@ -58,7 +58,17 @@ import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
  * 被测 provider 自己的 {@code getRemappedJars()}，只把落位换成探针的独立文件
  * （{@code build/probe/configtime-<type>.jar}）。
  *
- * <p>因此**被测产物的路径上只有被测任务一个写入者**：「两者一致」不可能由「读到了同一份文件」伪造出来。
+ * <p>这次调用由**探针任务在执行期**发起（早先写在 {@code project.afterEvaluate} 里，即配置期）：那一处
+ * 调用点要读输入 jar（vanilla split 的 common / client-only jar），而输入 jar 在生产链迁到任务之后由
+ * 执行期任务产出，配置期它还不存在——冷缓存/CI 下配置期调用必以
+ * {@code FileNotFoundException ... caches/fabric-loom/1.20.1/minecraft-common.jar} 失败，
+ * 只有本机那种「产物早已落在共享 gradle home 里」的热缓存才掩盖得住。探针任务因此声明
+ * {@code dependsOn(四个被测任务)}：配置期调用点的输入是被测任务输入的真子集（同一份
+ * {@code RemappedJars} 的 {@code inputJar} / {@code remapClasspath}），跟在被测任务之后就一次性拿到它们
+ * 全部的任务依赖，探针里不必复刻那套生产接线。**被调用的调用点与比对口径一个字没有改**：搬的只是发起时机。
+ *
+ * <p>因此**被测产物的路径上只有被测任务一个写入者**：「两者一致」不可能由「读到了同一份文件」伪造出来；
+ * 探针改到执行期发起也不引入这类别名——对照仍写在上面那个独立文件上。
  *
  * <h2>比对口径</h2>
  * 解压后比**每一个 entry 的字节摘要**（SHA-256），entry 名集合也必须一致——不是整文件哈希：
@@ -132,6 +142,13 @@ class FabricSplitRemapEquivalenceTest extends Specification implements GradlePro
 	private static final String PERTURBED_NAMESPACE_CLIENT_ONLY = "equivalencePerturbedToNamespaceClientOnly"
 	/** 目标命名空间扰动的取值：另一个真实存在的命名空间. */
 	private static final String PERTURBED_NAMESPACE = "intermediary"
+	/**
+	 * 探针任务名：在执行期调用配置期调用点，产出对照并写报告.
+	 *
+	 * <p>它必须在**执行期**跑：配置期调用点要读的输入 jar（vanilla split 的 common / client-only jar）现在由
+	 * 执行期任务产出，配置期读不到（冷缓存/CI 下必以 {@code FileNotFoundException} 失败）。
+	 */
+	private static final String PROBE_TASK = "equivalenceConfigTimeReferenceProbe"
 	/** 报告里 common jar 的键前缀. */
 	private static final String COMMON = "COMMON"
 	/** 报告里 client-only jar 的键前缀（类型名 {@code clientOnly} 大写后无分隔）. */
@@ -159,14 +176,17 @@ class FabricSplitRemapEquivalenceTest extends Specification implements GradlePro
             }
             ''' + probeScript()
 
-		when: "一次构建里既跑两个被测任务，也跑四个扰动任务；对照来自探针在配置期按同一 provider 调用的配置期调用点"
-		// 探针在配置期调用配置期调用点（它需要 Gradle 项目模型），故显式关掉配置缓存；
-		// 同时关掉构建缓存：本用例要断言被测任务**真的执行了**，而不是从缓存恢复了别的产物
+		when: "一次构建里既跑四个被测任务与四个扰动任务，也跑探针任务；对照来自探针任务在执行期调用的配置期调用点"
+		// 探针任务在执行期调用配置期调用点（它要读那两个输入 jar，而它们由执行期的产出任务给出），
+		// 故探针排在四个被测任务之后；比较口径不变：仍是「任务产出 vs 配置期调用点产出」的全量逐条字节对比。
+		// 仍显式关掉配置缓存与构建缓存：探针任务读的是 Gradle 项目模型（关配置缓存），
+		// 而本用例要断言被测任务**真的执行了**，不是从缓存恢复了别的产物（关构建缓存）
 		def build = gradle.run(tasks: [
 			TASK_COMMON,
 			TASK_CLIENT_ONLY,
 			TASK_INTERMEDIARY_COMMON,
 			TASK_INTERMEDIARY_CLIENT_ONLY,
+			PROBE_TASK,
 			PERTURBED_VISITOR_COMMON,
 			PERTURBED_VISITOR_CLIENT_ONLY,
 			PERTURBED_NAMESPACE_COMMON,
@@ -183,11 +203,14 @@ class FabricSplitRemapEquivalenceTest extends Specification implements GradlePro
 		Map<String, Object> intermediaryClientOnly = loadPairEvidence(report, "INTERMEDIARY_", CLIENT_ONLY)
 		printEvidence(report, common, clientOnly, intermediaryCommon, intermediaryClientOnly)
 
-		then: "八个任务都执行了（两个被测、两个 intermediary 被测、四个扰动）"
+		then: "九个任务都执行了（四个被测、四个扰动，以及产出对照的探针任务）"
+		// 探针任务不声明任何产物 ⇒ 永不 UP-TO-DATE；报告里的键全由它在执行期写出，
+		// 因此「报告读得到」本身也是它真跑过的证据，这条断言把它明写成断言而不是隐含前提。
 		build.task(":" + TASK_COMMON).outcome == SUCCESS
 		build.task(":" + TASK_CLIENT_ONLY).outcome == SUCCESS
 		build.task(":" + TASK_INTERMEDIARY_COMMON).outcome == SUCCESS
 		build.task(":" + TASK_INTERMEDIARY_CLIENT_ONLY).outcome == SUCCESS
+		build.task(":" + PROBE_TASK).outcome == SUCCESS
 		build.task(":" + PERTURBED_VISITOR_COMMON).outcome == SUCCESS
 		build.task(":" + PERTURBED_VISITOR_CLIENT_ONLY).outcome == SUCCESS
 		build.task(":" + PERTURBED_NAMESPACE_COMMON).outcome == SUCCESS
@@ -359,7 +382,13 @@ class FabricSplitRemapEquivalenceTest extends Specification implements GradlePro
 	}
 
 	/**
-	 * 探针脚本：在配置期按被测 provider 逐 jar 调用配置期调用点，并把任务侧接线与两侧产物路径写进报告.
+	 * 探针脚本：注册一个执行期的探针任务，在**执行期**按被测 provider 逐 jar 调用配置期调用点，
+	 * 并把任务侧接线与两侧产物路径写进报告.
+	 *
+	 * <p>为什么必须挂在执行期：配置期调用点要读输入 jar（vanilla split 的 common / client-only jar），
+	 * 而它们现在由执行期任务产出——配置期（{@code project.afterEvaluate} 里）它们还不存在，冷缓存下必以
+	 * {@code FileNotFoundException} 失败。探针任务声明 {@code dependsOn(被测任务)} 来拿到它们全部输入的任务
+	 * 依赖（见脚本里的说明）；任务注册（探针任务与四个扰动任务）留在配置期——任务注册本来就不能发生在执行期。
 	 *
 	 * <p>{@code remapJar} 的入口是 {@code protected}，这里用反射取到它以调用**同一段代码**；构造
 	 * {@code RemappedJars} 时只把落位换成探针自己的文件，输入、源命名空间与 classpath 都取自被测 provider。
@@ -376,12 +405,19 @@ project.afterEvaluate {
 	def remappedJars = provider.getRemappedJars()
 	def probeDir = new File(project.layout.buildDirectory.get().asFile, 'probe')
 	probeDir.mkdirs()
+	// 执行期要用 Project 时只能走这个**配置期捕获的局部变量**：任务动作里直接写 `project` 会被解析成
+	// Task.getProject()，Gradle 8 起那是弃用 API（"Invocation of Task.project at execution time has been
+	// deprecated"），而内层构建以 --warning-mode fail 运行——弃用警告会把构建直接判失败。
+	def probeProject = project
 	def lines = []
 
 	// 被测任务名刻意在这里写成字面量，而不是复刻生产代码里的拼接公式：复刻公式会让
 	// 「生产代码换了命名」这件事在探针里同步发生，测试侧对任务名的断言随之失去意义。
 	def taskNamesByType = ['common': '@TASK_COMMON@', 'clientOnly': '@TASK_CLIENT_ONLY@']
 	def suffixByType = ['common': 'Common', 'clientOnly': 'ClientOnly']
+	// 逐 jar 的被测任务对象：报告里的接线字段与探针任务的排序都要用它们。一律在**配置期**取好，
+	// 执行期不再碰任务容器——任务注册与按名查找都只属于配置期。
+	def realTasksByType = taskNamesByType.collectEntries { type, name -> [(type): project.tasks.getByName(name)] }
 
 	def baseClass = Class.forName('net.fabricmc.loom.configuration.providers.minecraft.mapped.AbstractMappedMinecraftProvider')
 
@@ -438,9 +474,6 @@ project.afterEvaluate {
 			net.fabricmc.loom.api.mappings.layered.MappingsNamespace,
 			java.nio.file.Path[].class)
 
-	def serviceFactory = new net.fabricmc.loom.util.service.ScopedServiceFactory()
-	def configContext = new net.fabricmc.loom.configuration.ConfigContextImpl(project, serviceFactory, loomExt)
-
 	// 活性检查：把被测任务的每一个输入原样搬过去，只扰动其中一个维度。
 	def perturb = { String perturbationTask, File output, def realTask, Closure mutate ->
 		project.tasks.register(perturbationTask, net.fabricmc.loom.pipeline.RemapMinecraftTask) { task ->
@@ -480,93 +513,65 @@ project.afterEvaluate {
 		return output
 	}
 
-	try {
-		remappedJars.each { remappedJar ->
-			def jarType = remappedJar.type().toString()
-			def key = jarType.toUpperCase(Locale.ROOT)
-			def referenceJar = new File(probeDir, 'configtime-' + jarType + '.jar')
-			def perturbedVisitor = new File(probeDir, 'perturbed-client-visitor-' + jarType + '.jar')
-			def perturbedNamespace = new File(probeDir, 'perturbed-to-' + '@PERTURBED_NAMESPACE@' + '-' + jarType + '.jar')
-			def realTask = project.tasks.getByName(taskNamesByType[jarType])
-
-			// remapJar 末尾会写 pom（savePom 假设构件目录已存在——配置期路径里它是「先把 jar 写进该目录」
-			// 顺带建出来的）。探针把落位改到独立文件后这个前提消失，这里显式补上：它只是让同一段配置期代码
-			// 能跑完，不改变任何输入，也不改变被测产物的路径。
-			realTask.getOutputPom().get().asFile.parentFile.mkdirs()
-
-			// 只改落位：输入、源命名空间与 classpath 都沿用被测 provider 自己声明的那一份
-			def ctorArgs = new Object[4]
-			ctorArgs[0] = remappedJar.inputJar()
-			ctorArgs[1] = remappedJar.outputJar().forPath(referenceJar.toPath())
-			ctorArgs[2] = remappedJar.sourceNamespace()
-			ctorArgs[3] = remappedJar.remapClasspath()
-			def referenceEntry = remappedJarsCtor.newInstance(ctorArgs)
-
-			try {
-				remapJarMethod.invoke(provider, referenceEntry, configContext)
-			} catch (java.lang.reflect.InvocationTargetException e) {
-				throw new RuntimeException('配置期对照的重映射失败（' + jarType + '）', e.getTargetException())
-			}
-
-			perturb.call('equivalencePerturbedClientVisitor' + suffixByType[jarType], perturbedVisitor, realTask) { task ->
-				task.getInjectClientSidedVisitor().set(!realTask.getInjectClientSidedVisitor().get())
-			}
-			perturb.call('equivalencePerturbedToNamespace' + suffixByType[jarType], perturbedNamespace, realTask) { task ->
-				task.getToNamespace().set('@PERTURBED_NAMESPACE@')
-			}
-
-			lines << 'SOURCE_NAMESPACE_' + key + '=' + remappedJar.sourceNamespace().toString()
-			lines << 'INPUT_JAR_' + key + '=' + remappedJar.inputJar().toAbsolutePath().normalize().toString()
-			lines << 'SUBJECT_JAR_' + key + '=' + realTask.getOutputJar().get().asFile.absolutePath
-			lines << 'REFERENCE_JAR_' + key + '=' + referenceJar.absolutePath
-			lines << 'TASK_' + key + '_NAME=' + realTask.getName()
-			lines << 'TASK_INPUT_JAR_' + key + '=' + realTask.getInputJar().get().asFile.absolutePath
-			lines << 'TASK_OUTPUT_JAR_' + key + '=' + realTask.getOutputJar().get().asFile.absolutePath
-			lines << 'TASK_' + key + '_OUTPUT_MERGED=' + remappedJar.outputJar().isMerged()
-			lines << 'TASK_' + key + '_OUTPUT_INCLUDES_CLIENT=' + remappedJar.outputJar().includesClient()
-			lines << 'TASK_' + key + '_FROM_NAMESPACE=' + realTask.getFromNamespace().get()
-			lines << 'TASK_' + key + '_TO_NAMESPACE=' + realTask.getToNamespace().get()
-			lines << 'TASK_' + key + '_FORGE_LIKE=' + realTask.getForgeLike().get()
-			lines << 'TASK_' + key + '_INJECT_MIXIN_EXTENSION=' + realTask.getInjectMixinExtension().get()
-			lines << 'TASK_' + key + '_INJECT_CLIENT_SIDED_VISITOR=' + realTask.getInjectClientSidedVisitor().get()
-			lines << 'TASK_' + key + '_COPY_ONLY=' + realTask.getCopyOnly().get()
-			lines << 'TASK_' + key + '_FIX_RECORDS=' + realTask.getFixRecords().get()
-			lines << 'TASK_' + key + '_VALIDATE_TARGET_NAMESPACE=' + realTask.getValidateTargetNamespace().get()
-			lines << 'TASK_' + key + '_INNER_CLASS_COUNT=' + realTask.getInnerClassNames().get().size()
-			lines << 'TASK_' + key + '_SIGNATURE_FIX_COUNT=' + realTask.getSignatureFixes().get().size()
-			lines << 'TASK_' + key + '_ANNOTATIONS_PRESENT=' + realTask.getAnnotationsJson().isPresent()
-			lines << 'TASK_' + key + '_OBJECT_HOLDER_CLASS=' + (realTask.getObjectHolderClassName().isPresent() ? realTask.getObjectHolderClassName().get() : '')
-			lines << 'TASK_' + key + '_OBJECT_HOLDER_SOURCE_NAMESPACE=' + (realTask.getObjectHolderSourceNamespace().isPresent() ? realTask.getObjectHolderSourceNamespace().get() : '')
-			lines << 'TASK_' + key + '_OBJECT_HOLDER_TARGET_NAMESPACE=' + realTask.getObjectHolderTargetNamespace().get()
-			lines << 'TASK_' + key + '_REMAP_CLASSPATH_COUNT=' + realTask.getRemapClasspath().getFiles().size()
-			lines << 'TASK_' + key + '_OUTPUT_POM_PRESENT=' + realTask.getOutputPom().isPresent()
-			lines << 'TASK_' + key + '_OUTPUT_POM=' + (realTask.getOutputPom().isPresent() ? realTask.getOutputPom().get().asFile.absolutePath : '')
-			lines << 'TASK_' + key + '_OUTPUT_BACKUP_PRESENT=' + realTask.getOutputBackupJar().isPresent()
-			lines << 'TASK_' + key + '_OUTPUT_BACKUP_JAR=' + (realTask.getOutputBackupJar().isPresent() ? realTask.getOutputBackupJar().get().asFile.absolutePath : '')
-			lines << 'PERTURBED_VISITOR_JAR_' + key + '=' + perturbedVisitor.absolutePath
-			lines << 'PERTURBED_NAMESPACE_JAR_' + key + '=' + perturbedNamespace.absolutePath
+	// 扰动任务**必须在配置期注册**（任务注册不能发生在执行期），因此这一段留在 afterEvaluate 里；
+	// 对照产出则搬进执行期的探针任务（见下）。扰动任务自身的输入接线一字未改。
+	remappedJars.each { remappedJar ->
+		def jarType = remappedJar.type().toString()
+		def realTask = realTasksByType[jarType]
+		perturb.call('equivalencePerturbedClientVisitor' + suffixByType[jarType],
+				new File(probeDir, 'perturbed-client-visitor-' + jarType + '.jar'), realTask) { task ->
+			task.getInjectClientSidedVisitor().set(!realTask.getInjectClientSidedVisitor().get())
 		}
-		// 第二个 provider：intermediary split（同一处 configureRemapper 覆写、同一条 configureSplitRemapper
-		// 判据的另一处声明）。为了拿到对照，它同样逐 jar 反射调用配置期调用点被切走的那一处；**不**再为它注册
-		// 扰动任务——口径的活性与 visitor 的产物级效果已在 named 一侧证明，两者用的是同一个任务类与同一套接线。
-		def intermediaryProvider = loomExt.getIntermediaryMinecraftProvider()
+		perturb.call('equivalencePerturbedToNamespace' + suffixByType[jarType],
+				new File(probeDir, 'perturbed-to-' + '@PERTURBED_NAMESPACE@' + '-' + jarType + '.jar'), realTask) { task ->
+			task.getToNamespace().set('@PERTURBED_NAMESPACE@')
+		}
+	}
 
-		if (intermediaryProvider != null) {
-			def intermediaryJars = intermediaryProvider.getRemappedJars()
-			lines << 'INTERMEDIARY_PROVIDER_CLASS=' + intermediaryProvider.getClass().name
-			lines << 'INTERMEDIARY_REMAPPED_JAR_COUNT=' + intermediaryJars.size()
-			lines << 'INTERMEDIARY_TARGET_NAMESPACE=' + intermediaryProvider.getTargetNamespace().toString()
-			hookFacts.call(intermediaryProvider, 'INTERMEDIARY')
+	// 第二个 provider：intermediary split（同一处 configureRemapper 覆写、同一条 configureSplitRemapper
+	// 判据的另一处声明）。为了拿到对照，它同样逐 jar 反射调用配置期调用点被切走的那一处；**不**再为它注册
+	// 扰动任务——口径的活性与 visitor 的产物级效果已在 named 一侧证明，两者用的是同一个任务类与同一套接线。
+	def intermediaryProvider = loomExt.getIntermediaryMinecraftProvider()
+	def intermediaryJars = intermediaryProvider == null ? null : intermediaryProvider.getRemappedJars()
+	def intermediaryTasksByType = intermediaryProvider == null ? [:] : suffixByType.collectEntries { type, suffix ->
+		[(type): project.tasks.getByName('remapMinecraftIntermediary' + suffix)]
+	}
 
-			intermediaryJars.each { remappedJar ->
+	if (intermediaryProvider != null) {
+		lines << 'INTERMEDIARY_PROVIDER_CLASS=' + intermediaryProvider.getClass().name
+		lines << 'INTERMEDIARY_REMAPPED_JAR_COUNT=' + intermediaryJars.size()
+		lines << 'INTERMEDIARY_TARGET_NAMESPACE=' + intermediaryProvider.getTargetNamespace().toString()
+		hookFacts.call(intermediaryProvider, 'INTERMEDIARY')
+	}
+
+	// ==== 探针本体：必须挂在**执行期** ====
+	// 配置期调用点要读输入 jar（vanilla split 的 common / client-only jar），而它现在由执行期任务产出：
+	// 冷缓存下配置期它还不存在。这段原先直接写在 afterEvaluate 里（即配置期），于是必以
+	// FileNotFoundException .../caches/fabric-loom/1.20.1/minecraft-common.jar 失败——CI 上必现，
+	// 本机只是恰好共享 gradle home 里早就有那两个 jar 才一直掩盖着这条路径。
+	//
+	// 搬进任务动作**不改变调用点本身**：仍是反射调 AbstractMappedMinecraftProvider.remapJar(
+	// RemappedJars, ConfigContext)，参数仍取自被测 provider 自己的 getRemappedJars()，只把落位换到
+	// 探针自己的文件。对照因此仍是「配置期调用点」的产出，不是它的再实现。
+	def probeAction = {
+		def serviceFactory = new net.fabricmc.loom.util.service.ScopedServiceFactory()
+		def configContext = new net.fabricmc.loom.configuration.ConfigContextImpl(probeProject, serviceFactory, loomExt)
+
+		try {
+			remappedJars.each { remappedJar ->
 				def jarType = remappedJar.type().toString()
 				def key = jarType.toUpperCase(Locale.ROOT)
-				def referenceJar = new File(probeDir, 'configtime-intermediary-' + jarType + '.jar')
-				def realTask = project.tasks.getByName('remapMinecraftIntermediary' + suffixByType[jarType])
+				def referenceJar = new File(probeDir, 'configtime-' + jarType + '.jar')
+				def perturbedVisitor = new File(probeDir, 'perturbed-client-visitor-' + jarType + '.jar')
+				def perturbedNamespace = new File(probeDir, 'perturbed-to-' + '@PERTURBED_NAMESPACE@' + '-' + jarType + '.jar')
+				def realTask = realTasksByType[jarType]
 
-				// 同 named 一侧：补上配置期路径隐含依赖的构件目录（见上面的说明）
+				// remapJar 末尾会写 pom（savePom 假设构件目录已存在——配置期路径里它是「先把 jar 写进该目录」
+				// 顺带建出来的）。探针把落位改到独立文件后这个前提消失，这里显式补上：它只是让同一段配置期代码
+				// 能跑完，不改变任何输入，也不改变被测产物的路径。
 				realTask.getOutputPom().get().asFile.parentFile.mkdirs()
 
+				// 只改落位：输入、源命名空间与 classpath 都沿用被测 provider 自己声明的那一份
 				def ctorArgs = new Object[4]
 				ctorArgs[0] = remappedJar.inputJar()
 				ctorArgs[1] = remappedJar.outputJar().forPath(referenceJar.toPath())
@@ -575,34 +580,106 @@ project.afterEvaluate {
 				def referenceEntry = remappedJarsCtor.newInstance(ctorArgs)
 
 				try {
-					remapJarMethod.invoke(intermediaryProvider, referenceEntry, configContext)
+					remapJarMethod.invoke(provider, referenceEntry, configContext)
 				} catch (java.lang.reflect.InvocationTargetException e) {
-					throw new RuntimeException('配置期对照的重映射失败（intermediary ' + jarType + '）', e.getTargetException())
+					throw new RuntimeException('配置期对照的重映射失败（' + jarType + '）', e.getTargetException())
 				}
 
-				lines << 'INTERMEDIARY_SOURCE_NAMESPACE_' + key + '=' + remappedJar.sourceNamespace().toString()
-				lines << 'INTERMEDIARY_INPUT_JAR_' + key + '=' + remappedJar.inputJar().toAbsolutePath().normalize().toString()
-				lines << 'INTERMEDIARY_SUBJECT_JAR_' + key + '=' + realTask.getOutputJar().get().asFile.absolutePath
-				lines << 'INTERMEDIARY_REFERENCE_JAR_' + key + '=' + referenceJar.absolutePath
-				lines << 'INTERMEDIARY_TASK_' + key + '_NAME=' + realTask.getName()
-				lines << 'INTERMEDIARY_TASK_' + key + '_INJECT_CLIENT_SIDED_VISITOR=' + realTask.getInjectClientSidedVisitor().get()
-				lines << 'INTERMEDIARY_TASK_' + key + '_OUTPUT_MERGED=' + remappedJar.outputJar().isMerged()
-				lines << 'INTERMEDIARY_TASK_' + key + '_OUTPUT_INCLUDES_CLIENT=' + remappedJar.outputJar().includesClient()
-				lines << 'INTERMEDIARY_TASK_' + key + '_TO_NAMESPACE=' + realTask.getToNamespace().get()
-				lines << 'INTERMEDIARY_TASK_' + key + '_REMAP_CLASSPATH_COUNT=' + realTask.getRemapClasspath().getFiles().size()
-				lines << 'INTERMEDIARY_TASK_' + key + '_OUTPUT_BACKUP_PRESENT=' + realTask.getOutputBackupJar().isPresent()
+				lines << 'SOURCE_NAMESPACE_' + key + '=' + remappedJar.sourceNamespace().toString()
+				lines << 'INPUT_JAR_' + key + '=' + remappedJar.inputJar().toAbsolutePath().normalize().toString()
+				lines << 'SUBJECT_JAR_' + key + '=' + realTask.getOutputJar().get().asFile.absolutePath
+				lines << 'REFERENCE_JAR_' + key + '=' + referenceJar.absolutePath
+				lines << 'TASK_' + key + '_NAME=' + realTask.getName()
+				lines << 'TASK_INPUT_JAR_' + key + '=' + realTask.getInputJar().get().asFile.absolutePath
+				lines << 'TASK_OUTPUT_JAR_' + key + '=' + realTask.getOutputJar().get().asFile.absolutePath
+				lines << 'TASK_' + key + '_OUTPUT_MERGED=' + remappedJar.outputJar().isMerged()
+				lines << 'TASK_' + key + '_OUTPUT_INCLUDES_CLIENT=' + remappedJar.outputJar().includesClient()
+				lines << 'TASK_' + key + '_FROM_NAMESPACE=' + realTask.getFromNamespace().get()
+				lines << 'TASK_' + key + '_TO_NAMESPACE=' + realTask.getToNamespace().get()
+				lines << 'TASK_' + key + '_FORGE_LIKE=' + realTask.getForgeLike().get()
+				lines << 'TASK_' + key + '_INJECT_MIXIN_EXTENSION=' + realTask.getInjectMixinExtension().get()
+				lines << 'TASK_' + key + '_INJECT_CLIENT_SIDED_VISITOR=' + realTask.getInjectClientSidedVisitor().get()
+				lines << 'TASK_' + key + '_COPY_ONLY=' + realTask.getCopyOnly().get()
+				lines << 'TASK_' + key + '_FIX_RECORDS=' + realTask.getFixRecords().get()
+				lines << 'TASK_' + key + '_VALIDATE_TARGET_NAMESPACE=' + realTask.getValidateTargetNamespace().get()
+				lines << 'TASK_' + key + '_INNER_CLASS_COUNT=' + realTask.getInnerClassNames().get().size()
+				lines << 'TASK_' + key + '_SIGNATURE_FIX_COUNT=' + realTask.getSignatureFixes().get().size()
+				lines << 'TASK_' + key + '_ANNOTATIONS_PRESENT=' + realTask.getAnnotationsJson().isPresent()
+				lines << 'TASK_' + key + '_OBJECT_HOLDER_CLASS=' + (realTask.getObjectHolderClassName().isPresent() ? realTask.getObjectHolderClassName().get() : '')
+				lines << 'TASK_' + key + '_OBJECT_HOLDER_SOURCE_NAMESPACE=' + (realTask.getObjectHolderSourceNamespace().isPresent() ? realTask.getObjectHolderSourceNamespace().get() : '')
+				lines << 'TASK_' + key + '_OBJECT_HOLDER_TARGET_NAMESPACE=' + realTask.getObjectHolderTargetNamespace().get()
+				lines << 'TASK_' + key + '_REMAP_CLASSPATH_COUNT=' + realTask.getRemapClasspath().getFiles().size()
+				lines << 'TASK_' + key + '_OUTPUT_POM_PRESENT=' + realTask.getOutputPom().isPresent()
+				lines << 'TASK_' + key + '_OUTPUT_POM=' + (realTask.getOutputPom().isPresent() ? realTask.getOutputPom().get().asFile.absolutePath : '')
+				lines << 'TASK_' + key + '_OUTPUT_BACKUP_PRESENT=' + realTask.getOutputBackupJar().isPresent()
+				lines << 'TASK_' + key + '_OUTPUT_BACKUP_JAR=' + (realTask.getOutputBackupJar().isPresent() ? realTask.getOutputBackupJar().get().asFile.absolutePath : '')
+				lines << 'PERTURBED_VISITOR_JAR_' + key + '=' + perturbedVisitor.absolutePath
+				lines << 'PERTURBED_NAMESPACE_JAR_' + key + '=' + perturbedNamespace.absolutePath
 			}
+
+			if (intermediaryProvider != null) {
+				intermediaryJars.each { remappedJar ->
+					def jarType = remappedJar.type().toString()
+					def key = jarType.toUpperCase(Locale.ROOT)
+					def referenceJar = new File(probeDir, 'configtime-intermediary-' + jarType + '.jar')
+					def realTask = intermediaryTasksByType[jarType]
+
+					// 同 named 一侧：补上配置期路径隐含依赖的构件目录（见上面的说明）
+					realTask.getOutputPom().get().asFile.parentFile.mkdirs()
+
+					def ctorArgs = new Object[4]
+					ctorArgs[0] = remappedJar.inputJar()
+					ctorArgs[1] = remappedJar.outputJar().forPath(referenceJar.toPath())
+					ctorArgs[2] = remappedJar.sourceNamespace()
+					ctorArgs[3] = remappedJar.remapClasspath()
+					def referenceEntry = remappedJarsCtor.newInstance(ctorArgs)
+
+					try {
+						remapJarMethod.invoke(intermediaryProvider, referenceEntry, configContext)
+					} catch (java.lang.reflect.InvocationTargetException e) {
+						throw new RuntimeException('配置期对照的重映射失败（intermediary ' + jarType + '）', e.getTargetException())
+					}
+
+					lines << 'INTERMEDIARY_SOURCE_NAMESPACE_' + key + '=' + remappedJar.sourceNamespace().toString()
+					lines << 'INTERMEDIARY_INPUT_JAR_' + key + '=' + remappedJar.inputJar().toAbsolutePath().normalize().toString()
+					lines << 'INTERMEDIARY_SUBJECT_JAR_' + key + '=' + realTask.getOutputJar().get().asFile.absolutePath
+					lines << 'INTERMEDIARY_REFERENCE_JAR_' + key + '=' + referenceJar.absolutePath
+					lines << 'INTERMEDIARY_TASK_' + key + '_NAME=' + realTask.getName()
+					lines << 'INTERMEDIARY_TASK_' + key + '_INJECT_CLIENT_SIDED_VISITOR=' + realTask.getInjectClientSidedVisitor().get()
+					lines << 'INTERMEDIARY_TASK_' + key + '_OUTPUT_MERGED=' + remappedJar.outputJar().isMerged()
+					lines << 'INTERMEDIARY_TASK_' + key + '_OUTPUT_INCLUDES_CLIENT=' + remappedJar.outputJar().includesClient()
+					lines << 'INTERMEDIARY_TASK_' + key + '_TO_NAMESPACE=' + realTask.getToNamespace().get()
+					lines << 'INTERMEDIARY_TASK_' + key + '_REMAP_CLASSPATH_COUNT=' + realTask.getRemapClasspath().getFiles().size()
+					lines << 'INTERMEDIARY_TASK_' + key + '_OUTPUT_BACKUP_PRESENT=' + realTask.getOutputBackupJar().isPresent()
+				}
+			}
+		} finally {
+			serviceFactory.close()
 		}
-	} finally {
-		serviceFactory.close()
+
+		lines << 'PERTURBED_TO_NAMESPACE=' + '@PERTURBED_NAMESPACE@'
+		probeReportFile.text = lines.join(System.lineSeparator()) + System.lineSeparator()
 	}
 
-	lines << 'PERTURBED_TO_NAMESPACE=' + '@PERTURBED_NAMESPACE@'
-	probeReportFile.text = lines.join(System.lineSeparator()) + System.lineSeparator()
+	// 探针任务：不声明任何产物 ⇒ 永不 UP-TO-DATE，每次构建都会把报告重写一遍
+	def equivalenceProbe = project.tasks.register('@PROBE_TASK@') { task ->
+		task.doLast(probeAction)
+		// 排在被测任务之后执行：配置期调用点要读的输入是被测任务输入的真子集（同一份 RemappedJars 的
+		// inputJar / remapClasspath），让探针跟在被测任务后面，就按生产自己的接线一次性拿到它们全部的任务依赖。
+		// 这里刻意不在探针里复刻一套接线：生产接线一变，复刻的那份会静默失真。
+		task.dependsOn(realTasksByType.values())
+		task.dependsOn(intermediaryTasksByType.values())
+		// 另外按生产消费方的通道（登记过任务产出的命名空间集合）补一条直接依赖，让「读的这两个 jar
+		// 由谁产出」在 Gradle 的任务模型里是明写的，而不是只靠上面那条间接可达。
+		task.dependsOn(loomExt.getMinecraftJarsCollection(net.fabricmc.loom.api.mappings.layered.MappingsNamespace.OFFICIAL))
+		realTasksByType.values().each { subjectTask -> task.inputs.file(subjectTask.getInputJar()) }
+		intermediaryTasksByType.values().each { subjectTask -> task.inputs.file(subjectTask.getInputJar()) }
+	}
 }
 '''
 				.replace('@TASK_COMMON@', TASK_COMMON)
 				.replace('@TASK_CLIENT_ONLY@', TASK_CLIENT_ONLY)
+				.replace('@PROBE_TASK@', PROBE_TASK)
 				.replace('@PERTURBED_NAMESPACE@', PERTURBED_NAMESPACE)
 	}
 
