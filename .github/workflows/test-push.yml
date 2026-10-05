@@ -37,6 +37,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    # 单作业超时。GitHub 默认是 6 小时——曾有一个用例在内层 Gradle daemon OOM 后挂死，
+    # 把整条工作流拖到 361 分钟才被上限杀掉。这里按实测耗时给足余量后显式封顶。
+    timeout-minutes: 30
     steps:
       - name: setup jdk
         uses: actions/setup-java@v5
@@ -57,6 +60,9 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.extended_tests == 'true' }}
 
     runs-on: windows-2025
+    # 单作业超时。GitHub 默认是 6 小时——曾有一个用例在内层 Gradle daemon OOM 后挂死，
+    # 把整条工作流拖到 361 分钟才被上限杀掉。这里按实测耗时给足余量后显式封顶。
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - name: setup jdk
@@ -73,6 +79,9 @@ jobs:
     needs: build
 
     runs-on: ubuntu-24.04
+    # 单作业超时。GitHub 默认是 6 小时——曾有一个用例在内层 Gradle daemon OOM 后挂死，
+    # 把整条工作流拖到 361 分钟才被上限杀掉。这里按实测耗时给足余量后显式封顶。
+    timeout-minutes: 15
 
     steps:
       - name: setup jdk
@@ -100,6 +109,9 @@ jobs:
         test: ${{ fromJson(needs.prepare_test_matrix.outputs.matrix) }}
 
     runs-on: ubuntu-24.04
+    # 单作业超时。GitHub 默认是 6 小时——曾有一个用例在内层 Gradle daemon OOM 后挂死，
+    # 把整条工作流拖到 361 分钟才被上限杀掉。这里按实测耗时给足余量后显式封顶。
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v6
@@ -154,6 +166,9 @@ jobs:
         test: ${{ fromJson(needs.prepare_test_matrix.outputs.matrix) }}
 
     runs-on: windows-2025
+    # 单作业超时。GitHub 默认是 6 小时——曾有一个用例在内层 Gradle daemon OOM 后挂死，
+    # 把整条工作流拖到 361 分钟才被上限杀掉。这里按实测耗时给足余量后显式封顶。
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v6
@@ -196,6 +211,9 @@ jobs:
         os: [ windows-2025, ubuntu-24.04, macos-26 ]
 
     runs-on: ${{ matrix.os }}
+    # 单作业超时。GitHub 默认是 6 小时——曾有一个用例在内层 Gradle daemon OOM 后挂死，
+    # 把整条工作流拖到 361 分钟才被上限杀掉。这里按实测耗时给足余量后显式封顶。
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-java@v5
