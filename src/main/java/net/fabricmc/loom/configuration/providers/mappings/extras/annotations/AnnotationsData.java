@@ -45,11 +45,14 @@ import org.jspecify.annotations.Nullable;
 import org.objectweb.asm.tree.AnnotationNode;
 import org.objectweb.asm.tree.TypeAnnotationNode;
 
+import net.fabricmc.mappingio.tree.MappingTree;
+import net.fabricmc.mappingio.tree.MappingTreeView;
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration;
 import net.fabricmc.loom.task.service.TinyRemapperService;
 import net.fabricmc.loom.util.service.ServiceFactory;
 import net.fabricmc.tinyremapper.TinyRemapper;
+import net.fabricmc.tinyremapper.api.TrRemapper;
 
 public record AnnotationsData(Map<String, ClassAnnotationData> classes, String namespace) {
 	public static final Gson GSON = new GsonBuilder()
@@ -166,15 +169,97 @@ public record AnnotationsData(Map<String, ClassAnnotationData> classes, String n
 		return new AnnotationsData(newClassData, namespace);
 	}
 
-	public AnnotationsData remap(TinyRemapper remapper, String newNamespace) {
+	public AnnotationsData remap(TinyRemapper remapper, MappingTree mappingTree, String fromNamespace, String toNamespace, String newNamespace) {
 		return new AnnotationsData(
 				remapMap(
 						classes,
 						entry -> remapper.getEnvironment().getRemapper().map(entry.getKey()),
-						entry -> entry.getValue().remap(entry.getKey(), remapper)
+						entry -> entry.getValue().remap(entry.getKey(), remapper, mappingTree, namespace, toNamespace)
 				),
 				newNamespace
 		);
+	}
+
+	/**
+	 * {@return 成员名交给 {@code remapper} 自行解决的重映射}.
+	 *
+	 * <p>保留这个两参重载是<b>契约要求</b>，不是历史包袱：调用方可以自己
+	 * {@code remapper.readClassPath(目标类)}，此时 tiny-remapper 认得那些成员，成员名就由它解决
+	 * （{@code AnnotationsDataRemapTest} 覆盖的正是这条路径）。生产链路不这么做——它没有读 MC 的类，
+	 * 于是走 {@link #remap(TinyRemapper, MappingTree, String, String, String)} 把映射树一并传进来。
+	 */
+	public AnnotationsData remap(TinyRemapper remapper, String newNamespace) {
+		return remap(remapper, null, namespace, newNamespace, newNamespace);
+	}
+
+	/**
+	 * {@return 成员在 {@code toNamespace} 下的名字；两处都答不出时原样返回}.
+	 *
+	 * <p><b>先问映射树</b>：{@code TrRemapper.mapMethodName(owner, name, desc)} 需要先「知道」owner 这个类的
+	 * 成员——而生产链路上那个 remapper 是
+	 * {@code TinyRemapperService.createSimple(..., ClasspathLibraries.EXCLUDE)} 建的，从未读过 Minecraft 的
+	 * 类，于是对任何成员名都原样返回（实测：同一个 remapper 上 {@code mapMethodDesc} 正常、{@code mapMethodName}
+	 * 不变）。要让它知道就得把整个 MC jar 读进索引——为几个成员名付这个代价不划算。映射树本来就是这条链的
+	 * 权威来源（类名与描述符也在用它），成员名直接问它即可：既准确，又完全不读 MC jar。
+	 *
+	 * <p><b>remapper 仍是回退</b>：调用方若已读过目标类，它就答得出来——上文那个两参重载走的就是这条。
+	 * 所以两边都不放弃，顺序是「树答得出用树，答不出再问 remapper」。
+	 */
+	static String mapMemberName(@Nullable TinyRemapper remapper, @Nullable MappingTree mappingTree, String fromNamespace, String toNamespace, String owner, String name, String desc, boolean method) {
+		String fromTree = mapMemberNameFromTree(mappingTree, fromNamespace, toNamespace, owner, name, desc, method);
+
+		if (fromTree != null) {
+			return fromTree;
+		}
+
+		if (remapper == null) {
+			return name;
+		}
+
+		TrRemapper trRemapper = remapper.getEnvironment().getRemapper();
+		String fromRemapper = method
+				? trRemapper.mapMethodName(owner, name, desc)
+				: trRemapper.mapFieldName(owner, name, desc);
+		return fromRemapper != null ? fromRemapper : name;
+	}
+
+	/**
+	 * {@return 映射树给出的成员名；树里查不到（或没有树）时为 {@code null}}，
+	 * 用 {@code null} 与「名字恰好不变」区分开，好让调用方决定是否回退到 remapper。
+	 */
+	@Nullable
+	private static String mapMemberNameFromTree(@Nullable MappingTree mappingTree, String fromNamespace, String toNamespace, String owner, String name, String desc, boolean method) {
+		if (mappingTree == null) {
+			return null;
+		}
+
+		// 用 getNamespaceId 而不是按 getDstNamespaces 的下标猜：本树是 official 为 src、[intermediary, named]
+		// 为 dst，而注解数据里的名字在 intermediary 命名空间——它在 dst 里，索引 0。按 src 名直接查
+		// getClass(owner) 会落空（树按 src 名建索引），必须带上命名空间 id 查。
+		int srcId = mappingTree.getNamespaceId(fromNamespace);
+		int dstId = mappingTree.getNamespaceId(toNamespace);
+
+		if (srcId == MappingTreeView.NULL_NAMESPACE_ID || dstId == MappingTreeView.NULL_NAMESPACE_ID) {
+			return null;
+		}
+
+		MappingTree.ClassMapping classMapping = mappingTree.getClass(owner, srcId);
+
+		if (classMapping == null) {
+			return null;
+		}
+
+		// 必须带 srcId：不带命名空间的重载按 **src**（本树是 official，名字形如 a/b/c）匹配，
+		// 而注解数据里的名字在 intermediary 命名空间，直接查会落空。
+		MappingTree.MemberMapping memberMapping = method
+				? classMapping.getMethod(name, desc, srcId)
+				: classMapping.getField(name, desc, srcId);
+
+		if (memberMapping == null) {
+			return null;
+		}
+
+		return memberMapping.getDstName(dstId);
 	}
 
 	static AnnotationNode remap(AnnotationNode node, TinyRemapper remapper) {
@@ -209,16 +294,16 @@ public record AnnotationsData(Map<String, ClassAnnotationData> classes, String n
 			return null;
 		}
 
-		AnnotationsData result = datas.getFirst().remap(targetNamespace, project, serviceFactory, newNamespace);
+		AnnotationsData result = datas.getFirst().remap(targetNamespace, mappingConfiguration, project, serviceFactory, newNamespace);
 
 		for (int i = 1; i < datas.size(); i++) {
-			result = result.merge(datas.get(i).remap(targetNamespace, project, serviceFactory, newNamespace));
+			result = result.merge(datas.get(i).remap(targetNamespace, mappingConfiguration, project, serviceFactory, newNamespace));
 		}
 
 		return result;
 	}
 
-	private AnnotationsData remap(MappingsNamespace targetNamespace, Project project, ServiceFactory serviceFactory, String newNamespace) {
+	private AnnotationsData remap(MappingsNamespace targetNamespace, MappingConfiguration mappingConfiguration, Project project, ServiceFactory serviceFactory, String newNamespace) {
 		if (namespace.equals(targetNamespace.toString())) {
 			return this;
 		}
@@ -230,7 +315,9 @@ public record AnnotationsData(Map<String, ClassAnnotationData> classes, String n
 				TinyRemapperService.ClasspathLibraries.EXCLUDE
 		));
 		TinyRemapper remapper = remapperService.getTinyRemapperForRemapping();
+		// 成员名走映射树（见 mapMemberName 的说明）：remapper 只负责类名与描述符
+		MappingTree mappingTree = mappingConfiguration.getMappingsService(project, serviceFactory).getMappingTree();
 
-		return remap(remapper, newNamespace);
+		return remap(remapper, mappingTree, namespace, newNamespace, newNamespace);
 	}
 }

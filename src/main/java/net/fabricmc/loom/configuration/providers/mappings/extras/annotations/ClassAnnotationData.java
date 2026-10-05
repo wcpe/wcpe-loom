@@ -38,6 +38,7 @@ import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.AnnotationNode;
 import org.objectweb.asm.tree.TypeAnnotationNode;
 
+import net.fabricmc.mappingio.tree.MappingTree;
 import net.fabricmc.tinyremapper.TinyRemapper;
 import net.fabricmc.tinyremapper.api.TrRemapper;
 
@@ -109,7 +110,7 @@ public record ClassAnnotationData(
 		return new ClassAnnotationData(newAnnotationsToRemove, newAnnotationsToAdd, newTypeAnnotationsToRemove, newTypeAnnotationsToAdd, newFields, newMethods);
 	}
 
-	ClassAnnotationData remap(String className, TinyRemapper remapper) {
+	ClassAnnotationData remap(String className, TinyRemapper remapper, MappingTree mappingTree, String fromNamespace, String toNamespace) {
 		return new ClassAnnotationData(
 				annotationsToRemove.stream().map(remapper.getEnvironment().getRemapper()::map).collect(Collectors.toCollection(LinkedHashSet::new)),
 				annotationsToAdd.stream().map(ann -> AnnotationsData.remap(ann, remapper)).collect(Collectors.toCollection(ArrayList::new)),
@@ -117,18 +118,18 @@ public record ClassAnnotationData(
 				typeAnnotationsToAdd.stream().map(ann -> AnnotationsData.remap(ann, remapper)).collect(Collectors.toCollection(ArrayList::new)),
 				AnnotationsData.remapMap(
 						fields,
-						entry -> remapField(className, entry.getKey(), remapper),
+						entry -> remapField(className, entry.getKey(), remapper, mappingTree, fromNamespace, toNamespace),
 						entry -> entry.getValue().remap(remapper)
 				),
 				AnnotationsData.remapMap(
 						methods,
-						entry -> remapMethod(className, entry.getKey(), remapper),
+						entry -> remapMethod(className, entry.getKey(), remapper, mappingTree, fromNamespace, toNamespace),
 						entry -> entry.getValue().remap(remapper)
 				)
 		);
 	}
 
-	private static String remapField(String className, String field, TinyRemapper remapper) {
+	private static String remapField(String className, String field, TinyRemapper remapper, MappingTree mappingTree, String fromNamespace, String toNamespace) {
 		String[] nameDesc = field.split(":", 2);
 
 		if (nameDesc.length != 2) {
@@ -136,10 +137,12 @@ public record ClassAnnotationData(
 		}
 
 		TrRemapper trRemapper = remapper.getEnvironment().getRemapper();
-		return trRemapper.mapFieldName(className, nameDesc[0], nameDesc[1]) + ":" + trRemapper.mapDesc(nameDesc[1]);
+		// 字段名：映射树优先、remapper 回退（见 AnnotationsData.mapMemberName 的说明）
+		String name = AnnotationsData.mapMemberName(remapper, mappingTree, fromNamespace, toNamespace, className, nameDesc[0], nameDesc[1], false);
+		return name + ":" + trRemapper.mapDesc(nameDesc[1]);
 	}
 
-	private static String remapMethod(String className, String method, TinyRemapper remapper) {
+	private static String remapMethod(String className, String method, TinyRemapper remapper, MappingTree mappingTree, String fromNamespace, String toNamespace) {
 		int parenIndex = method.indexOf('(');
 
 		if (parenIndex == -1) {
@@ -149,7 +152,9 @@ public record ClassAnnotationData(
 		String name = method.substring(0, parenIndex);
 		String desc = method.substring(parenIndex);
 		TrRemapper trRemapper = remapper.getEnvironment().getRemapper();
-		return trRemapper.mapMethodName(className, name, desc) + trRemapper.mapMethodDesc(desc);
+		// 方法名：映射树优先、remapper 回退（见 AnnotationsData.mapMemberName 的说明）
+		String mappedName = AnnotationsData.mapMemberName(remapper, mappingTree, fromNamespace, toNamespace, className, name, desc, true);
+		return mappedName + trRemapper.mapMethodDesc(desc);
 	}
 
 	public int modifyAccessFlags(int access) {
