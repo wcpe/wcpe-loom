@@ -49,7 +49,7 @@ class DataGenerationTest extends Specification implements GradleProjectTestTrait
 	@Unroll
 	def "dataGeneration (gradle #version)"() {
 		setup:
-		def gradle = gradleProject(project: "minimalBase", version: version)
+		def gradle = dataGenProject(version)
 		gradle.buildGradle << '''
                 fabricApi {
                     configureDataGeneration()
@@ -68,7 +68,7 @@ class DataGenerationTest extends Specification implements GradleProjectTestTrait
 	@Unroll
 	def "dataGeneration sourceset (gradle #version)"() {
 		setup:
-		def gradle = gradleProject(project: "minimalBase", version: version)
+		def gradle = dataGenProject(version)
 		gradle.buildGradle << '''
                 // Must configure the main mod
                 loom.mods {
@@ -102,7 +102,7 @@ class DataGenerationTest extends Specification implements GradleProjectTestTrait
 	@Unroll
 	def "client dataGeneration (gradle #version)"() {
 		setup:
-		def gradle = gradleProject(project: "minimalBase", version: PRE_RELEASE_GRADLE)
+		def gradle = dataGenProject(PRE_RELEASE_GRADLE)
 		gradle.buildGradle << '''
                 fabricApi {
                     configureDataGeneration {
@@ -120,7 +120,7 @@ class DataGenerationTest extends Specification implements GradleProjectTestTrait
 	@Unroll
 	def "client dataGeneration sourceset (gradle #version)"() {
 		setup:
-		def gradle = gradleProject(project: "minimalBase", version: PRE_RELEASE_GRADLE)
+		def gradle = dataGenProject(PRE_RELEASE_GRADLE)
 		gradle.buildGradle << '''
                 // Must configure the main mod
                 loom.mods {
@@ -149,7 +149,7 @@ class DataGenerationTest extends Specification implements GradleProjectTestTrait
 	@Unroll
 	def "split client dataGeneration (gradle #version)"() {
 		setup:
-		def gradle = gradleProject(project: "minimalBase", version: PRE_RELEASE_GRADLE)
+		def gradle = dataGenProject(PRE_RELEASE_GRADLE)
 		gradle.buildGradle << '''
 				loom {
 					splitEnvironmentSourceSets()
@@ -177,7 +177,7 @@ class DataGenerationTest extends Specification implements GradleProjectTestTrait
 	@Unroll
 	def "split client dataGeneration sourceset (gradle #version)"() {
 		setup:
-		def gradle = gradleProject(project: "minimalBase", version: PRE_RELEASE_GRADLE)
+		def gradle = dataGenProject(PRE_RELEASE_GRADLE)
 		gradle.buildGradle << '''
                 loom {
 					splitEnvironmentSourceSets()
@@ -209,7 +209,7 @@ class DataGenerationTest extends Specification implements GradleProjectTestTrait
 	@Unroll
 	def "game tests (gradle #version)"() {
 		setup:
-		def gradle = gradleProject(project: "minimalBase", version: version)
+		def gradle = dataGenProject(version)
 		gradle.buildGradle << '''
                 fabricApi {
                     configureTests()
@@ -232,7 +232,7 @@ class DataGenerationTest extends Specification implements GradleProjectTestTrait
 	@IgnoreIf({ System.getenv("CI") != null }) // This test is disabled on CI because it launches a real client and cannot run headless.
 	def "client game tests (gradle #version)"() {
 		setup:
-		def gradle = gradleProject(project: "minimalBase", version: version)
+		def gradle = dataGenProject(version)
 		gradle.buildGradle << '''
                 fabricApi {
                     configureTests {
@@ -252,5 +252,22 @@ class DataGenerationTest extends Specification implements GradleProjectTestTrait
 
 		where:
 		version << STANDARD_TEST_VERSIONS
+	}
+
+	/**
+	 * 建测试工程，并给内层构建显式设堆。
+	 *
+	 * <p>本用例要下载 Minecraft 并跑数据生成（runDatagen 系列），内层 Gradle daemon 的内存开销高于
+	 * 其余用例。CI runner 上曾因此 OOM：{@code OutOfMemoryError: Java heap space} 后 daemon 退出，
+	 * 外层拿到 {@code CompletionException} / {@code ExecutionException}，用例失败。与
+	 * {@code RemapTaskCacheTest}、{@code MigrateMappingsTest} 同款做法：把堆显式写进测试工程的
+	 * gradle.properties，不再依赖默认值。
+	 *
+	 * @param version 内层构建使用的 Gradle 版本
+	 */
+	private def dataGenProject(String version) {
+		def gradle = gradleProject(project: "minimalBase", version: version)
+		gradle.gradleProperties << "org.gradle.jvmargs=-Xmx2G\n"
+		return gradle
 	}
 }
