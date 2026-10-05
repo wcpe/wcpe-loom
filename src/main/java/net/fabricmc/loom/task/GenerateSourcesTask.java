@@ -75,6 +75,7 @@ import org.jetbrains.annotations.ApiStatus;
 import org.jspecify.annotations.Nullable;
 
 import net.fabricmc.loom.LoomGradleExtension;
+import net.fabricmc.loom.LoomNoRemapGradlePlugin;
 import net.fabricmc.loom.api.decompilers.DecompilationMetadata;
 import net.fabricmc.loom.api.decompilers.DecompilerOptions;
 import net.fabricmc.loom.api.decompilers.LoomDecompiler;
@@ -243,8 +244,23 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
 		//
 		// 依赖取自扩展登记的产出集合（它派生自 TaskProvider，携带生产者的任务依赖）：
 		// 未登记任务产出的命名空间（回退到配置期生产）里它是裸文件，此时不加任何依赖，行为与改造前一致。
-		// MappingsNamespace.NAMED 而非其他命名空间：反编译的输入固定是 named 分支的 jar。
+		//
+		// 这里声明 NAMED 与 INTERMEDIARY 两个命名空间，而不是只声明 NAMED：反编译的输入固定是 named
+		// 分支的 jar，但 decompilerOptions 的 classpath 还会读到 intermediary 的 MC jar（DecompileTest
+		// 实测），只声明 NAMED 会让那条读取发生在生产者之前，撞上 ContextImplHelper.minecraftClassPath
+		// 的「尚不存在」守卫而硬失败。
+		//
+		// INTERMEDIARY 只在非 no-remap 工程上声明：不使用映射的工程（loom-no-remap，如 DecompileTest
+		// 的 CFR legacy 用例）根本没有 intermediary provider，取它会抛
+		// 「Cannot get IntermediaryMinecraftProvider before it has been setup」。
+		//
+		// 其余命名空间刻意不列：SRG 与 MOJANG 在非 Forge 平台上 getMinecraftJarsCollection 会直接抛
+		// （见 LoomGradleExtension.getMinecraftJars 的平台断言），而 OFFICIAL 一族本任务并不读。
 		dependsOn(getExtension().getMinecraftJarsCollection(MappingsNamespace.NAMED).getBuildDependencies());
+
+		if (!LoomNoRemapGradlePlugin.isApplied(getProject())) {
+			dependsOn(getExtension().getMinecraftJarsCollection(MappingsNamespace.INTERMEDIARY).getBuildDependencies());
+		}
 
 		getMinecraftCompileLibraries().from(getProject().getConfigurations().named(Constants.Configurations.MINECRAFT_COMPILE_LIBRARIES));
 		getDecompileCacheFile().set(getExtension().getFiles().getDecompileCache(CACHE_VERSION));
