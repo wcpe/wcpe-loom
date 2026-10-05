@@ -163,9 +163,19 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
 		this.hashPath = mappingsWorkingDir().resolve("mappings-migrated.hash");
 		this.hash = 1;
 
-		this.rawTinyMappings = this.tinyMappings;
-		this.rawTinyMappingsWithSrg = this.tinyMappingsWithSrg;
-		this.rawTinyMappingsWithMojang = this.tinyMappingsWithMojang;
+		// 只在**首次**调用时捕获「原始 mappings 路径」。
+		//
+		// 本实例经 {@code MappingConfiguration.SHARED_INSTANCES} 在同一 daemon 内跨构建复用，
+		// 而下面会把 tinyMappings* 重写成迁移产物的路径：第二次调用起 this.tinyMappings 已经不是原始
+		// mappings，再照抄一次就会把**迁移产物自己**当成输入（迁移器读自己的输出，任务声明的输入也随之
+		// 指向错误的文件）。本仓库实测：同一 daemon 内第三次构建起 rawTinyMappings 变成
+		// mappings-migrated.tiny，任务输入随即错位。
+		if (this.rawTinyMappings == null) {
+			this.rawTinyMappings = this.tinyMappings;
+			this.rawTinyMappingsWithSrg = this.tinyMappingsWithSrg;
+			this.rawTinyMappingsWithMojang = this.tinyMappingsWithMojang;
+		}
+
 		Path rawTinyMappingsWithNs = hasSrg ? this.rawTinyMappingsWithSrg : hasMojang ? this.rawTinyMappingsWithMojang : this.rawTinyMappings;
 
 		// 产物路径在两条路径下都必须重写成迁移后的位置：消费方（getMappingsPath / getPlatformMappingFile）

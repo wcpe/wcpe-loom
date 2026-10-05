@@ -382,6 +382,9 @@ public class MinecraftPatchedProvider {
 					throw new UncheckedIOException("无法声明 pre-patch jar 的 MCP 执行器选项", e);
 				}
 			}
+
+			// 本任务的输入是 vanilla jar（两条分支都读它，见 wireVanillaJarDependencies）
+			wireVanillaJarDependencies(task);
 		}));
 
 		final Producer patchedProducer = RemapMinecraftTaskRegistry.claim(project, patchedIntermediate, Map.of(
@@ -455,6 +458,30 @@ public class MinecraftPatchedProvider {
 	 */
 	public @Nullable String getPrePatchJarProducerTaskPath() {
 		return prePatchJarProducer != null ? prePatchJarProducer.taskPath() : null;
+	}
+
+	/**
+	 * 把「本任务读 vanilla jar」表达成任务依赖.
+	 *
+	 * <p>本形态的输入是 vanilla jar：MCP {@code rename} 步经 {@code downloadClient}/{@code downloadServer}
+	 * 读它们，NeoForge installer tools 分支的 {@code --input} 也指向它们。但它们在任务里只以**路径**形式
+	 * 出现（MCP 执行器选项、工具参数模板），Gradle 无从据此建依赖：vanilla jar 一旦改由执行期任务产出
+	 * （见 {@code MinecraftProvider.provideMinecraftJars()}），冷缓存下本任务会在输入落位前开跑。
+	 *
+	 * <p>未投影时（legacy / unobfuscated）这些产物早已在配置期落盘，登记表里查不到产出方，本方法为空操作。
+	 *
+	 * <p>逐形态取用的 jar 与 {@link #createNeoForgeInstallerTools()} 的输入参数、以及 MCP 配置里
+	 * {@code joined}/{@code client}/{@code server} 三个环境的步进集合逐项对应：
+	 * {@code MERGED} 两个都读，单边形态只读自己那一边。
+	 */
+	private void wireVanillaJarDependencies(Task task) {
+		if (type == Type.MERGED || type == Type.CLIENT_ONLY) {
+			minecraftProvider.addProducerDependency(task, minecraftProvider.getMinecraftClientJar().toPath());
+		}
+
+		if (type == Type.MERGED || type == Type.SERVER_ONLY) {
+			minecraftProvider.addProducerDependency(task, minecraftProvider.getMinecraftServerJar().toPath());
+		}
 	}
 
 	/** 把上一级产物的产出方登记成任务依赖；未建任务（已有其它生产者）时什么也不做. */
@@ -693,7 +720,11 @@ public class MinecraftPatchedProvider {
 					// NeoForge 的 dist 清单要按 client/server 分边（见 generateNeoForgeDistManifest）；
 					// 服务端侧取的是与生产同一判据的那一件（bootstrap 版本是抽取产物，否则是下载下来的 server jar）
 					task.getServerJar().set(serverJar);
+					minecraftProvider.addProducerDependency(task, serverJar.toPath());
 				}
+
+				// client-extra 读 client jar：投影后它由执行期任务产出，按路径声明输入不带任务依赖
+				minecraftProvider.addProducerDependency(task, minecraftProvider.getMinecraftClientJar().toPath());
 			}
 
 			// at-patched jar 由本链上一阶段（配置期 provide / 或任务化后的 intermediate 任务）产出：

@@ -67,6 +67,14 @@ public final class LegacyMergedMinecraftProvider extends MinecraftProvider {
 	}
 
 	@Override
+	public void provideMinecraftJars() throws Exception {
+		// 两个子 provider 都是 env-only 形态（判据见 SingleJarMinecraftProvider.earlyProjectionBlocker），
+		// 生产必定留在它们各自的 provide() 里，因此这里恒为空操作；保留覆写是为了让「本类不自己生产」显式可见。
+		serverMinecraftProvider.provideMinecraftJars();
+		clientMinecraftProvider.provideMinecraftJars();
+	}
+
+	@Override
 	public List<Path> getMinecraftJars() {
 		return List.of(
 			serverMinecraftProvider.getMinecraftEnvOnlyJar(),

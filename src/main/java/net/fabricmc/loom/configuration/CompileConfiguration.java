@@ -256,6 +256,7 @@ public abstract class CompileConfiguration implements Runnable {
 		}
 
 		extension.setMinecraftProvider(minecraftProvider);
+		// 内存配置段：initFiles / java 版本校验 / 库注入。产物生产不在这里，见下面 provideMinecraftJars()
 		minecraftProvider.provide();
 
 		if (!extension.disableObfuscation()) {
@@ -264,11 +265,19 @@ public abstract class CompileConfiguration implements Runnable {
 
 			// Created any layered mapping files.
 			LayeredMappingsFactory.afterEvaluate(configContext);
+		}
 
-			// This needs to run after MinecraftProvider.initFiles and MinecraftLibraryProvider.provide
-			// but before MinecraftPatchedProvider.provide.
+		// 依赖 provider 必须在库注入之后建立：库处理器会往仓库里加自定义源，而依赖解析要求仓库已定稿
+		// （见 MinecraftLibraryProvider）；纯 disableObfuscation（非 unobfuscated Forge）不建立它们。
+		if (!extension.disableObfuscation() || extension.isUnobfuscatedForge()) {
 			setupDependencyProviders(project, extension);
+		}
 
+		// 产物生产段：必须在依赖 provider 建立之后——能否投影成执行期任务的判据要读 isLegacyForge()，
+		// 而它经 extension.getDependencyProviders() 取 ForgeUserdevProvider（未解析时会抛异常）。
+		minecraftProvider.provideMinecraftJars();
+
+		if (!extension.disableObfuscation()) {
 			if (extension.isLegacyForge()) {
 				extension.setIntermediateMappingsProvider(GeneratedIntermediateMappingsProvider.class, provider -> {
 					provider.minecraftProvider = minecraftProvider;
@@ -289,7 +298,6 @@ public abstract class CompileConfiguration implements Runnable {
 			mappingConfiguration.applyToProject(getProject(), mappingsDep);
 		} else if (extension.isUnobfuscatedForge()) {
 			// Unobfuscated NeoForge: run the forge patch pipeline without requiring user-provided mappings.
-			setupDependencyProviders(project, extension);
 			ForgeLibrariesProvider.provide(null, project);
 			((ForgeMinecraftProvider) minecraftProvider).getPatchedProvider().provide();
 		}

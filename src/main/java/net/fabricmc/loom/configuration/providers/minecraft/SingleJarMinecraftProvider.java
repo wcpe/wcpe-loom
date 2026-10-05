@@ -88,7 +88,7 @@ public abstract class SingleJarMinecraftProvider extends MinecraftProvider {
 	 * <p>legacy merged（MC 1.3 之前）经两个本类实例委托生产，因此同样被这条判据覆盖。
 	 */
 	@Override
-	protected @Nullable String projectionBlocker() {
+	protected @Nullable String earlyProjectionBlocker() {
 		return "env-only jar（clientOnly/serverOnly 形态）在配置期读 vanilla jar 做 TinyRemapper 透传";
 	}
 
@@ -100,7 +100,10 @@ public abstract class SingleJarMinecraftProvider extends MinecraftProvider {
 		if (provideClient() && !isLegacyVersion()) {
 			getProject().getLogger().warn("Using `clientOnlyMinecraftJar()` is not recommended for Minecraft versions 1.3 or newer.");
 		}
+	}
 
+	@Override
+	protected void produceOwnJars() throws Exception {
 		processJar();
 	}
 

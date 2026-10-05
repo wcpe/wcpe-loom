@@ -68,11 +68,9 @@ public final class SplitMinecraftProvider extends MinecraftProvider {
 	}
 
 	@Override
-	public void provide() throws Exception {
-		super.provide();
-
+	protected void produceOwnJars() throws Exception {
 		if (isTaskProduction()) {
-			// 产物已由 splitMinecraftJars 任务承担（在 super.provide() 里登记），这里不再写任何产物
+			// 产物已由 splitMinecraftJars 任务承担（在基类的生产段里登记），这里不再写任何产物
 			return;
 		}
 

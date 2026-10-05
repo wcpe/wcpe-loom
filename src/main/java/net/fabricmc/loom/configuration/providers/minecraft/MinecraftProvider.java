@@ -91,6 +91,15 @@ public abstract class MinecraftProvider {
 	private boolean taskProduction;
 
 	/**
+	 * 本次是否把产物生产推迟到 {@link #provideMinecraftJars()}.
+	 *
+	 * <p>{@link #provide()} 与 {@link #provideMinecraftJars()} 合起来恰好生产一次：判据能在
+	 * {@link #provide()} 里算完的形态就地生产并把本字段留为假，只有 Forge 系（判据要读
+	 * {@code isLegacyForge()}）才置真。
+	 */
+	private boolean productionDeferred;
+
+	/**
 	 * 本次登记给执行期任务的生产产物：产物路径（绝对规范化）→ 生产者.
 	 *
 	 * <p>未投影时为空。消费方（mapped provider 的重映射任务、生产环境客户端任务）据此把
@@ -111,6 +120,19 @@ public abstract class MinecraftProvider {
 		return true;
 	}
 
+	/**
+	 * 内存配置段：与产物是否已落位无关的那部分.
+	 *
+	 * <p>产物生产（下载/抽取，子类再含合并/拆分/env-only 透传）**不在这里**，由
+	 * {@link #provideMinecraftJars()} 承担。拆开的理由是判据的求值时机：
+	 * {@link #projectionBlocker()} 里那条 Forge 系判据要读 {@code isLegacyForge()}，而它依赖已解析的
+	 * userdev 配置——依赖 provider 只能在库处理器把仓库定稿之后建立
+	 * （见 {@code CompileConfiguration.setupDependencyProviders} 的注释），因此生产整体推迟到那之后。
+	 *
+	 * <p>库注入（{@link MinecraftLibraryProvider}）仍留在本段：它必须在依赖 provider 之前完成，
+	 * 且服务端库列表取自 bundle 元数据。推迟路径下元数据由
+	 * {@link #earlyProjectionBlocker()} 的末条保证命中 L2 规格缓存，读它不会打开 server jar。
+	 */
 	public void provide() throws Exception {
 		// 内存配置：无论缓存冷热都必须执行
 		if (getExtension().shouldGenerateSrgTiny() && !getExtension().isForgeLike()) {
@@ -121,26 +143,66 @@ public abstract class MinecraftProvider {
 
 		verifyJavaVersion();
 
-		// 可投影则把产物生产交给执行期任务，否则整批沿用改造前的配置期路径（含留痕，见 projectionBlocker）
-		if (canProjectToTasks()) {
-			projectToTasks();
+		// 判据分两段求值：与依赖 provider 无关的那些先算，命中即整批回退，生产留在原位（与改造前逐字一致）
+		final String earlyBlocker = earlyProjectionBlocker();
+		// Forge 系且无其它阻碍时，判据还要读 isLegacyForge()，那要等依赖 provider 建立（见类注释）
+		productionDeferred = earlyBlocker == null && getExtension().isForgeLike();
+
+		if (productionDeferred) {
+			// 库注入（下面）要读 bundle 元数据，而它必须早于依赖 provider：这里从 L2 规格缓存取
+			serverBundleMetadata = readServerBundleMetadata();
 		} else {
-			produceJarsInConfiguration();
+			produceJars(earlyBlocker);
 		}
 
 		// 内存配置：libraryProvider 每次都必须执行
 		final MinecraftLibraryProvider libraryProvider = new MinecraftLibraryProvider(this, configContext.project());
 		libraryProvider.provide();
+
+		if (!productionDeferred) {
+			// 子类产物在基类产物与库注入之后生产，与改造前同序
+			produceOwnJars();
+		}
 	}
 
 	/**
-	 * {@return 本 provider 能否把产物生产投影成执行期任务}.
+	 * 产物生产段：由 {@code CompileConfiguration} 在 {@code setupDependencyProviders} 之后调用.
 	 *
-	 * <p>覆写点只有 {@link #projectionBlocker()} 一个：判定与「为什么不能投影」必须在同一处，
-	 * 否则回退会变成静默的（看不到被拒的具体原因）。
+	 * <p>只有 {@link #provide()} 判定「判据尚不可求值」的形态（Forge 系）才会真正生产；其余形态
+	 * 已在 {@link #provide()} 里就地生产完毕，这里什么也不做——生产段对每个 provider 恰好执行一次。
 	 */
-	protected final boolean canProjectToTasks() {
-		return taskProduction || projectionBlocker() == null;
+	public void provideMinecraftJars() throws Exception {
+		if (!productionDeferred) {
+			return;
+		}
+
+		productionDeferred = false;
+		produceJars(projectionBlocker());
+		produceOwnJars();
+	}
+
+	/**
+	 * 生产基类产物：可投影则把生产交给执行期任务，否则整批沿用改造前的配置期路径.
+	 *
+	 * @param blocker 本次的投影阻碍（{@code null} 表示可投影）；由调用方传入而不是在这里再算一次，
+	 *        否则「判定」与「留痕里写的原因」会各自求值一次，两者可能不一致
+	 */
+	private void produceJars(@Nullable String blocker) throws Exception {
+		if (blocker == null) {
+			projectToTasks();
+		} else {
+			produceJarsInConfiguration(blocker);
+		}
+	}
+
+	/**
+	 * 子类在此生产自己的产物（合并/拆分/env-only 透传）.
+	 *
+	 * <p>由 {@link #provide()} 与 {@link #provideMinecraftJars()} 在基类产物之后调用，因此
+	 * 「我的输入就是基类产物」这条关系由调用点保证。投影时不会调用本方法：那时产物由
+	 * {@link #registerProviderTasks} 登记的执行期任务承担（子类在那里决定自己怎么接线）。
+	 */
+	protected void produceOwnJars() throws Exception {
 	}
 
 	/** {@return 本次是否已把产物生产交给执行期任务} 子 provider（合并/拆分）据此决定自己怎么生产. */
@@ -154,10 +216,46 @@ public abstract class MinecraftProvider {
 	 * <p>每一条都是一个「配置期必须真读产物 jar（或必须由配置期落盘）」的形态。投影后产物只在执行期落位，
 	 * 这些配置期读者会读到不存在（或上一代）的文件，因此必须整批退回配置期生产——那个路径与改造前逐字一致。
 	 *
+	 * <p><b>只能在依赖 provider 建立之后调用</b>：最后那条 Forge 系判据要读 {@code isLegacyForge()}，
+	 * 它依赖已解析的 userdev 配置。{@link #provide()} 执行得更早，那里只能求
+	 * {@link #earlyProjectionBlocker()}；两者的差集就是「本形态为什么必须把生产推迟」。
+	 *
 	 * <ul>
-	 *   <li><b>Forge 系</b>：patch 流程、MCP 映射合并、内部类名集合（
-	 *       {@code InnerClassRemapper.readClassNames}）都在配置期读 vanilla jar。</li>
-	 *   <li><b>disableObfuscation</b>：mapped 阶段自身整批回退到配置期生产，配置期会按路径读 vanilla jar。</li>
+	 *   <li><b>legacy Forge（FG2 形态的 userdev，MC 1.7-1.12.2）</b>：patch 流程走 FG2 工作目录下的一组产物，
+	 *       {@code MinecraftLegacyPatchedProvider} 在配置期按路径读 vanilla jar。</li>
+	 * </ul>
+	 *
+	 * <p>与依赖 provider 无关的那几条见 {@link #earlyProjectionBlocker()}。
+	 */
+	protected @Nullable String projectionBlocker() {
+		final String earlyBlocker = earlyProjectionBlocker();
+
+		if (earlyBlocker != null) {
+			return earlyBlocker;
+		}
+
+		if (getExtension().isForgeLike() && getExtension().isLegacyForge()) {
+			// 前缀 isForgeLike() 不只是语义修饰：isLegacyForge() 要经 getDependencyProviders() 取
+			// ForgeUserdevProvider，而依赖 provider 只在「非 disableObfuscation」与「unobfuscated Forge」
+			// 两个分支里建立；前缀让「依赖 provider 必然存在」这件事在判据里显式可见。
+			//
+			// 分界是 **userdev 配置的形态**（FG2 / userdev3 都算 legacy），不是 MC 版本号：
+			// 实测 1.14.4 / 1.16.5 的 userdev 带 mcp 段、走现代管线，只有 1.7-1.12.2 是 FG2 形态。
+			return "legacy Forge（FG2 形态的 userdev：MC 1.7-1.12.2）的 patch 流程在配置期按路径读 vanilla jar";
+		}
+
+		return null;
+	}
+
+	/**
+	 * {@return 与依赖 provider 无关的那部分判据；子类覆写点}.
+	 *
+	 * <p>本方法能在 {@link #provide()} 里求值（那时依赖 provider 尚未建立），因此它是子类表达
+	 * 「本形态不能投影」的唯一位置：命中即整批回退，生产与库注入都留在改造前的位置与顺序上。
+	 *
+	 * <ul>
+	 *   <li><b>disableObfuscation</b>：mapped 阶段自身整批回退到配置期生产，配置期会按路径读 vanilla jar；
+	 *       它同时覆盖 unobfuscated Forge，故必须排在 Forge 判据之前——那一条要读依赖 provider。</li>
 	 *   <li><b>签名校验开启</b>：校验要打开 jar 读签名与内容，本次未随链迁移（见
 	 *       {@link #verificationEnabled()}）。</li>
 	 *   <li><b>映射可能不是 tiny v2</b>：V1 映射的字段名补全在配置期读 merged jar，且只支持单 jar 形态。</li>
@@ -165,16 +263,7 @@ public abstract class MinecraftProvider {
 	 *       下载并打开 server jar——那正是本次要移出配置期的动作。</li>
 	 * </ul>
 	 */
-	protected @Nullable String projectionBlocker() {
-		if (getExtension().isForgeLike()) {
-			// 这一条**不能**细化成「legacy Forge 才回退」：本方法执行得比 setupDependencyProviders 早得多
-			// （{@code CompileConfiguration.setupMinecraft} 里 minecraftProvider.provide() 在
-			// setupDependencyProviders 之前），而 isLegacyForge() 要读 ForgeUserdevProvider，
-			// 那时 getDependencyProviders() 仍是 null，判据会以 NPE 打断配置。
-			// 真要细化，必须先让依赖 provider 早于本方法建立、或把 vanilla jar 的生产决策整体推迟到那之后。
-			return "Forge 系的 vanilla jar 在配置期就被真读（patch 流程、MCP 映射合并、内部类名集合）";
-		}
-
+	protected @Nullable String earlyProjectionBlocker() {
 		if (getExtension().disableObfuscation()) {
 			return "disableObfuscation 下 mapped 阶段整批回退到配置期生产，配置期会按路径读 vanilla jar";
 		}
@@ -278,12 +367,30 @@ public abstract class MinecraftProvider {
 
 		jarProducers = Map.copyOf(producers);
 		taskProduction = true;
-		// 登记任务产出：消费侧（重映射任务、生产环境客户端）据此拿到携带任务依赖的文件集合
-		registerJarOutputs();
+
+		// 登记任务产出：消费侧（重映射任务、生产环境客户端）据此拿到携带任务依赖的文件集合。
+		// 最终产物尚未确定时跳过：Forge 的合并形态就是这种情形，它的产物由 patch 链稍后自行登记
+		// （见 isFinalProductKnown()）
+		if (isFinalProductKnown()) {
+			registerJarOutputs();
+		}
+
 		// 用 Gradle 的 lifecycle 而不是 SLF4J 的 info：默认控制台级别是 LIFECYCLE，
 		// 「本次到底走哪条生产路径」必须默认可见，否则回退是静默的
 		getProject().getLogger().lifecycle("Minecraft {} 的 jar 生产由执行期任务承担：{}", minecraftVersion(),
 				producers.values().stream().map(Producer::taskPath).distinct().toList());
+	}
+
+	/**
+	 * {@return 此刻 {@link #getMinecraftJars()} 是否已能求值}.
+	 *
+	 * <p>默认恒为真。Forge 的合并形态是唯一例外：它的最终产物是 patched jar，其路径要等
+	 * {@code MinecraftPatchedProvider.initPatchedFiles()} 之后才确定，而那时 patch 链已经自己走过
+	 * {@link #registerTaskProducedArtifact}（同一条 {@link #registerJarOutputs()} 登记路径），
+	 * 因此这里跳过不会让任何产物失去登记。
+	 */
+	protected boolean isFinalProductKnown() {
+		return true;
 	}
 
 	/**
@@ -476,13 +583,11 @@ public abstract class MinecraftProvider {
 	 * 配置期生产：本次改造前的路径，只对「无法安全投影」的形态保留.
 	 *
 	 * <p>整段语义与改造前逐字一致——无锁快路径、跨进程互斥、锁内二次确认、抽取、签名校验。
+	 *
+	 * @param blocker 本次的投影阻碍，用于 lifecycle 留痕；由调用方传入，见 {@link #produceJars(String)}
 	 */
-	private void produceJarsInConfiguration() throws Exception {
-		final String blocker = projectionBlocker();
-
-		if (blocker != null) {
-			getProject().getLogger().lifecycle("Minecraft {} 的 jar 保持配置期生产：{}", minecraftVersion(), blocker);
-		}
+	private void produceJarsInConfiguration(String blocker) throws Exception {
+		getProject().getLogger().lifecycle("Minecraft {} 的 jar 保持配置期生产：{}", minecraftVersion(), blocker);
 
 		// 无锁快路径：未要求刷新且所有产物已就绪时，不获取任何文件锁
 		if (jarsRequireProduction()) {
