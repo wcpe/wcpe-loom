@@ -40,7 +40,9 @@ public record CraneMappingLayer(Path craneJar) implements MappingLayer {
 
 	@Override
 	public void visit(MappingVisitor visitor) throws IOException {
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(craneJar(), false)) {
+		// 只读：crane 映射 jar 是外部产物，loom 只从里面读 crane.tiny。
+		// 走独立文件系统可避免把它登记进 JDK 进程级 zipfs 登记簿（JDK-8291712 的毒化前提）。
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(craneJar())) {
 			try (BufferedReader reader = Files.newBufferedReader(fs.get().getPath(TINY_FILE_NAME), StandardCharsets.UTF_8)) {
 				Tiny2FileReader.read(reader, visitor);
 			}

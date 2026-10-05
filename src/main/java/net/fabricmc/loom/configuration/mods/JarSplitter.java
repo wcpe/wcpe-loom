@@ -45,6 +45,7 @@ import org.jspecify.annotations.Nullable;
 
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
+import net.fabricmc.loom.util.cache.AtomicFiles;
 
 public class JarSplitter {
 	private static final Attributes.Name MANIFEST_SPLIT_ENV_NAME = new Attributes.Name(Constants.Manifest.SPLIT_ENV);
@@ -119,9 +120,28 @@ public class JarSplitter {
 	}
 
 	public boolean split(Path commonOutputJar, Path clientOutputJar) throws IOException {
-		Files.deleteIfExists(commonOutputJar);
-		Files.deleteIfExists(clientOutputJar);
+		// 原子落位：两个输出都是 loom-cache 里的共享 jar。旧写法「先删再就地写」会留下「文件不存在」窗口，
+		// 并发读方在窗口里打开它，关闭时就会因 toRealPath() 失败而把该路径的 zipfs 登记簿条目永久留成
+		// 死实例（JDK-8291712）。这里把内容写进各自同目录的私有临时文件，最后一起 move 落位。
+		final Path commonStaging = AtomicFiles.tempSibling(commonOutputJar);
+		final Path clientStaging = AtomicFiles.tempSibling(clientOutputJar);
 
+		try {
+			if (!splitInto(commonStaging, clientStaging)) {
+				return false;
+			}
+
+			AtomicFiles.move(commonStaging, commonOutputJar);
+			AtomicFiles.move(clientStaging, clientOutputJar);
+			return true;
+		} finally {
+			Files.deleteIfExists(commonStaging);
+			Files.deleteIfExists(clientStaging);
+		}
+	}
+
+	/** 把拆分结果写进两个独占的暂存路径；返回 false 表示调用方要求的「不需要拆分」. */
+	private boolean splitInto(Path commonOutputJar, Path clientOutputJar) throws IOException {
 		try (FileSystemUtil.Delegate input = FileSystemUtil.getReadOnlyJarFileSystem(inputJar)) {
 			final Manifest manifest = input.fromInputStream(Manifest::new, Constants.Manifest.PATH);
 

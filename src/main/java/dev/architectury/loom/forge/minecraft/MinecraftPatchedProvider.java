@@ -1490,13 +1490,19 @@ public class MinecraftPatchedProvider {
 	 *
 	 * @param options 配置期接好的 AT 选项
 	 * @param input 待执行 AT 的 jar
-	 * @param target AT 结果落位路径（调用方负责原子落位；本方法先删除它，与改造前逐字一致）
+	 * @param target AT 结果落位路径（本方法负责原子落位：先写私有副本，再 move 到 target）
 	 */
 	public static void runAccessTransformer(Provider<AccessTransformerService.Options> options, Path input, Path target,
 			ServiceFactory serviceFactory) throws IOException {
 		final AccessTransformerService service = serviceFactory.get(options);
-		Files.deleteIfExists(target);
-		service.execute(input, target);
+		// 原子落位：target 是共享缓存里的产物（legacy Forge 的 client/server/merged-patched.jar），
+		// 旧写法「先删 target 再就地写」会留下「文件不存在」窗口；并发读方在窗口里打开它，关闭时就会因
+		// toRealPath() 失败而把该路径的 zipfs 登记簿条目永久留成死实例（JDK-8291712）。
+		// 「执行 AT 前删掉目标」的既有语义保留，只是删的变成调用方独占的私有副本。
+		AtomicFiles.publish(target, tmp -> {
+			Files.deleteIfExists(tmp);
+			service.execute(input, tmp);
+		});
 	}
 
 	private static void remapPatchedJar(ProductionOptions options, Path mcOutput, Consumer<String> lifecycle) throws Exception {
@@ -1645,7 +1651,9 @@ public class MinecraftPatchedProvider {
 
 	static void walkFileSystems(Path source, Path target, Predicate<Path> filter, Function<FileSystem, Iterable<Path>> toWalk, FsPathConsumer action)
 			throws IOException {
-		try (FileSystemUtil.Delegate sourceFs = FileSystemUtil.getJarFileSystem(source, false);
+		// source 只读、target 要写入：source 走独立文件系统（不登记，避免被 JDK-8291712 毒化），
+		// target 必须保留共享文件系统的写入路线。
+		try (FileSystemUtil.Delegate sourceFs = FileSystemUtil.getReadOnlyJarFileSystem(source);
 				FileSystemUtil.Delegate targetFs = FileSystemUtil.getJarFileSystem(target, false)) {
 			for (Path sourceDir : toWalk.apply(sourceFs.get())) {
 				Path dir = sourceDir.toAbsolutePath();

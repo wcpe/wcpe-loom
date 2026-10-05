@@ -79,7 +79,11 @@ public record ArtifactMetadata(boolean isFabricMod, RemapRequirements remapRequi
 			remapRequirements = RemapRequirements.OPT_IN;
 		}
 
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(artifact.path())) {
+		// 只读：依赖 jar 由 Gradle 缓存提供、loom 从不写入，用独立文件系统打开即可。
+		// 关键点是它不进入 JDK 进程级 zipfs 登记簿（JDK-8291712 的毒化只发生在登记簿里）：
+		// 该路径正是 remapJar 的 classpath 条目，一旦在这里被登记，refresh-dependencies 期间
+		// 依赖 jar 被「先删后写」替换时，关闭瞬间文件不在盘上就会把该路径永久毒化。
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(artifact.path())) {
 			isFabricMod = FabricModJsonFactory.containsMod(fs, platform);
 			final Path manifestPath = fs.getPath(Constants.Manifest.PATH);
 

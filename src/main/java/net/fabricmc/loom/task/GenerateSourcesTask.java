@@ -34,7 +34,6 @@ import java.lang.reflect.InvocationTargetException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.HashMap;
@@ -101,6 +100,7 @@ import net.fabricmc.loom.util.gradle.LoomCacheService;
 import net.fabricmc.loom.util.gradle.SyncTaskBuildService;
 import net.fabricmc.loom.util.gradle.ThreadedProgressLoggerConsumer;
 import net.fabricmc.loom.util.gradle.ThreadedSimpleProgressLogger;
+import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.loom.util.gradle.WorkerDaemonClientsManagerHelper;
 import net.fabricmc.loom.util.gradle.daemon.DaemonUtils;
 import net.fabricmc.loom.util.ipc.IPCClient;
@@ -478,7 +478,9 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
 			remapLineNumbers(lineNumbers, classesInputJar, tempJar);
 		}
 
-		Files.move(tempJar, classesOutputJar, StandardCopyOption.REPLACE_EXISTING);
+		// 原子落位：classesOutputJar 是 loom-cache 里的共享产物，用 AtomicFiles 走 ATOMIC_MOVE 落位，
+		// 避免「目标被并发读方持有」时在 Windows 上替换失败，也避免留下半截文件
+		AtomicFiles.move(tempJar, classesOutputJar);
 	}
 
 	private String getCacheKey(ServiceFactory serviceFactory) {

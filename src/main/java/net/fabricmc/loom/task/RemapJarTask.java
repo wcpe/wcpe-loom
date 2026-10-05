@@ -83,6 +83,7 @@ import net.fabricmc.loom.util.ModPlatform;
 import net.fabricmc.loom.util.Pair;
 import net.fabricmc.loom.util.SidedClassVisitor;
 import net.fabricmc.loom.util.ZipUtils;
+import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.loom.util.fmj.FabricModJsonFactory;
 import net.fabricmc.loom.util.fmj.FabricModJsonUtils;
 import net.fabricmc.loom.util.service.ScopedServiceFactory;
@@ -312,13 +313,16 @@ public abstract class RemapJarTask extends AbstractRemapJarTask {
 			Objects.requireNonNull(tinyRemapperService, "tinyRemapperService");
 			Objects.requireNonNull(tinyRemapper, "tinyRemapper");
 
-			// Delete the old file to prevent deleted contents from sticking around in the jar.
-			Files.deleteIfExists(outputFile);
-
-			try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(outputFile).build()) {
-				outputConsumer.addNonClassFiles(inputFile);
-				tinyRemapper.apply(outputConsumer, tinyRemapperService.getOrCreateTag(inputFile));
-			}
+			// 原子落位：remap 输出会被同一构建里的其它项目当作 classpath 读，旧写法
+			// 「先 deleteIfExists(outputFile) 再就地写」留下的「文件不存在」窗口，会让读方在窗口里打开的
+			// 路径在关闭时因 toRealPath() 失败而把 zipfs 登记簿条目永久留成死实例（JDK-8291712）。
+			// 改成「先在私有临时文件里生成完整 jar，再 move 落位」后同样保证旧内容不会残留。
+			AtomicFiles.publish(outputFile, tmp -> {
+				try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(tmp).build()) {
+					outputConsumer.addNonClassFiles(inputFile);
+					tinyRemapper.apply(outputConsumer, tinyRemapperService.getOrCreateTag(inputFile));
+				}
+			});
 		}
 
 		private void markClientOnlyClasses() throws IOException {

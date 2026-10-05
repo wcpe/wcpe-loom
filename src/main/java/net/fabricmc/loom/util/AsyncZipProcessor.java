@@ -39,7 +39,9 @@ import java.util.concurrent.Executors;
 
 public interface AsyncZipProcessor {
 	static void processEntries(Path inputZip, Path outputZip, AsyncZipProcessor processor) throws IOException {
-		try (FileSystemUtil.Delegate inFs = FileSystemUtil.getJarFileSystem(inputZip, false);
+		// 输入只读取：用独立文件系统（不登记），从而不会被 JDK-8291712 毒化；
+		// 输出必须保留共享文件系统的写入路线（tiny-remapper 引用计数 + 落盘语义）。
+		try (FileSystemUtil.Delegate inFs = FileSystemUtil.getReadOnlyJarFileSystem(inputZip);
 				FileSystemUtil.Delegate outFs = FileSystemUtil.getJarFileSystem(outputZip, true);
 				ExecutorService executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())) {
 			final Path inRoot = inFs.get().getPath("/");

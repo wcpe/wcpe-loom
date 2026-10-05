@@ -1,0 +1,20 @@
+// 本夹具供 ZipFsCloseRaceHealTest 使用：一个最小 mod 工程，跑 remapJar 时 TinyRemapperService 会读取
+// remapJar 的 classpath，其中包含下面这条由测试写出的「受害者」库依赖。
+plugins {
+	id 'dev.architectury.loom'
+}
+
+version = "1.0.0"
+
+base {
+	archivesName = "zipfs-close-race"
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:1.20.1"
+	mappings "net.fabricmc:yarn:1.20.1+build.10:v2"
+
+	// 普通库依赖（不是 mod 依赖）：它会进入 compileClasspath，因而出现在 remapJar 读取的那批 classpath 里。
+	// 文件由测试在跑构建之前写入 libs/（依赖在配置期就要解析，运行时再写就来不及了）。
+	implementation files("libs/zipfs-close-race-victim.jar")
+}

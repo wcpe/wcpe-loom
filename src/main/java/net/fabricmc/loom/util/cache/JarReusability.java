@@ -83,7 +83,10 @@ public final class JarReusability {
 			return false;
 		}
 
-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar, false); var entries = Files.list(fs.getPath("/"))) {
+		// 只读探测，且刻意走独立文件系统（不登记）：本方法要判定的正是「磁盘上的产物是否完整」，
+		// 共享文件系统反而会把别的持有者的未落盘内容算进来。更重要的是一旦登记，产物被重建
+		// （先删后写）时关闭瞬间文件不在盘上就会毒化该路径，使同一 daemon 之后再也打不开它。
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(jar); var entries = Files.list(fs.getPath("/"))) {
 			// 至少一个条目：空 zip（0 条目）虽然能被 zipfs 打开，但作为 Minecraft/Forge 链的输入必然是残骸
 			if (entries.findAny().isEmpty()) {
 				reportUnreusable(jar, "可作为 zip 打开，但不含任何条目（0 条目空 zip 壳）");

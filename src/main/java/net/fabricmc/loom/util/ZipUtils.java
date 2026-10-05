@@ -55,6 +55,7 @@ import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
 
 import net.fabricmc.loom.LoomGradlePlugin;
+import net.fabricmc.loom.util.cache.AtomicFiles;
 
 public class ZipUtils {
 	public static boolean isZip(Path zip) throws IOException {
@@ -158,10 +159,23 @@ public class ZipUtils {
 	}
 
 	public static void pack(Path from, Path zip) throws IOException {
-		Files.deleteIfExists(zip);
-
 		if (!Files.isDirectory(from)) throw new IllegalArgumentException(from + " is not a directory!");
 
+		// 原子落位：内容先写进同目录的私有临时文件，写完整后再 move 到 zip。
+		// 旧写法是「先 deleteIfExists(zip) 再就地建 zip」，那会在两次调用之间留下「文件不存在」的窗口；
+		// 窗口里被并发读方打开，关闭时就会因 toRealPath() 失败而把该路径的 zipfs 登记簿条目永久留成
+		// 死实例（JDK-8291712）。同理，pack 失败时旧产物也不会再被提前删掉。
+		final AtomicInteger count = new AtomicInteger();
+
+		AtomicFiles.publish(zip, tmp -> count.set(packInto(from, tmp)));
+
+		if (count.get() == 0) {
+			throw new IOException("Noting packed into %s from %s".formatted(zip, from));
+		}
+	}
+
+	/** 把目录 {@code from} 的内容打进 zip，返回写入的条目数（目标必须是调用方独占的路径）. */
+	private static int packInto(Path from, Path zip) throws IOException {
 		int count = 0;
 
 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(zip, true);
@@ -179,9 +193,7 @@ public class ZipUtils {
 			}
 		}
 
-		if (count == 0) {
-			throw new IOException("Noting packed into %s from %s".formatted(zip, from));
-		}
+		return count;
 	}
 
 	public static void add(Path zip, String path, String str) throws IOException {

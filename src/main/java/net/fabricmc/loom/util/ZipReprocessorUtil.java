@@ -29,7 +29,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.Calendar;
 import java.util.Comparator;
 import java.util.GregorianCalendar;
@@ -41,6 +40,8 @@ import java.util.zip.ZipOutputStream;
 
 import org.gradle.api.tasks.bundling.ZipEntryCompression;
 import org.intellij.lang.annotations.MagicConstant;
+
+import net.fabricmc.loom.util.cache.AtomicFiles;
 
 public class ZipReprocessorUtil {
 	private ZipReprocessorUtil() { }
@@ -131,7 +132,8 @@ public class ZipReprocessorUtil {
 			}
 		}
 
-		Files.move(tempFile, file, StandardCopyOption.REPLACE_EXISTING);
+		// 原子落位：目标 jar 可能正被并发读方持有，用 AtomicFiles 走 ATOMIC_MOVE 并在 Windows 的共享冲突上退避重试
+		AtomicFiles.move(tempFile, file);
 	}
 
 	/**
@@ -168,7 +170,8 @@ public class ZipReprocessorUtil {
 			}
 		}
 
-		Files.move(tempFile, file, StandardCopyOption.REPLACE_EXISTING);
+		// 原子落位：目标 jar 可能正被并发读方持有，用 AtomicFiles 走 ATOMIC_MOVE 并在 Windows 的共享冲突上退避重试
+		AtomicFiles.move(tempFile, file);
 	}
 
 	/**
@@ -209,7 +212,8 @@ public class ZipReprocessorUtil {
 			}
 		}
 
-		Files.move(tempFile, file, StandardCopyOption.REPLACE_EXISTING);
+		// 原子落位：目标 jar 可能正被并发读方持有，用 AtomicFiles 走 ATOMIC_MOVE 并在 Windows 的共享冲突上退避重试
+		AtomicFiles.move(tempFile, file);
 	}
 
 	/**
@@ -248,7 +252,8 @@ public class ZipReprocessorUtil {
 			}
 		}
 
-		Files.move(tempFile, file, StandardCopyOption.REPLACE_EXISTING);
+		// 原子落位：目标 jar 可能正被并发读方持有，用 AtomicFiles 走 ATOMIC_MOVE 并在 Windows 的共享冲突上退避重试
+		AtomicFiles.move(tempFile, file);
 	}
 
 	private static void copyZipEntry(ZipOutputStream zipOutputStream, ZipEntry entry, InputStream inputStream) throws IOException {

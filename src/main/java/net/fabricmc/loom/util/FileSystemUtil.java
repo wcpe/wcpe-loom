@@ -190,6 +190,54 @@ public final class FileSystemUtil {
 		}
 	}
 
+	/**
+	 * 探测某路径是否已被 JDK 进程级 zipfs 登记簿毒化.
+	 *
+	 * <p>JDK-8291712：{@code ZipFileSystem.close()} 在文件已不在盘上时先抛 {@link IOException}，
+	 * 来不及把实例从 {@code ZipFileSystemProvider.filesystems} 里摘掉，登记簿于是永久留下一个
+	 * 「已关闭」的实例。此后凡是走 URI 路线打开同一路径的代码（tiny-remapper 的
+	 * {@code FileSystemReference.openJar} 就先查登记簿）都会拿到这个死实例，
+	 * 并在第一次访问时抛出 {@code ClosedFileSystemException}。
+	 *
+	 * <p>登记簿的 Key 含文件的真实路径，因而文件缺失期间查不到该条目、文件一重建就又查得到——
+	 * 本方法因此必须在文件存在时调用才有意义。只读诊断，不修改任何状态.
+	 *
+	 * @param path 待探测的 jar 路径
+	 * @return 登记簿中该路径对应的「已关闭」实例；健康（未登记或仍打开）时返回 {@code null}
+	 */
+	public static @Nullable FileSystem findClosedRegistryEntry(Path path) {
+		try {
+			FileSystem fileSystem = FileSystems.getFileSystem(toJarUri(path));
+			return fileSystem.isOpen() ? null : fileSystem;
+		} catch (RuntimeException e) {
+			// 未登记时 getFileSystem 抛 FileSystemNotFoundException；路径名不是 .jar/.zip 时
+			// Key 构造还可能抛别的运行时异常。两种情况都表示「登记簿里没有毒化条目」，
+			// 探测本身不能影响构建，因此一律放行。
+			return null;
+		}
+	}
+
+	/**
+	 * 探测某路径在 JDK 进程级 zipfs 登记簿里是否有一个「仍打开」的共享实例.
+	 *
+	 * <p>与 {@link #findClosedRegistryEntry(Path)} 对称：后者找死实例（毒化），本方法找活实例。
+	 * 活实例存在的含义是「此刻有持有者正拿着这个 jar 的共享实例」——登记簿的 Key 是文件的真实路径，
+	 * 因此读取方按 URI 路线打开（tiny-remapper 的 {@code FileSystemReference.openJar}）时，
+	 * 条目就已经在这里出现了。只读探测，不修改任何状态.
+	 *
+	 * @param path 待探测的 jar 路径
+	 * @return 登记簿中该路径对应的仍在打开的实例；未登记或条目已关闭时返回 {@code null}
+	 */
+	public static @Nullable FileSystem findOpenRegistryEntry(Path path) {
+		try {
+			FileSystem fileSystem = FileSystems.getFileSystem(toJarUri(path));
+			return fileSystem.isOpen() ? fileSystem : null;
+		} catch (RuntimeException e) {
+			// 与 findClosedRegistryEntry 同理：未登记 / Key 构造失败都表示「登记簿里没有可用条目」
+			return null;
+		}
+	}
+
 	public static class UnrecoverableZipException extends RuntimeException {
 		public UnrecoverableZipException(String message, Throwable cause) {
 			super(message, cause);

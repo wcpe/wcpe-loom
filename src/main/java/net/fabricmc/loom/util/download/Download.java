@@ -57,6 +57,7 @@ import org.slf4j.LoggerFactory;
 
 import net.fabricmc.loom.util.AttributeHelper;
 import net.fabricmc.loom.util.Checksum;
+import net.fabricmc.loom.util.cache.AtomicFiles;
 
 public final class Download {
 	private static final String E_TAG = "ETag";
@@ -239,8 +240,10 @@ public final class Download {
 		// Download the file initially to a .part file
 		final Path partFile = getPartFile(output);
 
+		// 刻意不在下载前删除 output：那会留下「文件不存在」的窗口，而 output 是可以被并发读取的共享缓存产物
+		// （依赖 jar 就是被 remap classpath 读的）。读方在窗口里打开它，关闭时就会因 toRealPath() 失败而把该
+		// 路径的 zipfs 登记簿条目永久留成死实例（JDK-8291712）。old output 由下载完成后的原子 move 覆盖。
 		try {
-			Files.deleteIfExists(output);
 			Files.deleteIfExists(partFile);
 		} catch (IOException e) {
 			throw error(e, "Failed to delete existing file");
@@ -280,7 +283,9 @@ public final class Download {
 		try {
 			// Once the file has been fully read, move it to the destination file.
 			// This ensures that the output file only exists in fully populated state.
-			Files.move(partFile, output);
+			// 用原子 move（而不是裸 Files.move）：目标可能已存在且正被读方持有，
+			// AtomicFiles 会优先 ATOMIC_MOVE，并在 Windows 的共享冲突上做有上限的退避重试。
+			AtomicFiles.move(partFile, output);
 		} catch (IOException e) {
 			throw error(e, "Failed to complete download");
 		}

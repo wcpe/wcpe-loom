@@ -39,6 +39,7 @@ import java.util.stream.Stream;
 
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
+import net.fabricmc.loom.util.cache.AtomicFiles;
 
 public class MinecraftJarSplitter implements AutoCloseable {
 	private final Path clientInputJar;
@@ -104,8 +105,14 @@ public class MinecraftJarSplitter implements AutoCloseable {
 	}
 
 	private void copyEntriesToJar(Set<String> entries, Path inputJar, Path outputJar, String env) throws IOException {
-		Files.deleteIfExists(outputJar);
+		// 原子落位：输出是 loom-cache 里的共享 jar，旧写法「先 deleteIfExists(outputJar) 再就地写」留下
+		// 的「文件不存在」窗口会让并发读方在关闭时因 toRealPath() 失败而把该路径的 zipfs 登记簿条目
+		// 永久留成死实例（JDK-8291712）。
+		AtomicFiles.publish(outputJar, tmp -> writeEntriesToJar(entries, inputJar, tmp, env));
+	}
 
+	/** 把 {@code entries} 从 inputJar 复制进 zip（目标必须是调用方独占的路径），并写入 split env 清单. */
+	private void writeEntriesToJar(Set<String> entries, Path inputJar, Path outputJar, String env) throws IOException {
 		try (FileSystemUtil.Delegate inputFs = FileSystemUtil.getReadOnlyJarFileSystem(inputJar);
 				FileSystemUtil.Delegate outputFs = FileSystemUtil.getJarFileSystem(outputJar, true)) {
 			for (String entry : entries) {
