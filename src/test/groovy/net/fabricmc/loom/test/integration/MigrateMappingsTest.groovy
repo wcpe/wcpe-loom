@@ -36,7 +36,7 @@ class MigrateMappingsTest extends Specification implements GradleProjectTestTrai
 	@Unroll
 	def "Migrate mappings yarn short hand (gradle #version)"() {
 		setup:
-		def gradle = gradleProject(project: "minimalBase", version: version)
+		def gradle = migrateProject(version)
 		gradle.buildGradle << """
             dependencies {
                 minecraft 'com.mojang:minecraft:24w36a'
@@ -78,7 +78,7 @@ class MigrateMappingsTest extends Specification implements GradleProjectTestTrai
 	@Unroll
 	def "Migrate mappings maven complete (gradle #version)"() {
 		setup:
-		def gradle = gradleProject(project: "minimalBase", version: version)
+		def gradle = migrateProject(version)
 		gradle.buildGradle << """
             dependencies {
                 minecraft 'com.mojang:minecraft:24w36a'
@@ -120,7 +120,7 @@ class MigrateMappingsTest extends Specification implements GradleProjectTestTrai
 	@Unroll
 	def "Migrate mappings to mojmap (gradle #version)"() {
 		setup:
-		def gradle = gradleProject(project: "minimalBase", version: version)
+		def gradle = migrateProject(version)
 		gradle.buildGradle << """
             dependencies {
                 minecraft 'com.mojang:minecraft:24w36a'
@@ -161,7 +161,7 @@ class MigrateMappingsTest extends Specification implements GradleProjectTestTrai
 	@Unroll
 	def "Migrate client mappings (gradle #version)"() {
 		setup:
-		def gradle = gradleProject(project: "minimalBase", version: version)
+		def gradle = migrateProject(version)
 		gradle.buildGradle << """
             loom {
                 splitEnvironmentSourceSets()
@@ -206,7 +206,7 @@ class MigrateMappingsTest extends Specification implements GradleProjectTestTrai
 	@Unroll
 	def "Override inputs (gradle #version)"() {
 		setup:
-		def gradle = gradleProject(project: "minimalBase", version: version)
+		def gradle = migrateProject(version)
 		gradle.buildGradle << """
             dependencies {
                 minecraft 'com.mojang:minecraft:24w36a'
@@ -247,7 +247,7 @@ class MigrateMappingsTest extends Specification implements GradleProjectTestTrai
 
 	def "Migrate AW (in place: #inPlace, header: #header)"() {
 		setup:
-		def gradle = gradleProject(project: "minimalBase")
+		def gradle = migrateProject(null)
 		gradle.buildGradle << """
 			loom.accessWidenerPath = file('src/main/resources/test.accesswidener')
             dependencies {
@@ -284,5 +284,24 @@ class MigrateMappingsTest extends Specification implements GradleProjectTestTrai
 		'accessWidener\tv1\tnamed' | true // the code is the same so we only need one case for in place remapping
 		'accessWidener\tv2\tnamed' | false
 		'classTweaker\tv1\tnamed'  | false
+	}
+
+	/**
+	 * 建测试工程，并给内层构建显式设堆。
+	 *
+	 * <p>本用例要下载并重映射一个 Minecraft 快照（24w36a）的完整客户端映射，内层 Gradle daemon 的内存
+	 * 开销远高于其余用例。CI runner 上曾因此 OOM：daemon 抛 {@code OutOfMemoryError: Java heap space}
+	 * 后退出，外层拿到 {@code DaemonStoppedException}，用例重试数次仍失败；更早一次还挂死到 GitHub 的
+	 * 单作业 6 小时上限才被杀。与 {@code RemapTaskCacheTest} 同款做法：把堆显式写进测试工程的
+	 * gradle.properties，不再依赖默认值。
+	 *
+	 * @param version 内层构建使用的 Gradle 版本；{@code null} 表示用测试框架的默认版本
+	 */
+	private def migrateProject(String version) {
+		def gradle = version == null
+				? gradleProject(project: "minimalBase")
+				: gradleProject(project: "minimalBase", version: version)
+		gradle.gradleProperties << "org.gradle.jvmargs=-Xmx2G\n"
+		return gradle
 	}
 }
