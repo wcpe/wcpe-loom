@@ -76,8 +76,10 @@ import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
  * <ul>
  *   <li>{@code getTargetNamespace()} 是 {@code srg} / {@code mojang} 而不是 {@code named}，
  *       {@code getRemappedJars()} 的源命名空间同为 {@code official}；</li>
- *   <li>{@code innerClassNames} **非空**：{@code isForgeLike()} 为真时配置期会读一遍输入 jar 取出内部类
- *       名集合（fabric 的 Named 那条是空集）；</li>
+ *   <li>{@code innerClassNames} **非空**：{@code isForgeLike()} 为真时它是输入 jar 的一列内部类名。
+ *       接线侧登记的是**算法**而不是配置期算好的值（它要读输入 jar，而输入 jar 在生产链迁移后由执行期任务
+ *       产出），故该输入在执行期才求值；本探针在配置期读它只是为了钉住「这个夹具确实有内部类」，
+ *       那次读取不构成对被测实现求值时机的断言（fabric 的 Named 那条两者都是空集）；</li>
  *   <li>{@code objectHolder*} **非空**：{@code isForgeLikeAndOfficial()} 为真（本夹具的 mcp/neoform 配置
  *       都是 {@code official: true}），object holder 改写的类名与源命名空间都参与产物内容；</li>
  *   <li>{@code injectMixinExtension} = {@code isNeoForge()}：Forge 为 false、NeoForge 为 true。
@@ -409,7 +411,25 @@ project.afterEvaluate {
 	lines << 'TASK_COPY_ONLY=' + realTask.getCopyOnly().get()
 	lines << 'TASK_FIX_RECORDS=' + realTask.getFixRecords().get()
 	lines << 'TASK_VALIDATE_TARGET_NAMESPACE=' + realTask.getValidateTargetNamespace().get()
-	lines << 'TASK_INNER_CLASS_COUNT=' + realTask.getInnerClassNames().get().size()
+	// 内部类名集合不再是一个「配置期接线的输入」：它由任务在执行期从 (inputJar, forgeLike) 现算
+	// （见 RemapMinecraftTask.resolveInnerClassNames）。接线侧若给它挂惰性 provider，配置缓存写入
+	// 任务状态时会求值它，冷缓存下输入 jar 尚不存在，整次配置缓存写入直接失败；而若让它吞掉缺失
+	// 返回空集，序列化下来的就是与 jar 内容脱钩的陈旧值。故只能在执行期现算。
+	// 探针于是在配置期按同一条函数关系自行现算被断言的那个量——断言守的仍是同一件事：
+	// Forge 系的输入 jar 确实含内部类，Named 那条（forgeLike=false）不含。
+	def innerClassCount = 0
+
+	if (realTask.getForgeLike().get()) {
+		def taskInputJar = realTask.getInputJar().get().asFile
+
+		if (taskInputJar.isFile()) {
+			innerClassCount = dev.architectury.loom.forge.InnerClassRemapper
+					.readClassNames(taskInputJar.toPath())
+					.size()
+		}
+	}
+
+	lines << 'TASK_INNER_CLASS_COUNT=' + innerClassCount
 	lines << 'TASK_SIGNATURE_FIX_COUNT=' + realTask.getSignatureFixes().get().size()
 	lines << 'TASK_ANNOTATIONS_PRESENT=' + realTask.getAnnotationsJson().isPresent()
 	lines << 'TASK_OBJECT_HOLDER_CLASS=' + (realTask.getObjectHolderClassName().isPresent() ? realTask.getObjectHolderClassName().get() : '')

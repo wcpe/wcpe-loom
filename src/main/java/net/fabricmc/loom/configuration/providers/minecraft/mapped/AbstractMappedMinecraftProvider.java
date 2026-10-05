@@ -623,8 +623,11 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 	 *       的同名字段，{@code fromNamespace} ← {@code sourceNamespace}</li>
 	 *   <li>{@code toNamespace} ← {@link #getTargetNamespace()}（取 {@code toString()}，
 	 *       与 {@code remapJar} 交给 L4 的字符串一致）</li>
-	 *   <li>{@code fixRecords} / {@code validateTargetNamespace} / {@code innerClassNames} /
-	 *       {@code objectHolder*} ← 与 {@code remapJar} 逐项同判据</li>
+	 *   <li>{@code fixRecords} / {@code validateTargetNamespace} / {@code objectHolder*} ←
+	 *       与 {@code remapJar} 逐项同判据</li>
+	 *   <li>{@code innerClassNames} ← 判据同 {@code remapJar}（Forge 系才算，否则空集）：它是输入 jar 的纯函数，
+	 *       由任务在执行期从 ({@code inputJar}, {@code forgeLike}) 现算，**不经任何任务属性**
+	 *       （理由见 {@code RemapMinecraftTask.resolveInnerClassNames} 的说明）</li>
 	 *   <li>{@code mappingsServiceOptions} ←
 	 *       {@code MappingConfiguration.getMappingsServiceOptions(project, MappingOption.forPlatform(extension))}，
 	 *       与配置期 {@code getMappingsService} 取的是同一份映射来源（换来源会产出不等价的 jar）</li>
@@ -699,10 +702,9 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		// Arch: 中间映射被关闭时不校验目标命名空间（与 remapJar 同一判据，见 fabric-loom#1576）
 		final boolean validateTargetNamespace = !(getTargetNamespace() == MappingsNamespace.INTERMEDIARY && !extension.getUseIntermediateMappings().get());
 
-		// Forge 系才需要内部类名集合；这一步要读输入 jar，配置期只能同步做
-		final Set<String> innerClassNames = extension.isForgeLike()
-				? InnerClassRemapper.readClassNames(remappedJars.inputJar())
-				: Set.of();
+		// 这里刻意不再算内部类名集合：它要读输入 jar，而输入 jar 在生产链迁移完成后由执行期任务产出，
+		// 配置期读到的是「不存在」或「上一代」的文件。改由 RemapMinecraftTask 在执行期从
+		// (inputJar, forgeLike) 现算，见 RemapMinecraftTask.resolveInnerClassNames 的说明。
 
 		final String objectHolderClassName;
 		final String objectHolderSourceNamespace;
@@ -754,7 +756,10 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		identity.put("fixRecords", Boolean.toString(fixRecords));
 		identity.put("forgeLike", Boolean.toString(extension.isForgeLike()));
 		identity.put("validateTargetNamespace", Boolean.toString(validateTargetNamespace));
-		identity.put("innerClassNames", fingerprintValues(innerClassNames));
+		// innerClassNames 没有指纹项：它不再是配置期读出来的值，而是 (inputJar, forgeLike) 的纯函数，
+		// 由 RemapMinecraftTask 在执行期现算（见 resolveInnerClassNames）。这两个判据都已经在上面
+		// ——inputJar 的路径与 forgeLike 的布尔值——同一对取值必然算出同一个集合，故指纹的判别力不变；
+		// 记一个常量反而会让人误以为它参与了判定。
 		identity.put("knownIndyBsms", fingerprintValues(extension.getKnownIndyBsms().get()));
 		identity.put("signatureFixes", fingerprintEntries(remappedSignatures));
 		identity.put("annotationsJson", remappedAnnotations == null ? "" : remappedAnnotations.toJson().toString());
@@ -802,7 +807,10 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 					task.getFixRecords().set(fixRecords);
 					task.getForgeLike().set(extension.isForgeLike());
 					task.getValidateTargetNamespace().set(validateTargetNamespace);
-					task.getInnerClassNames().set(innerClassNames);
+					// 内部类名集合刻意不在这里设置：它是 (inputJar, forgeLike) 的纯函数，由任务在执行期
+					// 现算（RemapMinecraftTask.resolveInnerClassNames）。此处曾用惰性 provider 登记「怎么算」，
+					// 但 SetProperty 是托管属性、配置缓存写入任务状态时会求值并序列化它，于是读 jar 落在
+					// 配置缓存序列化期——那时输入 jar 的产出任务还没跑，冷缓存下直接让整次配置缓存写入失败。
 					task.getKnownIndyBsms().set(extension.getKnownIndyBsms());
 					task.getSignatureFixes().set(remappedSignatures);
 					// object holder 改写只在「官方命名空间」下需要，其目标命名空间是字面量 named，

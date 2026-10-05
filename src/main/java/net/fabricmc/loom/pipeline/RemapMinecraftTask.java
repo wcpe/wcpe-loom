@@ -32,6 +32,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
 
+import dev.architectury.loom.forge.InnerClassRemapper;
 import org.gradle.api.DefaultTask;
 import org.gradle.api.file.ConfigurableFileCollection;
 import org.gradle.api.file.RegularFileProperty;
@@ -242,8 +243,31 @@ public abstract class RemapMinecraftTask extends DefaultTask {
 	@Input
 	public abstract Property<Boolean> getValidateTargetNamespace();
 
-	/** Forge 系内部类重映射所需的类名集合. */
-	@Input
+	/**
+	 * Forge 系内部类重映射所需的类名集合：显式覆盖项，接线侧通常留空.
+	 *
+	 * <h4>缺省由本任务在执行期现算</h4>
+	 * 未设置时，本任务在 {@code remap()} 里由 {@link #getInputJar()} 与 {@link #getForgeLike()} 现算：
+	 * Forge 系取 {@code InnerClassRemapper.readClassNames(inputJar)}，非 Forge 系取空集。接线侧
+	 * （{@code AbstractMappedMinecraftProvider.registerRemapTask}）因此**不设置本属性**。
+	 *
+	 * <h4>为什么不能由接线侧挂惰性 provider</h4>
+	 * 曾经的做法是接线侧 set 一个 {@code inputJar.zip(forgeLike, …)} 惰性 provider，意图是「配置期不打开
+	 * 输入 jar」。但 {@link SetProperty} 是 Gradle 托管属性，**配置缓存写入任务状态时会求值并序列化它**：
+	 * 读 jar 于是从配置期挪到了配置缓存序列化期——那仍然是配置期，而且此时输入 jar 的产出任务尚未运行，
+	 * 冷缓存下直接抛 {@code NoSuchFileException}，使整次配置缓存写入失败（Forge 全链用例在 CI 上正是这样
+	 * 成片失败的）。只有让该值**不经过任何任务属性**，读取才真正推迟到执行期。
+	 *
+	 * <h4>改判 {@code @Internal} 不降低判别力</h4>
+	 * 本集合是（{@link #getInputJar()} 的内容、{@link #getForgeLike()}）的纯函数，而这一对判据本身已是本任务
+	 * 的输入（前者是内容哈希的 {@code @InputFile}，后者是 {@code @Input}）：同一对取值必然算出同一个集合。
+	 * 故它无须再登记为输入，up-to-date 判定与构建缓存键的判别力不变。
+	 *
+	 * <h4>显式设置仍然有效</h4>
+	 * 不经接线侧、直接注册本任务的场景（例如与配置期做对照的探针）可显式设置本属性以覆盖现算结果。
+	 * 所设的值会照常参与配置缓存序列化，因此必须是普通值，不得是读文件的惰性 provider。
+	 */
+	@Internal
 	public abstract SetProperty<String> getInnerClassNames();
 
 	/** 已知的 indy BSM 集合. */
@@ -401,7 +425,7 @@ public abstract class RemapMinecraftTask extends DefaultTask {
 					getInjectMixinExtension().get(),
 					getFixRecords().get(),
 					getValidateTargetNamespace().get(),
-					Set.copyOf(getInnerClassNames().get()),
+					resolveInnerClassNames(),
 					Set.copyOf(getKnownIndyBsms().get()),
 					readAnnotations(),
 					Map.copyOf(getSignatureFixes().getOrElse(Map.of())),
@@ -411,6 +435,35 @@ public abstract class RemapMinecraftTask extends DefaultTask {
 					extraRemapperConfig
 			));
 		}
+	}
+
+	/**
+	 * {@return 内部类名集合：{@link #getInnerClassNames()} 显式给出的优先，否则按输入现算}.
+	 *
+	 * <p>现算分支即改造前接线侧（{@code AbstractMappedMinecraftProvider}）那条惰性 provider 登记的函数关系，
+	 * 只是求值点从「配置缓存序列化任务状态时」挪到了「任务动作执行时」——后者输入 jar 的产出任务已经跑完，
+	 * 前者没有。两条路径的取值规则逐字相同：Forge 系（{@link #getForgeLike()} 为真）取输入 jar 里名字带
+	 * {@code $} 的 {@code .class} 条目名，非 Forge 系取空集（非 Forge 系下游也不消费它）。
+	 *
+	 * <p>显式设置优先是为了保留「直接注册本任务」的调用方（与配置期做对照的探针）覆盖取值的能力；
+	 * 接线侧不设置本属性，走现算分支。
+	 */
+	private Set<String> resolveInnerClassNames() {
+		// 用 getOrElse + 空集判据而不是 isPresent()：本属性不再由接线侧设置，属性「存在但为空」
+		// （例如被赋了一个解析为空的 provider）与「完全没有值」在本任务的语义里是同一件事——
+		// 都表示「没有显式覆盖，走现算」。只看 isPresent() 会让前者短路掉现算，Forge 系于是拿到
+		// 空集、内部类不被重映射，产物与配置期路径静默不同（SrgMojangMappedRemapEquivalenceTest 抓到过）。
+		Set<String> explicit = getInnerClassNames().getOrElse(Set.of());
+
+		if (!explicit.isEmpty()) {
+			return Set.copyOf(explicit);
+		}
+
+		if (!getForgeLike().get()) {
+			return Set.of();
+		}
+
+		return InnerClassRemapper.readClassNames(getInputJar().get().getAsFile().toPath());
 	}
 
 	/**
