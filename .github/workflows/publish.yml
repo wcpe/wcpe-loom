@@ -38,6 +38,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    # 单作业超时。GitHub 默认是 6 小时——曾有一个用例在内层 Gradle daemon OOM 后挂死，
+    # 把整条工作流拖到 361 分钟才被上限杀掉。这里按实测耗时给足余量后显式封顶。
+    timeout-minutes: 75
     outputs:
       is-release: ${{ steps.meta.outputs.is-release }}
       release-version: ${{ steps.meta.outputs.release-version }}
@@ -155,6 +158,9 @@ jobs:
     needs: build
     if: needs.build.outputs.is-release == 'true'
     runs-on: ubuntu-24.04
+    # 单作业超时。GitHub 默认是 6 小时——曾有一个用例在内层 Gradle daemon OOM 后挂死，
+    # 把整条工作流拖到 361 分钟才被上限杀掉。这里按实测耗时给足余量后显式封顶。
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
