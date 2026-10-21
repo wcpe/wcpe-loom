@@ -54,9 +54,11 @@ import java.util.stream.Stream;
 
 import de.oceanlabs.mcp.mcinjector.adaptors.ParameterAnnotationFixer;
 import dev.architectury.loom.accesstransformer.AccessTransformerService;
+import dev.architectury.loom.forge.AccessTransformerRuleTranslator;
 import dev.architectury.loom.forge.CoreModClassRemapper;
 import dev.architectury.loom.forge.ForgeMigratedMappingConfiguration;
 import dev.architectury.loom.forge.InnerClassRemapper;
+import dev.architectury.loom.forge.JarClassHierarchy;
 import dev.architectury.loom.forge.config.UserdevConfig;
 import dev.architectury.loom.forge.dependency.DependencyProvider;
 import dev.architectury.loom.forge.dependency.ForgeProvider;
@@ -64,6 +66,7 @@ import dev.architectury.loom.forge.dependency.ForgeUserdevProvider;
 import dev.architectury.loom.forge.dependency.PatchProvider;
 import dev.architectury.loom.forge.tool.ForgeExternalToolService;
 import dev.architectury.loom.mappings.MappingOption;
+import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import dev.architectury.loom.mcpconfig.McpConfigProvider;
 import dev.architectury.loom.mcpconfig.McpExecutor;
 import dev.architectury.loom.mcpconfig.McpExecutorBuilder;
@@ -435,6 +438,11 @@ public class MinecraftPatchedProvider {
 				return null;
 			});
 
+			// AT 规则在 SRG 命名空间，而本链路的 AT 作用对象是 notch jar（见 AccessTransformerRuleTranslator）
+			task.getMappings().set(mappingsFile(project).toFile());
+			task.getAtSourceNamespace().set(MappingsNamespace.SRG.toString());
+			task.getAtTargetNamespace().set(MappingsNamespace.OFFICIAL.toString());
+
 			dependsOnProducer(task, patchedProducer);
 		}));
 
@@ -666,6 +674,17 @@ public class MinecraftPatchedProvider {
 	 * （{@code getMinecraftJarsCollection(OFFICIAL)}、mapped provider 的重映射任务）正是从这里拿到
 	 * 「我的输入由哪个任务产出」的任务依赖。
 	 */
+	/**
+	 * {@return AT 规则翻译要用的映射文件}
+	 *
+	 * <p>与 {@code buildRemapper} / {@link #getMappingTree} 取映射用的是同一个 {@link MappingOption}，
+	 * 保证「翻译 AT 用的映射」与「重映射 MC jar 用的映射」是同一份数据，不会出现两边命名空间不一致。
+	 */
+	private Path mappingsFile(Project project) {
+		final LoomGradleExtension extension = getExtension();
+		return extension.getMappingConfiguration().getMappingsPath(MappingOption.forPlatform(extension));
+	}
+
 	private void registerPatchedJarTask() {
 		final Path patchedJar = minecraftPatchedJar.toAbsolutePath().normalize();
 		final Path clientExtra = providesClientJar() ? minecraftClientExtra.toAbsolutePath().normalize() : null;
@@ -1278,7 +1297,13 @@ public class MinecraftPatchedProvider {
 		}
 	}
 
-	private MemoryMappingTree getMappingTree(ServiceFactory serviceFactory) {
+	/**
+	 * {@return 本工程的映射树}.
+	 *
+	 * <p>对子类开放：legacy Forge（1.8-1.16）的 forge.jar 修补需要按 srg→named 重映射，
+	 * 与这里产出 {@code minecraftPatchedAtJar} 用的是同一棵映射树。
+	 */
+	protected MemoryMappingTree getMappingTree(ServiceFactory serviceFactory) {
 		final MappingOption mappingOption = MappingOption.forPlatform(getExtension());
 		TinyMappingsService mappingsService = getExtension().getMappingConfiguration().getMappingsService(project, serviceFactory, mappingOption);
 		return mappingsService.getMappingTree();
@@ -1461,10 +1486,52 @@ public class MinecraftPatchedProvider {
 		logger.lifecycle(":access transforming minecraft");
 
 		try (var tempFiles = new TempFiles(); var serviceFactory = new ScopedServiceFactory()) {
-			runAccessTransformer(createAccessTransformerOptions(tempFiles), input, target, serviceFactory);
+			runAccessTransformer(createTranslatedAccessTransformerOptions(tempFiles, input, serviceFactory), input, target, serviceFactory);
 		}
 
 		logger.lifecycle(":access transformed minecraft in " + stopwatch.stop());
+	}
+
+	/**
+	 * {@return 把 AT 规则翻译到 {@code input} 命名空间之后的 AT 工具选项}.
+	 *
+	 * <p>legacy Forge 的 {@code forge_at.cfg} 用 SRG 命名空间（MCP 类名 + srg 成员名），而本链路 AT
+	 * 作用的对象是 notch jar。AT 工具按字面量匹配、自身不做名称翻译，直接喂原始规则会一条都匹配不上
+	 * 且不报错（表现为 AT 静默失效，症状推迟到运行期的 {@code IllegalAccessError}）。
+	 * 因此这里先把规则翻译到 {@code input} 所在命名空间，再交给工具。
+	 *
+	 * <p>继承关系取自 {@code input} 自身：AT 允许把规则写在子类上而成员声明在父类，
+	 * 上溯必须以字节码里的真实继承为准。
+	 */
+	private Provider<AccessTransformerService.Options> createTranslatedAccessTransformerOptions(TempFiles tempFiles, Path input,
+			ServiceFactory serviceFactory) {
+		return createAccessTransformerOptions(tempFiles).map(options -> {
+			try {
+				final MemoryMappingTree mappings = getMappingTree(serviceFactory);
+				final JarClassHierarchy hierarchy = JarClassHierarchy.read(List.of(input));
+				final List<File> translated = new ArrayList<>();
+
+				for (File atFile : options.getAccessTransformers().getFiles()) {
+					final List<String> result = AccessTransformerRuleTranslator.translate(
+							new AccessTransformerRuleTranslator.Input(
+									Files.readAllLines(atFile.toPath()),
+									mappings,
+									MappingsNamespace.SRG.toString(),
+									MappingsNamespace.OFFICIAL.toString(),
+									hierarchy));
+
+					final Path tmpFile = tempFiles.file("at-translated", ".cfg");
+					Files.write(tmpFile, result);
+					translated.add(tmpFile.toFile());
+				}
+
+				logger.lifecycle(":translated " + translated.size() + " AT file(s) to the official namespace");
+				options.getAccessTransformers().setFrom(translated);
+				return options;
+			} catch (IOException e) {
+				throw new UncheckedIOException(e);
+			}
+		});
 	}
 
 	/**
