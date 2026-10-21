@@ -63,6 +63,8 @@ import net.fabricmc.loom.util.service.ScopedServiceFactory;
 import net.fabricmc.mappingio.tree.MemoryMappingTree;
 import net.fabricmc.tinyremapper.TinyRemapper;
 
+import dev.architectury.loom.forge.ForgeMemberNameFixer;
+
 /**
  * L3 流水线：把 Minecraft jar 重映射到目标命名空间.
  *
@@ -192,6 +194,32 @@ public abstract class RemapMinecraftTask extends DefaultTask {
 	/** 是否 Forge/NeoForge 系，影响内部类重映射. */
 	@Input
 	public abstract Property<Boolean> getForgeLike();
+
+	/**
+	 * {@return 补充翻译用的 Forge 参考 jar（srg 命名空间），未设置时不做补充翻译}.
+	 *
+	 * <p>与 {@link #getForgeNamedJar()} 成对使用：两者都设置时，重映射落位后会把产物里
+	 * 「指向 Forge 类的成员引用」按两份 jar 的成员名差异再翻译一次。
+	 *
+	 * <h4>为什么需要这一步</h4>
+	 * TinyRemapper 只按映射表翻译。legacy Forge（1.12.2）的 Forge 类不在 MC 映射表内，
+	 * 于是 MC 类里那些「Forge 补丁新增的、指向 Forge 成员的引用」保持 srg 名（如
+	 * {@code ModelLoader.a}），而编译期类路径上的 forge jar 是 named 形（{@code setupModelRegistry}），
+	 * 运行期就会 AbstractMethodError。补充翻译不依赖 MC 映射表，只依赖 Forge 自身两版 jar 的成员名差异。
+	 *
+	 * <p>只有 legacy Forge 同时存在「universal（srg）+ named」两份 jar；现代 Forge/NeoForge 车道
+	 * 拿不到可对比的两份，故该输入在这些车道上不会被设置，工序自动不执行。
+	 */
+	@Optional
+	@InputFile
+	@PathSensitive(PathSensitivity.NONE)
+	public abstract RegularFileProperty getForgeSrgJar();
+
+	/** {@return 补充翻译用的 Forge 参考 jar（named 命名空间），与 {@link #getForgeSrgJar()} 成对}. */
+	@Optional
+	@InputFile
+	@PathSensitive(PathSensitivity.NONE)
+	public abstract RegularFileProperty getForgeNamedJar();
 
 	/**
 	 * 是否向 remapper 注入 mixin 扩展（NeoForge 系需要）.
@@ -435,6 +463,29 @@ public abstract class RemapMinecraftTask extends DefaultTask {
 					extraRemapperConfig
 			));
 		}
+
+		fixForgeMemberNames(outputJar);
+	}
+
+	/**
+	 * 对刚重映射好的 jar 补做一次「Forge 成员名翻译」.
+	 *
+	 * <p>两个参考 jar 缺一就跳过：只有 legacy Forge 才有 srg + named 两份，其余车道拿不到，
+	 * 那时本工序是空操作（不是失败）。
+	 */
+	private void fixForgeMemberNames(Path outputJar) throws IOException {
+		final Path srgJar = getForgeSrgJar().getOrNull() == null
+				? null : getForgeSrgJar().get().getAsFile().toPath();
+		final Path namedJar = getForgeNamedJar().getOrNull() == null
+				? null : getForgeNamedJar().get().getAsFile().toPath();
+
+		if (srgJar == null || namedJar == null) {
+			return;
+		}
+
+		final ForgeMemberNameFixer.Stats stats = ForgeMemberNameFixer.fix(outputJar, srgJar, namedJar);
+		LOGGER.info("补充翻译 Forge 成员名：映射 {} 条，改写 {} 个 class（产物 {}）",
+				stats.mappingCount(), stats.changedClasses(), outputJar.getFileName());
 	}
 
 	/**
