@@ -72,6 +72,7 @@ import net.fabricmc.loom.configuration.providers.mappings.tiny.MappingsMerger;
 import net.fabricmc.loom.configuration.providers.mappings.tiny.TinyJarInfo;
 import net.fabricmc.loom.configuration.providers.mappings.unpick.UnpickMetadata;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+import net.fabricmc.loom.pipeline.GenerateLegacyInheritedMappingsTask;
 import net.fabricmc.loom.pipeline.GenerateSrgNamedMappingsTask;
 import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
 import net.fabricmc.loom.util.Checksum;
@@ -104,6 +105,8 @@ public class MappingConfiguration {
 	private static final String PAIR_MARKER_READY = "ready";
 	/** 成对就绪标记的失效内容：本轮正在（重新）生成这对产物. */
 	private static final String PAIR_MARKER_INVALID = "invalidated";
+	/** 补全继承方法映射的任务名（登记与依赖接线共用同一常量，避免字符串漂移）. */
+	public static final String LEGACY_INHERITED_TASK_NAME = "generateLegacyInheritedMappings";
 
 	/**
 	 * 跨项目复用缓存：同构项目（同一套 mappings + 同一 MC 版本 + 同一平台）产出的
@@ -153,6 +156,8 @@ public class MappingConfiguration {
 	public final Path tinyMappingsJar;
 	public Path tinyMappingsWithMojang;
 	public Path tinyMappingsWithSrg;
+	/** legacy Forge（1.12.2）用：补全继承方法映射后的 srg tiny（执行期任务产出）. */
+	public Path tinyMappingsWithSrgInherited;
 	public final Map<String, Path> mixinTinyMappings; // The mixin mappings have other names in intermediary.
 	public final Path srgToNamedSrg; // FORGE: srg to named in srg file format
 	private final Map<MappingOption, Supplier<Path>> mappingOptions;
@@ -187,6 +192,10 @@ public class MappingConfiguration {
 		this.mappingsPairMarker = mappingsWorkingDir.resolve("mappings-pair.ready");
 		this.unpickDefinitions = mappingsWorkingDir.resolve("mappings.unpick");
 		this.tinyMappingsWithSrg = mappingsWorkingDir.resolve("mappings-srg.tiny");
+		// legacy Forge（1.12.2）专用：补全「实现类缺失的继承方法映射」后的版本。
+		// 由 GenerateLegacyInheritedMappingsTask 在执行期产出（配置期只登记，不计算），
+		// 详见该任务类注释。
+		this.tinyMappingsWithSrgInherited = mappingsWorkingDir.resolve("mappings-srg-inherited.tiny");
 		this.tinyMappingsWithMojang = mappingsWorkingDir.resolve("mappings-mojang.tiny");
 		// 线程安全实现：本实例经 SHARED_INSTANCES 在 daemon 内跨项目共享，而 getReplacedTarget 由
 		// Mixin AP 的配置路径调用——两个项目并行配置时会同时向这张表 computeIfAbsent，普通 HashMap
@@ -307,11 +316,18 @@ public class MappingConfiguration {
 	/**
 	 * {@return 该映射选项指向的文件是否由执行期任务产出（配置期允许它尚不存在）}.
 	 *
-	 * <p>默认恒为假：绝大多数平台（Fabric/Quilt）的映射文件都在配置期就绪，那条存在性校验仍然有效。
-	 * Forge 系覆写它，把「迁移产物」这一族标出来。
+	 * <p>覆写者必须用 {@code ||} 保留基类结果——基类已经覆盖了 legacy Forge 的继承补全映射，
+	 * 直接返回自己的判断会把它漏掉。
+	 *
+	 * <p>基类的情形：仅 legacy Forge 的 {@link MappingOption#WITH_SRG_INHERITED} 指向
+	 * {@code mappings-srg-inherited.tiny}，由 {@code generateLegacyInheritedMappings} 任务产出，
+	 * 配置期必然不存在；就绪由 {@link #addMappingsProducerDependency} 建立的任务依赖保证。
+	 * 其余（Fabric/Quilt 的原始 mappings、{@code WITH_SRG} 的原始 srg tiny、mixin 派生映射）
+	 * 都在配置期结束时已落位，存在性校验仍然生效。
 	 */
 	protected boolean isTaskProducedMappings(MappingOption mappingOption) {
-		return false;
+		return mappingOption == MappingOption.WITH_SRG_INHERITED
+				&& mappingOptions.containsKey(MappingOption.WITH_SRG_INHERITED);
 	}
 
 	/**
@@ -337,6 +353,18 @@ public class MappingConfiguration {
 
 		if (taskPath != null) {
 			task.dependsOn(taskPath);
+		}
+
+		// legacy Forge 的重映射输入是「补全继承方法条目」后的映射，由该任务产出。
+		//
+		// 判据用「选项是否已登记」而不是 legacyInheritedMappings 标志：标志在
+		// projectLegacyInheritedMappings 里才置位，而调用本方法的 registerRemapTasks 跑在
+		// provideMinecraftJars() 阶段，**早于** setupPost()（后者才登记补全任务）。用标志会读到
+		// false 而漏接线，构建仍能过（读到旧产物或空文件），是最难发现的那种错。
+		// mappingOptions 里的 WITH_SRG_INHERITED 在 setupPost 更早的映射选项登记段就已放入，时序上安全。
+		// 按任务名建依赖而非任务实例：dependsOn(String) 由 Gradle 延迟解析，时序无关。
+		if (mappingOptions.containsKey(MappingOption.WITH_SRG_INHERITED)) {
+			task.dependsOn(LEGACY_INHERITED_TASK_NAME);
 		}
 	}
 
@@ -553,12 +581,28 @@ public class MappingConfiguration {
 		LoomGradleExtension extension = LoomGradleExtension.get(project);
 		final boolean refresh = extension.refreshDeps();
 
+		// 本实例经 SHARED_INSTANCES 在 daemon 内跨项目、跨构建复用，而本方法每轮都会被再次调用。
+		// 先清掉上一轮可能登记的补全选项，避免跨项目复用者继承「该选项存在」的判断
+		// （isTaskProducedMappings / addMappingsProducerDependency 都以「选项已登记」为准）。
+		this.mappingOptions.remove(MappingOption.WITH_SRG_INHERITED);
+
 		if (extension.isNeoForge()) {
 			this.mappingOptions.put(MappingOption.WITH_MOJANG, () -> this.tinyMappingsWithMojang);
 		}
 
 		if (extension.shouldGenerateSrgTiny()) {
+			// WITH_SRG 保持指向原始 srg tiny：它在配置期还要被读成映射树
+			// （srgNamedTree / LorenzMappingService），必须此时期就存在。
 			this.mappingOptions.put(MappingOption.WITH_SRG, () -> this.tinyMappingsWithSrg);
+
+			// legacy Forge（1.8-1.16）：重映射必须用「补全了继承方法条目」的那份映射，
+			// 否则子类 override 的方法拿不到父类型上的名字（TinyRemapper 不做继承回退，
+			// 而 ForgeGradle 用的 SpecialSource 有 fallbackInheritanceProvider）。
+			// 补全版由 generateLegacyInheritedMappings 任务在执行期产出，故单独一个选项，
+			// 只有「重映射 Minecraft jar」那条执行期路径取用它（见 AbstractMappedMinecraftProvider）。
+			if (!extension.isModernForgeLike()) {
+				this.mappingOptions.put(MappingOption.WITH_SRG_INHERITED, () -> this.tinyMappingsWithSrgInherited);
+			}
 
 			if (extension.isForge() && extension.getForgeProvider().usesMojangAtRuntime()) {
 				this.mappingOptions.put(MappingOption.WITH_MOJANG, () -> this.tinyMappingsWithSrg);
@@ -647,6 +691,13 @@ public class MappingConfiguration {
 				// 整批回退：配置期路径逐字保留（含它自己的就绪判据、跨进程锁与原子发布）
 				generateSrgNamedInConfiguration(project, extension, blocker);
 			}
+
+			// 只有 legacy Forge（1.8-1.16 那条链）才需要补全继承方法映射：
+			// 它的 MC jar 走的是「notch -> named 一次性重映射」，而 TinyRemapper 不做继承回退。
+			// modern Forge 用官方映射，不存在这个缺口，注册了只是白跑一次扫描。
+			if (!extension.isModernForgeLike()) {
+				projectLegacyInheritedMappings(project, extension);
+			}
 		}
 
 		project.getDependencies().add(Constants.Configurations.MAPPINGS_FINAL, project.files(tinyMappingsJar.toFile()));
@@ -698,6 +749,40 @@ public class MappingConfiguration {
 	private @Nullable Path srgNamedMappingsPath() {
 		final Supplier<Path> mappingsSupplier = mappingOptions.get(MappingOption.WITH_SRG);
 		return mappingsSupplier == null ? null : mappingsSupplier.get();
+	}
+
+	/**
+	 * 把「补全继承方法映射」投影成执行期任务（仅 legacy Forge / 1.12.2 需要）.
+	 *
+	 * <p>为什么必须是执行期任务：本任务的输入之一是重映射前的 notch 命名空间 MC jar，
+	 * 而它由 {@code RemapMinecraftTask} / {@code ProcessMinecraftJarTask} 在**执行期**产出，
+	 * 配置期读不到（loom 自己的日志也这么写）。放在配置期既拿不到输入，也会让每次 Gradle
+	 * 启动都重扫全部 class。
+	 *
+	 * <p>配置缓存友好性：本方法只登记任务与输入输出路径，不做任何文件读取、不解析 class、
+	 * 不触碰 {@code Project} 的非配置期状态；任务动作内也不访问 {@code Project}。
+	 */
+	private void projectLegacyInheritedMappings(Project project, LoomGradleExtension extension) {
+		final Path source = tinyMappingsWithSrg;
+		final Path output = tinyMappingsWithSrgInherited;
+
+		project.getTasks().register(LEGACY_INHERITED_TASK_NAME,
+				GenerateLegacyInheritedMappingsTask.class, task -> {
+					task.setGroup(Constants.TaskGroup.FABRIC);
+					task.setDescription("Completes inherited method entries in the srg mappings for legacy Forge");
+					task.getMappings().set(source.toFile());
+					// MC jar 作为输入：这里取的是未经补丁的 vanilla client/server jar
+					// （{@code MinecraftProvider} 的产物），配置期路径已知，直接登记为输入。
+					// 不用 provider 延迟求值——任务执行期再回头问 extension 会读到已切换的状态，
+					// 且延迟求值也拿不到正确的 jar。
+					final var minecraftProvider = extension.getMinecraftProvider();
+					task.getMinecraftJars().from(
+							minecraftProvider.getMinecraftClientJar(),
+							minecraftProvider.getMinecraftServerJar());
+					task.getOutputMappings().set(output.toFile());
+				});
+
+		project.getLogger().lifecycle("继承方法映射的补全由执行期任务承担：{}", output.getFileName());
 	}
 
 	/**

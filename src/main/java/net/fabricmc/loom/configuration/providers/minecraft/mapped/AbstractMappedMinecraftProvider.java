@@ -903,7 +903,14 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 						minecraftProvider.addProducerDependency(task, path);
 					}
 
-					task.getMappingsServiceOptions().set(mappingConfiguration.getMappingsServiceOptions(project, MappingOption.forPlatform(extension)));
+					// legacy Forge 的重映射输入要用「补全了继承方法条目」的映射：TinyRemapper 不做继承回退，
+					// 而 MCP 映射只给声明类记条目，子类 override 拿不到名字（运行期 AbstractMethodError）。
+					// 该补全产物由执行期任务产出，故不能占用 WITH_SRG——那个选项在配置期还要被读成映射树。
+					final boolean useInheritedMappings = !extension.isModernForgeLike()
+							&& extension.shouldGenerateSrgTiny();
+
+					task.getMappingsServiceOptions().set(mappingConfiguration.getMappingsServiceOptions(project,
+							useInheritedMappings ? MappingOption.WITH_SRG_INHERITED : MappingOption.forPlatform(extension)));
 					// 映射树取自迁移产物：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
 					mappingConfiguration.addMappingsProducerDependency(task);
 					task.getFromNamespace().set(fromNamespace);
@@ -924,6 +931,7 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 						task.getForgeSrgJar().set(forgeReferenceJars[0].toFile());
 						task.getForgeNamedJar().set(forgeReferenceJars[1].toFile());
 					}
+
 					task.getValidateTargetNamespace().set(validateTargetNamespace);
 					// 内部类名集合刻意不在这里设置：它是 (inputJar, forgeLike) 的纯函数，由任务在执行期
 					// 现算（RemapMinecraftTask.resolveInnerClassNames）。此处曾用惰性 provider 登记「怎么算」，
