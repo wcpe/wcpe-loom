@@ -144,6 +144,18 @@ public class MinecraftPatchedProvider {
 	private Path minecraftPatchedIntermediateJar;
 	// Step 3: Access Transform
 	private Path minecraftPatchedIntermediateAtJar;
+	/**
+	 * 中间产物的命名空间标识，同时决定 AT 规则的源命名空间.
+	 *
+	 * <p>它与产物文件名用的是同一个值（构造器里算出的 {@code intermediateId}）：
+	 * Forge 是 {@code srg}，NeoForge 是 {@code mojang}（unobfuscated 时 {@code official}）。
+	 *
+	 * <p>AT 规则的书写命名空间随平台而变，实测两版 Forge 的 userdev AT 文件对同一个方法写法不同：
+	 * Forge 1.21.1 写 {@code m_10595_}（srg），NeoForge 1.20.2 写 {@code register}（mojang）。
+	 * 故 AT 的源命名空间必须取本值，不能硬编码成 srg——硬编码会让 NeoForge 车道的 508 条规则
+	 * 全部因「类找不到」而失败（NeoForge 的映射树里根本没有 srg 列）。
+	 */
+	private String intermediateNamespace;
 	// Step 4: Remap Patched AT & Forge to official
 	private Path minecraftPatchedJar;
 	private Path minecraftClientExtra;
@@ -187,6 +199,7 @@ public class MinecraftPatchedProvider {
 		final String intermediateId = getExtension().isNeoForge()
 				? (getExtension().isUnobfuscatedForge() ? "official" : "mojang")
 				: "srg";
+		intermediateNamespace = intermediateId;
 		minecraftIntermediateJar = forgeWorkingDir.resolve("minecraft-" + type.id + "-" + intermediateId + ".jar");
 		minecraftPatchedIntermediateJar = forgeWorkingDir.resolve("minecraft-" + type.id + "-" + intermediateId + "-patched.jar");
 		minecraftPatchedIntermediateAtJar = forgeWorkingDir.resolve("minecraft-" + type.id + "-" + intermediateId + "-at-patched.jar");
@@ -446,7 +459,11 @@ public class MinecraftPatchedProvider {
 			// declaring an explicit or implicit dependency」。接线方式与同类消费方一致（见下方
 			// registerPatchedJarTask 里 migrateForgeJar 那处）。
 			extension.getMappingConfiguration().addMappingsProducerDependency(task);
-			task.getAtSourceNamespace().set(MappingsNamespace.SRG.toString());
+			// AT 规则的书写命名空间随平台而变（见 intermediateNamespace 的字段注释）：
+			// Forge 的 userdev AT 用 srg 成员名，NeoForge 的用 mojang 名。原实现硬编码 SRG，
+			// 在 NeoForge 车道上必然全部失败——它的映射树里没有 srg 列，任何类名都查不到
+			// （实测 508 条「类无法翻译」）。源命名空间取自产物文件名同源的 intermediateNamespace。
+			task.getAtSourceNamespace().set(intermediateNamespace);
 			task.getAtTargetNamespace().set(MappingsNamespace.OFFICIAL.toString());
 
 			dependsOnProducer(task, patchedProducer);
