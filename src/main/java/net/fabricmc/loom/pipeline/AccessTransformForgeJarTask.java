@@ -24,14 +24,19 @@
 
 package net.fabricmc.loom.pipeline;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 
 import javax.inject.Inject;
 
 import dev.architectury.loom.accesstransformer.AccessTransformerService;
+import dev.architectury.loom.forge.AccessTransformerRuleTranslator;
+import dev.architectury.loom.forge.JarClassHierarchy;
 import dev.architectury.loom.forge.config.UserdevConfig;
 import dev.architectury.loom.util.TempFiles;
 import org.gradle.api.DefaultTask;
@@ -53,6 +58,9 @@ import org.jspecify.annotations.Nullable;
 
 import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.loom.util.service.ScopedServiceFactory;
+import net.fabricmc.mappingio.MappingReader;
+import net.fabricmc.mappingio.format.MappingFormat;
+import net.fabricmc.mappingio.tree.MemoryMappingTree;
 
 /**
  * L3 流水线：对打补丁后的中间 Minecraft jar 执行 Forge 的 access transform
@@ -124,6 +132,24 @@ public abstract class AccessTransformForgeJarTask extends DefaultTask {
 	@OutputFile
 	public abstract RegularFileProperty getOutputJar();
 
+	/**
+	 * 输入：映射文件，用于把 AT 规则翻译到目标 jar 的命名空间.
+	 *
+	 * <p>声明成文件而非映射树：映射树不可序列化，配置缓存在此只记录文件路径与内容哈希，
+	 * 树本身在执行期按需重建（见 {@link #readMappings()}）。
+	 */
+	@InputFile
+	@PathSensitive(PathSensitivity.NONE)
+	public abstract RegularFileProperty getMappings();
+
+	/** 规则当前的命名空间（legacy Forge 为 {@code srg}）. */
+	@Input
+	public abstract Property<String> getAtSourceNamespace();
+
+	/** 目标 jar 所在的命名空间（notch jar 为 {@code official}）. */
+	@Input
+	public abstract Property<String> getAtTargetNamespace();
+
 	/** 执行期实例化服务选项用（{@code Project} 在执行期不可用，见类注释）. */
 	@Inject
 	public abstract ObjectFactory getObjects();
@@ -134,8 +160,11 @@ public abstract class AccessTransformForgeJarTask extends DefaultTask {
 		final Path output = getOutputJar().get().getAsFile().toPath();
 
 		try (var tempFiles = new TempFiles(); var serviceFactory = new ScopedServiceFactory()) {
-			final List<String> atFiles = AccessTransformerService.extractLoaderAts(
+			List<String> atFiles = AccessTransformerService.extractLoaderAts(
 					getForgeUserdevJar().get().getAsFile().toPath(), atLocation(), tempFiles);
+			// AT 规则来自 forge_at.cfg（SRG 命名空间），而作用对象是本仓库的 notch jar：
+			// 不翻译的话 AT 工具按字面量一条都匹配不上，且不会报错（表现为 AT 静默失效）。
+			atFiles = translateAtFiles(atFiles, tempFiles);
 			final AccessTransformerService service = serviceFactory.get(
 					AccessTransformerService.createOptions(getObjects(), atTool(), atFiles));
 
@@ -145,6 +174,50 @@ public abstract class AccessTransformForgeJarTask extends DefaultTask {
 				service.execute(input, tmp);
 			});
 		}
+	}
+
+	/**
+	 * {@return 翻译到目标命名空间后的 AT 文件路径} 每条输入对应一个同序输出.
+	 *
+	 * <p>翻译结果写进本任务的临时目录：它是 (AT 内容, 映射) 的纯函数，
+	 * 而这两者都是任务的 {@code @Input}，因此翻译不需要独立的任务级缓存。
+	 */
+	private List<String> translateAtFiles(List<String> atFiles, TempFiles tempFiles) throws IOException {
+		final MemoryMappingTree mappings = readMappings();
+		// 继承索引来自本次 AT 的作用对象（notch jar）：AT 规则可能写在子类上而成员声明在父类，
+		// 上溯需要字节码里的真实继承关系，映射表不提供
+		final JarClassHierarchy hierarchy = JarClassHierarchy.read(List.of(
+				getPatchedIntermediateJar().get().getAsFile().toPath()));
+		final List<String> translated = new ArrayList<>(atFiles.size());
+
+		for (String atFile : atFiles) {
+			final List<String> rules = Files.readAllLines(Path.of(atFile));
+			final List<String> result = AccessTransformerRuleTranslator.translate(
+					new AccessTransformerRuleTranslator.Input(
+							rules,
+							mappings,
+							getAtSourceNamespace().get(),
+							getAtTargetNamespace().get(),
+							hierarchy));
+
+			final Path tmpFile = tempFiles.file("at-translated", ".cfg");
+			Files.write(tmpFile, result);
+			translated.add(tmpFile.toAbsolutePath().toString());
+		}
+
+		return translated;
+	}
+
+	/** {@return 从任务输入的映射文件读出的映射树}. */
+	private MemoryMappingTree readMappings() throws IOException {
+		final MemoryMappingTree mappings = new MemoryMappingTree();
+		final Path path = getMappings().get().getAsFile().toPath();
+
+		try (BufferedReader reader = Files.newBufferedReader(path)) {
+			MappingReader.read(reader, MappingFormat.TINY_2_FILE, mappings);
+		}
+
+		return mappings;
 	}
 
 	/** {@return 本次的 AT 文件位置声明} 与配置期读的 {@code UserdevConfig.ats} 逐项同源. */
