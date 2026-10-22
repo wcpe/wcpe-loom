@@ -196,7 +196,11 @@ jobs:
           VERSION="${TAG_NAME#wcpe-v}"
 
           NOTES_FILE="$(mktemp)"
-          bash scripts/gen-release-notes.sh "${PREV_TAG}" "${TAG_NAME}" > "${NOTES_FILE}"
+          # 交点显式指定主线 ref：本作业由 tag 触发、处于 detached 状态，本地不一定有 dev/1.17-wcpe。
+          # 脚本靠它判断「端点是否在主线历史内」，据此决定要不要查 .upstream/release-anchors.txt。
+          # 少了它，孤立 tag 会被当成正常端点，区间把上一版已发布的提交重复算进来。
+          WCPE_MAIN_REF="${WCPE_DEFAULT_BRANCH:-dev/1.17-wcpe}" \
+            bash scripts/gen-release-notes.sh "${PREV_TAG}" "${TAG_NAME}" > "${NOTES_FILE}"
           echo "--- 生成的变更清单 ---"
           cat "${NOTES_FILE}"
 
