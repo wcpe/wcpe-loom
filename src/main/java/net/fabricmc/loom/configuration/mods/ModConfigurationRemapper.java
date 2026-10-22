@@ -312,11 +312,23 @@ public class ModConfigurationRemapper {
 
 					// 只声明认领到的产物；声明集合同时就是写出集合（见 RemapModsTask.getOutputJars）
 					task.getOutputJars().from(ownedArtifacts.stream().map(Path::toFile).toList());
+					// 源配置的 provider 必须在**配置期**取好：RemapConfigurationSettings 是 Gradle 装饰对象，
+					// 它的 getSourceConfiguration() 内部要走抽象方法 getProject()——在 provider 的 lambda 里回调它，
+					// 就构成「执行期访问 Project」，配置缓存会直接抛
+					// InvalidUserCodeException（--rerun-tasks 这类跳过快照的用法必踩）。
+					// 取到的 NamedDomainObjectProvider 本身是可序列化的惰性句柄，getFiles() 仍推迟到快照时刻解析，
+					// 因此不改变上面那段性能约束。
+					final List<NamedDomainObjectProvider<Configuration>> remapSourceConfigurations = new ArrayList<>();
+
+					for (RemapConfigurationSettings entry : extension.getRemapConfigurations()) {
+						remapSourceConfigurations.add(entry.getSourceConfiguration());
+					}
+
 					task.getRemapClasspath().from(project.provider(() -> {
 						final List<File> remapConfigSourceFiles = new ArrayList<>();
 
-						for (RemapConfigurationSettings entry : extension.getRemapConfigurations()) {
-							remapConfigSourceFiles.addAll(entry.getSourceConfiguration().get().getFiles());
+						for (NamedDomainObjectProvider<Configuration> sourceConfiguration : remapSourceConfigurations) {
+							remapConfigSourceFiles.addAll(sourceConfiguration.get().getFiles());
 						}
 
 						return RemapModsTask.collectRemapClasspath(remapConfigSourceFiles, inputsBeingRemapped);
