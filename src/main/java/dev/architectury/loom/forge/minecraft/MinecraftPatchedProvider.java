@@ -440,6 +440,12 @@ public class MinecraftPatchedProvider {
 
 			// AT 规则在 SRG 命名空间，而本链路的 AT 作用对象是 notch jar（见 AccessTransformerRuleTranslator）
 			task.getMappings().set(mappingsFile(project).toFile());
+			// 映射文件在投影形态下由迁移任务在执行期产出（manipulateForgeMappings），
+			// 而上面只按路径声明成 @InputFile——不带任务依赖。缺这条接线时 Gradle 会直接拒绝构建：
+			// 「accessTransformForgeJar uses this output of task manipulateForgeMappings without
+			// declaring an explicit or implicit dependency」。接线方式与同类消费方一致（见下方
+			// registerPatchedJarTask 里 migrateForgeJar 那处）。
+			extension.getMappingConfiguration().addMappingsProducerDependency(task);
 			task.getAtSourceNamespace().set(MappingsNamespace.SRG.toString());
 			task.getAtTargetNamespace().set(MappingsNamespace.OFFICIAL.toString());
 
