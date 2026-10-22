@@ -1,5 +1,10 @@
-# GitHub 自动生成 Release Notes 的分组配置（gh release create --generate-notes 读取）。
-# 前提：版本的改动经由 PR 合入默认分支；直推提交不会进入 What's Changed。
+# GitHub 自动生成 Release Notes 的分组配置。
+#
+# 注意：本仓库的自动发布（.github/workflows/publish.yml）**已不再使用** --generate-notes，
+# 改为 scripts/gen-release-notes.sh 按提交生成——原因是 --generate-notes 只统计经 PR 合入的
+# 提交，而本线以直推为主，结果会出现正文全空或只剩零星几条 PR。
+# 本文件现在只服务 GitHub 网页端的「Generate release notes」按钮（人工触发时读取）。
+# 直推提交不会进入它的 What's Changed；需要完整清单请用上面的脚本。
 # 命中越靠前的 category 优先级越高；不带 label 的 PR 落入「其他变更」。
 changelog:
   exclude:
