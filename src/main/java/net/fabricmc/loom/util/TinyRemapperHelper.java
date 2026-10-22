@@ -196,6 +196,21 @@ public final class TinyRemapperHelper {
 					IMappingProvider.Member methodIdentifier = memberOf(className, methodName, method.getDesc(fromId));
 					acceptor.acceptMethod(methodIdentifier, dstMethodName);
 
+					// 同一方法再按「目标命名空间描述符」注册一次。
+					//
+					// TinyRemapper 匹配调用点时，描述符会先被翻译，再拿翻译后的描述符去查方法映射；
+					// 而上面那条键用的是源命名空间描述符。当调用点的描述符已经翻成目标形态时
+					// （legacy Forge 的 forge jar 就是这种形态），两边不等，方法名就被跳过——
+					// 实测表现为 ModelLoader 的 a:(Lbvv;Lcgd;)V 重映射后变成
+					// a:(ModelBlockDefinition,ModelResourceLocation)V：描述符翻了、名字没翻，
+					// 运行期 NoSuchMethodError。字段侧靠 ignoreFieldDesc(true) 绕过同类问题，
+					// 但 TinyRemapper 0.14.0 没有对应的方法级开关，只能在映射层补一条备用键。
+					final String dstDesc = method.getDesc(toId);
+
+					if (dstDesc != null && !dstDesc.equals(method.getDesc(fromId))) {
+						acceptor.acceptMethod(memberOf(className, methodName, dstDesc), dstMethodName);
+					}
+
 					if (remapLocalVariables) {
 						for (MappingTree.MethodArgMapping parameter : method.getArgs()) {
 							String name = parameter.getName(toId);

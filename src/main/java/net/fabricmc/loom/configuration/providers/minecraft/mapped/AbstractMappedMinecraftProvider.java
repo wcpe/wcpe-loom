@@ -28,11 +28,13 @@ import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.reflect.Method;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -254,7 +256,16 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 	 */
 	private void produceInConfiguration(ProvideContext context, List<RemappedJars> remappedJars, List<MinecraftJar> minecraftJars) throws Exception {
 		// 无锁快路径：shouldRefreshOutputs 只做只读检查（产物存在且内容可复用），缓存就绪时不会进入下面的锁
-		if (!shouldRefreshOutputs(context)) {
+		final boolean refresh = shouldRefreshOutputs(context);
+
+		if (!refresh) {
+			// 产物已就绪、走快路径时也要补做 Forge 成员名改写：本工序在产物生成之后才引入，
+			// 而已存在的产物不会因为本工序新增而失效，故必须在这里补一次（幂等：已改写的引用
+			// 名字已是目标名，再次扫描不会命中）。
+			for (RemappedJars remappedJar : remappedJars) {
+				fixForgeMemberNames(remappedJar);
+			}
+
 			return;
 		}
 
@@ -510,7 +521,9 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 			objectHolderSourceNamespace = null;
 		}
 
-		// 主重映射与 object holder 改写用的是同一套按平台选出的映射树
+		// 主重映射与 object holder 改写用的是同一套按平台选出的映射树。
+		// legacy Forge 的补全版由 MappingConfiguration 在 WITH_SRG 上直接提供（见那边的接线），
+		// 这里不必再区分——MappingOption.forPlatform 已对 Forge 返回 WITH_SRG。
 		final MemoryMappingTree mappings = mappingConfiguration
 				.getMappingsService(getProject(), configContext.serviceFactory(), MappingOption.forPlatform(extension))
 				.getMappingTree();
@@ -520,7 +533,7 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 					null,
 					remappedJars.inputJar(),
 					remappedJars.outputJarPath(),
-					List.of(remappedJars.remapClasspath()),
+					remapClasspath(remappedJars),
 					mappings,
 					fromM,
 					toM,
@@ -542,9 +555,98 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		}
 
 		getMavenHelper(remappedJars.type()).savePom();
+
+		// legacy Forge：MC 的重映射表只含 MC 自身成员，因此 Forge 的 binpatch 写进 MC 类的
+		// 「对 Forge 成员的 srg 名引用」不会被翻译（如 ModelLoader.a → setupModelRegistry），
+		// 运行期抛 NoSuchMethodError。这里用 Forge 自身两份 jar 的成员差异做一次补充改写。
+		// 现代 Forge 的 universal jar 本身在 named 空间、没有 named 版产物，工序整体跳过。
+		fixForgeMemberNames(remappedJars);
+	}
+
+	/**
+	 * 用 Forge 自身两版 jar 的成员差异，改写最终 jar 里对 Forge 成员的未翻译引用.
+	 *
+	 * <p>见 {@link dev.architectury.loom.forge.ForgeMemberNameFixer} 的类注释。
+	 * 拿不到两份 Forge jar 时静默跳过——现代 Forge 车道本就无需这一步。
+	 */
+	private void fixForgeMemberNames(RemappedJars remappedJars) throws IOException {
+		final Path[] referenceJars = getForgeReferenceJars();
+
+		if (referenceJars == null) {
+			return;
+		}
+
+		final var stats = dev.architectury.loom.forge.ForgeMemberNameFixer.fix(
+				remappedJars.outputJarPath(), referenceJars[0], referenceJars[1]);
+
+		if (stats.changedClasses() > 0) {
+			LOGGER.info(":fixed Forge member names in {} class(es) ({} mappings) for {}",
+					stats.changedClasses(), stats.mappingCount(), remappedJars.outputJarPath().getFileName());
+		}
+	}
+
+	/**
+	 * {@return 补充翻译所需的两份 Forge 参考 jar（依次为 srg 版、named 版），拿不到时返回 {@code null}}.
+	 *
+	 * <p>只有 legacy Forge 同时存在这两份：{@code forge-universal.jar} 按 SRG 名发布，
+	 * {@code forge.jar} 由本 provider 重映射成 named。现代 Forge/NeoForge 的 universal jar
+	 * 本身就在 named 空间、没有可对比的第二份，故在那里返回 {@code null}，工序自动跳过。
+	 *
+	 * <p>配置期生产路径（{@link #fixForgeMemberNames(RemappedJars)}）与执行期任务路径
+	 * （{@link #registerRemapTasks}）共用本方法，两条路径因此对「该不该做这一步、用哪两份 jar」
+	 * 保持一致——不一致会让同一车道在两种生产形态下得到不同的产物。
+	 */
+	@Nullable
+	private Path[] getForgeReferenceJars() {
+		if (!(minecraftProvider instanceof ForgeMinecraftProvider withForge)) {
+			return null;
+		}
+
+		final Path namedForgeJar = withForge.getPatchedProvider().getNamedForgeJar();
+
+		if (namedForgeJar == null || !Files.isRegularFile(namedForgeJar)) {
+			return null;
+		}
+
+		final Path srgForgeJar = extension.getForgeUniversalProvider().getForge().toPath();
+
+		if (!Files.isRegularFile(srgForgeJar)) {
+			return null;
+		}
+
+		return new Path[] { srgForgeJar, namedForgeJar };
 	}
 
 	protected void configureRemapper(RemappedJars remappedJars, TinyRemapper.Builder tinyRemapperBuilder) {
+	}
+
+	/**
+	 * {@return 本次重映射要用的 classpath}.
+	 *
+	 * <p>除原有的 {@link RemappedJars#remapClasspath()} 之外，Forge 系还要把 Forge universal jar
+	 * 补进来。原因：legacy Forge 的接口层次会跨到 Forge 侧——例如
+	 * {@code ShapedRecipes implements IShapedRecipe}（Forge 接口，映射表里没有它）
+	 * 而 {@code IShapedRecipe extends IRecipe}（MC 接口，映射表里有 getRecipeOutput）。
+	 *
+	 * <p>TinyRemapper 的成员名传播要沿继承链走；链在 {@code IShapedRecipe} 处断掉时，
+	 * {@code ShapedRecipes} 的实现方法就拿不到接口上的映射名，方法名停在 notch 名
+	 * （实测 {@code b()} 未被改成 {@code getRecipeOutput()}），下游
+	 * {@code RecipesMapExtending} 继承不到实现，运行期抛
+	 * {@code AbstractMethodError: getRecipeOutput is abstract}。
+	 * 把 Forge jar 作为 classpath 提供后，这条链能连通。
+	 */
+	private List<Path> remapClasspath(RemappedJars remappedJars) {
+		final List<Path> classpath = new ArrayList<>(List.of(remappedJars.remapClasspath()));
+
+		if (extension.isForgeLike()) {
+			final Path forgeJar = extension.getForgeUniversalProvider().getForge().toPath();
+
+			if (Files.isRegularFile(forgeJar) && !classpath.contains(forgeJar)) {
+				classpath.add(forgeJar);
+			}
+		}
+
+		return List.copyOf(classpath);
 	}
 
 	// Configure the remapper to add the client @Environment annotation to all classes in the client jar.
@@ -808,6 +910,20 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 					task.getToNamespace().set(toNamespace);
 					task.getFixRecords().set(fixRecords);
 					task.getForgeLike().set(extension.isForgeLike());
+
+					// legacy Forge 的补充翻译：MC 的重映射表只含 MC 自身成员，Forge 的 binpatch 写进
+					// MC 类的「对 Forge 成员 srg 名引用」不会随之翻译（如 ModelLoader.a →
+					// setupModelRegistry），运行期抛 NoSuchMethodError。这里把 Forge 自身两份 jar
+					// 交给任务，由它在重映射落位后补做一次改写。
+					//
+					// 只有 legacy Forge 同时存在「universal（srg）+ named」两份 jar；现代 Forge/NeoForge
+					// 车道取不到可对比的两份，故不设置这两个输入，任务侧自动跳过（不是失败）。
+					final Path[] forgeReferenceJars = getForgeReferenceJars();
+
+					if (forgeReferenceJars != null) {
+						task.getForgeSrgJar().set(forgeReferenceJars[0].toFile());
+						task.getForgeNamedJar().set(forgeReferenceJars[1].toFile());
+					}
 					task.getValidateTargetNamespace().set(validateTargetNamespace);
 					// 内部类名集合刻意不在这里设置：它是 (inputJar, forgeLike) 的纯函数，由任务在执行期
 					// 现算（RemapMinecraftTask.resolveInnerClassNames）。此处曾用惰性 provider 登记「怎么算」，
