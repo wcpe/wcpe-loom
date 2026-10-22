@@ -231,6 +231,32 @@ java {
 spotless {
 	lineEndings = com.diffplug.spotless.LineEnding.UNIX
 
+	// greclipse 的格式化器由 spotless 在首次使用时从 Eclipse 的 P2 仓库下载（不随插件分发，
+	// 本地也没有任何缓存）。download.eclipse.org 整站会周期性返回「Temporary shutdown」页面
+	// （HTTP 200 + HTML，而非 p2.index 文本），此时 spotless 报
+	// "Failed to provision P2 dependencies: No match found"，并连带让 build 失败。
+	//
+	// 这里把官方源映射到镜像。默认用 Kakao 的 4.35 具体版本目录
+	// （`updates/4.35` 本身是「组合仓库」，镜像通常只同步它的 p2.index，指向的
+	// compositeContent.xml 缺失；`R-4.35-202502280140/` 才是完整的真实仓库）。
+	// 不用清华 TUNA：它对非常用 UA（Gradle 的 okhttp）返回反爬拦截页，spotless 会把它
+	// 当成 .xz 内容去解压，报 XZFormatException。可用
+	//   -Ploom.eclipseP2Mirror=<可达的 P2 仓库根 URL>   覆盖
+	// 或传空值（-Ploom.eclipseP2Mirror=）强制走官方源。
+	// 只影响下载地址，不改变任何格式化规则或产物内容。
+	def eclipseP2Mirror = providers.gradleProperty('loom.eclipseP2Mirror').getOrElse(
+			'https://mirror.kakao.com/eclipse/eclipse/updates/4.35/R-4.35-202502280140')
+	// greclipse 的 P2 模型含两个仓库，spotless 要求**每个**仓库都有镜像条目。
+	// Groovy 那个仓库本身可达（返回正常的 p2.index），所以镜像指向它自己；
+	// 只有 Eclipse 平台那个需要换到可达的副本。
+	def groovyP2Repo = 'https://groovy.jfrog.io/artifactory/plugins-release/org/codehaus/groovy/groovy-eclipse-integration'
+	def eclipseP2Mirrors = eclipseP2Mirror.isEmpty() ? [:] : [
+		// 键要写到版本号为止：spotless 是「前缀替换 + 剩余路径原样追加」，
+		// 键只写到 /updates 时剩余路径会带 /4.35 再拼一次，落到不存在的 .../R-.../4.35/。
+		'https://download.eclipse.org/eclipse/updates/4.35': eclipseP2Mirror,
+		(groovyP2Repo): groovyP2Repo,
+	]
+
 	java {
 		licenseHeaderFile(rootProject.file("HEADER")).yearSeparator("-")
 		targetExclude("**/loom/util/DownloadUtil.java", "**/loom/util/FileSystemUtil.java")
@@ -240,12 +266,12 @@ spotless {
 	groovy {
 		importOrder('java', 'javax', '', 'net.fabricmc', '\\#')
 		licenseHeaderFile(rootProject.file("HEADER")).yearSeparator("-")
-		greclipse()
+		greclipse().withP2Mirrors(eclipseP2Mirrors)
 	}
 
 	groovyGradle {
 		target 'src/**/*.gradle', '*.gradle'
-		greclipse()
+		greclipse().withP2Mirrors(eclipseP2Mirrors)
 
 		targetExclude(
 				// These files use a @MAPPINGS@ token which is not valid Groovy
