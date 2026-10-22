@@ -32,6 +32,8 @@ import java.util.List;
 import java.util.Set;
 
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import net.fabricmc.mappingio.tree.MappingTree;
 import net.fabricmc.mappingio.tree.MappingTreeView;
@@ -66,6 +68,8 @@ import net.fabricmc.mappingio.tree.MappingTreeView;
  * 因此宁可让构建在翻译阶段失败并列出具体规则，也不允许它带着残缺的 AT 继续产出 jar。
  */
 public final class AccessTransformerRuleTranslator {
+	private static final Logger LOGGER = LoggerFactory.getLogger(AccessTransformerRuleTranslator.class);
+
 	private AccessTransformerRuleTranslator() {
 	}
 
@@ -112,6 +116,7 @@ public final class AccessTransformerRuleTranslator {
 	public static List<String> translate(Input input) {
 		final List<String> output = new ArrayList<>(input.rules().size());
 		final List<String> failures = new ArrayList<>();
+		final List<String> skipped = new ArrayList<>();
 
 		for (String line : input.rules()) {
 			final String rule = stripComment(line).trim();
@@ -127,10 +132,20 @@ public final class AccessTransformerRuleTranslator {
 				continue;
 			}
 
-			final String translated = translateRule(rule, input, failures);
+			final String translated = translateRule(rule, input, failures, skipped);
 
 			if (translated != null) {
 				output.add(translated);
+			}
+		}
+
+		if (!skipped.isEmpty()) {
+			// 用 warn 而不是 info：默认控制台级别是 LIFECYCLE，info 不可见，
+			// 「有规则被跳过」必须默认可见，否则等于静默丢 AT。
+			LOGGER.warn("有 {} 条 access transformer 规则指向此版本不存在的成员，已跳过（不影响构建，但该行的 AT 不会生效）：", skipped.size());
+
+			for (String message : skipped) {
+				LOGGER.warn("  {}", message);
 			}
 		}
 
@@ -146,7 +161,7 @@ public final class AccessTransformerRuleTranslator {
 	 *
 	 * @return 翻译结果；无法翻译时记入 {@code failures} 并返回 {@code null}
 	 */
-	private static @Nullable String translateRule(String rule, Input input, List<String> failures) {
+	private static @Nullable String translateRule(String rule, Input input, List<String> failures, List<String> skipped) {
 		// 规则以空白切分：<access> <class> [member [descriptor]]
 		final String[] parts = rule.split("\\s+");
 
@@ -196,6 +211,15 @@ public final class AccessTransformerRuleTranslator {
 			final ResolvedMember resolved = resolveMember(sourceClass.replace('.', '/'), member, descriptor, input);
 
 			if (resolved == null) {
+				// 区分「翻译缺陷」与「上游坏条目」：成员名在整个映射树里一次都没出现过时，
+				// 这条规则指向的名字在此版本根本不存在，任何映射都译不出来，强行译出也作用不到
+				// 任何东西。这类降级为警告并原样跳过；其余失败照旧报错（见方法注释里的实测来源）。
+				if (memberNameAbsentEverywhere(member, input)) {
+					skipped.add("规则指向的成员在此版本不存在，已跳过（%s 的 %s 在 %s 里从未出现）: %s"
+							.formatted(sourceClass, member, input.sourceNamespace(), rule));
+					return null;
+				}
+
 				failures.add("成员无法翻译（%s 的 %s 在 %s → %s 里找不到，继承链上也未找到）: %s".formatted(
 						sourceClass, member, input.sourceNamespace(), input.targetNamespace(), rule));
 				return null;
@@ -289,6 +313,50 @@ public final class AccessTransformerRuleTranslator {
 		}
 
 		return null;
+	}
+
+	/**
+	 * {@return 该成员名在整个映射树里是否一次都没出现过}.
+	 *
+	 * <p>用来区分两类「成员无法翻译」：
+	 * <ul>
+	 *   <li>成员名在映射里存在、只是不在当前类及其祖先上——可能是继承链信息不全，
+	 *       属需要排查的翻译缺陷，仍应报错；</li>
+	 *   <li>成员名在整棵树里一次都没有——规则指向的名字在此版本根本不存在，
+	 *       任何映射都无法翻译成功。这类是上游 AT 文件的坏条目：即便强行译出，
+	 *       AT 也作用不到任何东西。</li>
+	 * </ul>
+	 *
+	 * <p>实测来源：NeoForge 20.2.93 的 accesstransformer.cfg 里
+	 * {@code BlockEntityRenderDispatcher fontRenderer} 一行，`fontRenderer` 是注释文字被误写成了
+	 * 成员名；该字段的正确名一直是 {@code font}（对照 1.20.1 同一条规则写的是 srg 名
+	 * {@code f_112253_}，其 named 列即 {@code font}）。
+	 *
+	 * <p>只遍历方法名与字段名，不碰描述符：描述符不一致本身不会让名字消失，
+	 * 而放宽到「描述符不符也算不存在」会把真正的翻译缺陷一起吞掉。
+	 */
+	private static boolean memberNameAbsentEverywhere(String member, Input input) {
+		final int sourceId = namespaceId(input, input.sourceNamespace());
+
+		if (sourceId == MappingTreeView.NULL_NAMESPACE_ID) {
+			return false;
+		}
+
+		for (MappingTreeView.ClassMappingView classMapping : input.mappings().getClasses()) {
+			for (MappingTreeView.MethodMappingView method : classMapping.getMethods()) {
+				if (member.equals(method.getName(input.sourceNamespace()))) {
+					return false;
+				}
+			}
+
+			for (MappingTreeView.FieldMappingView field : classMapping.getFields()) {
+				if (member.equals(field.getName(input.sourceNamespace()))) {
+					return false;
+				}
+			}
+		}
+
+		return true;
 	}
 
 	/** {@return 目标命名空间下的类名；找不到时返回 {@code null}} */
