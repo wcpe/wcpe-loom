@@ -36,9 +36,68 @@ PREV_COMMIT="$(git rev-parse -q --verify "${PREV}^{commit}")" \
 CURR_COMMIT="$(git rev-parse -q --verify "${CURR}^{commit}")" \
 	|| { echo "无法解析为提交: ${CURR}" >&2; exit 1; }
 
+# 主线（默认分支）。环境变量可覆盖，CI 里通常就是当前分支。
+WCPE_MAIN_REF="${WCPE_MAIN_REF:-dev/1.17-wcpe}"
+
+# 发布点 → 主线提交的对照表。理由与格式见该文件头部说明。
+ANCHORS_FILE=".upstream/release-anchors.txt"
+
+# 查表：把 tag/ref 换成主线上对应的提交。
+#
+# 顺序很重要：先判断该提交是否已在主线历史内——在的话无需换算（它就是自己的锚点），
+# 否则才查表。反过来做会把本来正确的端点也换掉（曾把 1.17.13 自身换算成旧提交）。
+anchor_of() {
+	local ref="$1" commit
+
+	commit="$(git rev-parse "${ref}^{commit}")"
+
+	if git merge-base --is-ancestor "${commit}" "${WCPE_MAIN_REF}" 2>/dev/null; then
+		printf '%s' "${commit}"
+		return 0
+	fi
+
+	local mapped=""
+
+	if [ -f "${ANCHORS_FILE}" ]; then
+		mapped="$(awk -v r="${ref}" '
+			/^[[:space:]]*#/ { next }
+			NF >= 2 && $1 == r { print $2; exit }
+		' "${ANCHORS_FILE}")"
+	fi
+
+	if [ -n "${mapped}" ]; then
+		# 表里写的是短 SHA，解析成完整提交
+		if git rev-parse -q --verify "${mapped}^{commit}" >/dev/null 2>&1; then
+			git rev-parse "${mapped}^{commit}"
+			return 0
+		fi
+
+		echo "警告：${ANCHORS_FILE} 里 ${ref} 的锚点 ${mapped} 无法解析，按原值使用。" >&2
+	fi
+
+	printf '%s' "${commit}"
+}
+
+# 区间端点：优先用对照表里的主线提交，避免跨分叉重复计算。
+PREV_ANCHOR="$(anchor_of "${PREV}")"
+CURR_ANCHOR="$(anchor_of "${CURR}")"
+
+for pair in "起点:${PREV}:${PREV_ANCHOR}" "终点:${CURR}:${CURR_ANCHOR}"; do
+	role="${pair%%:*}"
+	rest="${pair#*:}"
+	name="${rest%%:*}"
+	anchor="${rest#*:}"
+
+	if [ "${anchor}" != "$(git rev-parse "${name}^{commit}")" ]; then
+		echo "注：${name} 已按对照表换算为主线提交 $(git rev-parse --short "${anchor}")（${role}）。" >&2
+	elif ! git merge-base --is-ancestor "${anchor}" "${WCPE_MAIN_REF}" 2>/dev/null; then
+		echo "警告：${name} 不在 ${WCPE_MAIN_REF} 历史内，且 ${ANCHORS_FILE} 未收录它；" >&2
+		echo "      区间可能把上一版已发布的提交重复算入。请在该表补一行：${name} <主线提交>" >&2
+	fi
+done
+
 # 对比链接里优先显示 tag 名（人读得懂），只有传进来的不是 tag 时才退回提交 SHA。
-# WCPE_LABEL_PREV / WCPE_LABEL_CURR 可显式覆盖显示名——修历史 release 时会用到：
-# 那时区间端点必须是主线上的 commit（孤立 tag 会让区间失真），但链接仍应显示 tag 名。
+# WCPE_LABEL_PREV / WCPE_LABEL_CURR 可显式覆盖显示名。
 label_of() {
 	if git rev-parse -q --verify "refs/tags/$1" >/dev/null; then
 		printf '%s' "$1"
@@ -51,7 +110,7 @@ CURR_LABEL="${WCPE_LABEL_CURR:-$(label_of "${CURR}")}"
 
 # 取区间内的非 merge 提交，格式：<type>(<scope>): <描述>\x1f<短hash>
 # 用 0x1F 作分隔符：提交信息里不会出现这个控制字符
-RAW="$(git log --no-merges --reverse --pretty=format:'%s%x1f%h' "${PREV_COMMIT}..${CURR_COMMIT}")"
+RAW="$(git log --no-merges --reverse --pretty=format:'%s%x1f%h' "${PREV_ANCHOR}..${CURR_ANCHOR}")"
 
 if [ -z "${RAW}" ]; then
 	echo "本版无提交变更。"
