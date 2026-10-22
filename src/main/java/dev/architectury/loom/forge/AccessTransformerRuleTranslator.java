@@ -255,19 +255,36 @@ public final class AccessTransformerRuleTranslator {
 				continue;
 			}
 
-			// 继承关系由 jar 提供，其名称在目标命名空间；转到源命名空间后才能继续查映射
-			final String notch = mapClassBetween(current, input.sourceNamespace(), input.targetNamespace(), input);
+			// 继承关系由 jar 提供，而 jar 的类名用哪个命名空间**随车道而变**：
+			//   · legacy Forge（1.12.2）：AT 作用对象是 notch jar，类名在 official 命名空间；
+			//   · 现代 Forge/NeoForge：AT 作用对象是 patched intermediate jar，类名已是 srg 名
+			//     （1.17+ 起 srg 命名空间的类名沿用 mojang 名，只有成员是 m_/f_ 形式）。
+			// 因此不能写死成某一个命名空间：先按目标命名空间查，查不到再按源命名空间查。
+			// 只按目标命名空间查会让现代车道的继承链永远为空，进而漏掉「规则写在子类、
+			// 成员声明在祖先」的那部分规则（实测 1.21.1 有 8 条，如 LocalPlayer 的 m_8088_
+			// 实际声明在 Entity 上）。
+			for (String candidateNs : new String[] { input.targetNamespace(), input.sourceNamespace() }) {
+				final String candidate = mapClassBetween(current, input.sourceNamespace(), candidateNs, input);
 
-			if (notch == null) {
-				continue;
-			}
-
-			for (String parentNotch : input.hierarchy().parentsOf(notch)) {
-				final String parentSource = mapClassBetween(parentNotch, input.targetNamespace(), input.sourceNamespace(), input);
-
-				if (parentSource != null) {
-					queue.add(parentSource);
+				if (candidate == null) {
+					continue;
 				}
+
+				final List<String> parentNotches = input.hierarchy().parentsOf(candidate);
+
+				if (parentNotches.isEmpty()) {
+					continue;
+				}
+
+				for (String parentNotch : parentNotches) {
+					final String parentSource = mapClassBetween(parentNotch, candidateNs, input.sourceNamespace(), input);
+
+					if (parentSource != null) {
+						queue.add(parentSource);
+					}
+				}
+
+				break;
 			}
 		}
 
