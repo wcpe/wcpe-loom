@@ -32,12 +32,15 @@ import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Objects;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.jar.Attributes;
@@ -64,9 +67,14 @@ import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.Pair;
 import net.fabricmc.loom.util.ZipUtils;
+import net.fabricmc.loom.util.TinyRemapperHelper;
 import net.fabricmc.loom.util.service.ScopedServiceFactory;
 import net.fabricmc.loom.util.service.ServiceFactory;
 import net.fabricmc.stitch.merge.JarMerger;
+import net.fabricmc.tinyremapper.InputTag;
+import net.fabricmc.tinyremapper.NonClassCopyMode;
+import net.fabricmc.tinyremapper.OutputConsumerPath;
+import net.fabricmc.tinyremapper.TinyRemapper;
 
 public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 	// Step 1: Binary Patch
@@ -92,7 +100,6 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 		String forgeVersion = getExtension().getForgeProvider().getVersion().getCombined();
 		Path forgeWorkingDir = ForgeProvider.getForgeCache(project);
 		String patchId = "forge-" + forgeVersion + "-";
-
 		minecraftProvider.setJarPrefix(patchId);
 
 		minecraftClientPatchedJar = forgeWorkingDir.resolve("client-patched.jar");
@@ -192,6 +199,19 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 		}
 	}
 
+	/**
+	 * {@inheritDoc}
+	 *
+	 * <p>legacy 的 named forge jar 由 {@code patchForge} 内的 srg→named 重映射产出，
+	 * 位置固定为 {@code forgeWorkingDir/forge.jar}，在 {@link #provide()} 阶段就已写入字段
+	 * （与重映射是否已执行无关）。因此本方法只负责给路径，**是否真的产出**由调用方用
+	 * {@code Files.isRegularFile} 自行判断——基类的按路径推导版本也是同样的契约。
+	 */
+	@Override
+	public Path getNamedForgeJar() {
+		return forgeJar;
+	}
+
 	@Override
 	public void remapJar(ServiceFactory serviceFactory) throws Exception {
 		// 无锁快路径：provide 已判定产物齐备（needsWork=false → dirty=false）时，本方法的全链
@@ -209,7 +229,7 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 			// 锁内二次确认：等锁期间其它进程可能已完成生产；所有产物均以「临时文件 + 原子落位」生成
 			if (dirty || !isReusableJar(forgeJar)) {
 				dirty = true;
-				publishAtomically(forgeJar, this::patchForge);
+				publishAtomically(forgeJar, output -> patchForge(output, serviceFactory));
 			}
 
 			if (dirty || !isReusableJar(minecraftClientPatchedJar) || !isReusableJar(minecraftServerPatchedJar)) {
@@ -241,12 +261,25 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 		});
 	}
 
-	private void patchForge(Path output) throws Exception {
+	private void patchForge(Path output, ServiceFactory serviceFactory) throws Exception {
 		Stopwatch stopwatch = Stopwatch.createStarted();
 		logger.lifecycle(":patching forge");
 
 		// output 是本次独占的临时文件：复制与全部加工都在它上面完成，最后原子落位
 		Files.copy(getExtension().getForgeUniversalProvider().getForge().toPath(), output);
+
+		// legacy Forge 的 universal jar 是按 SRG 名发布的（例如 GameData$ClearableObjectIntIdentityMap
+		// 的字节码是 `extends fd`）。而 dev 运行期 CoreModManager.handleLaunch 用
+		// getClassBytes("net.minecraft.world.World") 能否命中来判定 deobfuscatedEnvironment ；
+		// loom 提供的 Minecraft jar 类名是 named(MCP) 名，故必然判定为 true，于是
+		// DeobfuscationTransformer.shouldTransform 对 net.minecraft.* 与 net.minecraftforge.* 全部豁免
+		// （EXEMPT_DEV），运行期完全不做反混淆。若 forge.jar 仍保持 SRG 名，则：
+		//   - `extends fd` 无人翻译 → IllegalAccessError；
+		//   - AccessTransformer 的 `field_148749_a` 与 named 名 `identityMap` 逐字比较不等 → AT 静默失效；
+		//   - DeobfuscationTransformer.unmapClassName 反查出 SRG 名后 getClassBytes 取不到字节
+		//     → defineClass(null) 在 LaunchClassLoader 抛 NPE，该类被钉进 invalidClasses。
+		// 因此这里必须先把 forge.jar 从 SRG 重映射到 named，与 Minecraft jar 的命名体系对齐。
+		remapForgeToNamed(output, serviceFactory);
 
 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(output, false)) {
 			// For the development environment, we need to remove the binpatches, otherwise forge will try to re-apply them
@@ -326,6 +359,153 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 		applyLoomPatchVersion(output);
 
 		logger.lifecycle(":patched forge in " + stopwatch.stop());
+	}
+
+	/**
+	 * 把 legacy Forge 的 universal jar 重映射到 named(MCP) 名.
+	 *
+	 * <p>dev 运行期 {@code CoreModManager.handleLaunch} 以「{@code getClassBytes("net.minecraft.world.World")}
+	 * 是否命中」判定 {@code deobfuscatedEnvironment}；loom 的 Minecraft jar 类名是 named 名，
+	 * 故必然判定为 true，此时 {@code DeobfuscationTransformer.shouldTransform} 对
+	 * {@code net.minecraft.*} 与 {@code net.minecraftforge.*} 全部豁免（{@code EXEMPT_DEV}），
+	 * 运行期不再做任何反混淆。因此 forge.jar 若不事先对齐到 named 名，它对这些 MC 符号的引用
+	 * 就无人翻译：类引用报 {@code IllegalAccessError}，字段引用报 {@code NoSuchFieldError}
+	 * （例如 {@code ForgeHooksClient} 引用 {@code DefaultVertexFormats} 的 notch 字段 {@code o}）。
+	 *
+	 * <p>映射用四列 tiny（{@code official / srg / intermediary / named}），方向 {@code official -> named}。
+	 * 只用 srg→named 的 V1 srg 不够——它没有 notch 列，翻不出 Forge 字节码里的 notch 字段名。
+	 *
+	 * @param forgeJar 本次独占的临时产物（可原地替换）
+	 */
+	private void remapForgeToNamed(Path forgeJar, ServiceFactory serviceFactory) throws Exception {
+		if (getExtension().isUnobfuscatedForge()) {
+			// unobfuscated Forge 没有映射配置，其 universal jar 本就是 named 名，无需重映射
+			logger.lifecycle(":skip forge remap (unobfuscated forge)");
+			return;
+		}
+
+		// 映射源必须用四列 tiny（official/srg/intermediary/named），不能用 srg→named 的 V1 srg：
+		// Forge universal 的字节码里既引用 srg 名（方法/字段的 field_xxx 形式），也引用 notch 名
+		// （如 ForgeHooksClient 引用 DefaultVertexFormats 的字段 `o`）。V1 srg 里没有 notch 列，
+		// `o` 翻不到 named 名，运行期就抛 NoSuchFieldError: o。四列 tiny 能 notch→srg→named 链式翻译。
+		final Path tinyMappings = getExtension().getMappingConfiguration().tinyMappingsWithSrg;
+
+		if (tinyMappings == null || !Files.exists(tinyMappings)) {
+			logger.lifecycle(":skip forge remap (srg tiny mappings unavailable)");
+			return;
+		}
+
+		logger.lifecycle(":remapping forge (TinyRemapper, official -> named), mappings=" + tinyMappings.getFileName());
+		Stopwatch stopwatch = Stopwatch.createStarted();
+
+		// 重映射结果先写同目录私有副本，完整后再原子替换 forgeJar：
+		// TinyRemapper 不能读写同一个文件，且中途失败时不能破坏已复制好的 forge.jar 内容。
+		final Path remapped = forgeJar.resolveSibling(forgeJar.getFileName() + ".srg2named.tmp");
+
+		boolean moved = false;
+
+		try {
+			// 关键：先把源 jar 复制成目标文件。OutputConsumerPath 对「不存在的路径」会建目录
+			// （它把 jar 当 zipfs 挂载），随后 Files.move 就会把一个目录搬到 forgeJar 位置，
+			// 外层 AtomicFiles 再落位时抛 DirectoryNotEmptyException（实测）。预创建成文件即可避开。
+			Files.copy(forgeJar, remapped, StandardCopyOption.REPLACE_EXISTING);
+
+			TinyRemapper remapper = TinyRemapper.newRemapper()
+					.withMappings(TinyRemapperHelper.create(tinyMappings, "official", "named", true))
+					// Forge jar 只含 Forge 自己的类，它引用的 MC 类（如 DefaultVertexFormats）
+					// 不在输入里。默认 TinyRemapper 只按「输入类的成员」建映射视图，
+					// 外部类的成员引用不落到 named 名上——实测表现为类名与描述符都翻对了、
+					// 只有成员名仍是 notch 名（ForgeHooksClient 引用 cdy.o，运行期 NoSuchFieldError: o）。
+					.resolveMissing(true)
+					.keepInputData(true)
+					// 字段映射按「类名+字段名」匹配、不比较描述符：Forge 字节码里字段描述符
+					// 仍是 notch 形式（Lceb;），与映射表里的描述符列不一致时会被判为不匹配而跳过。
+					//
+					// 放宽描述符会让人担心「同类里两个同名字段被互相误译」。这在 MCP/srg 体系下不会发生：
+					// 实测 1.12.2 / 1.20.1 / 1.21.1 的 srg 映射中，「同类同名字段但描述符不同」的组数
+					// 均为 0（字段名在混淆表里本就唯一）。若将来换到不保证这一点的映射源，这个开关要重新评估。
+					// 注意：本方法只在 legacy 车道上被调用，注释化的放宽不应被其它重映射复用。
+					.ignoreFieldDesc(true)
+					.renameInvalidLocals(true)
+					.rebuildSourceFilenames(true)
+					.build();
+
+			try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(remapped).build()) {
+				outputConsumer.addNonClassFiles(forgeJar, NonClassCopyMode.FIX_META_INF, remapper);
+
+				// 关键：把 Minecraft jar 作为 classpath 交给 remapper（不输出）。
+				// Forge jar 只含 Forge 自己的类，它引用的 MC 类（DefaultVertexFormats 等）不在输入里；
+				// 没有这些类的定义，TinyRemapper 建不出它们的方法/字段继承视图，于是只翻类名与描述符、
+				// 不翻成员名——实测表现为 `cdy.o` → `DefaultVertexFormats.o`（字段名仍是 notch 名），
+				// 运行期抛 NoSuchFieldError: o。readClassPath 正是为「外部依赖」准备的入口。
+				remapper.readClassPath(minecraftClassPath());
+
+				InputTag inputTag = remapper.createInputTag();
+				remapper.readInputsAsync(inputTag, forgeJar);
+				remapper.apply(outputConsumer, inputTag);
+			} finally {
+				remapper.finish();
+			}
+
+			Files.move(remapped, forgeJar, StandardCopyOption.REPLACE_EXISTING);
+			moved = true;
+		} finally {
+			// 只在「未成功落位」时清理临时副本：move 成功后该路径已不存在，
+			// 再动它只会把一个成功的重映射变成失败（实测 DirectoryNotEmptyException）。
+			if (!moved) {
+				deleteRecursivelyQuietly(remapped);
+			}
+		}
+
+		logger.lifecycle(":remapped forge in " + stopwatch.stop());
+	}
+
+	/**
+	 * {@return 供重映射解析外部类用的 Minecraft jar 列表}.
+	 *
+	 * <p>这里给的是**未被 Forge 打过补丁**的干净 MC jar：重映射发生在 {@code patchForge} 阶段，
+	 * 彼时 {@code client-patched.jar} / {@code server-patched.jar} 尚未产出（它们在随后的
+	 * {@code patchJars} 里才生成）。而重映射只需要 MC 类的成员签名，干净 jar 已足够。
+	 */
+	private Path[] minecraftClassPath() {
+		final MinecraftProvider minecraftProvider = getExtension().getMinecraftProvider();
+		return Stream.of(
+						minecraftProvider.getMinecraftClientJar(),
+						minecraftProvider.getMinecraftServerJar())
+				.filter(Objects::nonNull)
+				.map(jar -> jar.toPath())
+				.toArray(Path[]::new);
+	}
+
+	/**
+	 * 尽力清理一个临时路径；失败只记日志，不向外抛.
+	 *
+	 * <p>重映射产物可能已被 zipfs 打开成目录形态，直接 {@code Files.deleteIfExists} 会因
+	 * 「目录非空」失败。这里按「是目录就逐层删」处理，且任何异常都不影响主流程——
+	 * 清理失败最多留下一个临时文件，不能让成功的重映射因此变成失败。
+	 */
+	private void deleteRecursivelyQuietly(Path path) {
+		try {
+			if (!Files.exists(path)) {
+				return;
+			}
+
+			if (Files.isDirectory(path)) {
+				try (Stream<Path> walk = Files.walk(path)) {
+					walk.sorted(Comparator.reverseOrder()).forEach(child -> {
+						try {
+							Files.deleteIfExists(child);
+						} catch (IOException ignored) {
+							// 尽力而为：单个子项失败不阻断其余清理
+						}
+					});
+				}
+			} else {
+				Files.deleteIfExists(path);
+			}
+		} catch (IOException e) {
+			logger.warn("清理临时重映射产物失败（不影响构建结果）：{}", path, e);
+		}
 	}
 
 	private void patchJars() throws Exception {

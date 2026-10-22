@@ -66,7 +66,6 @@ import dev.architectury.loom.forge.dependency.ForgeUserdevProvider;
 import dev.architectury.loom.forge.dependency.PatchProvider;
 import dev.architectury.loom.forge.tool.ForgeExternalToolService;
 import dev.architectury.loom.mappings.MappingOption;
-import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import dev.architectury.loom.mcpconfig.McpConfigProvider;
 import dev.architectury.loom.mcpconfig.McpExecutor;
 import dev.architectury.loom.mcpconfig.McpExecutorBuilder;
@@ -92,6 +91,7 @@ import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.tree.ClassNode;
 
 import net.fabricmc.loom.LoomGradleExtension;
+import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.build.IntermediaryNamespaces;
 import net.fabricmc.loom.configuration.providers.mappings.TinyMappingsService;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
@@ -1453,6 +1453,33 @@ public class MinecraftPatchedProvider {
 
 	private File getForgeJar() {
 		return getExtension().getForgeUniversalProvider().getForge();
+	}
+
+	/**
+	 * {@return 已重映射到 named 的 Forge jar} 仅 legacy Forge 具备该产物.
+	 *
+	 * <p>legacy 的 Forge universal jar 按 srg 名发布，{@code patchForge} 会把它重映射成 named，
+	 * 落位在 Forge 缓存工作目录的 {@code forge.jar}。该产物是
+	 * {@link dev.architectury.loom.forge.ForgeMemberNameFixer} 建立「srg 名 → named 名」映射的
+	 * 对照来源之一；现代 Forge 的 universal jar 本身就在 named 空间，没有这份产物。
+	 *
+	 * <p>这里按路径定位而非依赖实例类型：{@code MergedForgeMinecraftProvider.getPatchedProvider()}
+	 * 在部分时序下返回的是本基类而非 {@link MinecraftLegacyPatchedProvider}（实测 1.12.2 即如此），
+	 * 若只靠子类覆写会拿到 null。产物不存在时返回 {@code null}，调用方据此跳过。
+	 */
+	public @Nullable Path getNamedForgeJar() {
+		// 不用 ForgeProvider.getForgeCache(project)：多项目构建下它按 extension.getForgeProvider()
+		// 的版本拼路径，实测在 1.12.2 车道里取到的是 26.2 的版本目录（跨项目状态串用），
+		// 于是永远定位不到产物。改从「本项目的 forge universal jar 所在目录」推导——
+		// legacy 的 named forge jar 与它同目录，文件名固定为 forge.jar。
+		final File universal = getForgeJar();
+
+		if (universal == null) {
+			return null;
+		}
+
+		final Path candidate = universal.toPath().resolveSibling("forge.jar");
+		return Files.isRegularFile(candidate) ? candidate : null;
 	}
 
 	private File getForgeUserdevJar() {
