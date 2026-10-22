@@ -459,12 +459,16 @@ public class MinecraftPatchedProvider {
 			// declaring an explicit or implicit dependency」。接线方式与同类消费方一致（见下方
 			// registerPatchedJarTask 里 migrateForgeJar 那处）。
 			extension.getMappingConfiguration().addMappingsProducerDependency(task);
-			// AT 规则的书写命名空间随平台而变（见 intermediateNamespace 的字段注释）：
-			// Forge 的 userdev AT 用 srg 成员名，NeoForge 的用 mojang 名。原实现硬编码 SRG，
-			// 在 NeoForge 车道上必然全部失败——它的映射树里没有 srg 列，任何类名都查不到
-			// （实测 508 条「类无法翻译」）。源命名空间取自产物文件名同源的 intermediateNamespace。
-			task.getAtSourceNamespace().set(intermediateNamespace);
-			task.getAtTargetNamespace().set(MappingsNamespace.OFFICIAL.toString());
+
+			// AT 规则是否需要翻译，取决于「规则的书写命名空间」与「AT 作用对象的命名空间」是否一致。
+			// 只有 legacy Forge 不一致：userdev 的 AT 用 srg 成员名，而作用对象是 official（notch）jar，
+			// 不翻译的话 AT 工具按字面量一条都匹配不上，且不报错（AT 静默失效）。
+			// 其余车道两者一致，规则原样交给 AT 工具即可——强行翻译反而会因映射表缺失而失败
+			// （实测 1.20.1 有 18 条规则如 Gui.screenWidth 报「mojang → official 找不到」）。
+			if (getExtension().isLegacyForge()) {
+				task.getAtSourceNamespace().set(intermediateNamespace);
+				task.getAtTargetNamespace().set(MappingsNamespace.OFFICIAL.toString());
+			}
 
 			dependsOnProducer(task, patchedProducer);
 		}));
