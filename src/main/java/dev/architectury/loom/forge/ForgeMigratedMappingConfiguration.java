@@ -135,10 +135,14 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
 	 *
 	 * <p>未投影时（legacy Forge 与 legacy mixin AP）产物在配置期已落位，
 	 * {@link MappingConfiguration#getMappingsPath} 的存在性校验照旧生效。
+	 *
+	 * <p>{@code super} 必须保留：基类已经覆盖了 legacy Forge 的继承补全映射
+	 * （{@code WITH_SRG} 指向 {@code generateLegacyInheritedMappings} 的产物），
+	 * 本方法只管「迁移产物」这一族，二者是并列关系。
 	 */
 	@Override
 	protected boolean isTaskProducedMappings(MappingOption mappingOption) {
-		return manipulateTaskPath != null;
+		return super.isTaskProducedMappings(mappingOption) || manipulateTaskPath != null;
 	}
 
 	@Override
