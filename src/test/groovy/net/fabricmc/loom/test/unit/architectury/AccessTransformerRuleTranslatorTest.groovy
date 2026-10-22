@@ -1,14 +1,39 @@
-package net.fabricmc.loom.test.unit.architectury
+/*
+ * This file is part of fabric-loom, licensed under the MIT License (MIT).
+ *
+ * Copyright (c) 2026 FabricMC
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 
-import dev.architectury.loom.forge.AccessTransformerRuleTranslator
-import net.fabricmc.mappingio.format.MappingFormat
-import net.fabricmc.mappingio.MappingReader
-import net.fabricmc.mappingio.tree.MemoryMappingTree
-import spock.lang.Specification
-import spock.lang.TempDir
+package net.fabricmc.loom.test.unit.architectury
 
 import java.nio.file.Files
 import java.nio.file.Path
+
+import dev.architectury.loom.forge.AccessTransformerRuleTranslator
+import spock.lang.Specification
+import spock.lang.TempDir
+
+import net.fabricmc.mappingio.MappingReader
+import net.fabricmc.mappingio.format.MappingFormat
+import net.fabricmc.mappingio.tree.MemoryMappingTree
 
 /**
  * AT 规则名称空间翻译的契约测试.
@@ -50,7 +75,9 @@ c\tfd\tnet/minecraft/util/ObjectIntIdentityMap\tnet/minecraft/class_2112\tnet/mi
 
 	def "字段规则翻译成 notch 名"() {
 		when:
-		def result = translate(["protected net.minecraft.util.ObjectIntIdentityMap field_148749_a # internal map"])
+		def result = translate([
+			"protected net.minecraft.util.ObjectIntIdentityMap field_148749_a # internal map"
+		])
 
 		then: "类名变 fd、字段名变 a，注释被去掉"
 		result == ["protected fd a"]
@@ -59,22 +86,24 @@ c\tfd\tnet/minecraft/util/ObjectIntIdentityMap\tnet/minecraft/class_2112\tnet/mi
 	def "注释与空行原样保留"() {
 		when:
 		def result = translate([
-				"# a comment line",
-				"",
-				"public net.minecraft.util.ObjectIntIdentityMap field_148748_b"
+			"# a comment line",
+			"",
+			"public net.minecraft.util.ObjectIntIdentityMap field_148748_b"
 		])
 
 		then: "非规则行不动，规则行才翻译"
 		result == [
-				"# a comment line",
-				"",
-				"public fd b"
+			"# a comment line",
+			"",
+			"public fd b"
 		]
 	}
 
 	def "整类规则翻译成 notch 名"() {
 		when:
-		def result = translate(["public net.minecraft.util.ObjectIntIdentityMap"])
+		def result = translate([
+			"public net.minecraft.util.ObjectIntIdentityMap"
+		])
 
 		then:
 		result == ["public fd"]
@@ -82,7 +111,9 @@ c\tfd\tnet/minecraft/util/ObjectIntIdentityMap\tnet/minecraft/class_2112\tnet/mi
 
 	def "方法描述符原样保留"() {
 		when: "真实 forge_at.cfg 的写法：成员名与描述符之间没有空白"
-		def result = translate(["public net.minecraft.util.ObjectIntIdentityMap func_186804_a()I"])
+		def result = translate([
+			"public net.minecraft.util.ObjectIntIdentityMap func_186804_a()I"
+		])
 
 		then: "方法名翻译，描述符不动"
 		result == ["public fd a()I"]
@@ -90,7 +121,9 @@ c\tfd\tnet/minecraft/util/ObjectIntIdentityMap\tnet/minecraft/class_2112\tnet/mi
 
 	def "无法翻译的规则必须让构建失败而不是静默丢弃"() {
 		when: "类名在映射里根本不存在"
-		translate(["protected net.minecraft.util.DoesNotExist field_1"])
+		translate([
+			"protected net.minecraft.util.DoesNotExist field_1"
+		])
 
 		then: "抛异常，并指出具体规则"
 		def e = thrown(AccessTransformerRuleTranslator.AccessTransformerTranslationException)
@@ -100,7 +133,9 @@ c\tfd\tnet/minecraft/util/ObjectIntIdentityMap\tnet/minecraft/class_2112\tnet/mi
 
 	def "成员缺失也要失败"() {
 		when: "类存在但字段名不在该类下"
-		translate(["protected net.minecraft.util.ObjectIntIdentityMap field_999999_x"])
+		translate([
+			"protected net.minecraft.util.ObjectIntIdentityMap field_999999_x"
+		])
 
 		then:
 		def e = thrown(AccessTransformerRuleTranslator.AccessTransformerTranslationException)
@@ -121,16 +156,18 @@ c\tsub\tnet/minecraft/Sub\tnet/minecraft/class_2\tnet/minecraft/Sub
 
 		and: "继承关系：Sub(notch=sub) 的父类是 Base(notch=bse)"
 		def hierarchy = new AccessTransformerRuleTranslator.ClassHierarchy() {
-			@Override
-			List<String> parentsOf(String className) {
-				return className == "sub" ? ["bse"] : []
-			}
-		}
+					@Override
+					List<String> parentsOf(String className) {
+						return className == "sub" ? ["bse"] : []
+					}
+				}
 
 		when: "AT 规则写在子类上（无空格描述符，与真实 AT 一致）"
 		def result = AccessTransformerRuleTranslator.translate(
 				new AccessTransformerRuleTranslator.Input(
-						["public net.minecraft.Sub func_100_a()V"], tree, "srg", "official", hierarchy))
+				[
+					"public net.minecraft.Sub func_100_a()V"
+				], tree, "srg", "official", hierarchy))
 
 		then: "规则被改写到声明它的父类，成员名翻译成 notch 名"
 		result == ["public bse a()V"]
@@ -148,16 +185,18 @@ c\tsub\tnet/minecraft/Sub\tnet/minecraft/class_2\tnet/minecraft/Sub
 		}
 
 		def hierarchy = new AccessTransformerRuleTranslator.ClassHierarchy() {
-			@Override
-			List<String> parentsOf(String className) {
-				return className == "sub" ? ["bse"] : []
-			}
-		}
+					@Override
+					List<String> parentsOf(String className) {
+						return className == "sub" ? ["bse"] : []
+					}
+				}
 
 		when:
 		AccessTransformerRuleTranslator.translate(
 				new AccessTransformerRuleTranslator.Input(
-						["public net.minecraft.Sub func_999_nope()V"], tree, "srg", "official", hierarchy))
+				[
+					"public net.minecraft.Sub func_999_nope()V"
+				], tree, "srg", "official", hierarchy))
 
 		then:
 		def e = thrown(AccessTransformerRuleTranslator.AccessTransformerTranslationException)

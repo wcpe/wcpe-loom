@@ -32,6 +32,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
 
+import dev.architectury.loom.forge.ForgeMemberNameFixer;
 import dev.architectury.loom.forge.InnerClassRemapper;
 import org.gradle.api.DefaultTask;
 import org.gradle.api.file.ConfigurableFileCollection;
@@ -62,8 +63,6 @@ import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.loom.util.service.ScopedServiceFactory;
 import net.fabricmc.mappingio.tree.MemoryMappingTree;
 import net.fabricmc.tinyremapper.TinyRemapper;
-
-import dev.architectury.loom.forge.ForgeMemberNameFixer;
 
 /**
  * L3 流水线：把 Minecraft jar 重映射到目标命名空间.
