@@ -142,12 +142,19 @@ public abstract class AccessTransformForgeJarTask extends DefaultTask {
 	@PathSensitive(PathSensitivity.NONE)
 	public abstract RegularFileProperty getMappings();
 
-	/** 规则当前的命名空间（legacy Forge 为 {@code srg}）. */
+	/**
+	 * 规则当前的命名空间.
+	 *
+	 * <p>仅在「规则命名空间与作用对象不一致」时需要——目前只有 legacy Forge（{@code srg} 规则
+	 * 作用于 official jar）。未设置表示不翻译，规则原样交给 AT 工具。
+	 */
 	@Input
+	@Optional
 	public abstract Property<String> getAtSourceNamespace();
 
-	/** 目标 jar 所在的命名空间（notch jar 为 {@code official}）. */
+	/** 目标 jar 所在的命名空间；与 {@link #getAtSourceNamespace()} 同时设置或同时缺省. */
 	@Input
+	@Optional
 	public abstract Property<String> getAtTargetNamespace();
 
 	/** 执行期实例化服务选项用（{@code Project} 在执行期不可用，见类注释）. */
@@ -162,9 +169,13 @@ public abstract class AccessTransformForgeJarTask extends DefaultTask {
 		try (var tempFiles = new TempFiles(); var serviceFactory = new ScopedServiceFactory()) {
 			List<String> atFiles = AccessTransformerService.extractLoaderAts(
 					getForgeUserdevJar().get().getAsFile().toPath(), atLocation(), tempFiles);
-			// AT 规则来自 forge_at.cfg（SRG 命名空间），而作用对象是本仓库的 notch jar：
-			// 不翻译的话 AT 工具按字面量一条都匹配不上，且不会报错（表现为 AT 静默失效）。
-			atFiles = translateAtFiles(atFiles, tempFiles);
+
+			// 命名空间未设置表示「规则与作用对象同命名空间」，原样交给 AT 工具即可。
+			// 目前只有 legacy Forge 需要翻译：它的 AT 用 srg 成员名，而作用对象是 official jar。
+			if (getAtSourceNamespace().isPresent() && getAtTargetNamespace().isPresent()) {
+				atFiles = translateAtFiles(atFiles, tempFiles);
+			}
+
 			final AccessTransformerService service = serviceFactory.get(
 					AccessTransformerService.createOptions(getObjects(), atTool(), atFiles));
 
