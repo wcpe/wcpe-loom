@@ -8,7 +8,7 @@
 | 文件 | 作用 |
 |---|---|
 | `PATCH-QUEUE.md` | 队列**规范**（结构、补丁判定标准、DEP-3 溯源标注、维护纪律） |
-| `migration-1.17.md` | **谱系清单**（基底、22 个补丁与来源对照、例外说明、审计方法、已知遗留） |
+| `migration-1.17.md` | **谱系清单**（基底、补丁与来源对照、例外说明、审计方法、已知遗留） |
 | `README.md` | 本文件：**操作手册** |
 | `../scripts/sync-upstream.sh` | 维护脚本：`status` / `verify` / `add-patch` / `rebase` |
 
@@ -16,11 +16,14 @@
 
 ```
 base/architectury-1.17-026ce830        ← 基底（不可变 tag）
-  ↓  22 个代码补丁，每个带 Origin: / Forwarded: 溯源块
+  ↓  代码补丁，每个带 Origin: / Forwarded: 溯源块
 patch-queue/1.17                       ← 队列末端标记（tag）
-  ↓  1 个元数据提交
+  ↓  元数据提交（CI / 文档 / 脚本 / 队列规范）
 HEAD = dev/1.17-wcpe（默认分支）
 ```
+
+> 具体条数以 `scripts/sync-upstream.sh status` 为准：它直接数 `基底..队列末端` 的提交，
+> 而本文与 `PATCH-QUEUE.md` 里的数字是写作时的快照，加补丁后不会自动更新。
 
 - **补丁段**：会被**重放到新上游基底**的内容 —— 代码、构建配置、测试。
 - **元数据段**：描述**本仓库自身**、重放时没有意义的内容 —— CI、README、队列规范、脚本、CHANGELOG。
@@ -34,7 +37,7 @@ HEAD = dev/1.17-wcpe（默认分支）
 
 | Debian（gbp / quilt） | 本线 | 1.15 线 |
 |---|---|---|
-| `debian/patches/` + `series` | `patch-queue/1.17` 之前的 22 个补丁 | 12 个补丁提交 |
+| `debian/patches/` + `series` | `patch-queue/1.17` 之前的补丁段 | 12 个补丁提交 |
 | 打包元数据 | 队列末端之后的元数据提交 | 1 个元数据提交 |
 | `gbp pq rebase` | `scripts/sync-upstream.sh rebase` | `sync-upstream.sh essential-rebase` |
 | `gbp pq start` / `export` | `sync-upstream.sh add-patch` / `add-patch finish` | `sync-upstream.sh pick` |
