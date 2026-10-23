@@ -4,6 +4,11 @@
 # 用法：
 #   scripts/gen-release-notes.sh <上一版tag> <本版tag>     # 输出到 stdout
 #
+# 环境变量：
+#   WCPE_CHERRY_PICK=1   跨分叉时排除「内容相同但 SHA 不同」的重复提交（1.17.4 这类分叉版本用）
+#   WCPE_SKIP_PATTERN    额外过滤掉匹配该正则的提交标题（如开发过程提交），可重复用 `|` 组合
+#   WCPE_MAIN_REF        主线分支名，默认 dev/1.17-wcpe
+#
 # 背景：GitHub 的 `gh release create --generate-notes` 只统计**经 PR 合入**的提交，
 # 而本仓库以直推为主，于是出现两种坏结果：正文全空（一条 PR 都没有时），
 # 或只剩零星几条 PR、同版本其它提交全丢。改用提交本身生成，直推与 PR 合入一视同仁。
@@ -132,7 +137,22 @@ CURR_LABEL="${WCPE_LABEL_CURR:-$(label_of "${CURR}")}"
 
 # 取区间内的非 merge 提交，格式：<type>(<scope>): <描述>\x1f<短hash>
 # 用 0x1F 作分隔符：提交信息里不会出现这个控制字符
-RAW="$(git log --no-merges --reverse --pretty=format:'%s%x1f%h' "${PREV_ANCHOR}..${CURR_ANCHOR}")"
+#
+# WCPE_CHERRY_PICK=1：跨分叉时排除「内容相同但 SHA 不同」的重复提交。
+# 背景：两条发布支线各自 cherry-pick 过同一批改动时，A..B 会把 B 侧那批重复算入。
+# 实测 1.17.3 → 1.17.4 只差 3 条实变更，不加此选项会算成 36 条。
+# --cherry-pick --right-only 必须配三点号：配两点号会静默给出错误结果，故这里按开关切换运算符。
+# 注意它依赖 patch-id，而重写会改变 patch-id，因此只能作**辅助**：
+# 需要精确结果时仍应拿 `git diff --name-only 上一版 本版` 的文件清单交叉验证。
+if [ "${WCPE_CHERRY_PICK:-0}" = "1" ]; then
+	RANGE="${PREV_ANCHOR}...${CURR_ANCHOR}"
+	CHERRY_ARGS=(--cherry-pick --right-only)
+else
+	RANGE="${PREV_ANCHOR}..${CURR_ANCHOR}"
+	CHERRY_ARGS=()
+fi
+
+RAW="$(git log --no-merges "${CHERRY_ARGS[@]}" --reverse --pretty=format:'%s%x1f%h' "${RANGE}")"
 
 if [ -z "${RAW}" ]; then
 	echo "本版无提交变更。"
@@ -169,6 +189,12 @@ trap 'rm -rf "${TMPDIR_NOTES}"' EXIT
 
 while IFS=$'\x1f' read -r subject hash; do
 	[ -n "${subject}" ] || continue
+	# 过程性提交（验证工具的 scratch、误提交的临时文件等）对使用者无意义，按需过滤。
+	# 用正则而不是写死清单：不同版本的噪声提交标题不一样。
+	if [ -n "${WCPE_SKIP_PATTERN:-}" ] \
+		&& printf '%s' "${subject}" | grep -qE "${WCPE_SKIP_PATTERN}"; then
+		continue
+	fi
 	cat_name="$(categorize "${subject}")"
 	# 去掉类型前缀，标题更易读；scope 提取出来加粗前置
 	clean="$(printf '%s' "${subject}" | sed -E 's/^[a-zA-Z]+(\([^)]*\))?!?:[[:space:]]*//')"
