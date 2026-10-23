@@ -46,13 +46,17 @@ ANCHORS_FILE=".upstream/release-anchors.txt"
 #
 # 顺序很重要：先判断该提交是否已在主线历史内——在的话无需换算（它就是自己的锚点），
 # 否则才查表。反过来做会把本来正确的端点也换掉（曾把 1.17.13 自身换算成旧提交）。
+#
+# 输出格式：`<self标志>\t<commit>`。self 标志为 1 表示「刻意就用它自己」——这类发布点
+# 不在主线、但与相邻发布点之间可直接比较（例如早期几条各自独立的支线），不该告警。
+# 用输出字段而不是全局变量传递：调用方写在 `$(...)` 里，全局变量改在子 shell 里传不回来。
 anchor_of() {
 	local ref="$1" commit
 
 	commit="$(git rev-parse "${ref}^{commit}")"
 
 	if git merge-base --is-ancestor "${commit}" "${WCPE_MAIN_REF}" 2>/dev/null; then
-		printf '%s' "${commit}"
+		printf '0\t%s' "${commit}"
 		return 0
 	fi
 
@@ -66,33 +70,51 @@ anchor_of() {
 	fi
 
 	if [ -n "${mapped}" ]; then
+		if [ "${mapped}" = "self" ]; then
+			printf '1\t%s' "${commit}"
+			return 0
+		fi
+
 		# 表里写的是短 SHA，解析成完整提交
 		if git rev-parse -q --verify "${mapped}^{commit}" >/dev/null 2>&1; then
-			git rev-parse "${mapped}^{commit}"
+			printf '0\t%s' "$(git rev-parse "${mapped}^{commit}")"
 			return 0
 		fi
 
 		echo "警告：${ANCHORS_FILE} 里 ${ref} 的锚点 ${mapped} 无法解析，按原值使用。" >&2
 	fi
 
-	printf '%s' "${commit}"
+	printf '0\t%s' "${commit}"
 }
 
 # 区间端点：优先用对照表里的主线提交，避免跨分叉重复计算。
-PREV_ANCHOR="$(anchor_of "${PREV}")"
-CURR_ANCHOR="$(anchor_of "${CURR}")"
+#
+# `anchor_of` 跑在命令替换的子 shell 里，函数内设的 SELF_ANCHOR 传不回来。
+# 用「把标记写进输出」的办法：约定返回 "<self标志>\t<commit>"，调用方再拆开。
+PREV_RAW="$(anchor_of "${PREV}")"
+CURR_RAW="$(anchor_of "${CURR}")"
 
-for pair in "起点:${PREV}:${PREV_ANCHOR}" "终点:${CURR}:${CURR_ANCHOR}"; do
+PREV_SELF="${PREV_RAW%%	*}"
+PREV_ANCHOR="${PREV_RAW##*	}"
+CURR_SELF="${CURR_RAW%%	*}"
+CURR_ANCHOR="${CURR_RAW##*	}"
+
+for pair in "起点:${PREV}:${PREV_ANCHOR}:${PREV_SELF}" "终点:${CURR}:${CURR_ANCHOR}:${CURR_SELF}"; do
 	role="${pair%%:*}"
 	rest="${pair#*:}"
 	name="${rest%%:*}"
-	anchor="${rest#*:}"
+	rest="${rest#*:}"
+	anchor="${rest%%:*}"
+	self="${rest##*:}"
 
 	if [ "${anchor}" != "$(git rev-parse "${name}^{commit}")" ]; then
 		echo "注：${name} 已按对照表换算为主线提交 $(git rev-parse --short "${anchor}")（${role}）。" >&2
+	elif [ "${self}" = "1" ]; then
+		echo "注：${name} 按对照表声明为 self，直接用它自身（${role}）。" >&2
 	elif ! git merge-base --is-ancestor "${anchor}" "${WCPE_MAIN_REF}" 2>/dev/null; then
 		echo "警告：${name} 不在 ${WCPE_MAIN_REF} 历史内，且 ${ANCHORS_FILE} 未收录它；" >&2
 		echo "      区间可能把上一版已发布的提交重复算入。请在该表补一行：${name} <主线提交>" >&2
+		echo "      若它与相邻发布点可直接比较、无需换算，写 ${name} self 即可。" >&2
 	fi
 done
 
