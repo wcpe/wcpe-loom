@@ -44,7 +44,8 @@ HEAD
 **压缩判据**：若补丁 B 修改的内容全部是补丁 A 新增或修改过的行，B 必须压缩进 A。队列描述的是
 **最终状态**，不是开发过程的年表；"先实现、再修正实现"的中间态不属于队列。
 
-> 本线的 25 个补丁提交即按此判据由 42 个开发提交合并而来（见 `migration-1.17.md` 第四节）。
+> 本线首次重建时，25 个补丁提交即按此判据由 42 个开发提交合并而来（见 `migration-1.17.md`
+> 第四节）。此后陆续追加补丁，当前条数以 `scripts/sync-upstream.sh status` 为准。
 
 ## 3. 溯源标注
 
@@ -101,4 +102,6 @@ Forwarded: <取值>
 | 主题 | Origin | Forwarded |
 |---|---|---|
 | 本线自行开发的补丁，以及 CI/文档/脚本等仓库元数据 | `vendor, wcpe-loom` | `not-needed` |
-| 其中修复既有缺陷、值得反馈上游者（AW/AT 条目纯值化进配置缓存、SourceRemapper 静默丢 MC classpath、ForgeSources 空 jar 与反编译缓存键、Forge 处理器执行期重建两处缺陷） | `vendor, wcpe-loom` | `no` |
+| 其中修复既有缺陷、值得反馈上游者（AW/AT 条目纯值化进配置缓存、SourceRemapper 静默丢 MC classpath、ForgeSources 空 jar 与反编译缓存键、Forge 处理器执行期重建两处缺陷、AT 规则按目标 jar 命名空间翻译、jar processor 哈希随配置顺序漂移） | `vendor, wcpe-loom` | `no` |
+| legacy Forge 专属（universal jar 重映射到 named、继承方法映射补全）——上游 1.17 已移除该链路 | `vendor, wcpe-loom` | `no` |
+| spotless 的 Eclipse P2 镜像与 `splitModDependency` 夹具堆设置——本仓库环境专属 | `vendor, wcpe-loom` | `not-needed` |
