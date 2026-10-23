@@ -1,3 +1,172 @@
-- Do not run the full Gradle build or the entire test suite at once; they take many hours in this repository.
-- Prefer targeted Gradle tasks that validate only the area you changed.
-- When verifying final changes, run `./gradlew build -x test`.
+# WCPE Loom — 开发者与 AI 代理指南
+
+本文件面向在本仓库工作的开发者与 AI 代理：先讲清仓库结构（含补丁队列这一非标准约定），
+再给构建与提交规范。**动手前请先读完第一节**——本仓库的历史是被显式管理的，不是普通 Git 流程。
+
+## 1. 这是什么
+
+`wcpe-loom` 是 [fabric-loom](https://github.com/FabricMC/fabric-loom) 的 fork，
+经由 [architectury-loom](https://github.com/architectury/architectury-loom) 分叉而来，
+面向 WCPE 的 Minecraft 模组开发场景。它是一个 Gradle 插件，提供 Minecraft 的下载、映射、
+重映射、反编译、运行配置与 mod 依赖处理。
+
+对外发布的插件 id：
+
+| 插件 id | 实现类 | 用途 |
+|---|---|---|
+| `top.wcpe.loom` | `net.fabricmc.loom.LoomGradlePlugin` | 主插件（混淆环境） |
+| `top.wcpe.loom-no-remap` | `net.fabricmc.loom.LoomNoRemapGradlePlugin` | 非混淆环境 |
+| `top.wcpe.loom-remap` | `net.fabricmc.loom.LoomRemapGradlePlugin` | remap 变体 |
+| `top.wcpe.loom-companion` | `net.fabricmc.loom.LoomCompanionGradlePlugin` | 复合构建配套 |
+
+**构建要求**：JDK 21+（`build.gradle` 启动即校验）。
+
+## 2. 仓库结构
+
+```
+src/main/java/
+├── net/fabricmc/loom/          上游 fabric-loom 的主体
+│   ├── api/                    对外 API：扩展接口、MappingOption、processor 契约
+│   ├── configuration/          配置期：Minecraft/mappings/mod 依赖的解析与产出
+│   ├── extension/              LoomGradleExtension 实现
+│   ├── pipeline/               执行期任务（RemapMinecraft、GenerateSrgNamed、AT 等）
+│   ├── task/                   面向用户的 Gradle 任务与服务
+│   ├── spec/                   分层规格与派生数据缓存
+│   ├── internal/               内部工具（LoomProjectData 等）
+│   └── util/                   通用工具
+└── dev/architectury/loom/      architectury 扩展
+    ├── forge/                  Forge / legacy Forge 支持（含 mcpconfig）
+    ├── neoforge/               NeoForge 支持
+    ├── accesstransformer/      AT 规则解析与翻译
+    └── mappings/               MappingOption 等映射平台抽象
+
+src/test/groovy/…/test/
+├── unit/                       单元测试（快，优先跑）
+├── integration/                集成测试（起真 Gradle 构建，慢）
+└── benchmark/                  基准
+
+src/test/resources/projects/    集成测试用的消费方夹具工程
+scripts/                        队列维护与发布脚本（见第 3 节）
+.upstream/                      补丁队列的规范、手册、谱系清单（见第 3 节）
+.github/workflows/              CI：test-push.yml（测试）、publish.yml（发布）
+```
+
+**架构要点**：`configuration/` 是配置期（Gradle 配置阶段，急切产出产物），
+`pipeline/` 是执行期（任务化，可缓存）。近年大量工作是把产物生产从配置期迁到执行期任务，
+以支持 configuration cache 与 build cache。改动这两处的边界时要留意缓存键。
+
+## 3. 补丁队列（本仓库最重要、也最反直觉的约定）
+
+本仓库**不是**普通 Git 流程。默认分支 `dev/1.17-wcpe` 的历史分三段：
+
+```
+base/architectury-1.17-026ce830   基底（不可变 tag，上游快照）
+  ↓  补丁段：线性提交，每个 = 一个逻辑变更，带 DEP-3 溯源块
+patch-queue/1.17                  队列末端（可移动 tag，重写后需前移）
+  ↓  元数据段：CI / 文档 / 脚本 / 队列规范
+dev/1.17-wcpe                     默认分支 = HEAD
+```
+
+**判据**：*换上游这行还需要吗？* 需要 → 补丁段；不需要 → 元数据段。
+
+### 改代码（补丁段）
+
+```bash
+scripts/sync-upstream.sh add-patch <名字>   # 起点是 patch-queue/1.17，不是默认分支 HEAD
+# …改代码、提交（末尾带溯源块）…
+git checkout dev/1.17-wcpe
+scripts/sync-upstream.sh add-patch finish <名字>
+```
+
+提交信息末尾必须有溯源块：
+
+```
+fix(forge): 修掉 xxx
+
+正文说明为什么改、改动要点。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+```
+
+- `Origin`：`vendor, wcpe-loom` / `backport, <上游版本>` / `upstream, <URL>`
+- `Forwarded`：`no`（该反馈上游）/ `not-needed`（本仓库专属）/ `<URL>`（已反馈）
+
+### 改 CI / 文档 / 脚本（元数据段）
+
+直接在 `dev/1.17-wcpe` 提交并 `git push`，无需强推、无需动分支保护。
+
+### 发版纪律（最容易踩）
+
+**一旦打了 `wcpe-v*` tag，那个提交之前的历史就不能再改写。**
+
+插补丁必然要重写队列并强推，但如果重写在已发布 tag 之前，那个 tag 会永久脱离主线历史，
+导致 compare 失真、发版区间跳版、同版本号对应两份历史。
+
+- 插补丁、压缩元数据都放在**发版之前**
+- 打完 tag 之后只用普通提交，直到下次发版前再整理
+- 万一已发生：把该 tag 的主线等价提交补进 `.upstream/release-anchors.txt`
+
+### 校验与同步上游
+
+```bash
+scripts/sync-upstream.sh verify     # 只读自检：线性、无 merge、溯源齐备、基于队列末端
+scripts/sync-upstream.sh status     # 只读：基底/队列/元数据/远端一览
+scripts/sync-upstream.sh rebase <新基底sha> [tag]   # 整条队列重放到新基底
+```
+
+详细规范见 `.upstream/README.md`（操作手册）、`.upstream/PATCH-QUEUE.md`（规范）、
+`.upstream/migration-1.17.md`（谱系清单）。
+
+## 4. 构建与测试
+
+**不要一次跑完整 `./gradlew build` 或整套测试**——本仓库集成测试要起真实 Gradle 构建并下载
+Minecraft 产物，全量跑耗时数小时。
+
+```bash
+# 局部验证：只编解码改动区域
+./gradlew compileJava
+./gradlew checkstyleMain codenarcMain
+
+# 单元测试（快）
+./gradlew test --tests "net.fabricmc.loom.test.unit.*"
+
+# 针对性的集成测试（慢，按需挑）
+./gradlew test --tests "net.fabricmc.loom.test.integration.forge.AccessTransformerTest"
+
+# 最终验证
+./gradlew build -x test
+```
+
+### 测试注意事项
+
+- **集成测试的内层 daemon 会 OOM**：处理完整 Minecraft 产物的用例（MigrateMappings、DataGeneration、
+  RemapTaskCache、SplitModDependencyProducer 等）需要在夹具工程的 `gradle.properties` 里显式写
+  `org.gradle.jvmargs=-Xmx2G`，否则 CI 上会以 `DaemonStoppedException` 失败而非断言失败。
+- **配置缓存相关**：执行期任务里**不能访问 `Project`**。如果在 provider 的 lambda 里回调到
+  `getProject()`，`--rerun-tasks` 这类跳过快照的用法会抛 `InvalidUserCodeException`。
+  配置期就要把需要的东西取好（例如 `NamedDomainObjectProvider` 是可序列化的惰性句柄）。
+- **`git cherry` 在本仓库不可靠**：队列重写会生成新 patch-id，内容已合入的提交仍会被报成未合入。
+  判断某修复是否已落地，看实质标志（函数、字段、文件是否存在）。
+
+## 5. 代码规范
+
+- **注释一律用中文**；提交信息用简体中文（标题与正文都是）。
+- 缩进用 tab，`checkstyle.xml` 校验：import 分组顺序、声明后紧跟 `if`/`try` 需空一行、
+  禁止连续空行、Javadoc 首句以句号结尾等。
+- 提交信息格式：`<type>(<scope>): <中文描述>`，type 用英文小写
+  （`feat` `fix` `refactor` `docs` `chore` `test` `build` `ci`）。
+- 禁止在提交信息里加 AI 签名或作者尾注。
+
+## 6. 已知环境注意事项
+
+- **spotless 的 greclipse 需要从 Eclipse P2 仓库下载格式化器**。`download.eclipse.org` 会周期性
+  返回「Temporary shutdown」页面，导致 `build` 失败。`build.gradle` 已把源映射到可达镜像，
+  可用 `-Ploom.eclipseP2Mirror=<URL>` 覆盖，传空值回退官方源。
+- **不能指望 `--generate-notes`**：它只统计经 PR 合入的提交，而本仓库以直推为主。
+  发布说明由 `scripts/gen-release-notes.sh` 按提交生成。
+
+## 7. 临时文件
+
+过程性文件（脚本、笔记、验证工程）一律放进项目根目录的 `.tmp/`（已 gitignore），
+不要散落在仓库根目录，也不要提交。
