@@ -115,6 +115,18 @@ scripts/sync-upstream.sh status     # 只读：基底/队列/元数据/远端一
 scripts/sync-upstream.sh rebase <新基底sha> [tag]   # 整条队列重放到新基底
 ```
 
+**首次同步上游前必须先配置远端**——仓库只带 `origin`，脚本默认的上游名 `architectury`
+需要自己添加，否则 `fetch` 会失败、`status` 会显示「上游远端: architectury -> (未 fetch)」：
+
+```bash
+git remote add architectury https://github.com/architectury/architectury-loom.git
+git fetch architectury dev/1.17          # 本线跟随的分支是 dev/1.17，不是 architectury
+```
+
+> 基底 tag 的注释里记着当时的来源与日期，例如
+> `base/architectury-1.17-026ce830` 对应上游 `dev/1.17` 的 `026ce830`。
+> 换基底时用 `git tag -l --format='%(contents)' <基底tag>` 回溯来源。
+
 详细规范见 `.upstream/README.md`（操作手册）、`.upstream/PATCH-QUEUE.md`（规范）、
 `.upstream/migration-1.17.md`（谱系清单）。
 
