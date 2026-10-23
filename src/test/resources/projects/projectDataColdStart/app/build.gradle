@@ -1,0 +1,28 @@
+plugins {
+	id "java"
+	id "dev.architectury.loom"
+}
+
+version = "1.0.0"
+
+base {
+	archivesName = "coldapp"
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:1.20.4"
+	mappings "net.fabricmc:yarn:1.20.4+build.3:v2"
+	modImplementation "net.fabricmc:fabric-loader:0.19.2"
+
+	// 关键：必须是普通 implementation，而不是 modImplementation。
+	// mod 重映射会把 ProjectDependency 从 runtime/compile classpath 上换成普通文件依赖，
+	// Loom 的跨项目数据链路（ProjectView.getLoomProjectDataDependencies）根本不会被触发。
+	implementation project(":lib")
+}
+
+// 配置顺序探针（ProjectDataColdStartTest 断言用）：build 脚本自己的 afterEvaluate 注册晚于
+// Loom 插件注册的那一个，而 Loom 正是在自己的 afterEvaluate 里读取依赖项目数据的，
+// 因此这条日志出现时，本次构建对 :lib 数据的读取已经结束。
+afterEvaluate {
+	logger.lifecycle("coldstart-probe app-config-finished")
+}

@@ -36,6 +36,17 @@ import net.fabricmc.loom.internal.LoomProjectData;
 public interface DeobfProjectView extends ProjectView {
 	FileCollection getDependencies(DebofConfiguration debofConfiguration, DebofConfiguration.TargetSourceSet targetSourceSet);
 
+	/**
+	 * 返回给定 deobf 配置上的依赖项目数据.
+	 *
+	 * <p>这里刻意不重复实现「读取前强制依赖项目求值」：它们全部经由
+	 * {@link #getLoomProjectDataDependencies(String)} 读取，非隔离模式下的强制求值、以及隔离模式下
+	 * 数据缺失时的去重告警，都在那一个入口完成，语义与限制见该方法的说明。deobf 配置（{@code runtimeClasspath}
+	 * 等）就是本项目的 classpath 配置，因此两条路径没有别的读法。
+	 *
+	 * @param debofConfiguration 目标 deobf 配置
+	 * @return 该配置上的依赖项目数据流
+	 */
 	Stream<LoomProjectData> getProjectDependencies(DebofConfiguration debofConfiguration);
 
 	FileCollection getFullClasspath();
@@ -52,6 +63,7 @@ public interface DeobfProjectView extends ProjectView {
 
 		@Override
 		public Stream<LoomProjectData> getProjectDependencies(DebofConfiguration debofConfiguration) {
+			// 单点入口：强制求值与缺失告警都在 getLoomProjectDataDependencies 里，见其 Javadoc。
 			return debofConfiguration.getConfigurations(project).stream()
 					.flatMap(configuration -> getLoomProjectDataDependencies(configuration.getName()));
 		}
