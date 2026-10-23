@@ -188,8 +188,21 @@ jobs:
             exit 0
           fi
 
-          # 上一个 wcpe-v* 正式版 tag，作为变更区间的起点
-          PREV_TAG="$(git describe --tags --abbrev=0 --match 'wcpe-v*' "${TAG_NAME}^")"
+          # 上一个 wcpe-v* 正式版 tag，作为变更区间的起点。
+          #
+          # 不用 `git describe`：它按祖先关系找最近的 tag，而本仓库会为整理补丁队列重写历史，
+          # 已发布 tag 可能不在当前提交的祖先链上——被跳过就会退到更早的版本。
+          # 实测 1.17.13 因孤立而被跳过、describe 直接选中 1.17.11，区间多算整整一版。
+          # 改按**版本号顺序**取当前 tag 的前一个，与分支拓扑无关；换算到主线由脚本按
+          # .upstream/release-anchors.txt 完成。
+          PREV_TAG="$(git tag -l 'wcpe-v*' | sort -V | awk -v cur="${TAG_NAME}" '
+            $0 == cur { print prev; exit }
+            { prev = $0 }
+          ')"
+          if [ -z "${PREV_TAG}" ]; then
+            echo "::error::找不到 ${TAG_NAME} 之前的正式版 tag，无法确定变更区间"
+            exit 1
+          fi
           echo "变更区间: ${PREV_TAG}..${TAG_NAME}"
 
           # wcpe-v1.17.8 → 1.17.8
