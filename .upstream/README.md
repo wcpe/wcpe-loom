@@ -216,8 +216,26 @@ scripts/sync-upstream.sh status    # 只读：基底/队列/元数据/远端状�
 
 ### 4. 同步上游
 
+**首次同步前必须先配置上游远端。** 仓库只带 `origin`，而脚本默认的上游名是
+`architectury`（可用 `WCPE_UPSTREAM_REMOTE` 覆盖）——不先添加，`git fetch architectury`
+会失败，`status` 也会显示「上游远端: architectury -> (未 fetch)」：
+
 ```bash
-git fetch architectury
+git remote add architectury https://github.com/architectury/architectury-loom.git
+# 本线跟随的分支是 dev/1.17（不是名为 architectury 的分支）
+git fetch architectury dev/1.17
+```
+
+确认是否有新基底：
+
+```bash
+# 输出 0 表示上游未更新，无需 rebase
+git rev-list --count base/architectury-1.17-026ce830..architectury/dev/1.17
+```
+
+换基底：
+
+```bash
 scripts/sync-upstream.sh rebase <新基底sha> base/architectury-1.17-<新sha>
 ```
 
