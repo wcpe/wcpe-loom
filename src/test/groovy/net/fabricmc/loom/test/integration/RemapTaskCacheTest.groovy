@@ -97,7 +97,10 @@ class RemapTaskCacheTest extends Specification implements GradleProjectTestTrait
 		given:
 		def gradle = cacheProject()
 		gradle.buildGradle << '''
-			gradle.sharedServices.registrations.named("LoomJarManifestService:" + project.name) {
+			// 服务键用 project.path 而不是 project.name：name 对根项目是目录名
+			// （测试里是随机临时目录），换一个临时目录就会算出不同的服务，
+			// 同一 daemon 内跨工作树复用缓存时会互相干扰。
+			gradle.sharedServices.registrations.named("LoomJarManifestService:" + project.path) {
 				parameters.minecraftVersion.set(providers.gradleProperty("cacheTestManifestVersion").orElse("manifest-one"))
 			}
 			tasks.named("jar") {
