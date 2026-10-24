@@ -289,6 +289,17 @@ public class MappingConfiguration {
 	}
 
 	/**
+	 * {@return 该映射选项是否已登记}.
+	 *
+	 * <p>供环内调用方判断是否需要先补齐：{@code WITH_SRG} 只在
+	 * {@link #ensureMappingOptionsReady} / {@link #setupPost} 中登记，
+	 * 而 Forge 的 patched jar 生产早于 {@code setupPost}。
+	 */
+	public boolean hasMappingOption(MappingOption mappingOption) {
+		return this.mappingOptions.containsKey(mappingOption);
+	}
+
+	/**
 	 * {@return 该映射选项指向的映射文件}.
 	 *
 	 * <p>存在性校验对**执行期产出**的映射放宽：Forge 的迁移后 mappings 由执行期任务产出
@@ -577,10 +588,54 @@ public class MappingConfiguration {
 		AtomicFiles.publish(mappingsPairMarker, tmp -> Files.writeString(tmp, PAIR_MARKER_INVALID, StandardCharsets.UTF_8));
 	}
 
-	public void setupPost(Project project) throws IOException {
-		LoomGradleExtension extension = LoomGradleExtension.get(project);
+	/**
+	 * 确保映射选项已登记、且 {@code WITH_SRG} 指向的合并产物已落位.
+	 *
+	 * <p>幂等，可重复调用。
+	 *
+	 * <p><b>为什么需要它</b>：Forge 车道的 {@code MinecraftPatchedProvider#provide()}
+	 * 在 access transform 阶段会经 {@code getMappingTree} 请求
+	 * {@link MappingOption#forPlatform} 给出的选项（Forge 恒为 {@code WITH_SRG}）。
+	 * 而 {@code WITH_SRG} 原本只在 {@link #setupPost} 里登记，且 {@code setupPost} 自身的
+	 * {@code manipulateMappings} 又会回调 {@code provide()}——二者构成环：
+	 * {@code provide()} 需要 {@code WITH_SRG}，{@code WITH_SRG} 又要等 {@code provide()}。
+	 * 故本方法把「登记选项 + 合并共享 mappings」从 {@code setupPost} 中拆出，供迁回环内的
+	 * 调用方按需先补齐。
+	 *
+	 * <p>本方法不触碰 patched 中间产物，因此可在环内安全调用。
+	 *
+	 * <p><b>该缺陷只在冷缓存下暴露</b>：patched 中间产物已存在时 {@code provide()} 走
+	 * {@code isReusableJar} 快路径直接复用、不进入 access transform，故本机预热过缓存后长期不可见。
+	 */
+	public void ensureMappingOptionsReady(Project project) throws IOException {
+		final LoomGradleExtension extension = LoomGradleExtension.get(project);
 		final boolean refresh = extension.refreshDeps();
 
+		registerMappingOptions(extension);
+
+		final boolean needsMojangMerge =
+				extension.isNeoForge() && (refresh || !isReusableMappingsText(tinyMappingsWithMojang));
+		final boolean needsSrgMerge =
+				extension.shouldGenerateSrgTiny() && (refresh || !isReusableMappingsText(tinyMappingsWithSrg));
+
+		if (needsMojangMerge || needsSrgMerge) {
+			runWithMappingsLock(project, "生成共享 mappings（mojang/srg 合并结果）失败", () -> {
+				if (needsMojangMerge && (refresh || !isReusableMappingsText(tinyMappingsWithMojang))) {
+					mergeMojangAtomic(project, tinyMappingsWithMojang);
+				}
+
+				// 锁内二次确认：等锁期间可能已被其它进程产出（refresh 时仍需强制重建）
+				if (needsSrgMerge && (refresh || !isReusableMappingsText(tinyMappingsWithSrg))) {
+					mergeSrgAtomic(project, extension, tinyMappingsWithSrg);
+				}
+
+				return null;
+			});
+		}
+	}
+
+	/** 登记映射选项，幂等. */
+	private void registerMappingOptions(LoomGradleExtension extension) {
 		// 本实例经 SHARED_INSTANCES 在 daemon 内跨项目、跨构建复用，而本方法每轮都会被再次调用。
 		// 先清掉上一轮可能登记的补全选项，避免跨项目复用者继承「该选项存在」的判断
 		// （isTaskProducedMappings / addMappingsProducerDependency 都以「选项已登记」为准）。
@@ -608,32 +663,12 @@ public class MappingConfiguration {
 				this.mappingOptions.put(MappingOption.WITH_MOJANG, () -> this.tinyMappingsWithSrg);
 			}
 		}
+	}
 
-		// 无锁快路径：两件共享产物（mappings-mojang.tiny / mappings-srg.tiny）均已就绪且未要求刷新时，
-		// 本方法不含任何共享写入，故不取锁。
-		// 就绪判据为内容级（见 isReusableMappingsText），不能只判存在：两件产物都在共享工作目录下被
-		// 多个工作树/daemon 交叉读写，被中断的就地写会留下 0 字节残骸，存在性判定会把它永久复用。
-		final boolean needsMojangMerge = extension.isNeoForge() && (refresh || !isReusableMappingsText(tinyMappingsWithMojang));
-		final boolean needsSrgMerge = extension.shouldGenerateSrgTiny() && (refresh || !isReusableMappingsText(tinyMappingsWithSrg));
-
-		if (needsMojangMerge || needsSrgMerge) {
-			// 一次写一组互相依赖的共享产物（mojang 合并结果 + srg 合并结果）时，整段包进同一把 mappings 锁：
-			// 与 produceMappings 共用 key，避免同一 mappings 的产物被不同工作树/daemon 交叉生产。
-			runWithMappingsLock(project, "生成共享 mappings（mojang/srg 合并结果）失败", () -> {
-				// Generate the Mojmap-merged mappings if needed.
-				// Note that this needs to happen before manipulateMappings for FieldMigratedMappingConfiguration.
-				if (needsMojangMerge && (refresh || !isReusableMappingsText(tinyMappingsWithMojang))) {
-					mergeMojangAtomic(project, tinyMappingsWithMojang);
-				}
-
-				// 锁内二次确认：等锁期间可能已被其它进程产出（refresh 时仍需强制重建）
-				if (needsSrgMerge && (refresh || !isReusableMappingsText(tinyMappingsWithSrg))) {
-					mergeSrgAtomic(project, extension, tinyMappingsWithSrg);
-				}
-
-				return null;
-			});
-		}
+	public void setupPost(Project project) throws IOException {
+		// 登记映射选项 + 合并共享 mappings。与 provide() 环内按需调用的
+		// ensureMappingOptionsReady 共用同一实现，二者幂等（清理旧登记也在其中完成）。
+		ensureMappingOptionsReady(project);
 
 		manipulateMappings(project, tinyMappingsJar);
 	}

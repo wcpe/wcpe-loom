@@ -93,6 +93,7 @@ import org.objectweb.asm.tree.ClassNode;
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.build.IntermediaryNamespaces;
+import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration;
 import net.fabricmc.loom.configuration.providers.mappings.TinyMappingsService;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
@@ -1331,8 +1332,30 @@ public class MinecraftPatchedProvider {
 	 * 与这里产出 {@code minecraftPatchedAtJar} 用的是同一棵映射树。
 	 */
 	protected MemoryMappingTree getMappingTree(ServiceFactory serviceFactory) {
+		// 无混淆环境不创建 MappingConfiguration（getMappingConfiguration 会直接抛
+		// "Cannot get mappings configuration in a non-obfuscated environment"）。
+		// 调用方应已按 isUnobfuscatedForge() 分流；这里再拦一次，把违反前提的情形
+		// 变成明确的编程错误而不是误导性的映射缺失异常。
+		if (getExtension().isUnobfuscatedForge()) {
+			throw new IllegalStateException("无混淆环境没有映射配置，调用方应先按 isUnobfuscatedForge() 分流");
+		}
+
 		final MappingOption mappingOption = MappingOption.forPlatform(getExtension());
-		TinyMappingsService mappingsService = getExtension().getMappingConfiguration().getMappingsService(project, serviceFactory, mappingOption);
+		final MappingConfiguration mappingConfiguration = getExtension().getMappingConfiguration();
+
+		// 环内自愈：provide() 早于 MappingConfiguration#setupPost，此时 WITH_SRG 尚未登记。
+		// 这里按需补齐一次（幂等），否则 getMappingsService 会抛
+		// UnsupportedOperationException: Unsupported mapping option: WITH_SRG。
+		// 冷缓存或 patched 产物失效时才会走到；缓存命中时 provide() 直接复用、不进本方法。
+		if (!mappingConfiguration.hasMappingOption(mappingOption)) {
+			try {
+				mappingConfiguration.ensureMappingOptionsReady(project);
+			} catch (IOException e) {
+				throw new UncheckedIOException("补齐映射选项失败：" + mappingOption, e);
+			}
+		}
+
+		TinyMappingsService mappingsService = mappingConfiguration.getMappingsService(project, serviceFactory, mappingOption);
 		return mappingsService.getMappingTree();
 	}
 
@@ -1561,6 +1584,28 @@ public class MinecraftPatchedProvider {
 			ServiceFactory serviceFactory) {
 		return createAccessTransformerOptions(tempFiles).map(options -> {
 			try {
+				// 没有任何 AT 规则时直接返回：无规则可翻译，也就不需要映射树。
+				//
+				// 这一步是必须的短路——getMappingTree() 对 Forge 平台会请求 WITH_SRG 映射，
+				// 而 withPatchedLock 阶段早于 MappingConfiguration#setupPost（后者才登记 WITH_SRG），
+				// 在「零 AT 文件」的车道上会因此抛
+				// UnsupportedOperationException: Unsupported mapping option: WITH_SRG。
+				// 缓存命中时 patched jar 被直接复用、不进入本方法，所以该缺陷只在冷缓存下暴露。
+				if (options.getAccessTransformers().isEmpty()) {
+					logger.lifecycle(":no access transformer rules, skipping AT translation");
+					return options;
+				}
+
+				// 无混淆环境没有 MappingConfiguration（LoomGradleExtension#getMappingConfiguration
+				// 在该形态下直接抛 "Cannot get mappings configuration in a non-obfuscated
+				// environment"），且 MC 本身即 official 名，AT 规则无需 SRG→official 翻译，
+				// 直接用原始规则即可。此处与 productionOptions 中
+				// `isUnobfuscatedForge() ? null : getMappingTree(...)` 采取同一判据。
+				if (getExtension().isUnobfuscatedForge()) {
+					logger.lifecycle(":unobfuscated environment, using AT rules as-is");
+					return options;
+				}
+
 				final MemoryMappingTree mappings = getMappingTree(serviceFactory);
 				final JarClassHierarchy hierarchy = JarClassHierarchy.read(List.of(input));
 				final List<File> translated = new ArrayList<>();
