@@ -223,7 +223,19 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
 
 			for (MinecraftJar minecraftJar : minecraftJars) {
 				if (minecraftJar.getName().equals(minecraftJarName)) {
-					return minecraftJar.toFile();
+					// 写回带行号的 classes 必须是本任务独占的路径，不能是 MC jar 本体。
+					//
+					// MC jar 本体由 processMinecraft*（ProcessMinecraftJarTask）声明为 outputJar。
+					// 若本任务也把同一路径声明成 @OutputFile 并写回，就构成「一条路径两个生产者」——
+					// 这正是 ProcessedNamedMinecraftProvider 里「同一条路径上只允许有一个生产者」那条约定要防的。
+					// 后果是两者互相判定对方改写了产物：processMinecraft 看到 outputJar changed → 重跑重写；
+					// genSources 看到 classesOutputJar changed → 重跑重写。于是永远无法 UP-TO-DATE
+					// （实测连续两次 genSources 第二次仍全量重跑，--info 给出的原因是
+					//  'Output property classesOutputJar ... has changed'）。
+					//
+					// 本任务不需要写回本体：它读的是 backup（见 getClassesInputJar），
+					// 带行号的 classes 也只被本任务内部消费，没有外部读者按 MC jar 路径去取。
+					return linenumbersJarPath(minecraftJar).toFile();
 				}
 			}
 
@@ -370,6 +382,18 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
 	 *
 	 * @throws IllegalStateException 输入 jar 在执行期仍不存在
 	 */
+	/**
+	 * 带行号的 classes jar 的落位路径：与 MC jar 同目录的兄弟文件，加 {@code .linenumbers} 后缀.
+	 *
+	 * <p>取兄弟文件而不是写回 MC jar 本体，是为了让本任务对这条路径独占写入
+	 * （理由与后果见 {@code getClassesOutputJar()} 处的注释）；做法与 backup jar
+	 * （{@code AbstractMappedMinecraftProvider.getBackupJarPath}）一致，都靠后缀与本体区分。
+	 */
+	private static Path linenumbersJarPath(MinecraftJar minecraftJar) {
+		final Path jarPath = minecraftJar.getPath();
+		return jarPath.resolveSibling(jarPath.getFileName() + ".linenumbers");
+	}
+
 	private Path getClassesInputJarPath() {
 		final Path path = getClassesInputJar().get().getAsFile().toPath();
 
