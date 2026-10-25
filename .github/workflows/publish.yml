@@ -212,7 +212,11 @@ jobs:
           # 交点显式指定主线 ref：本作业由 tag 触发、处于 detached 状态，本地不一定有 dev/1.17-wcpe。
           # 脚本靠它判断「端点是否在主线历史内」，据此决定要不要查 .upstream/release-anchors.txt。
           # 少了它，孤立 tag 会被当成正常端点，区间把上一版已发布的提交重复算进来。
-          WCPE_MAIN_REF="${WCPE_DEFAULT_BRANCH:-dev/1.17-wcpe}" \
+          #
+          # 这里用 origin/dev/1.17-wcpe（远程跟踪引用）而不是 dev/1.17-wcpe：checkout@v5 在 detached
+          # 状态下只建 refs/remotes/origin/*，不建同名本地分支。用本地名会让脚本误判「不在主线」，
+          # 每个正式版都刷一条假告警（1.17.14 实测）。
+          WCPE_MAIN_REF="${WCPE_DEFAULT_BRANCH:-origin/dev/1.17-wcpe}" \
             bash scripts/gen-release-notes.sh "${PREV_TAG}" "${TAG_NAME}" > "${NOTES_FILE}"
           echo "--- 生成的变更清单 ---"
           cat "${NOTES_FILE}"
