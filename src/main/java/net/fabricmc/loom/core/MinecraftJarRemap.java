@@ -40,6 +40,7 @@ import net.fabricmc.loom.configuration.providers.mappings.extras.annotations.Ann
 import net.fabricmc.loom.configuration.providers.minecraft.AnnotationsApplyVisitor;
 import net.fabricmc.loom.configuration.providers.minecraft.SignatureFixerApplyVisitor;
 import net.fabricmc.loom.util.TinyRemapperHelper;
+import net.fabricmc.loom.util.ZipReprocessorUtil;
 import net.fabricmc.loom.util.cache.AtomicFiles;
 import net.fabricmc.tinyremapper.extension.mixin.MixinExtension;
 import net.fabricmc.tinyremapper.OutputConsumerPath;
@@ -153,6 +154,17 @@ public final class MinecraftJarRemap {
 							options.objectHolderTargetNamespace()
 					);
 				}
+
+				// 时间戳归一化，必须是落位前的最后一步（上面 remapObjectHolder 若重写 zip 会引入新时间戳）。
+				//
+				// 为什么必须做：TinyRemapper 的 OutputConsumerPath 用「当前时刻」写每个 ZIP entry 的修改时间，
+				// 于是同一份输入重映射两次的字节不同。而本产物由 RemapMinecraftTask 用 @OutputFile 声明，
+				// Gradle 靠输出指纹判 up-to-date —— 指纹每次都变，该任务就永远重跑（实测：
+				// 「Output property 'outputJar' ... has changed」），下游 genSources 也跟着每轮重做。
+				//
+				// 固定条目顺序 + 固定时间戳后，重映射变成输入的纯函数，产物字节可复现。
+				// 用「保留原压缩方法」的变体：不把原本 STORED 的目录项改成压缩存储，避免无谓的产物结构变化。
+				ZipReprocessorUtil.reprocessZipPreservingCompression(tmpJar, true);
 			});
 		} catch (Exception e) {
 			LOGGER.error("Failed to remap {} to namespace {}", options.inputJar(), options.toNamespace(), e);
