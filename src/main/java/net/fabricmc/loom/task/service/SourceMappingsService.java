@@ -80,30 +80,43 @@ public class SourceMappingsService extends Service<SourceMappingsService.Options
 
 	public static Provider<Options> create(Project project) {
 		final Property<String> hash = project.getObjects().property(String.class);
-		final Path mappings = getMappings(project, hash);
+
+		// 路径与 hash 都必须在配置期算出来：getMappings / getProcessorHash 都是 @Input(File)，
+		// Gradle 要在执行前拿它们做输入指纹。若随生成动作一起延迟，快照时二者恒为空 →
+		// 指纹不稳定 → 任务每轮重跑（实测：连续两次构建都不 UP-TO-DATE）。
+		//
+		// 二者都只依赖「补丁器 cacheValue + 扩展的缓存目录」，不读 MC jar，配置期求值安全。
+		final Path mappings = resolveMappingsPath(project, hash);
+
+		// 只有「写 mappings 文件」这一步延迟到执行期：它内部会经 createMappings →
+		// MinecraftJarProcessorManager.processMappings → TransitiveAccessWidenerMappingsProcessor
+		// 读 MC jar（依赖自带的传递性 AW 需要 remapper 翻译命名空间）。而在「MC jar 生产迁到
+		// 执行期任务」之后，配置期这些 jar 还不存在，ContextImplHelper.minecraftClassPath 会抛
+		// 「尚不存在，无法作为 remapper 的 classpath」——表现为任务创建阶段就失败。
+		//
+		// 缓存命中时不会走到该路径（见 ensureMappingsGenerated），所以本缺陷只在冷缓存下暴露。
+		final Provider<Path> resolvedMappings =
+				project.provider(() -> {
+					ensureMappingsGenerated(project, mappings);
+					return mappings;
+				});
 
 		return TYPE.create(project, options -> {
-			options.getMappings().fileValue(project.file(mappings));
+			options.getMappings().fileProvider(resolvedMappings.map(project::file));
 			options.getProcessorHash().set(hash);
 		});
 	}
 
-	private static Path getMappings(Project project, Property<String> hashProperty) {
+	/**
+	 * 在配置期求出 mappings 文件路径（不含生成动作）.
+	 *
+	 * <p>同时把补丁器 hash 填进 {@code hashProperty}；无补丁器时留空。
+	 */
+	private static Path resolveMappingsPath(Project project, Property<String> hashProperty) {
 		final LoomGradleExtension extension = LoomGradleExtension.get(project);
 		final MinecraftJarProcessorManager jarProcessor = MinecraftJarProcessorManager.create(project);
 		final Path dir = extension.getFiles().getProjectPersistentCache().toPath().resolve("source_mappings");
-		final Path emptyMappingsPath = dir.resolve("empty.tiny"); // empty base mappings for unobf
 		final boolean disableObf = extension.disableObfuscation();
-
-		if (disableObf && (!Files.exists(emptyMappingsPath) || extension.refreshDeps())) {
-			try {
-				Files.createDirectories(dir);
-				Files.deleteIfExists(emptyMappingsPath);
-				Files.writeString(emptyMappingsPath, "tiny\t2\t0\tofficial\n", StandardCharsets.UTF_8);
-			} catch (IOException e) {
-				throw new UncheckedIOException("Failed to create empty source mappings", e);
-			}
-		}
 
 		if (jarProcessor == null) {
 			if (!disableObf) {
@@ -111,14 +124,32 @@ public class SourceMappingsService extends Service<SourceMappingsService.Options
 				return extension.getMappingConfiguration().tinyMappings;
 			} else {
 				LOGGER.info("No jar processor found, using empty source mappings");
-				return emptyMappingsPath;
+				return dir.resolve("empty.tiny");
 			}
 		}
 
 		final String hash = jarProcessor.getSourceMappingsHash();
 		hashProperty.set(hash);
+		return dir.resolve(hash + ".tiny");
+	}
 
-		final Path path = dir.resolve(hash + ".tiny");
+	/** 执行期：mappings 文件不可复用时生成它，可复用或无需生成时直接返回. */
+	private static void ensureMappingsGenerated(Project project, Path path) {
+		final LoomGradleExtension extension = LoomGradleExtension.get(project);
+		final MinecraftJarProcessorManager jarProcessor = MinecraftJarProcessorManager.create(project);
+		final Path dir = extension.getFiles().getProjectPersistentCache().toPath().resolve("source_mappings");
+		final Path emptyMappingsPath = dir.resolve("empty.tiny"); // empty base mappings for unobf
+		final boolean disableObf = extension.disableObfuscation();
+
+		if (disableObf) {
+			ensureEmptyMappings(dir, emptyMappingsPath, extension);
+
+			if (jarProcessor == null) {
+				return; // 路径即 empty.tiny，已就绪
+			}
+		} else if (jarProcessor == null) {
+			return; // 路径即项目 mappings，无需生成
+		}
 
 		// 就绪判据为内容级，与共享 mappings 产物同一把尺子（见 MappingConfiguration.isReusableMappingsText）：
 		// 本文件是按补丁 hash 命名的纯文本 tiny，由 createMappings 用 Tiny2FileWriter 直接写最终路径
@@ -126,21 +157,40 @@ public class SourceMappingsService extends Service<SourceMappingsService.Options
 		// 只判存在会让这份残骸被永久复用，源码反编译静默地按空映射进行。
 		if (MappingConfiguration.isReusableMappingsText(path) && !extension.refreshDeps()) {
 			LOGGER.debug("Using cached source mappings");
-			return path;
+			return;
 		}
 
 		LOGGER.info("Creating source mappings for hash {}", jarProcessor.getSourceMappingsHash());
+		generateMappings(project, jarProcessor, disableObf ? emptyMappingsPath : extension.getPlatformMappingFile(), path);
+	}
+
+	/** 确保 unobf 形态的空 mappings 就位. */
+	private static void ensureEmptyMappings(Path dir, Path emptyMappingsPath, LoomGradleExtension extension) {
+		if (Files.exists(emptyMappingsPath) && !extension.refreshDeps()) {
+			return;
+		}
+
+		try {
+			Files.createDirectories(dir);
+			Files.deleteIfExists(emptyMappingsPath);
+			Files.writeString(emptyMappingsPath, "tiny\t2\t0\tofficial\n", StandardCharsets.UTF_8);
+		} catch (IOException e) {
+			throw new UncheckedIOException("Failed to create empty source mappings", e);
+		}
+	}
+
+	/** 写出 mappings 文件到 {@code path}. */
+	private static void generateMappings(Project project, MinecraftJarProcessorManager jarProcessor, Path inputMappings, Path path) {
+		final LoomGradleExtension extension = LoomGradleExtension.get(project);
+		final Path dir = extension.getFiles().getProjectPersistentCache().toPath().resolve("source_mappings");
 
 		try {
 			Files.createDirectories(dir);
 			Files.deleteIfExists(path);
-			final Path inputMappings = disableObf ? emptyMappingsPath : extension.getPlatformMappingFile();
 			createMappings(project, jarProcessor, inputMappings, path);
 		} catch (IOException e) {
 			throw new UncheckedIOException("Failed to create source mappings", e);
 		}
-
-		return path;
 	}
 
 	private static void createMappings(Project project, MinecraftJarProcessorManager jarProcessor, Path inputMappings, Path outputMappings) throws IOException {

@@ -94,6 +94,52 @@ public class ZipReprocessorUtil {
 		reprocessZip(file, reproducibleFileOrder, preserveFileTimestamps, ZipEntryCompression.DEFLATED);
 	}
 
+	/**
+	 * 归一化时间戳与条目顺序，但**逐条沿用原压缩方法**.
+	 *
+	 * <p>与 {@link #reprocessZip(Path, boolean, boolean)} 的区别：后者把整包统一按一种压缩方式重写
+	 * （{@code DEFLATED}），会把原本 {@code STORED} 的条目（目录项、预压缩资源）也改成压缩存储。
+	 * 对 Minecraft jar 这类混合条目产物，那会改变产物的字节结构，属于不必要的副作用——
+	 * 归一化的目的只是让「同输入产出同字节」，不需要也不应该动压缩方式。
+	 *
+	 * <p>用于需要可复现、但必须原样保留条目存储形式的场景（如 remapMinecraft* 的产物）。
+	 */
+	public static void reprocessZipPreservingCompression(Path file, boolean reproducibleFileOrder) throws IOException {
+		final Path tempFile = file.resolveSibling(file.getFileName() + ".tmp");
+
+		try (var zipFile = new ZipFile(file.toFile());
+				var fileOutputStream = Files.newOutputStream(tempFile)) {
+			final ZipEntry[] entries;
+
+			if (reproducibleFileOrder) {
+				entries = zipFile.stream()
+						.sorted(Comparator.comparing(ZipEntry::getName, ZipReprocessorUtil::specialOrdering))
+						.toArray(ZipEntry[]::new);
+			} else {
+				entries = zipFile.stream()
+						.toArray(ZipEntry[]::new);
+			}
+
+			try (var zipOutputStream = new ZipOutputStream(fileOutputStream)) {
+				for (ZipEntry entry : entries) {
+					// 沿用原条目的压缩方法：STORED 保持 STORED，DEFLATED 保持 DEFLATED
+					final boolean stored = entry.getMethod() == ZipEntry.STORED;
+					final ZipEntry newEntry = new ZipEntry(entry.getName());
+					setConstantFileTime(newEntry);
+					newEntry.setMethod(stored ? ZipEntry.STORED : ZipEntry.DEFLATED);
+
+					if (stored) {
+						copyUncompressedZipEntry(zipOutputStream, newEntry, zipFile.getInputStream(entry));
+					} else {
+						copyZipEntry(zipOutputStream, newEntry, zipFile.getInputStream(entry));
+					}
+				}
+			}
+		}
+
+		AtomicFiles.move(tempFile, file);
+	}
+
 	public static void reprocessZip(Path file, boolean reproducibleFileOrder, boolean preserveFileTimestamps, ZipEntryCompression zipEntryCompression) throws IOException {
 		final Path tempFile = file.resolveSibling(file.getFileName() + ".tmp");
 
