@@ -32,6 +32,7 @@ import net.fabricmc.loom.test.util.GradleProjectTestTrait
 import static net.fabricmc.loom.test.LoomTestConstants.PRE_RELEASE_GRADLE
 import static net.fabricmc.loom.test.LoomTestConstants.STANDARD_TEST_VERSIONS
 import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
+import static org.gradle.testkit.runner.TaskOutcome.UP_TO_DATE
 
 class DecompileTest extends Specification implements GradleProjectTestTrait {
 	@Unroll
@@ -104,7 +105,13 @@ class DecompileTest extends Specification implements GradleProjectTestTrait {
 		then:
 		result.task(":genSourcesWithVineflower").outcome == SUCCESS
 		result2.task(":genSourcesWithVineflower").outcome == SUCCESS
-		result3.task(":genSourcesWithVineflower").outcome == SUCCESS
+
+		and: "第三次没有任何改动，必须判定为最新而不是再反编译一遍"
+		// 本用例原先断言 SUCCESS。那其实是 genSources 无法判定最新（每轮重跑）这个缺陷的
+		// 表现——7e1536dc 修好之后第三次会正确返回 UP-TO-DATE，旧断言随即失效（CI 从该
+		// 提交起一直红在 DecompileTest.groovy:107）。这里改成断言新行为：
+		// 反编译是整条链里最贵的一步，无改动却重跑正是我们要防的。
+		result3.task(":genSourcesWithVineflower").outcome == UP_TO_DATE
 	}
 
 	// https://github.com/FabricMC/fabric-loom/issues/1362
