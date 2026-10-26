@@ -1,18 +1,23 @@
-name: Run Tests
+name: CI
+
+# 唯一的构建工作流：测试矩阵 + 发布。
+#
+# 历史上这里是两个文件（test-push.yml 跑测试、publish.yml 跑发布），两者都对
+# dev/1.17-wcpe 的 push 触发，于是每次推送都开两条流水线，各自重新 checkout、
+# 装 JDK、装 Gradle，同一份提交被完整处理两遍。更严重的是两者互不知情——
+# 实测 1.17-dev.167 就是在 Run Tests 失败（DecompileTest 下载超时）的情况下
+# 照常发布出去的。
+#
+# 合并后：
+#   · 分支推送 → 测试矩阵 → 发布开发版（**必须等测试通过**）
+#   · tag 推送 → 直接发布正式版（矩阵只在分支上跑：该提交推到分支时已被测过，
+#     打 tag 再跑一遍 78 个作业纯属浪费）
 on:
   push:
     branches:
       - dev/1.17-wcpe
-    # 显式排除所有 tag。本仓库的 patch-queue/<线> 是可移动的队列标记 tag，每次插入补丁
-    # 都会 force-push 前移一次；wcpe-v* 正式版 tag 的发布由 publish.yml 负责。
-    # 上游原版此处为 `on: push`（无过滤），会匹配一切 ref，导致每次前移队列标记都白跑
-    # 一轮完整测试（实测约 40 分钟）。注意此文件随补丁队列一起被重放，tag 推送触发时
-    # GitHub 读取的正是本提交上的版本，故修正必须落在队列内。
-    tags-ignore:
-      - '**'
-    # 纯文档推送不跑测试：与 publish.yml 的 paths-ignore 对齐，
-    # 避免一行 README 改动就白跑一轮约 30 分钟的完整测试。
-    # 仅作用于 push 触发，PR 仍照常运行，以免分支保护要求的状态检查缺失。
+    tags:
+      - 'wcpe-v*'
     paths-ignore:
       - 'README.md'
       - 'CHANGELOG.md'
@@ -30,8 +35,15 @@ on:
           - 'false'
           - 'true'
 
+permissions:
+  contents: read
+  # 注：合并后不再有「正式版运行取消分支运行」那一步——单个工作流里同一 ref 的
+  # 并发已由 concurrency 处理，跨 ref 的重复由 publish 的 guard（提交已带 tag 则跳过
+  # 开发版）兜底，因此这里不再需要 actions: write。
+
+# 同一分支的连续推送互相取代；正式版各占一组，避免被分支事件取消。
 concurrency:
-  group: build-${{ github.event.pull_request.number || github.ref }}
+  group: build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -77,6 +89,8 @@ jobs:
   prepare_test_matrix:
     # Lets wait to ensure it builds before going running tests
     needs: build
+    # tag 推送不跑矩阵：该提交推到分支时已被测过
+    if: github.ref_type != 'tag'
 
     runs-on: ubuntu-24.04
     # 单作业超时。GitHub 默认是 6 小时——曾有一个用例在内层 Gradle daemon OOM 后挂死，
@@ -100,11 +114,15 @@ jobs:
 
   run_tests:
     needs: prepare_test_matrix
+    if: github.ref_type != 'tag'
 
     strategy:
       fail-fast: false
-      # TestKit 各矩阵任务共享外部 Maven 仓库，限制并发以降低集中下载触发 403/runner 失联的概率。
-      max-parallel: 6
+      # 限制并发的原意是「TestKit 各矩阵任务共享外部 Maven 仓库，限制并发以降低集中下载
+      # 触发 403/runner 失联的概率」。但那是缓存缺位时的判断：现在依赖与 MC 产物都走缓存，
+      # 命中后基本不再打外部仓库，403 风险大幅下降。
+      # 实测 66 个作业串行总时长 299 分钟，6 路并发即约 50 分钟墙钟；提到 12 路约 25 分钟。
+      max-parallel: 12
       matrix:
         test: ${{ fromJson(needs.prepare_test_matrix.outputs.matrix) }}
 
@@ -115,13 +133,56 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
-      # TestKit 使用 .gradle/test-files/integration/gradle_home，不是 runner 默认 Gradle User Home。
-      - name: 缓存 TestKit Gradle 依赖
+      # 外层 Gradle User Home（wrapper 发行版 + 插件依赖）。
+      #
+      # 本工作流有约 78 个矩阵作业，每个都在全新 runner 上跑。此前**完全没有**这一层缓存，
+      # 意味着每个作业都要重新下载 Gradle 9.5.0-all 发行版（约 200MB）与全部插件依赖，
+      # 78 个作业就是同一份东西重复下载 78 次——这是「测试为什么那么久」的主因。
+      #
+      # 注意与下方 TestKit 缓存的分工：那一份管的是**内层** TestKit 构建的 gradle_home，
+      # 这一份管的是**外层**跑 ./gradlew 的那个 Gradle User Home，两者互不覆盖。
+      - name: 配置 Gradle（外层依赖与构建缓存）
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          # 只读：78 个矩阵作业都去写同一份缓存纯属浪费——每个作业在结束前都要打包上传，
+          # 而 GitHub 对已存在的 key 会拒绝保存。写入统一交给下方指定的那个测试作业。
+          cache-read-only: true
+      # TestKit 的内层构建用 .gradle/test-files/integration/gradle_home 作为 Gradle User Home，
+      # 不是 runner 默认的那个。这里缓存三部分：
+      #
+      #   modules-2        依赖构件
+      #   wrapper/dists    内层 Gradle 发行版
+      #   fabric-loom/minecraftMaven  Loom 解析/重映射后的 MC 产物（remapped jar、映射表）
+      #
+      # 只取 minecraftMaven 而不是整个 fabric-loom：后者本地实测 11GB（含 assets 1.5GB
+      # 与各版本工作目录 4.9GB），超过 GitHub 单仓库 10GB 的缓存上限，存进去会被 LRU
+      # 立刻挤掉。minecraftMaven 3.9GB，正是重映射产物本身，复用价值最高。
+      #
+      # 恢复（只读）与写入分开：78 个矩阵作业各自在结束前打包上传 4GB 是纯浪费，
+      # 且 GitHub 对已存在的 key 会直接拒绝。因此绝大多数作业只 restore，
+      # 由单个指定作业负责写入（见下一个步骤）。
+      - name: 恢复 TestKit 缓存（只读）
+        if: matrix.test != 'net.fabricmc.loom.test.integration.forge.ForgeTest'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            .gradle/test-files/integration/gradle_home/caches/modules-2
+            .gradle/test-files/integration/gradle_home/wrapper/dists
+            .gradle/test-files/integration/gradle_home/caches/fabric-loom/minecraftMaven
+          key: ${{ runner.os }}-testkit-gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', '**/*.gradle', '**/*.gradle.kts', 'src/test/**') }}
+          restore-keys: |
+            ${{ runner.os }}-testkit-gradle-
+
+      # 唯一负责写 TestKit 缓存的作业：ForgeTest 是最重的 MC 产物消费者，跑完时
+      # gradle_home 内容最完整。用普通 actions/cache（读 + 写）。
+      - name: 恢复并写入 TestKit 缓存
+        if: matrix.test == 'net.fabricmc.loom.test.integration.forge.ForgeTest'
         uses: actions/cache@v6
         with:
           path: |
             .gradle/test-files/integration/gradle_home/caches/modules-2
             .gradle/test-files/integration/gradle_home/wrapper/dists
+            .gradle/test-files/integration/gradle_home/caches/fabric-loom/minecraftMaven
           key: ${{ runner.os }}-testkit-gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', '**/*.gradle', '**/*.gradle.kts', 'src/test/**') }}
           restore-keys: |
             ${{ runner.os }}-testkit-gradle-
@@ -138,7 +199,7 @@ jobs:
         with:
           java-version: 25
           distribution: 'temurin'
-      - run: ./gradlew printActionsTestName --name="${{ matrix.test }}" test --tests ${{ matrix.test }} --stacktrace --warning-mode fail
+      - run: ./gradlew printActionsTestName --name="${{ matrix.test }}" test --tests "${{ matrix.test }}" --stacktrace --warning-mode fail
         env:
           TEST_WARNING_MODE: fail
           EXTENDED_TESTS: ${{ github.event.inputs.extended_tests }}
@@ -183,7 +244,7 @@ jobs:
         with:
           java-version: 25
           distribution: 'temurin'
-      - run: ./gradlew printActionsTestName --name="${{ matrix.test }}" test --tests ${{ matrix.test }} --stacktrace --warning-mode fail
+      - run: ./gradlew printActionsTestName --name="${{ matrix.test }}" test --tests "${{ matrix.test }}" --stacktrace --warning-mode fail
         env:
           TEST_WARNING_MODE: fail
         id: test
@@ -202,6 +263,7 @@ jobs:
   # Special case this test to run across all os's
   reproducible_build_test:
     needs: build
+    if: github.ref_type != 'tag'
 
     strategy:
       fail-fast: false
@@ -221,10 +283,172 @@ jobs:
           java-version: ${{ matrix.java }}
           distribution: 'temurin'
 
-      - run: ./gradlew test --tests *ReproducibleBuildTest --stacktrace --warning-mode fail
+      - run: ./gradlew test --tests "*ReproducibleBuildTest" --stacktrace --warning-mode fail
 
       - uses: actions/upload-artifact@v7
         if: ${{ failure() }}
         with:
           name: Reproducible Build ${{ matrix.os }} (${{ matrix.java }}) Results
           path: build/reports/
+
+  # 发布：分支推送发开发版，tag 推送发正式版。
+  #
+  # 与测试矩阵合并到同一工作流后，发布可以直接 needs 测试结论——不再存在
+  # 「Run Tests 失败、CI 照常发布」的时间窗（1.17-dev.167 就是这么发出去的）。
+  publish:
+    needs: [build, run_tests, reproducible_build_test]
+    # 分支：三个前置都成功才发布；tag：矩阵被上面的 if 跳过，只要求 build 成功。
+    # 用 !cancelled() 而不是 always()：被取消的运行不该继续发布。
+    # 必须限定 event_name == 'push'：PR 的 github.ref_type 也是 'branch'，不限定会在
+    # PR 上尝试发布（凭据缺失且语义错误）。
+    if: |
+      !cancelled() && github.event_name == 'push' && needs.build.result == 'success' &&
+      (github.ref_type == 'tag' ||
+       (needs.run_tests.result == 'success' && needs.reproducible_build_test.result == 'success'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    outputs:
+      is-release: ${{ steps.meta.outputs.is-release }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: 配置 JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - uses: gradle/actions/wrapper-validation@v6
+
+      - name: 配置 Gradle（依赖与构建缓存）
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          # 只读：缓存的写入交给测试矩阵里那个指定作业，本作业不需要重复上传。
+          cache-read-only: true
+
+      - name: 判断构建类型
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/wcpe-v* ]]; then
+            # 正式版：版本号取 tag 名去掉 wcpe-v 前缀（wcpe-v1.17.1 → 1.17.1）
+            VERSION="${GITHUB_REF#refs/tags/wcpe-v}"
+            echo "is-release=true" >> "$GITHUB_OUTPUT"
+            echo "release-version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "is-prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            # 开发版：1.17-dev.<运行号>，运行号单调递增，天然满足产物不可覆盖
+            echo "is-release=false" >> "$GITHUB_OUTPUT"
+            echo "release-version=1.17-dev.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "is-prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 判断该提交是否已是正式版
+        id: guard
+        shell: bash
+        run: |
+          # 正式版运行自身不跳过；分支推送若指向已带 wcpe-v* tag 的提交，则不再重复构建开发版
+          if [[ "${GITHUB_REF_TYPE}" == "branch" ]] && git tag --points-at HEAD | grep -q '^wcpe-v'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "该提交已带正式版 tag，跳过开发版构建"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 只跑单元测试：集成测试的权威结论由上面的矩阵给出（同一工作流、同一提交、已并行跑完），
+      # 在这里重跑同一批用例既慢又无法提供额外保障。PatchedDecompileTest 单独要 8 分 46 秒，
+      # 验证的是反编译产物正确性，与「能否发布」无关。
+      - name: 发布前冒烟（单元测试）
+        if: steps.guard.outputs.skip != 'true'
+        run: ./gradlew test --tests "net.fabricmc.loom.test.unit.*" --build-cache --no-daemon --stacktrace --warning-mode fail
+        env:
+          CI: true
+          RELEASE_VERSION: ${{ steps.meta.outputs.release-version }}
+
+      - name: 上传发布前冒烟的失败报告
+        if: failure() && steps.guard.outputs.skip != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: publish-smoke-test-results
+          path: |
+            build/reports/tests/test/
+            build/test-results/test/
+
+      - name: 构建并发布
+        if: steps.guard.outputs.skip != 'true'
+        # --build-cache：命中时直接复用矩阵作业产出的编译/jar 等任务产物
+        run: ./gradlew build publish exportVersion -x test --build-cache --no-daemon --stacktrace
+        env:
+          CI: true
+          RELEASE_VERSION: ${{ steps.meta.outputs.release-version }}
+          IS_PRERELEASE: ${{ steps.meta.outputs.is-prerelease }}
+          PUBLISH_LATEST: ${{ steps.meta.outputs.is-prerelease == 'true' && 'dev' || 'stable' }}
+          ORG_GRADLE_PROJECT_wcpeUsername: ${{ secrets.WCPE_USERNAME }}
+          ORG_GRADLE_PROJECT_wcpePassword: ${{ secrets.WCPE_PASSWORD }}
+
+  # 正式版发布后创建 GitHub Release（仅 tag 触发）
+  release:
+    needs: publish
+    if: needs.publish.outputs.is-release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+        with:
+          # 生成变更清单要遍历 PREV_TAG..TAG 的提交，fetch-depth=1 拿不到历史
+          fetch-depth: 0
+          # 推导上一版 tag 需要本地有 wcpe-v* 标签
+          fetch-tags: true
+
+      - name: 创建 GitHub Release（按提交生成变更清单）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        # 不用 `--generate-notes`：它只统计经 PR 合入的提交，而本仓库以直推为主。
+        # 改由 scripts/gen-release-notes.sh 按提交生成。
+        run: |
+          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::Release $TAG_NAME 已存在，跳过重复创建"
+            exit 0
+          fi
+
+          # 不用 `git describe`：它按祖先关系找最近 tag，而本仓库会重写补丁队列历史，
+          # 已发布 tag 可能不在当前提交的祖先链上（实测 1.17.13 因此被跳过、多算一整版）。
+          # 改按**版本号顺序**取前一个，与拓扑无关；换算到主线由 release-anchors.txt 完成。
+          PREV_TAG="$(git tag -l 'wcpe-v*' | sort -V | awk -v cur="${TAG_NAME}" '
+            $0 == cur { print prev; exit }
+            { prev = $0 }
+          ')"
+          if [ -z "${PREV_TAG}" ]; then
+            echo "::error::找不到 ${TAG_NAME} 之前的正式版 tag，无法确定变更区间"
+            exit 1
+          fi
+          echo "变更区间: ${PREV_TAG}..${TAG_NAME}"
+
+          VERSION="${TAG_NAME#wcpe-v}"
+          NOTES_FILE="$(mktemp)"
+          # 用 origin/ 前缀：本作业由 tag 触发、处于 detached 状态，checkout 只建
+          # refs/remotes/origin/*，不建同名本地分支。用本地名会让脚本误判「不在主线」。
+          WCPE_MAIN_REF="${WCPE_DEFAULT_BRANCH:-origin/dev/1.17-wcpe}" \
+            bash scripts/gen-release-notes.sh "${PREV_TAG}" "${TAG_NAME}" > "${NOTES_FILE}"
+          echo "--- 生成的变更清单 ---"
+          cat "${NOTES_FILE}"
+
+          if gh release create "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "WCPE Loom ${VERSION}" \
+            --notes-file "${NOTES_FILE}"; then
+            :
+          elif gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::Release $TAG_NAME 已由并发运行创建"
+            exit 0
+          else
+            exit 1
+          fi
