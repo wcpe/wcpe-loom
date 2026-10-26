@@ -326,8 +326,6 @@ jobs:
     runs-on: ubuntu-24.04
     # 门禁瘦身后只跑单元测试（原 48 分钟 → 约 3 分钟），75 分钟的旧余量已无必要。
     timeout-minutes: 30
-    outputs:
-      is-release: ${{ steps.meta.outputs.is-release }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v6
@@ -412,7 +410,11 @@ jobs:
   # 正式版发布后创建 GitHub Release（仅 tag 触发）
   release:
     needs: publish
-    if: needs.publish.outputs.is-release == 'true'
+    # 直接判 ref 类型，不依赖 publish 的 job output。
+    # 实测（run #148，tag wcpe-v1.17.16）依赖 output 时 release 被跳过、Release 未创建：
+    # publish 的 if 里带 !cancelled()，其 outputs 在该情形下没有传过来。
+    # 「推了 tag 且 publish 成功」就是创建 Release 的充分条件，不需要再绕一层。
+    if: github.ref_type == 'tag' && needs.publish.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
