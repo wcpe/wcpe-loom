@@ -124,10 +124,29 @@ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
 				sources.artifact();
 				sources.ignoreGradleMetadataRedirection();
 			});
+		});
 
-			// Fallback to maven central for artifacts such as sources or javadocs that are not mirrored on Mojang's repo.
-			// See: https://github.com/FabricMC/fabric-loom/issues/1032
-			repo.artifactUrls(ArtifactRepositoryContainer.MAVEN_CENTRAL_URL);
+		// Fallback to maven central for artifacts such as sources or javadocs that are not mirrored on Mojang's repo.
+		// See: https://github.com/FabricMC/fabric-loom/issues/1032
+		//
+		// 这里用「紧随其后的独立仓库」而不是 Mojang 仓库上的 artifactUrls：后者已被 Gradle 标记为
+		// 弃用（MavenArtifactRepository.artifactUrls 计划在 Gradle 10 移除），且没有同版本替代方法。
+		// 语义上二者等价——artifactUrls 表达的就是「POM 找不到时再去这些地址找构件」，而把同一个
+		// Maven Central 作为后一个仓库，解析顺序与失败回退都一致。
+		//
+		// 该仓库必须紧挨 Mojang 之后：Mojang 仓库在下方会按 issue #621 提前到项目自带的
+		// mavenCentral 之前，这个回退仓库跟着一起提前，才能保持「Mojang → 回退 → 其它」的次序。
+		MavenArtifactRepository mojangArtifactFallback = repositories.maven(repo -> {
+			repo.setName("MojangArtifactFallback");
+			repo.setUrl(ArtifactRepositoryContainer.MAVEN_CENTRAL_URL);
+
+			// 与 Mojang 仓库保持同一套 metadataSources：回退只负责补上缺失的构件文件，
+			// 不引入 Gradle module metadata（避免 Mojang 制品被 GMM 重定向）。
+			repo.metadataSources(sources -> {
+				sources.mavenPom();
+				sources.artifact();
+				sources.ignoreGradleMetadataRedirection();
+			});
 		});
 		repositories.maven(repo -> {
 			repo.setName("Forge");
@@ -154,8 +173,15 @@ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
 		ArtifactRepository mavenCentral = repositories.findByName(ArtifactRepositoryContainer.DEFAULT_MAVEN_CENTRAL_REPO_NAME);
 
 		if (mavenCentral != null) {
+			// 先移出、再按「Mojang → 回退」的次序整体插回 mavenCentral 之前。
+			// 只移动 Mojang 而把回退仓库留在原处会让次序变成「Mojang → …其它仓库… → 回退」，
+			// 那就破坏了 issue #1032 要的「Mojang 查不到立刻去 Central 取构件」。
+			repositories.remove(mojangArtifactFallback);
 			repositories.remove(mojangRepo);
-			repositories.add(repositories.indexOf(mavenCentral), mojangRepo);
+
+			final int index = repositories.indexOf(mavenCentral);
+			repositories.add(index, mojangArtifactFallback);
+			repositories.add(index, mojangRepo);
 		}
 
 		repositories.mavenCentral();
