@@ -60,6 +60,13 @@ jobs:
           distribution: 'temurin'
       - uses: actions/checkout@v6
       - uses: gradle/actions/wrapper-validation@v6
+      # 本作业是整条流水线的第一个 Gradle 消费者，也是外层 Gradle User Home 缓存的
+      # **唯一写入者**。必须能写：缓存不存在时若全链路只读，这份缓存永远是空的。
+      # （run_tests / publish 里都设了 cache-read-only: true，只读不写。）
+      - name: 配置 Gradle（外层依赖缓存，负责播种）
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          cache-read-only: false
       - run: ./gradlew build check -x test --stacktrace --warning-mode fail
       - uses: Juuxel/publish-checkstyle-report@v3
         if: ${{ failure() }}
@@ -104,6 +111,10 @@ jobs:
           java-version: 21
           distribution: 'temurin'
       - uses: actions/checkout@v6
+      - name: 配置 Gradle（只读缓存）
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          cache-read-only: true
       - run: ./gradlew writeActionsTestMatrix --stacktrace --warning-mode fail
       -
         id: set-matrix
@@ -162,7 +173,7 @@ jobs:
       # 且 GitHub 对已存在的 key 会直接拒绝。因此绝大多数作业只 restore，
       # 由单个指定作业负责写入（见下一个步骤）。
       - name: 恢复 TestKit 缓存（只读）
-        if: matrix.test != 'net.fabricmc.loom.test.integration.forge.ForgeTest'
+        if: strategy.job-index != 0
         uses: actions/cache/restore@v6
         with:
           path: |
@@ -173,10 +184,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-testkit-gradle-
 
-      # 唯一负责写 TestKit 缓存的作业：ForgeTest 是最重的 MC 产物消费者，跑完时
-      # gradle_home 内容最完整。用普通 actions/cache（读 + 写）。
+      # 唯一负责写 TestKit 缓存的作业：取矩阵第 0 项。
+      #
+      # 刻意不用 `matrix.test == '<某个具体类名>'`：那样一旦矩阵生成逻辑变化
+      # （比如该类被并入某个前缀组），条件永远不匹配，缓存会**静默停止更新**且
+      # 不会报任何错。job-index 是位置判据，与矩阵内容无关，永远恰好一个作业命中。
       - name: 恢复并写入 TestKit 缓存
-        if: matrix.test == 'net.fabricmc.loom.test.integration.forge.ForgeTest'
+        if: strategy.job-index == 0
         uses: actions/cache@v6
         with:
           path: |
@@ -283,6 +297,10 @@ jobs:
           java-version: ${{ matrix.java }}
           distribution: 'temurin'
 
+      - name: 配置 Gradle（只读缓存）
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          cache-read-only: true
       - run: ./gradlew test --tests "*ReproducibleBuildTest" --stacktrace --warning-mode fail
 
       - uses: actions/upload-artifact@v7
@@ -306,7 +324,8 @@ jobs:
       (github.ref_type == 'tag' ||
        (needs.run_tests.result == 'success' && needs.reproducible_build_test.result == 'success'))
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    # 门禁瘦身后只跑单元测试（原 48 分钟 → 约 3 分钟），75 分钟的旧余量已无必要。
+    timeout-minutes: 30
     outputs:
       is-release: ${{ steps.meta.outputs.is-release }}
     steps:
