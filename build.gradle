@@ -649,8 +649,8 @@ abstract class WriteActionsTestMatrix extends DefaultTask {
 		// 现有的 forge / neoforge 用例本来也要冷建工具链），拆成独立矩阵项反而会各付一次。
 		def mergedSubdirs = [
 			'architectury',
-			'neoforge',
-			'pipeline'
+			'neoforge'
+			// 'pipeline' 已移出：它单独走下面的前缀分组，拆成多个矩阵项以缩短关键路径。
 		]
 		// Subdirectories where individual tests are added to the matrix (= longer tests)
 		def directSubdirs = ['forge']
@@ -686,7 +686,52 @@ abstract class WriteActionsTestMatrix extends DefaultTask {
 			} else if (it.name.endsWith("noRemap")) {
 				testMatrix.add("net.fabricmc.loom.test.integration.noRemap.*")
 			} else if (it.isDirectory()) {
-				if (mergedSubdirs.contains(it.name)) {
+				if (it.name == 'pipeline') {
+					// pipeline 有 23 个类，早先整体塞进一个矩阵项（pipeline.*），实测独占 26.3 分钟——
+					// 它一个人就决定了整条流水线的最短墙钟，其它 65 个作业再怎么并行都得等它。
+					//
+					// 当初合并的理由是「共用 TestKit 的 gradle_home，只有第一个付冷启动成本」。
+					// 现在 gradle_home 的关键目录（modules-2 / wrapper/dists /
+					// caches/fabric-loom/minecraftMaven）都已进 actions/cache，
+					// 冷启动成本由缓存吸收，这个理由不再成立。
+					//
+					// 按类名前缀拆成 4 个互不重叠的组，其余 5 个无前缀的类逐个成项。
+					// Gradle 的 --tests 支持通配符，因此不需要改工作流里那条 --tests 调用。
+					//
+					// Forge 一族刻意**不拆**：这些 *Equivalence 用例会先把共享缓存里的产物
+					// 移到 build/gold-backup 再整链重建，用例之间存在隐含的先后依赖。
+					// 实测拆成 ForgePatched* / ForgeBinpatcher* / ForgeTool* 独立作业后，
+					// 三个作业都以 NoSuchFileException 失败：
+					//   .../caches/fabric-loom/1.20.1/.../mappings-srg-migrated.tiny
+					// 保留在同一个作业里按原顺序执行即正常（run #143 通过、run #145 失败）。
+					testMatrix.add("net.fabricmc.loom.test.integration.pipeline.Forge*")
+					testMatrix.add("net.fabricmc.loom.test.integration.pipeline.ProcessMinecraftJar*")
+					testMatrix.add("net.fabricmc.loom.test.integration.pipeline.Remap*")
+					testMatrix.add("net.fabricmc.loom.test.integration.pipeline.Srg*")
+
+					// 未被上述前缀覆盖的类（FabricSplitRemap / MinecraftJarTaskWiring /
+					// ModSourcesColdCache / SplitModDependencyProducer / ZipFsCloseRaceHeal）
+					// 逐个成项；新增类若落入已覆盖前缀会自动归组，若不带这些前缀则自动单项，
+					// 不需要维护名单。
+					def coveredPrefixes = [
+						'Forge',
+						'ProcessMinecraftJar',
+						'Remap',
+						'Srg'
+					]
+
+					it.eachFile { child ->
+						if (!child.name.endsWith('.groovy')) {
+							return
+						}
+
+						def className = child.name.replace('.groovy', '')
+
+						if (!coveredPrefixes.any { className.startsWith(it) }) {
+							testMatrix.add("net.fabricmc.loom.test.integration.pipeline.${className}")
+						}
+					}
+				} else if (mergedSubdirs.contains(it.name)) {
 					testMatrix.add("net.fabricmc.loom.test.integration.${it.name}.*")
 				} else if (directSubdirs.contains(it.name)) {
 					it.eachFile { child ->
