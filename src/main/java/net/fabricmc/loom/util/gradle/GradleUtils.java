@@ -25,6 +25,10 @@
 package net.fabricmc.loom.util.gradle;
 
 import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.util.Properties;
 import java.util.function.Consumer;
 
 import org.gradle.api.Project;
@@ -136,10 +140,57 @@ public final class GradleUtils {
 		LoomGradleExtension extension = LoomGradleExtension.get(project);
 
 		if (extension.isProjectIsolationActive()) {
-			return project.getProviders().gradleProperty(key).getOrNull();
+			final String gradleProperty = project.getProviders().gradleProperty(key).getOrNull();
+
+			if (gradleProperty != null) {
+				return gradleProperty;
+			}
+
+			// gradleProperty 只覆盖 GRADLE_USER_HOME 与**根项目**的 gradle.properties，
+			// 读不到子项目目录下那份。而子项目把自己的属性写在各自的 gradle.properties 是
+			// 合法且常见的用法（本仓库的 Forge 车道就靠 <sub>/gradle.properties 里的
+			// loom.platform=forge 声明平台）。早期这里直接返回 null，导致 platform 退化为
+			// 默认的 FABRIC → isForgeLike() 为 false → forge/neoforge 相关 configuration
+			// 根本不注册，最终表现为项目执行 add("forge", ...) 时报
+			// 「Configuration with name 'forge' not found」。
+			//
+			// 刻意不用 project.findProperty()：它在属性未定义时会沿层级向父项目查找，
+			// 隔离项目下会被判定为跨项目访问（cannot dynamically look up a property in
+			// the parent project）。这里只读**本项目目录**下的文件，不产生任何跨项目读取。
+			return readOwnGradleProperties(project, key);
 		}
 
 		return project.findProperty(key);
+	}
+
+	/**
+	 * 从**本项目目录**的 {@code gradle.properties} 读取属性；不存在该文件时返回 {@code null}.
+	 *
+	 * <p>只读本项目目录，不向父项目回溯，因此在隔离项目模式下是安全的。
+	 * 文件内容变化会进入配置缓存输入（见 {@link #configurationInputFile}），
+	 * 与 Gradle 自身对该文件的处理一致。
+	 */
+	@Nullable
+	private static String readOwnGradleProperties(Project project, String key) {
+		final File propertiesFile = new File(project.getProjectDir(), "gradle.properties");
+
+		if (!propertiesFile.isFile()) {
+			return null;
+		}
+
+		configurationInputFile(project, propertiesFile);
+
+		final Properties properties = new Properties();
+
+		try (InputStream input = Files.newInputStream(propertiesFile.toPath())) {
+			properties.load(input);
+		} catch (IOException e) {
+			// 读不出来时按「没有这个属性」处理，与 gradleProperty 未命中的语义保持一致，
+			// 不把可选的属性读取升级成构建失败。
+			return null;
+		}
+
+		return properties.getProperty(key);
 	}
 
 	// A hack to include the given file in the configuration cache input
