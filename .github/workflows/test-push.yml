@@ -418,17 +418,37 @@ jobs:
   # 正式版发布后创建 GitHub Release（仅 tag 触发）
   release:
     needs: publish
-    # 直接判 ref 类型，不依赖 publish 的 job output。
-    # 实测（run #148，tag wcpe-v1.17.16）依赖 output 时 release 被跳过、Release 未创建：
-    # publish 的 if 里带 !cancelled()，其 outputs 在该情形下没有传过来。
-    # 「推了 tag 且 publish 成功」就是创建 Release 的充分条件，不需要再绕一层。
-    if: github.ref_type == 'tag' && needs.publish.result == 'success'
+    # 作业级 if 只判「publish 成功且未被取消」，**不在 github 表达式里判 tag**。
+    #
+    # 历史教训（f2492d58，2026-10-27）：原来用 needs.publish.outputs.is-release，
+    # 改成 github.ref_type == 'tag' 之后，1.17.16 与 1.17.17 两次 tag 发布的 release
+    # 作业都是 skipped（1.17.15 及更早是 success），两个版本的 Release 都只能事后手动补建。
+    # 对照同一工作流里 publish 的 if：它能成功执行只能是因为 ref_type 判成了 'tag'
+    # （另一支路要求 run_tests 与 reproducible_build_test 都 success，而它们在 tag 上被 skip），
+    # 所以问题不在 ref_type 本身，而在“把 tag 判定放在作业级 if 里”这个做法不够稳。
+    #
+    # 改成：作业级只留 !cancelled()，真正的 tag 判定下沉到 step 里用 GITHUB_REF 前缀，
+    # 与 publish 的“判断构建类型”步骤同一判据（那里已实测可靠，发布出的就是 1.17.17）。
+    # 非 tag 运行时该 step 直接跳过，不会误建 Release。
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
+      - name: 确认这是正式版 tag 触发
+        id: tagguard
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/wcpe-v* ]]; then
+            echo "is-tag=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is-tag=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::非正式版 tag（GITHUB_REF=${GITHUB_REF}），不创建 Release"
+          fi
+
       - name: 检出代码
+        if: steps.tagguard.outputs.is-tag == 'true'
         uses: actions/checkout@v6
         with:
           # 生成变更清单要遍历 PREV_TAG..TAG 的提交，fetch-depth=1 拿不到历史
@@ -437,6 +457,7 @@ jobs:
           fetch-tags: true
 
       - name: 创建 GitHub Release（按提交生成变更清单）
+        if: steps.tagguard.outputs.is-tag == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
