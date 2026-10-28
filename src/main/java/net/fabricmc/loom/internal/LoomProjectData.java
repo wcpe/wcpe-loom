@@ -284,6 +284,16 @@ public final class LoomProjectData implements Serializable {
 			return Optional.of(data);
 		}
 
+		// 先按约定路径直接探测导出文件，**不解析配置**：解析含 ProjectDependency 的 configuration 会让 Gradle
+		// 去配置对端项目（ensureConfigured → 状态转换需要全部 worker lease）。在 --parallel 下这是一条能把
+		// 配置线程卡死的跨项目求值入口（它曾经与 CompileConfiguration 的全局 monitor 构成锁序反转），
+		// 而暖构建下这里的产物只是一个已经存在于磁盘上的小 JSON，没必要为此去配置另一个项目。
+		final Optional<Path> probed = probeExportedFile(project, dependency);
+
+		if (probed.isPresent()) {
+			return read(probed.get());
+		}
+
 		final Path path;
 
 		try {
@@ -308,6 +318,46 @@ public final class LoomProjectData implements Serializable {
 		// 项目配置完成 → 回到起点。
 		// 文件存在却读不出来仍由 read 抛出（见其 javadoc），损坏不会被伪装成「没有数据」。
 		return read(path);
+	}
+
+	/**
+	 * 按约定路径探测依赖项目导出的数据文件，避开「解析 configuration 会触发对端项目配置」这条路径.
+	 *
+	 * <p>约定路径与 {@code ExportLoomProjectDataTask} 的 {@code @OutputFile} 同源：
+	 * {@code <依赖项目目录>/build/loom/project-data.json}。依赖项目自定义了 {@code layout.buildDirectory}
+	 * 时探测会落空，此时返回 {@link Optional#empty()} 并由调用方退回解析路径（解析能拿到真实路径，
+	 * 代价是跨项目求值），保持行为不变。
+	 *
+	 * <p><b>隔离模式（Isolated Projects）下直接返回空</b>：{@code findProject(...).getProjectDir()} 是
+	 * 被 Gradle 禁止的跨项目模型访问，本方法不能在那里碰其它项目的状态。隔离模式原本就不会因为
+	 * 这条回退路径而崩——下方解析会被 Gradle 判为非法访问并抛出，再由 {@code catch} 降级为空。
+	 *
+	 * @param project 发起查询的项目
+	 * @param dependency 待查询的项目依赖
+	 * @return 已存在的导出文件路径；不存在 / 不可探测时为空
+	 */
+	private static Optional<Path> probeExportedFile(Project project, ProjectDependency dependency) {
+		if (LoomGradleExtension.get(project).isProjectIsolationActive()) {
+			return Optional.empty();
+		}
+
+		try {
+			final Project dependent = project.findProject(dependency.getPath());
+
+			if (dependent == null) {
+				// 依赖替换、复合构建等场景下项目的路径可能不在本构建里，交给解析路径处理
+				return Optional.empty();
+			}
+
+			// 只读本项目的布局约定与对端项目目录（不触发对端配置）
+			final Path candidate = dependent.getProjectDir().toPath().resolve("build/loom/project-data.json");
+
+			return Files.isRegularFile(candidate) ? Optional.of(candidate) : Optional.empty();
+		} catch (RuntimeException e) {
+			// 探测只是优化，任何失败都退回解析路径，不得改变原有语义
+			LOGGER.debug("Failed to probe exported data of {}", dependency.getPath(), e);
+			return Optional.empty();
+		}
 	}
 
 	/**

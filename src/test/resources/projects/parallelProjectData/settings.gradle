@@ -1,0 +1,4 @@
+rootProject.name = "parallel-project-data"
+
+include "core"
+include "consumer"

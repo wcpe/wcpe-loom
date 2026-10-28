@@ -1,0 +1,29 @@
+plugins {
+	id 'dev.architectury.loom'
+}
+
+version = "1.0.0"
+group = "com.example"
+
+base {
+	archivesName = "consumer"
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:1.20.4"
+	mappings loom.officialMojangMappings()
+	modImplementation "net.fabricmc:fabric-loader:0.15.6"
+
+	// 关键：子项目之间的 project 依赖。它让 consumer 的 jar processor spec 需要读 core 的
+	// 跨项目数据（mod 元数据、mixin 映射），也就是走上 LoomProjectData.fromDependency。
+	// 修复前那条路径会解析一个含 ProjectDependency 的 detachedConfiguration，从而在配置期
+	// 触发对 core 的求值，并在 --parallel 下与其它配置线程互相等待。
+	//
+	// 刻意用 implementation 而不是 modImplementation：modImplementation 属于 Loom 的 remap 配置，
+	// 它在配置期就要打开对端的 dev jar 读元数据（ModConfigurationRemapper.getMetadata），
+	// 而 dev jar 要等 jar 任务跑完才存在——那会让本用例在配置期就以
+	// “NoSuchFileException: core/build/devlibs/core-1.0.0-dev.jar”失败，走不到要验证的路径。
+	// implementation 同样会出现在 runtimeClasspath / compileClasspath 上，因此
+	// SpecContext.getDependentProjectData 仍会经 ProjectView 读到 core 的跨项目数据。
+	implementation project(path: ":core", configuration: "namedElements")
+}

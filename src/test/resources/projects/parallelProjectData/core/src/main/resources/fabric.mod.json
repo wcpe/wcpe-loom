@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "id": "paralleldata-core",
+  "version": "1.0.0",
+  "name": "Parallel Project Data Core",
+  "environment": "*"
+}

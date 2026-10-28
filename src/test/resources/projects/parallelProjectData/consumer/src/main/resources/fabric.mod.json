@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "id": "paralleldata-consumer",
+  "version": "1.0.0",
+  "name": "Parallel Project Data Consumer",
+  "environment": "*"
+}

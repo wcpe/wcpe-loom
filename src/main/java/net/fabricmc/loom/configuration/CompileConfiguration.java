@@ -37,7 +37,6 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
-import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
@@ -110,7 +109,6 @@ import net.fabricmc.loom.util.service.ScopedServiceFactory;
 import net.fabricmc.loom.util.service.ServiceFactory;
 
 public abstract class CompileConfiguration implements Runnable {
-	private static final String LOCK_PROPERTY_KEY = "fabric.loom.internal.global.lock";
 	// 本进程当前持有的构建锁路径，用于识别同一进程内的重复加锁
 	private static final Set<Path> OWNED_LOCKS = ConcurrentHashMap.newKeySet();
 	private FileLock processLock;
@@ -155,11 +153,24 @@ public abstract class CompileConfiguration implements Runnable {
 			}
 
 			try {
-				// Setting up loom across Gradle projects is not thread safe, synchronize it here to ensure that multiple projects cannot use it.
-				// There is no easy way around this, as we want to use the same global cache for downloaded or generated files.
-				synchronized (getGlobalLockObject()) {
-					setupMinecraft(configContext);
-				}
+				// 刻意**不**在这里包一层「跨项目全局锁」。历史上这里是一把经系统属性共享的 String monitor，
+				// 目的是让同一 JVM 内所有项目（含不同 classloader 的多份 Loom）串行化共享缓存的生产。
+				// 它现在同时是 --parallel 下必然可复现的死锁源：
+				//
+				//   持锁线程正在 setupMinecraft 里往上走，而 setupMinecraft 内部会回到 Gradle 的项目配置机制
+				//   （MinecraftJarProcessorManager.create → RemappedSpecContext → LoomProjectData.fromDependency
+				//   → configuration.getSingleFile() → Gradle ensureConfigured → DefaultSynchronizer.takeOwnership，
+				//   后者是阻塞调用，要求所有 worker lease 归还）；与此同时其余配置线程正各自持着 lease
+				//   BLOCKED 在这把 monitor 上。锁序反转成立 → 整个 daemon 永久卡死（实测两个 daemon 各 7 个线程）。
+				//
+				// 删掉它是安全的：锁原本要保证的「同一共享缓存条目只被生产一次」已经由每个生产点各自的 per-key 跨进程锁
+				// 承担（CacheEntryLock / LoomCacheService.runExclusive，键覆盖 mc 版本+映射标识、mappings、download、
+				// remap、processed、forge 补丁链等全部产出路径，且同 JVM 内还叠加了按 key 的监视器）；
+				// 该锁覆盖的静态可变状态也各自有锁（LoomGradleSharedData.REGISTRATION_LOCK、
+				// IdeaDownloadSourcesRegistry.REGISTRATION_LOCK、RemapMinecraftTaskRegistry 对 extensions 的同步），
+				// 落盘一律走 AtomicFiles.publish。剩下的唯一作用只是「把各项目的 setup 串成一条」，
+				// 而这恰好就是把 Gradle 的项目状态转换拖进临界区、造出上述死锁的原因。
+				setupMinecraft(configContext);
 
 				var dependencyManager = new LoomDependencyManager(getProject(), serviceFactory, extension);
 				dependencyManager.handleDependencies();
@@ -328,9 +339,8 @@ public abstract class CompileConfiguration implements Runnable {
 	/**
 	 * 跨进程供给已映射的 Minecraft jar.
 	 *
-	 * <p>getGlobalLockObject 只覆盖 JVM 内（同一 daemon 的多个 classloader），多个 daemon 并发构建同一版本时
-	 * 仍会同时生产共享缓存产物并互相踩踏；因此按 Minecraft 版本 + 映射标识叠加一把 per-key 跨进程文件锁，
-	 * 不同版本仍可并行。输出检查与重建必须同属一个事务，否则另一进程会在本项目读取 intermediary 时将它删除并重建。
+	 * <p>共享缓存的生产互斥由每个生产点各自的 per-key 跨进程锁承担（见 {@link LoomCacheService}），
+	 * 多个 daemon 并发构建同一版本时也不会互相踩踏；不同版本仍可并行。输出检查与重建必须同属一个事务，否则另一进程会在本项目读取 intermediary 时将它删除并重建。
 	 */
 	private void provideMappedMinecraftJars(LoomGradleExtension extension, Project project, ConfigContext configContext,
 			MinecraftJarConfiguration<?, ?, ?> jarConfiguration,
@@ -773,17 +783,8 @@ public abstract class CompileConfiguration implements Runnable {
 		});
 	}
 
-	// This is a nasty piece of work, but seems to work quite nicely.
-	// We need a lock that works across classloaders, a regular synchronized method will not work here.
-	// We can abuse system properties as a shared object store that we know for sure will be on the same classloader regardless of what Gradle does to loom.
-	// This allows us to ensure that all instances of loom regardless of classloader get the same object to lock on.
-	private static Object getGlobalLockObject() {
-		if (!System.getProperties().contains(LOCK_PROPERTY_KEY)) {
-			// The .intern resolves a possible race where two difference value objects (remember not the same classloader) are set.
-			//noinspection StringOperationCanBeSimplified
-			System.getProperties().setProperty(LOCK_PROPERTY_KEY, LOCK_PROPERTY_KEY.intern());
-		}
-
-		return Objects.requireNonNull(System.getProperty(LOCK_PROPERTY_KEY));
-	}
+	// 这里曾有 getGlobalLockObject()：一把经系统属性共享、跨 classloader 的 String monitor，
+	// 用来把同一 JVM 内各项目的 setupMinecraft 串行化。它已随 run() 里的调用点一起删除，
+	// 原因是它在 --parallel 下与 Gradle 的项目状态转换构成锁序反转，会让 daemon 永久死锁；
+	// 具体分析见 run() 中该调用点位置的注释。
 }

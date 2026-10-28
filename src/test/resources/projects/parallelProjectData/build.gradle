@@ -1,0 +1,11 @@
+// 根项目本身不应用 Loom，只用来驱动两个子项目的并行配置。
+// 应用 Loom 的只有 core 与 consumer，这样每个子项目各持一个 CompileConfiguration，
+// 才能复现“多个配置线程同时进 setupMinecraft”的条件。
+plugins {
+	id 'java'
+}
+
+allprojects {
+	version = "1.0.0"
+	group = "com.example"
+}
