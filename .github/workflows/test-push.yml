@@ -357,11 +357,18 @@ jobs:
             echo "is-release=true" >> "$GITHUB_OUTPUT"
             echo "release-version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "is-prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "publish-latest=stable" >> "$GITHUB_OUTPUT"
           else
-            # 开发版：1.17-dev.<运行号>，运行号单调递增，天然满足产物不可覆盖
+            # 开发版：直接用 1.17-SNAPSHOT。SNAPSHOT 是 Maven 里唯一允许“同版本号换内容”的形态，
+            # 正好对应开发线语义；Nexus 会按快照保留策略自动清理旧时间戳构件，
+            # 因此不再占 1.17-dev.<运行号> 那种不可回收的固定版号。
             echo "is-release=false" >> "$GITHUB_OUTPUT"
-            echo "release-version=1.17-dev.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "release-version=1.17-SNAPSHOT" >> "$GITHUB_OUTPUT"
             echo "is-prerelease=true" >> "$GITHUB_OUTPUT"
+            # 开发版不更新任何指针（它的版本号本身就是 SNAPSHOT）。
+            # 必须留空而不是用 `A && '' || 'stable'` 的写法：空字符串在 GitHub 表达式里是 falsy，
+            # 那个写法永远得到 'stable'，会让开发版错盖稳定线指针 1.17-latest。
+            echo "publish-latest=" >> "$GITHUB_OUTPUT"
           fi
 
       - name: 判断该提交是否已是正式版
@@ -403,7 +410,8 @@ jobs:
           CI: true
           RELEASE_VERSION: ${{ steps.meta.outputs.release-version }}
           IS_PRERELEASE: ${{ steps.meta.outputs.is-prerelease }}
-          PUBLISH_LATEST: ${{ steps.meta.outputs.is-prerelease == 'true' && 'dev' || 'stable' }}
+          # 由 meta 步骤直接给出：正式版 stable，开发版空。
+          PUBLISH_LATEST: ${{ steps.meta.outputs.publish-latest }}
           ORG_GRADLE_PROJECT_wcpeUsername: ${{ secrets.WCPE_USERNAME }}
           ORG_GRADLE_PROJECT_wcpePassword: ${{ secrets.WCPE_PASSWORD }}
 
