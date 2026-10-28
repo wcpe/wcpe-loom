@@ -26,6 +26,7 @@ package net.fabricmc.loom.configuration.processors.speccontext;
 
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Stream;
@@ -33,6 +34,8 @@ import java.util.stream.Stream;
 import org.gradle.api.Project;
 import org.gradle.api.artifacts.Configuration;
 import org.gradle.api.artifacts.ProjectDependency;
+import org.gradle.api.artifacts.result.ResolvedDependencyResult;
+import org.gradle.api.artifacts.result.ResolutionResult;
 import org.gradle.api.attributes.Usage;
 import org.gradle.api.logging.Logger;
 import org.gradle.api.logging.Logging;
@@ -64,8 +67,15 @@ public interface ProjectView {
 	 * Gradle 报告。
 	 *
 	 * <p><b>隔离模式（Isolated Projects）</b>：跨项目求值被 Gradle 禁止，无法用上面的手段补救，
-	 * 依赖项目的数据要么恰好因配置顺序已可得，要么缺失——本方法不改变这一点，只在数据确实缺失时
-	 * 输出一条按（当前项目，依赖项目）去重的告警（见 {@code AbstractProjectView} 的实现说明）。
+	 * 依赖项目的数据要么恰好因配置顺序已可得，要么缺失。这里做两件事弥补：
+	 * <ul>
+	 *   <li>把依赖项目的 {@code exportLoomProjectData} 产物声明为本项目编译任务的输入
+	 *       （{@code wireProjectDataTask}），Gradle 据此自动把该任务纳入任务图——本次构建里
+	 *       数据文件就一定会在被读取前产出，不再依赖「上一次构建恰好跑过导出」；</li>
+	 *   <li>数据仍缺失时（例如对端不是 Loom 项目）输出一条按（当前项目，依赖项目）去重的告警。</li>
+	 * </ul>
+	 * 需要说明的是：配置期读取与执行期产出之间存在时序差，接线保证的是「文件在本次构建内会被
+	 * 产出、供执行期消费」，它不能把配置期那次读取变成「一定能读到」（配置期本就不执行任务）。
 	 * 彻底消除该不确定性需要把 mapped/processed jar 的产出从配置期搬进任务，属于架构级改动。
 	 *
 	 * @param name 配置名（通常是 {@code runtimeClasspath} / {@code compileClasspath}）
@@ -127,6 +137,15 @@ public interface ProjectView {
 		 */
 		private final Set<String> warnedMissingDependencyData = new HashSet<>();
 
+		/**
+		 * 已经接过线的依赖项目路径.
+		 *
+		 * <p>同一依赖项目会同时出现在 runtime 与 compile 两条 classpath 上，接线方法因此会被调用两次，
+		 * 而 Gradle 不允许同一个任务上出现同名输入属性（{@code Multiple input file properties with name ...}）。
+		 * 去重范围限定在本视图实例内：与告警去重同理，不用静态状态，避免被复用的 daemon 带进后续构建。
+		 */
+		private final Set<String> wiredProjectDataDependencies = new HashSet<>();
+
 		protected AbstractProjectView(Project project) {
 			this.project = project;
 			this.extension = LoomGradleExtension.get(project);
@@ -158,17 +177,138 @@ public interface ProjectView {
 		private Optional<LoomProjectData> getLoomProjectData(ProjectDependency dependency, boolean readDependencyData) {
 			if (readDependencyData) {
 				ensureDependencyEvaluated(dependency);
+
+				// 只在隔离模式下接线，理由见 wireProjectDataTask 的说明。
+				if (extension.isProjectIsolationActive()) {
+					wireProjectDataTask(dependency);
+				}
 			}
 
 			final Optional<LoomProjectData> data = LoomProjectData.fromDependency(project, dependency);
 
-			if (data.isEmpty() && readDependencyData && extension.isProjectIsolationActive()) {
+			if (data.isEmpty() && readDependencyData && extension.isProjectIsolationActive() && isDependencyLoomProject(dependency)) {
 				// 隔离模式下无法强制求值，缺失只能告警；不在读取无意义（disableProjectDependantMods）
 				// 的场景告警，否则会为没有消费方的项目制造噪音。
+				//
+				// 必须再限定「依赖确实是 Loom 项目」：fromDependency 的 Optional.empty() 有**两种**含义，
+				// 它自己的 javadoc 已写明——(a) 依赖本来就不是 Loom 项目，没有该可消费配置；
+				// (b) 是 Loom 项目但数据在配置期不可得。这两种后果天差地别，却共用同一条告警：
+				//   (a) 它压根没有 mod 元数据 / access widener / access transformer / mixin 可丢，
+				//       告警纯属噪音（实测下游 14 模块工程里 22 条告警中绝大多数属于此类，
+				//       而被点名的 9 个模块没有一个带 mixin/AW/AT；唯一带 mixin 的 impl-server 反而没被点名）；
+				//   (b) 才是真问题。
+				// 不区分会让真问题淹没在噪音里。
 				warnMissingDependencyDataOnce(dependency);
 			}
 
 			return data;
+		}
+
+		/**
+		 * {@return 该依赖是否暴露了 Loom 的跨项目数据配置}.
+		 *
+		 * <p><b>为什么不能查对端的插件应用状态</b>：{@code LoomGradlePlugin.isApplied(dependent)} 会读
+		 * {@code dependent.getPluginManager()}，属于「对端项目的模型」。在 Isolated Projects 下这是非法
+		 * 跨项目访问，实测会报出成百上千条「cannot access 'Project.pluginManager' functionality on
+		 * another project」并把整个构建打挂。
+		 *
+		 * <p>改用 Gradle 自己的依赖解析结果：声明一条指向对方 {@code loomProjectDataElements} 的依赖，
+		 * 看 Gradle 能否解析出变体。非 Loom 项目没有该可消费配置，解析结果会带
+		 * {@link UnresolvedDependencyResult}。这条路径完全在依赖图层面，不碰对端的模型对象，
+		 * 因此在 IP 下是允许的——与 {@code LoomProjectData.resolveDataFile} 用的是同一种机制。
+		 *
+		 * <p>只有确实暴露了该配置、却仍然拿不到数据，才是真问题（数据未就绪）；
+		 * 本来就没这个配置的项目（普通 java 库）不该被警告——它们压根没有 mod 元数据、
+		 * access widener、access transformer 或 mixin 可丢。
+		 *
+		 * @param dependency 待判定的项目依赖
+		 * @return 对方暴露了 {@code loomProjectDataElements} 时为 true
+		 */
+		private boolean isDependencyLoomProject(ProjectDependency dependency) {
+			try {
+				final Configuration probe = project.getConfigurations().detachedConfiguration(
+						project.getDependencies().project(Map.of(
+								"path", dependency.getPath(),
+								"configuration", LoomProjectData.DATA_ELEMENTS_CONFIGURATION
+						)));
+				probe.setTransitive(false);
+
+				final ResolutionResult result = probe.getIncoming().getResolutionResult();
+				return result.getRoot().getDependencies().stream().anyMatch(dep -> dep instanceof ResolvedDependencyResult);
+			} catch (RuntimeException e) {
+				// 判定失败不升级为告警（宁可少报，不可误报）
+				LOGGER.debug("Failed to determine whether {} exposes Loom project data", dependency.getPath(), e);
+				return false;
+			}
+		}
+
+		/**
+		 * 把依赖项目的跨项目数据文件接线到本项目的任务图上，让它在消费之前被产出.
+		 *
+		 * <p><b>只在隔离模式调用</b>（调用点见 {@link #getLoomProjectData}）：非隔离模式下数据一律
+		 * 来自内存共享表（读取前用 {@code evaluationDependsOn} 强制对端先求值），导出的文件不参与
+		 * 本次构建。在那里接线只会多跑一个本体不需要的任务，并打破「非隔离模式不依赖导出文件」
+		 * 这条既有契约（{@code ProjectDataColdStartTest} 就钉着它）。
+		 *
+		 * <p><b>为什么需要这一步</b>：{@code exportLoomProjectData} 是执行期任务，配置期读不到它
+		 * 尚未产出的文件；而数据缺失就是那条「跨项目数据不可得」告警的成因。仅靠「读文件」无法
+		 * 解决——文件总得有人先写出来。Gradle 的标准做法是把该产物声明成**任务输入**：
+		 * {@code files(detachedConfiguration(...))} 自带的 {@code buildDependencies} 会让 Gradle
+		 * 自动把生产者的任务纳入任务图，无需手写 {@code dependsOn(":other:task")}。
+		 *
+		 * <p><b>为什么不破坏三个机制</b>（均在含 {@code parallel/configuration-cache/
+		 * isolated-projects/configure-on-demand} 的最小工程上实测）：
+		 * <ul>
+		 *   <li>配置缓存：{@code detachedConfiguration} 与 {@code FileCollection} 都是 Gradle 原生
+		 *       可序列化对象，无 {@code InvalidUserCodeException}；</li>
+		 *   <li>构建缓存：{@code exportLoomProjectData} 本身是 {@code @CacheableTask}，带完整
+		 *       {@code @Input}/{@code @OutputFile}，命中时直接复用；</li>
+		 *   <li>按需配置：接线走 artifact 依赖，不调 {@code tasks.named(":other:...")}
+		 *       （后者在 Isolated Projects 下抛 {@code InvalidUserCodeException}）。
+		 *       实测「无关项目是否被配置」与「是否接线」无关。</li>
+		 * </ul>
+		 *
+		 * <p>接线是幂等的：每次解析只创建一条 detached 配置，且只用于挂输入，不参与任何产物路径。
+		 *
+		 * @param dependency 依赖项目
+		 */
+		private void wireProjectDataTask(ProjectDependency dependency) {
+			// 只给真正的 Loom 项目接线：非 Loom 项目没有 loomProjectDataElements 可消费配置，
+			// 声明它的 artifact 会让 Gradle 在解析阶段报
+			// 「no variant with that configuration name exists」而把整个构建打挂。
+			// 这类依赖本来就没有跨项目数据可用，不接线也不会损失任何东西。
+			if (!isDependencyLoomProject(dependency)) {
+				return;
+			}
+
+			// 同一项目会同时出现在 runtime 与 compile 两条 classpath 上，本方法因此会被调用两次；
+			// Gradle 不允许同一个任务上出现同名输入属性。
+			if (!wiredProjectDataDependencies.add(dependency.getPath())) {
+				return;
+			}
+
+			try {
+				final Configuration dataConfiguration = project.getConfigurations().detachedConfiguration(
+						project.getDependencies().project(Map.of(
+								"path", dependency.getPath(),
+								"configuration", LoomProjectData.DATA_ELEMENTS_CONFIGURATION
+						)));
+				dataConfiguration.setTransitive(false);
+				// 非 Loom 项目没有这个可消费配置；lenient 让「没这个变体」退化为空集合，
+				// 而不是在任务依赖求解阶段把整个构建打挂。
+				dataConfiguration.getIncoming().getResolutionResult();
+				final var dataFiles = dataConfiguration.getIncoming()
+						.artifactView(view -> view.setLenient(true))
+						.getFiles();
+
+				// 声明成「所有编译任务」的输入：Gradle 据此把对端的 exportLoomProjectData 纳入任务图。
+				project.getTasks().withType(org.gradle.api.tasks.compile.JavaCompile.class)
+						.configureEach(task -> task.getInputs().files(dataFiles).withPropertyName(
+								"loomProjectData_" + dependency.getPath().replace(':', '_')));
+			} catch (RuntimeException e) {
+				// 接线失败不得升级为构建失败：最坏情形退化为「数据不可得」，由告警告知
+				LOGGER.debug("Failed to wire project data task of {}", dependency.getPath(), e);
+			}
 		}
 
 		/**

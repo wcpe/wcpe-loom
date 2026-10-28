@@ -104,6 +104,25 @@ class ProjectDataColdStartTest extends Specification implements GradleProjectTes
 		!dependencyDataFile(gradle).exists()
 	}
 
+	def "isolated projects wires the dependency's export task into the task graph"() {
+		setup:
+		def gradle = gradleProject(project: "projectDataColdStart", version: DEFAULT_GRADLE)
+
+		and: "冷启动前提：数据文件从未产出过"
+		deleteBuildDirectories(gradle)
+		assert !dependencyDataFile(gradle).exists()
+
+		when: "隔离模式下配置期不允许强制对端求值，只能靠任务图把导出任务拉进来"
+		def result = gradle.run(tasks: [":app:build"], isloatedProjects: true)
+
+		then: "构建必须成功，且依赖项目的数据导出任务确实进入了本次任务图"
+		result.task(":app:build").outcome == SUCCESS
+		result.task(":lib:exportLoomProjectData") != null
+
+		and: "数据在本次构建里被产出到磁盘（这正是接线要保证的事），并非依赖上一次构建的残留"
+		dependencyDataFile(gradle).exists()
+	}
+
 	def "a data file that exists but cannot be parsed no longer affects the consumer build"() {
 		setup:
 		def gradle = gradleProject(project: "projectDataColdStart", version: DEFAULT_GRADLE)

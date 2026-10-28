@@ -24,6 +24,7 @@
 
 package net.fabricmc.loom.internal;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.Serializable;
 import java.io.UncheckedIOException;
@@ -284,26 +285,13 @@ public final class LoomProjectData implements Serializable {
 			return Optional.of(data);
 		}
 
-		// 先按约定路径直接探测导出文件，**不解析配置**：解析含 ProjectDependency 的 configuration 会让 Gradle
-		// 去配置对端项目（ensureConfigured → 状态转换需要全部 worker lease）。在 --parallel 下这是一条能把
-		// 配置线程卡死的跨项目求值入口（它曾经与 CompileConfiguration 的全局 monitor 构成锁序反转），
-		// 而暖构建下这里的产物只是一个已经存在于磁盘上的小 JSON，没必要为此去配置另一个项目。
-		final Optional<Path> probed = probeExportedFile(project, dependency);
-
-		if (probed.isPresent()) {
-			return read(probed.get());
-		}
-
+		// 解析依赖项目的跨项目数据文件。走 Gradle 官方的 variant-aware ArtifactView（见
+		// resolveDataFile 的说明）：它沿依赖图取已声明的产物，不读对端项目的模型，因此在
+		// 隔离项目（Isolated Projects）下也是合法的。
 		final Path path;
 
 		try {
-			Configuration configuration = project.getConfigurations().detachedConfiguration(
-					project.getDependencies().project(Map.of(
-						"path", dependency.getPath(),
-						"configuration", DATA_ELEMENTS_CONFIGURATION
-					)));
-			configuration.setTransitive(false);
-			path = configuration.getSingleFile().toPath();
+			path = resolveDataFile(project, dependency);
 		} catch (RuntimeException e) {
 			// 「本来就没有」：依赖不是 Loom 项目、没有该可消费配置，或数据尚未登记。
 			// 这类情况在混用普通 jar 依赖的项目里很常见，因此只记 debug，不打断构建。
@@ -321,43 +309,47 @@ public final class LoomProjectData implements Serializable {
 	}
 
 	/**
-	 * 按约定路径探测依赖项目导出的数据文件，避开「解析 configuration 会触发对端项目配置」这条路径.
+	 * 用 Gradle 官方的 variant-aware 视图解析依赖项目的跨项目数据文件.
 	 *
-	 * <p>约定路径与 {@code ExportLoomProjectDataTask} 的 {@code @OutputFile} 同源：
-	 * {@code <依赖项目目录>/build/loom/project-data.json}。依赖项目自定义了 {@code layout.buildDirectory}
-	 * 时探测会落空，此时返回 {@link Optional#empty()} 并由调用方退回解析路径（解析能拿到真实路径，
-	 * 代价是跨项目求值），保持行为不变。
+	 * <p>走 {@code getIncoming().artifactView(...)} 而不是裸的 {@code configuration.getSingleFile()}：
+	 * ArtifactView 是 Gradle 为「拿对端产物」提供的官方通道，它会保留 component identity
+	 * （解析结果能告诉调用方“这条 artifact 来自 :other-project”），而 {@code getSingleFile()} 只
+	 * 返回一个路径，把依赖来源信息丢掉了。在隔离项目下前者也是合法的——它不读取对端项目的模型
+	 * （扩展 / 配置 / 源集），只沿依赖图取已声明的产物。
 	 *
-	 * <p><b>隔离模式（Isolated Projects）下直接返回空</b>：{@code findProject(...).getProjectDir()} 是
-	 * 被 Gradle 禁止的跨项目模型访问，本方法不能在那里碰其它项目的状态。隔离模式原本就不会因为
-	 * 这条回退路径而崩——下方解析会被 Gradle 判为非法访问并抛出，再由 {@code catch} 降级为空。
+	 * <p>{@code lenient = true} 是必要的：冷构建时 {@code exportLoomProjectData} 尚未执行、
+	 * 产物文件尚不存在，或依赖根本不是 Loom 项目（没有该可消费配置）。lenient 让这些情形
+	 * 退化为“解析结果为空”而不是抛异常，与本方法的“空 = 没有数据”语义一致。
 	 *
 	 * @param project 发起查询的项目
 	 * @param dependency 待查询的项目依赖
-	 * @return 已存在的导出文件路径；不存在 / 不可探测时为空
+	 * @return 数据文件路径；解析不到任何 artifact 时抛 {@link IllegalStateException}
 	 */
-	private static Optional<Path> probeExportedFile(Project project, ProjectDependency dependency) {
-		if (LoomGradleExtension.get(project).isProjectIsolationActive()) {
-			return Optional.empty();
+	private static Path resolveDataFile(Project project, ProjectDependency dependency) {
+		final Configuration configuration = project.getConfigurations().detachedConfiguration(
+				project.getDependencies().project(Map.of(
+						"path", dependency.getPath(),
+						"configuration", DATA_ELEMENTS_CONFIGURATION
+				)));
+		configuration.setTransitive(false);
+
+		final Set<File> files = configuration.getIncoming()
+				.artifactView(view -> view.setLenient(true))
+				.getFiles()
+				.getFiles();
+
+		if (files.isEmpty()) {
+			// 不抛异常：由调用方的 catch 转成 Optional.empty（“本来就没有数据”），
+			// 与「不是 Loom 项目」的原有语义保持一致。
+			throw new IllegalStateException("Dependency " + dependency.getPath() + " exposes no " + DATA_ELEMENTS_CONFIGURATION + " artifact");
 		}
 
-		try {
-			final Project dependent = project.findProject(dependency.getPath());
-
-			if (dependent == null) {
-				// 依赖替换、复合构建等场景下项目的路径可能不在本构建里，交给解析路径处理
-				return Optional.empty();
-			}
-
-			// 只读本项目的布局约定与对端项目目录（不触发对端配置）
-			final Path candidate = dependent.getProjectDir().toPath().resolve("build/loom/project-data.json");
-
-			return Files.isRegularFile(candidate) ? Optional.of(candidate) : Optional.empty();
-		} catch (RuntimeException e) {
-			// 探测只是优化，任何失败都退回解析路径，不得改变原有语义
-			LOGGER.debug("Failed to probe exported data of {}", dependency.getPath(), e);
-			return Optional.empty();
+		if (files.size() > 1) {
+			throw new IllegalStateException("Dependency %s exposes %d %s artifacts, expected exactly one"
+					.formatted(dependency.getPath(), files.size(), DATA_ELEMENTS_CONFIGURATION));
 		}
+
+		return files.iterator().next().toPath();
 	}
 
 	/**
