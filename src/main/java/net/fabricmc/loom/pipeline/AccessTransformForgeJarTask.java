@@ -122,7 +122,7 @@ public abstract class AccessTransformForgeJarTask extends DefaultTask {
 	public abstract Property<String> getAtJavaExecutable();
 
 	/**
-	 * 是否把 AT 工具的标准输出透传到构建日志。
+	 * 是否把 AT 工具的标准输出透传到构建日志.
 	 *
 	 * <p>标记为 {@code @Internal} 而**不是** {@code @Input}：它只决定输出流接哪里，
 	 * 不参与产物字节。当它是 {@code @Input} 时，本任务虽标了 {@code @CacheableTask}
@@ -132,7 +132,7 @@ public abstract class AccessTransformForgeJarTask extends DefaultTask {
 	@Internal
 	public abstract Property<Boolean> getAtVerboseStdout();
 
-	/** 同 {@link #getAtVerboseStdout()}：只影响日志透传，不影响产物。 */
+	/** 同 {@link #getAtVerboseStdout()}：只影响日志透传，不影响产物. */
 	@Internal
 	public abstract Property<Boolean> getAtVerboseStderr();
 

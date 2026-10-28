@@ -30,7 +30,6 @@ import org.gradle.api.logging.Logger;
 import org.gradle.api.logging.Logging;
 import org.gradle.api.provider.Property;
 import org.gradle.api.provider.Provider;
-import org.gradle.api.tasks.Input;
 import org.gradle.api.tasks.InputFiles;
 import org.gradle.api.tasks.Internal;
 import org.gradle.api.tasks.Nested;
@@ -102,7 +101,7 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
 		Property<SourceRemapperService.Options> getSourceRemapperService();
 
 		/**
-		 * 是否把工具的标准错误透传到构建日志。
+		 * 是否把工具的标准错误透传到构建日志.
 		 *
 		 * <p>标记为 {@code @Internal} 而**不是** {@code @Input}：它只决定错误流接哪里，
 		 * 不参与任何产物字节；而取值随构建日志级别与 stacktrace 开关变化

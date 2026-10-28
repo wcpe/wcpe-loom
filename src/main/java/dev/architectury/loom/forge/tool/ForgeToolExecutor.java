@@ -113,7 +113,7 @@ public final class ForgeToolExecutor {
 		ConfigurableFileCollection getExecClasspath();
 
 		/**
-		 * 是否把工具的标准输出透传到构建日志。
+		 * 是否把工具的标准输出透传到构建日志.
 		 *
 		 * <p>标记为 {@code @Internal} 而**不是** {@code @Input}：本值只决定「输出流接哪里」，
 		 * 不参与任何产物字节。而它的取值随构建日志级别变化（{@link #shouldShowVerboseStdout}），
@@ -128,7 +128,7 @@ public final class ForgeToolExecutor {
 		@Internal
 		Property<Boolean> getShowVerboseStdout();
 
-		/** 同 {@link #getShowVerboseStdout()}：只影响日志透传，不影响产物。 */
+		/** 同 {@link #getShowVerboseStdout()}：只影响日志透传，不影响产物. */
 		@Internal
 		Property<Boolean> getShowVerboseStderr();
 
