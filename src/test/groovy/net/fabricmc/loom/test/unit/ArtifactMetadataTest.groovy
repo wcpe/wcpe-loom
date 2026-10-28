@@ -143,6 +143,13 @@ class ArtifactMetadataTest extends Specification {
 		"1.17-wcpe-6" | "1.17-wcpe-5"
 		"1.17-wcpe-6" | "1.17-wcpe-6"
 		"1.18-wcpe-6" | "1.17-wcpe-5"
+		// 开发线版本号自己也要能解析：1.17-SNAPSHOT 曾被切成 "17-SNAPSHOT" 而报 Invalid Loom version
+		"1.17-SNAPSHOT" | "1.17.17"
+		"1.17-SNAPSHOT" | "1.17-wcpe-6"
+		"1.17-SNAPSHOT" | "1.17-SNAPSHOT"
+		"1.17-SNAPSHOT" | "1.16.99"
+		"1.17-dev.1234" | "1.17.17"
+		"1.17-PR.7.42"  | "1.17.17"
 	}
 
 	// Test that a mod with the same or older version of loom can be read
@@ -177,6 +184,10 @@ class ArtifactMetadataTest extends Specification {
 		"1.17-wcpe-6"   | "1.x"              | "1.x"
 		"1.17-wcpe-6"   | "1.17-wcpe-x"     | "1.17-wcpe-x"
 		"1.17-wcpe-6"   | "1.17-wcpe-"      | "1.17-wcpe-"
+		// 后缀白名单之外的一律仍判非法：剥掉任意 -xxx 会把笔误当成合法版本号
+		"1.17-SNAPSHOT" | "1.17-x"         | "1.17-x"
+		"1.17-SNAPSHOT" | "1.17-snapshot"  | "1.17-snapshot"
+		"1.17-SNAPSHOT" | "1.17-dev"       | "1.17-dev"
 	}
 
 	def "Accepts all Loom versions for remap 'false'"() {

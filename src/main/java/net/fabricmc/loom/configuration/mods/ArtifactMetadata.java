@@ -35,6 +35,7 @@ import java.util.Locale;
 import java.util.function.Predicate;
 import java.util.jar.Attributes;
 import java.util.jar.Manifest;
+import java.util.regex.Pattern;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonSyntaxException;
@@ -58,6 +59,20 @@ public record ArtifactMetadata(boolean isFabricMod, RemapRequirements remapRequi
 	private static final String INSTALLER_PATH = "fabric-installer.json";
 
 	private static final Logger LOGGER = LoggerFactory.getLogger(ArtifactMetadata.class);
+
+	/**
+	 * 开发线限定后缀：{@code -SNAPSHOT} / {@code -dev.<运行号>} / {@code -PR.<PR号>.<运行号>}.
+	 *
+	 * <p>这三种都由本项目的发布流水线自己产生（见 build.gradle 的版本推导），
+	 * 必须与 {@code -wcpe-<序号>} 一样先剥掉，否则 {@code 1.17-SNAPSHOT} 会被切成
+	 * {@code 17-SNAPSHOT} 而判成非法版本。
+	 */
+	private static final Pattern DEVELOPMENT_VERSION_SUFFIX = Pattern.compile("-(?:SNAPSHOT|dev\\.\\d+|PR\\.\\d+\\.\\d+)$");
+
+	/**
+	 * 版本号末尾的 WCPE 序号后缀：{@code -wcpe-<序号>} / {@code -wcpe-dev} / {@code -wcpe-ci}.
+	 */
+	private static final Pattern WCPE_VERSION_SUFFIX = Pattern.compile("-wcpe-(?:0|[1-9]\\d*|dev|ci)$");
 
 	// ARCH: Quilt support
 	private static final String QUILT_INSTALLER_PATH = "quilt_installer.json";
@@ -178,7 +193,12 @@ public record ArtifactMetadata(boolean isFabricMod, RemapRequirements remapRequi
 	}
 
 	private static int parseVersionPart(String version, int part) {
-		final String normalizedVersion = version.replaceFirst("-wcpe-(?:0|[1-9]\\d*|dev|ci)$", "");
+		// 先剥开发线后缀再剥 WCPE 序号后缀：两者不会同时出现，但这样写对任一种都不会留下残渣。
+		// 只剥白名单里的形态，不剥任意 -xxx —— 否则 1.17-wcpe-x 这类笔误会变成合法版本号。
+		String normalizedVersion = version;
+		normalizedVersion = DEVELOPMENT_VERSION_SUFFIX.matcher(normalizedVersion).replaceFirst("");
+		normalizedVersion = WCPE_VERSION_SUFFIX.matcher(normalizedVersion).replaceFirst("");
+
 		final String[] versionParts = normalizedVersion.split("\\.");
 
 		if (versionParts.length <= part || !versionParts[part].matches("\\d+")) {
