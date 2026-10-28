@@ -102,6 +102,6 @@ Forwarded: <取值>
 | 主题 | Origin | Forwarded |
 |---|---|---|
 | 本线自行开发的补丁，以及 CI/文档/脚本等仓库元数据 | `vendor, wcpe-loom` | `not-needed` |
-| 其中修复既有缺陷、值得反馈上游者（AW/AT 条目纯值化进配置缓存、SourceRemapper 静默丢 MC classpath、ForgeSources 空 jar 与反编译缓存键、Forge 处理器执行期重建两处缺陷、AT 规则按目标 jar 命名空间翻译、jar processor 哈希随配置顺序漂移） | `vendor, wcpe-loom` | `no` |
+| 其中修复既有缺陷、值得反馈上游者（AW/AT 条目纯值化进配置缓存、SourceRemapper 静默丢 MC classpath、ForgeSources 空 jar 与反编译缓存键、Forge 处理器执行期重建两处缺陷、AT 规则按目标 jar 命名空间翻译、jar processor 哈希随配置顺序漂移、forge 日志透传开关被当缓存输入） | `vendor, wcpe-loom` | `no` |
 | legacy Forge 专属（universal jar 重映射到 named、继承方法映射补全）——上游 1.17 已移除该链路 | `vendor, wcpe-loom` | `no` |
 | spotless 的 Eclipse P2 镜像与 `splitModDependency` 夹具堆设置——本仓库环境专属 | `vendor, wcpe-loom` | `not-needed` |
