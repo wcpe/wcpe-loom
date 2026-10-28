@@ -39,8 +39,10 @@ if (ENV.RELEASE_VERSION) {
 	// 发布流程可显式指定版本号（如从 tag 推导的 1.17.3），优先于按运行号推导
 	version = ENV.RELEASE_VERSION
 } else if (!isSnapshot) {
-	// 分支构建与正式版分属不同命名空间：正式版为 1.17.<N>（仅 tag 发布），分支构建为 1.17-dev.<运行号>
-	version = baseVersion + "-dev." + runNumber
+	// 分支构建直接用 1.17-SNAPSHOT：开发版不再占固定版本号（见下方 publications 的说明）。
+	// SNAPSHOT 是 Maven 里唯一可以“同版本号换内容”的形态，正好对应开发线的语义，
+	// 且 Nexus 会按自己的快照保留策略自动清理旧时间戳构件，仓库不会只增不减。
+	version = baseVersion + '-SNAPSHOT'
 } else {
 	version = baseVersion + "-PR." + ENV.PR_NUM + "." + runNumber
 }
@@ -227,6 +229,16 @@ java {
 	sourceCompatibility = JavaVersion.VERSION_21
 	targetCompatibility = JavaVersion.VERSION_21
 }
+
+// 不发 javadoc.jar：它是单次发布里最大的单个文件（实测 3.4 MiB，占一次发布的 49%），
+// 而本仓库的使用方是 mod 开发者，读文档看的是 sources.jar（IDE 内直接跳转），
+// 几乎不会去下载 javadoc 构件。开发线改成 SNAPSHOT 后每次推送都会产生一份快照，
+// 这个文件的累计开销变得主导，因此不再随发布产出。
+//
+// 用 configureEach 而不是 named('javadocJar')：该任务由 java-gradle-plugin 在稍后注册，
+// 在 java {} 块里用 named 会抛 “Task with name 'javadocJar' not found”。
+// 注：:javadoc 任务本身仍然保留并参与 `check`，所以文档注释的语法错误照样会拦住 CI。
+tasks.matching { it.name == 'javadocJar' }.configureEach { it.enabled = false }
 
 spotless {
 	lineEndings = com.diffplug.spotless.LineEnding.UNIX
@@ -466,17 +478,18 @@ publishing {
 
 	publications { pubs ->
 		if (!isSnapshot && !ENV.EXPERIMENTAL) {
-			// 除具体版本外，额外发布一组固定版本（随每次发布覆盖）：
-			//   1.17-SNAPSHOT    —— 始终指向最近一次发布（不论正式版还是分支构建）
-			//   1.17-latest      —— 稳定线指针，仅正式版发布时更新
-			//   1.17-dev-latest  —— 开发线指针，仅分支构建时更新
-			// 使用者写指针版本即可，无需关心单调递增的运行号。
-			def extraVersions = [(baseVersion + '-SNAPSHOT'): 'snapshot']
+			// 只保留稳定线的指针版本（随每次发布覆盖）：
+			//   1.17-latest  —— 稳定线指针，仅正式版发布时更新
+			//
+			// 开发线不再需要额外指针：分支构建的主 version 本身就是 1.17-SNAPSHOT（版本号推导段），
+			// 使用者写 1.17-SNAPSHOT 就是最新开发版。历史上这里还发 1.17-SNAPSHOT / 1.17-dev-latest
+			// 两个指针，加上每次构建的 1.17-dev.<运行号> 固定版号；三者叠加导致仓库只增不减
+			// （实测每个版本 5 个文件 6.86 MiB，含一份 3.4 MiB 的 javadoc.jar）。
+			// 现在开发线只占一份 SNAPSHOT，由 Nexus 按快照保留策略自动清理旧时间戳构件。
+			def extraVersions = [:]
 
 			if (ENV.PUBLISH_LATEST == 'stable') {
 				extraVersions[baseVersion + '-latest'] = 'latest'
-			} else if (ENV.PUBLISH_LATEST == 'dev') {
-				extraVersions[baseVersion + '-dev-latest'] = 'devLatest'
 			}
 
 			def projectGroup = project.group
