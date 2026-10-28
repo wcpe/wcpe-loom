@@ -49,6 +49,7 @@ import org.gradle.api.tasks.CacheableTask;
 import org.gradle.api.tasks.Classpath;
 import org.gradle.api.tasks.Input;
 import org.gradle.api.tasks.InputFile;
+import org.gradle.api.tasks.Internal;
 import org.gradle.api.tasks.Optional;
 import org.gradle.api.tasks.OutputFile;
 import org.gradle.api.tasks.PathSensitive;
@@ -120,12 +121,19 @@ public abstract class AccessTransformForgeJarTask extends DefaultTask {
 	@Optional
 	public abstract Property<String> getAtJavaExecutable();
 
-	/** 是否把 AT 工具的标准输出透传到构建日志. */
-	@Input
+	/**
+	 * 是否把 AT 工具的标准输出透传到构建日志。
+	 *
+	 * <p>标记为 {@code @Internal} 而**不是** {@code @Input}：它只决定输出流接哪里，
+	 * 不参与产物字节。当它是 {@code @Input} 时，本任务虽标了 {@code @CacheableTask}
+	 * 却会因「日志级别变化」而缓存键变化，永远撞不到同一键（实测：AllinGame 的
+	 * forge 生产线每轮重跑 10 步 MCP 链，并连带下游三个任务一起重跑）。
+	 */
+	@Internal
 	public abstract Property<Boolean> getAtVerboseStdout();
 
-	/** 是否把 AT 工具的标准错误透传到构建日志. */
-	@Input
+	/** 同 {@link #getAtVerboseStdout()}：只影响日志透传，不影响产物。 */
+	@Internal
 	public abstract Property<Boolean> getAtVerboseStderr();
 
 	/** 产物：AT 之后的 jar（与配置期同一条路径）. */

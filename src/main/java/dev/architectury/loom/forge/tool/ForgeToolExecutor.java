@@ -12,6 +12,7 @@ import org.gradle.api.provider.ListProperty;
 import org.gradle.api.provider.Property;
 import org.gradle.api.tasks.Classpath;
 import org.gradle.api.tasks.Input;
+import org.gradle.api.tasks.Internal;
 import org.gradle.api.tasks.Optional;
 import org.gradle.process.ExecOperations;
 import org.gradle.process.ExecResult;
@@ -111,10 +112,24 @@ public final class ForgeToolExecutor {
 		@Classpath
 		ConfigurableFileCollection getExecClasspath();
 
-		@Input
+		/**
+		 * 是否把工具的标准输出透传到构建日志。
+		 *
+		 * <p>标记为 {@code @Internal} 而**不是** {@code @Input}：本值只决定「输出流接哪里」，
+		 * 不参与任何产物字节。而它的取值随构建日志级别变化（{@link #shouldShowVerboseStdout}），
+		 * 若当 {@code @Input}，则「换一个日志级别」就等于换了一整套缓存键。
+		 *
+		 * <p>实测后果（2026-10-27，AllinGame）：节点 {@code generateForgePrePatchJar} 标了
+		 * {@code @CacheableTask} 却永远撞不到同一键，每轮重跑整条 10 步 MCP 链，
+		 * 直接造成 forge 全量 26 分钟的头部开销；下游 {@code generateForgePatchedIntermediateJar}
+		 * /{@code manipulateForgeMappings}/{@code accessTransformForgeJar}/{@code generateForgePatchedJar}
+		 * 全部跟着重跑。复合构建下更糟：每个构建根各自一份，重复行数成倍上涨。
+		 */
+		@Internal
 		Property<Boolean> getShowVerboseStdout();
 
-		@Input
+		/** 同 {@link #getShowVerboseStdout()}：只影响日志透传，不影响产物。 */
+		@Internal
 		Property<Boolean> getShowVerboseStderr();
 
 		default void classpath(Object... paths) {

@@ -32,6 +32,7 @@ import org.gradle.api.provider.Property;
 import org.gradle.api.provider.Provider;
 import org.gradle.api.tasks.Input;
 import org.gradle.api.tasks.InputFiles;
+import org.gradle.api.tasks.Internal;
 import org.gradle.api.tasks.Nested;
 import org.gradle.api.tasks.Optional;
 import org.gradle.api.tasks.PathSensitive;
@@ -100,7 +101,16 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
 		@Nested
 		Property<SourceRemapperService.Options> getSourceRemapperService();
 
-		@Input
+		/**
+		 * 是否把工具的标准错误透传到构建日志。
+		 *
+		 * <p>标记为 {@code @Internal} 而**不是** {@code @Input}：它只决定错误流接哪里，
+		 * 不参与任何产物字节；而取值随构建日志级别与 stacktrace 开关变化
+		 * （{@code ForgeToolExecutor#shouldShowVerboseStderr}），当 {@code @Input} 会让
+		 * 「换日志级别」等于换缓存键，使引用本服务选项的任务永远无法命中缓存。
+		 * 同上理由的还有 {@code ForgeToolExecutor.Settings} 与 {@code AccessTransformForgeJarTask} 里的对应字段。
+		 */
+		@Internal
 		Property<Boolean> getShouldShowVerboseStderr();
 	}
 
