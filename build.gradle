@@ -230,15 +230,26 @@ java {
 	targetCompatibility = JavaVersion.VERSION_21
 }
 
-// 不发 javadoc.jar：它是单次发布里最大的单个文件（实测 3.4 MiB，占一次发布的 49%），
-// 而本仓库的使用方是 mod 开发者，读文档看的是 sources.jar（IDE 内直接跳转），
-// 几乎不会去下载 javadoc 构件。开发线改成 SNAPSHOT 后每次推送都会产生一份快照，
-// 这个文件的累计开销变得主导，因此不再随发布产出。
+// 开发线不发 javadoc.jar —— 仅限开发线，正式版仍然照旧发布它。
+//
+// javadoc 是单次发布里最大的单个文件（实测 3.4 MiB，占一次的 49%），而本仓库的使用方
+// 是 mod 开发者，读文档看的是 sources.jar（IDE 内直接跳转），几乎不会去下载它。
+// 开发线改成 SNAPSHOT 后每次推送都会产生一份快照，累计开销变得主导，所以不在开发线产出。
+//
+// **不能无条件关掉**：正式版 1.17.<N> 一旦发布就不可回收，其构件清单应当与历史各版一致
+// （已核对 1.17.16 确实含 javadoc.jar）。若一并关掉，使用方的本地缓存或工具链里
+// 假定的 classifier 可能在某次发版后突然缺失。
+//
+// 判据用 version 而不是 RELEASE_VERSION：后者只在发布 job 里被注入，本地构建不设置它，
+// 而“本地构建是不是正式版”本质上就由 version 是否带 -SNAPSHOT/-PR 决定。
 //
 // 用 configureEach 而不是 named('javadocJar')：该任务由 java-gradle-plugin 在稍后注册，
 // 在 java {} 块里用 named 会抛 “Task with name 'javadocJar' not found”。
 // 注：:javadoc 任务本身仍然保留并参与 `check`，所以文档注释的语法错误照样会拦住 CI。
-tasks.matching { it.name == 'javadocJar' }.configureEach { it.enabled = false }
+tasks.matching { it.name == 'javadocJar' }.configureEach { task ->
+	def v = task.project.version.toString()
+	task.enabled = !(v.endsWith('-SNAPSHOT') || v.contains('-dev.') || v.contains('-PR.'))
+}
 
 spotless {
 	lineEndings = com.diffplug.spotless.LineEnding.UNIX
