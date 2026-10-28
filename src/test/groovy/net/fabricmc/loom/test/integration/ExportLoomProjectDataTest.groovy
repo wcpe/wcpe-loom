@@ -98,8 +98,8 @@ class ExportLoomProjectDataTest extends Specification implements GradleProjectTe
 
 	/** 配置缓存问题即失败；不这样设定时问题只是警告，用例会静默通过。 */
 	private static final List<String> CONFIG_CACHE_STRICT = [
-			"--configuration-cache",
-			"--configuration-cache-problems=fail",
+		"--configuration-cache",
+		"--configuration-cache-problems=fail",
 	]
 
 	private static File dataFile(GradleProjectTestTrait.GradleProject gradle) {

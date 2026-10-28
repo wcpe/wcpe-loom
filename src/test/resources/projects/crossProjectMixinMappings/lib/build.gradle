@@ -1,0 +1,32 @@
+plugins {
+	id "java"
+	id "dev.architectury.loom"
+}
+
+version = "1.0.0"
+
+base {
+	archivesName = "mixinlib"
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:1.20.4"
+	mappings "net.fabricmc:yarn:1.20.4+build.3:v2"
+	modImplementation "net.fabricmc:fabric-loader:0.19.2"
+
+	// 不要在这里手动加 sponge-mixin 作为 annotationProcessor：
+	// Loom 自己会把 fabric-mixin-compile-extensions 加到 AP 配置（见
+	// AnnotationProcessorInvoker.configureMixin），而它携带了 Fabric 自己的
+	// IObfuscationService（支持 named/intermediary）。手动只加 sponge-mixin 会盖过它，
+	// 导致 AP 只认 searge/notch，报「Unable to locate obfuscation mapping」。
+}
+
+// 显式启用 legacy mixin AP。
+// 新版 Loom 已默认不再启用 mixin 注解处理器（配置时直接报「The mixin annotation is no longer
+// enabled by default」），因此不写这个开关不会产出任何 mixin-map-*.tiny。
+loom {
+	mixin {
+		useLegacyMixinAp = true
+		add(sourceSets["main"], "mixinlib-refmap.json")
+	}
+}

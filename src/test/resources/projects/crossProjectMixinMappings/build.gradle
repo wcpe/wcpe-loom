@@ -1,0 +1,4 @@
+// 根项目不应用 Loom：本用例只关注 :app 与 :lib 之间的跨项目 mixin 映射链路。
+plugins {
+	id "base"
+}

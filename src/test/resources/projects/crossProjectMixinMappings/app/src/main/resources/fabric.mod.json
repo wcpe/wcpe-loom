@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "id": "mixinapp",
+  "version": "1.0.0",
+  "name": "Cross Project Mixin App",
+  "environment": "*"
+}

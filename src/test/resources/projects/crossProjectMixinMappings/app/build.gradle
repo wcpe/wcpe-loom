@@ -1,0 +1,26 @@
+plugins {
+	id "java"
+	id "dev.architectury.loom"
+}
+
+version = "1.0.0"
+
+base {
+	archivesName = "mixinapp"
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:1.20.4"
+	mappings "net.fabricmc:yarn:1.20.4+build.3:v2"
+	modImplementation "net.fabricmc:fabric-loader:0.19.2"
+
+	// 必须是普通 implementation，而不是 modImplementation：mod 重映射会把
+	// ProjectDependency 从 classpath 上换成普通文件依赖，跨项目数据链路就不会被走到
+	// （与 projectDataColdStart 夹具同理）。
+	implementation project(":lib")
+}
+
+// 本夹具不需要额外的探针任务：要验证的数据由 :lib 的 exportLoomProjectData 写成
+// <:lib>/build/loom/project-data.json，那是唯一一个跨项目数据链路真正落盘的、可直接观察的产物。
+// （不要在夹具里静态引用 net.fabricmc.loom.internal.* 或反射它：夹具的构建脚本跑在
+//  另一个类加载器里，看不到插件的 internal 类，会抳 ClassNotFoundException。）

@@ -1,0 +1,19 @@
+pluginManagement {
+	repositories {
+		mavenLocal()
+		maven {
+			name = 'Fabric'
+			url = 'https://maven.fabricmc.net/'
+		}
+		mavenCentral()
+		gradlePluginPortal()
+	}
+}
+
+rootProject.name = "cross-project-mixin-mappings"
+
+// 顺序即配置顺序：消费方 :app 必须排在生产者 :lib 之前。
+// 这样 :lib 排在之后，隔离模式下 Loom 无法用 evaluationDependsOn 强制它先求值，
+// 其跨项目数据（mixin 映射文件路径）能否拿到只能靠构建级共享表或导出的数据文件。
+include "app"
+include "lib"

@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "id": "mixinlib",
+  "version": "1.0.0",
+  "name": "Cross Project Mixin Lib",
+  "environment": "*",
+  "mixins": ["mixinlib.mixins.json"]
+}
