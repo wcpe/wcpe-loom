@@ -476,10 +476,27 @@ import org.w3c.dom.Node
 
 publishing {
 	repositories {
-		// WCPE Maven 仓库（CI 发布写入 maven-releases）
+		// WCPE Maven 仓库。
+		//
+		// 快照与正式必须分开发布：Maven 的快照语义是「同一个版本号可以被覆盖」，
+		// Nexus 会为它保留时间戳构件并按策略清理；把它写进 maven-releases 会污染
+		// 「release 仓库不出现 -SNAPSHOT 版本」这一既有约定，也拿不到快照清理。
+		//   version 以 -SNAPSHOT 结尾  → maven-snapshots
+		//   其余（正式版 / PR 预览）   → maven-releases
+		// 具体地址仍可分别用 wcpeSnapshotMavenUrl / wcpeMavenUrl 覆盖。
+		def isSnapshotVersion = version.toString().endsWith('-SNAPSHOT')
+		def defaultUrl = isSnapshotVersion
+				? 'https://repo.wcpe.top/repository/maven-snapshots/'
+				: 'https://repo.wcpe.top/repository/maven-releases/'
+		def urlOverride = isSnapshotVersion
+				? project.findProperty('wcpeSnapshotMavenUrl')
+				: project.findProperty('wcpeMavenUrl')
+
+		logger.lifecycle(":publishing ${version} to ${urlOverride ?: defaultUrl}")
+
 		maven {
 			name = 'WCPE'
-			url = project.findProperty('wcpeMavenUrl') ?: 'https://maven.wcpe.top/repository/maven-releases/'
+			url = urlOverride ?: defaultUrl
 			credentials {
 				username = project.findProperty('wcpeUsername')?.toString() ?: ''
 				password = project.findProperty('wcpePassword')?.toString() ?: ''
