@@ -161,11 +161,37 @@ Minecraft 产物，全量跑耗时数小时。
 - **`git cherry` 在本仓库不可靠**：队列重写会生成新 patch-id，内容已合入的提交仍会被报成未合入。
   判断某修复是否已落地，看实质标志（函数、字段、文件是否存在）。
 
+### 推送前必须本地跑完整静态检查（硬性要求）
+
+**每次 `git push` 之前，必须在本地跑完与 CI 同款的全量静态检查，通过后才能推：**
+
+```bash
+./gradlew build check -x test
+```
+
+这一条不是建议。教训（run 40638565347）：一个只含测试夹具的新用例有两行断言超了
+Groovy 行宽，`build` 作业在 `:spotlessGroovyCheck` 处挂掉，后续整个测试矩阵与发布全部跳过，
+白白占掉一轮 CI（本仓库矩阵要 30–40 分钟）。更糟的是发布被静默阻断：
+`test-push.yml` 的 publish 步骤要求测试通过，于是那次推送什么都没发出去。
+
+它同时能拦住另一类只有本地才便宜的问题（同一轮之后又补修过一次）：
+
+- `:spotlessGroovyCheck` / `:spotlessJavaCheck`：`./gradlew spotlessApply` 可自动修。
+- `:checkstyleMain` / `:checkstyleTest`：**Javadoc 首句必须以 `.` 结尾，不是 `。`**
+  （中文注释也适用）；把注解从 `@Input` 改成 `@Internal` 之后容易留下 unused import。
+- `:codenarcTest`、`:checkPackageInfos`、`:javadoc`。
+
+只跑 `compileJava` / `compileTestGroovy` 是不够的：它们覆盖不到上面任何一项。
+推送前也可以直接对照 `.github/workflows/test-push.yml` 里 `build` 作业的命令行。
+
+**代价对比**：本地一次 `build check -x test` 约 40 秒到 1.5 分钟（增量），而 CI 失败一轮
+是 30 分钟起步且会阻断发布。
+
 ## 5. 代码规范
 
 - **注释一律用中文**；提交信息用简体中文（标题与正文都是）。
 - 缩进用 tab，`checkstyle.xml` 校验：import 分组顺序、声明后紧跟 `if`/`try` 需空一行、
-  禁止连续空行、Javadoc 首句以句号结尾等。
+  禁止连续空行、**Javadoc 首句必须以 `.` 结尾**（是英文句点，不是中文句号「。」）等。
 - 提交信息格式：`<type>(<scope>): <中文描述>`，type 用英文小写
   （`feat` `fix` `refactor` `docs` `chore` `test` `build` `ci`）。
 - 禁止在提交信息里加 AI 签名或作者尾注。
