@@ -58,8 +58,11 @@ class OfflineModeTest extends Specification implements GradleProjectTestTrait {
 
 		def projectHash = result1.output.split("%%")[1]
 
-		// 写入一个伪造的残留锁文件：下一次运行只会把它当作「上次构建未干净收尾」的诊断信息，
-		// 不再触发 loom 缓存重建，因此缓存必须保持完好且可离线复用
+		// 写入一个伪造的残留锁文件。
+		//
+		// 锁文件机制已整个废弃（理由见 ConfigurationCacheTest 末尾的说明）：Loom 不再读写它。
+		// 但升级前的旧版本、或降级回去的构建会在缓存目录里留下这类文件，所以「它的存在
+		// 不得影响新版本」是一个真实且必须守住的风险。
 		def lockFile = new File(gradle.gradleHomeDir, "caches/fabric-loom/.${projectHash}.lock")
 		lockFile.text = "12345"
 
@@ -67,9 +70,10 @@ class OfflineModeTest extends Specification implements GradleProjectTestTrait {
 		def result2 = gradle.run(tasks: ["clean", "build"], args: ["--offline"])
 		then:
 		result1.task(":build").outcome == SUCCESS
+		// 残留锁文件不得导致离线构建失败，也不得触发缓存重建（离线环境下重建必然失败）
 		result2.task(":build").outcome == SUCCESS
 
-		result2.output.contains("was left by a previous build, assuming abrupt termination.")
-		result2.output.contains("reusing the existing loom cache")
+		and: "离线构建全程不得等待锁——配置期不再存在跨项目串行点"
+		!result2.output.contains("Have been waiting on")
 	}
 }

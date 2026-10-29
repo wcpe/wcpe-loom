@@ -87,11 +87,61 @@ public abstract class LoomCacheService implements BuildService<BuildServiceParam
 	}
 
 	/**
+	 * 双检锁形式执行「先检查、再生产」：已就绪时连锁都不取.
+	 *
+	 * <p><b>为什么需要它</b>：{@link #runExclusive} 是纯串行——后到的调用方必须先拿到锁，
+	 * 才能进入临界区做 {@code isUpToDate()} 检查，然后立刻退出。干净环境（CI 首次构建）下
+	 * N 个项目配置同一份 Minecraft 时，它们算出同一个 key，于是第 2..N 个项目各自白等
+	 * 「第一个项目做完整条 download→remap」的时间，而这个时间远超锁的 1 分钟超时。
+	 *
+	 * <p>双检锁把等待变成「只等第一个项目生产完」，而不是「每个都排一遍队」：
+	 * <ol>
+	 *   <li>锁外检查：已就绪 → 直接跑 {@code action} 之外的回退分支，不取锁；</li>
+	 *   <li>未就绪 → 取锁（可能等前一个项目生产完）；</li>
+	 *   <li>锁内<b>重检</b>：若前一个项目已经把产物做好，就跳过生产。这是关键一步：
+	 *       没有它，第 2..N 个项目拿到锁后会把同一份产物再重建一遍。</li>
+	 * </ol>
+	 *
+	 * <p>两次检查都必须是纯只读的存在性/脏标志判断（调用方保证），不得在锁外写共享缓存。
+	 *
+	 * @param lockRoot     锁文件目录
+	 * @param key          互斥 key
+	 * @param timeout      等待跨进程锁的超时时间
+	 * @param upToDate     只读就绪判定；锁内会被再次调用
+	 * @param onUpToDate   已就绪时的动作（跑在锁外，应做「读已发布产物」这类无副作用的事）
+	 * @param produce      需要生产时的动作（跑在锁内）
+	 */
+	public void runExclusiveChecking(Path lockRoot, String key, Duration timeout,
+			Callable<Boolean> upToDate, Callable<Void> onUpToDate, Callable<Void> produce) throws Exception {
+		if (Boolean.TRUE.equals(upToDate.call())) {
+			// 快路径：产物已就绪，全程不取锁（与 runExclusive 的「只在需要生产时才取锁」一致）
+			onUpToDate.call();
+			return;
+		}
+
+		final Object monitor = monitors.computeIfAbsent(key, k -> new Object());
+
+		synchronized (monitor) {
+			CacheEntryLock.withLock(lockRoot, key, timeout, () -> {
+				// 锁内重检：前一个持锁者可能刚把产物做完，此时不必再产一遍
+				if (Boolean.TRUE.equals(upToDate.call())) {
+					onUpToDate.call();
+					return null;
+				}
+
+				return produce.call();
+			});
+		}
+	}
+
+	/**
 	 * 共享缓存锁的默认等待超时.
 	 *
 	 * <p>可通过系统属性 {@code fabric.loom.lock.timeout.minutes} 覆盖
 	 * （在 gradle.properties 中写 {@code systemProp.fabric.loom.lock.timeout.minutes=10}）。
-	 * 未配置时：CI 上 1 分钟（不太可能解锁），本地 30 分钟（容忍首次冷构建的慢速下载，
+	 * 未配置时：CI 上 10 分钟（干净环境首次构建要下载、解压、重映射整份 MC，
+	 * 实测在 CI runner 上远超 1 分钟；原先按「CI 上不太可能解锁」取的 1 分钟正是
+	 * 多项目并发配置时超时的直接原因），本地 30 分钟（容忍首次冷构建的慢速下载，
 	 * 但避免在异常持有者上无限等待——配合等待日志中的持有者 PID 可手动处置）。
 	 */
 	public static Duration defaultTimeout() {
@@ -106,7 +156,7 @@ public abstract class LoomCacheService implements BuildService<BuildServiceParam
 		}
 
 		if (System.getenv("CI") != null) {
-			return Duration.ofMinutes(1);
+			return Duration.ofMinutes(10);
 		}
 
 		return Duration.ofMinutes(30);
