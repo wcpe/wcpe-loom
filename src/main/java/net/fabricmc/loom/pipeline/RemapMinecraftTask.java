@@ -174,7 +174,18 @@ public abstract class RemapMinecraftTask extends DefaultTask {
 	 * {@code MappingConfiguration.getMappingsService(project, serviceFactory, MappingOption.forPlatform(extension))}
 	 * 拿到这一份映射树。换用其它来源（例如 {@code MappingsService.createOptionsWithProjectMappings}）
 	 * 会解析到不同的映射文件，产出与配置期不等价——这正是等价性测试发现的问题。
+	 *
+	 * <h4>为何标为可选</h4>
+	 * 重映射路径（{@code copyOnly = false}）必须有它，否则无从取映射树。但**直通形态**
+	 * （{@code disableObfuscation} / unobfuscated Forge）里根本没有 {@code MappingConfiguration}：
+	 * 该形态下 {@code remapJar} 不做重映射而是原子复制，构建里也不存在可供装配的映射树。
+	 * 把它定为必填，会让该形态永远进不了任务路径——Gradle 的工作校验在配置期就要求所有
+	 * {@code @Nested} 输入有值，而它在执行期实际并不需要。
+	 *
+	 * <p>故改为可选，并在 {@link #remap()} 里**显式断言**：直通分支不需要它，其余分支缺少时
+	 * 以明确错误拦下，而不是把 {@code null} 传下去。
 	 */
+	@Optional
 	@Nested
 	public abstract Property<TinyMappingsService.Options> getMappingsServiceOptions();
 
@@ -410,6 +421,16 @@ public abstract class RemapMinecraftTask extends DefaultTask {
 			LOGGER.info("Copying {} to {} without remapping", inputJar.getFileName(), outputJar.getFileName());
 			AtomicFiles.copy(inputJar, outputJar);
 		} else {
+			// 重映射路径必须有映射树。{@code mappingsServiceOptions} 已标为可选（直通形态没有
+			// MappingConfiguration），所以缺失在这里是**可能的配置错误**而不是不可能事件——
+			// 显式拦下，避免把 null 传进 remapJar 后在深处报一个与原因无关的 NPE。
+			if (!getMappingsServiceOptions().isPresent()) {
+				throw new IllegalStateException(
+						"任务 %s 需要重映射（copyOnly=false），但没有配置 mappingsServiceOptions。"
+								+ "只有直通形态（disableObfuscation / unobfuscated Forge）可以不提供它。"
+								.formatted(getPath()));
+			}
+
 			remapJar(inputJar, outputJar);
 		}
 

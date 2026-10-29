@@ -241,7 +241,17 @@ public abstract class MinecraftProvider {
 			//
 			// 分界是 **userdev 配置的形态**（FG2 / userdev3 都算 legacy），不是 MC 版本号：
 			// 实测 1.14.4 / 1.16.5 的 userdev 带 mcp 段、走现代管线，只有 1.7-1.12.2 是 FG2 形态。
-			return "legacy Forge（FG2 形态的 userdev：MC 1.7-1.12.2）的 patch 流程在配置期按路径读 vanilla jar";
+
+			// legacy Forge 原本在这里整段回退，理由是「patch 流程在配置期按路径读 vanilla jar」。
+			// 该依赖已解除：FG2 链的四段（forge.jar 重映射 → client/server 打补丁 → 合并 → AT）
+			// 已全部投成执行期任务，见 MinecraftLegacyPatchedProvider.registerLegacyForgeJarTask。
+			// 产物路径与配置期完全一致，下游消费方按路径读到的是同一批文件。
+			// 前缀 isForgeLike() 仍保留：isLegacyForge() 要经 getDependencyProviders() 取
+			// ForgeUserdevProvider，依赖 provider 只在两个非 disableObfuscation 分支里建立。
+			if (getExtension().isForgeLike() && getExtension().isLegacyForge()) {
+				getProject().getLogger().lifecycle(
+						"legacy Forge（FG2 形态）的 patch 链由执行期任务承担（forge.jar / client-server patched / merged / at-patched）");
+			}
 		}
 
 		return null;
@@ -264,9 +274,16 @@ public abstract class MinecraftProvider {
 	 * </ul>
 	 */
 	protected @Nullable String earlyProjectionBlocker() {
-		if (getExtension().disableObfuscation()) {
-			return "disableObfuscation 下 mapped 阶段整批回退到配置期生产，配置期会按路径读 vanilla jar";
-		}
+		// disableObfuscation（直通形态）原本在这里整批回退到配置期生产，理由是「mapped 阶段会按路径读
+		// vanilla jar」。该说法不再成立：
+		//   · 下载 / 抽取由 projectToTasks 里的 registerDownloadTask / registerExtractTask 承担；
+		//   · 合并由子 provider 的 registerProviderTasks 承担（MergedMinecraftProvider 已注册
+		//     mergeMinecraftJars，且按任务依赖而不是按路径取输入）；
+		//   · 重映射由 RemapMinecraftTask 以 copyOnly 形态承担（已放开，等价性见
+		//     DisableObfuscationRemapEquivalenceTest）。
+		// 三者都不再需要在配置期读 vanilla jar 的内容，因此该形态可以进入任务路径。
+		// 与之配套的改动：AbstractMappedMinecraftProvider 的 verifyProjectable 已取消同一形态的拒绝，
+		// 并对无 MappingConfiguration / 无 knownIndyBsms 的情形做了显式处理。
 
 		if (verificationEnabled()) {
 			return "Minecraft jar 签名校验已启用（" + Constants.Properties.ENABLE_MINECRAFT_VERIFICATION + "），校验在配置期读 jar 内容";
@@ -310,8 +327,12 @@ public abstract class MinecraftProvider {
 		final Configuration mappings = getProject().getConfigurations().findByName(Constants.Configurations.MAPPINGS);
 
 		if (mappings == null || mappings.getDependencies().size() != 1) {
-			// 无映射依赖（无需映射的配置）或形态未知（多层映射由别处展开）：保守回退
-			return false;
+			// 「无映射依赖」有两种语义，后果完全不同：
+			//   · disableObfuscation 下本来就**不需要**映射（产物是原字节复制，不做任何重映射）。
+			//     既然不需要映射，也就不存在「V1 映射要打开 merged jar 补字段名」这件事，不应回退。
+			//   · 其余情形是「形态未知」（多层映射由别处展开），保守回退。
+			// 不区分的话，无混淆工程会永远停留在配置期生产。
+			return getExtension().disableObfuscation();
 		}
 
 		final Dependency dependency = mappings.getDependencies().iterator().next();
@@ -320,7 +341,27 @@ public abstract class MinecraftProvider {
 			return true;
 		}
 
+		// MCP 映射（1.12.2 之前的 Forge）：依赖是 zip 产物，**没有 classifier**，但它走的是
+		// readAndMergeMCP 那条路径，产物是 Tiny2FileWriter 写出的 tiny v2，而不是 baseTinyMappings
+		// 直通。因此「无 classifier」对它不意味着「可能不是 v2」——那是 storeMappings 里
+		// areMappingsV2(baseTinyMappings) 分支的事，它读的是 MCP jar 内部的 mappings/mappings.tiny，
+		// 而不是这里判定的依赖声明。不认这一条的话，1.12.2 会永远停在配置期生产。
+		if (isMcpMappingsDependency(dependency)) {
+			return true;
+		}
+
 		return "v2".equals(DependencyInfo.create(getProject(), dependency, mappings).getDeclaredClassifier());
+	}
+
+	/**
+	 * {@return 该映射依赖是否为 MCP 形态}.
+	 *
+	 * <p>按坐标判定：MCP 映射固定发布于 {@code de.oceanlabs.mcp} 组下的 {@code mcp_snapshot} / {@code mcp_stable}。
+	 * 不看扩展名（{@code @zip}）也不看内容——本方法跑在投影判定里，那时输入 jar 还没抽取。
+	 */
+	private static boolean isMcpMappingsDependency(Dependency dependency) {
+		return "de.oceanlabs.mcp".equals(dependency.getGroup())
+				&& ("mcp_snapshot".equals(dependency.getName()) || "mcp_stable".equals(dependency.getName()));
 	}
 
 	/** {@return server bundle 元数据是否已能在配置期无 jar 读取地拿到} 见 {@link BundleMetadata#isCached}. */

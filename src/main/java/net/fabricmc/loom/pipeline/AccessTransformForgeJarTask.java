@@ -27,6 +27,7 @@ package net.fabricmc.loom.pipeline;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -145,9 +146,13 @@ public abstract class AccessTransformForgeJarTask extends DefaultTask {
 	 *
 	 * <p>声明成文件而非映射树：映射树不可序列化，配置缓存在此只记录文件路径与内容哈希，
 	 * 树本身在执行期按需重建（见 {@link #readMappings()}）。
+	 *
+	 * <p><b>可选</b>：只有 legacy Forge 需要翻译（见 {@link #getAtSourceNamespace()}），
+	 * 而 disableObfuscation 形态下项目根本没有映射配置，此时既不翻译也不设置本输入。
 	 */
 	@InputFile
 	@PathSensitive(PathSensitivity.NONE)
+	@Optional
 	public abstract RegularFileProperty getMappings();
 
 	/**
@@ -164,6 +169,27 @@ public abstract class AccessTransformForgeJarTask extends DefaultTask {
 	@Input
 	@Optional
 	public abstract Property<String> getAtTargetNamespace();
+
+	/**
+	 * legacy Forge 专用：要合进产物的 {@code forge.jar}.
+	 *
+	 * <p>legacy 链的最终 jar 是「AT 后的 Minecraft jar + Forge 自身的类」，而 modern 链把这两者
+	 * 交给下游的 remap 任务。不设置表示不需要合并（modern / NeoForge 形态）。
+	 */
+	@InputFile
+	@PathSensitive(PathSensitivity.NONE)
+	@Optional
+	public abstract RegularFileProperty getMergeForgeJar();
+
+	/**
+	 * legacy Forge 专用：写完产物后要打的补丁版本标记.
+	 *
+	 * <p>legacy 链的最终 jar 不再经任何下游 remap 任务，所以就绪标记必须由本任务自己写。
+	 * 不设置表示不写（modern 形态由 {@code GenerateForgePatchedJarTask} 负责）。
+	 */
+	@Input
+	@Optional
+	public abstract Property<String> getPatchVersion();
 
 	/** 执行期实例化服务选项用（{@code Project} 在执行期不可用，见类注释）. */
 	@Inject
@@ -191,6 +217,20 @@ public abstract class AccessTransformForgeJarTask extends DefaultTask {
 			AtomicFiles.publish(output, tmp -> {
 				Files.deleteIfExists(tmp);
 				service.execute(input, tmp);
+
+				// legacy 形态：AT 后的产物还要把 forge.jar 的类合进去，再打就绪标记，
+				// 因为该 jar 不再经任何下游 remap 任务。两步都在同一个临时文件上完成，
+				// 顺序与配置期 remapJar 末段一致（AT → 合入 forge.jar → 写补丁版本）。
+				if (getMergeForgeJar().isPresent()) {
+					try {
+						dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider.walkFileSystems(
+								getMergeForgeJar().get().getAsFile().toPath(), tmp, path -> true,
+								dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider::copyReplacing);
+						dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider.applyLoomPatchVersion(tmp);
+					} catch (IOException e) {
+						throw new UncheckedIOException(e);
+					}
+				}
 			});
 		}
 	}

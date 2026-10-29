@@ -158,10 +158,18 @@ public class TinyRemapperService extends Service<TinyRemapperService.Options> im
 
 			options.getFrom().set(from);
 			options.getTo().set(to);
-			options.getMappings().add(MappingsService.createOptionsWithProjectMappings(project, options.getFrom(), options.getTo()));
+
+			// 无混淆形态（disableObfuscation）没有 MappingConfiguration，也没有 knownIndyBsms：
+			// 两者一读就抛 "Cannot ... in a non-obfuscated environment"。而该形态下 processor
+			// 的 spec 来自 DeobfSpecContext，不做重映射，这两个输入不会被执行期读到。
+			// 不跳过的话，配置缓存序列化本任务的 __remapperServiceOptions__ 时就会抛错。
+			if (!extension.disableObfuscation()) {
+				options.getMappings().add(MappingsService.createOptionsWithProjectMappings(project, options.getFrom(), options.getTo()));
+				options.getKnownIndyBsms().set(extension.getKnownIndyBsms().get().stream().sorted().toList());
+			}
+
 			options.getUselegacyMixinAP().set(true);
 			options.getClasspath().from(classpath);
-			options.getKnownIndyBsms().set(extension.getKnownIndyBsms().get().stream().sorted().toList());
 			options.getRemapperExtensions().set(extension.getRemapperExtensions());
 		});
 	}

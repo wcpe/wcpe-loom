@@ -121,8 +121,15 @@ public abstract class GenerateForgePatchedJarTask extends DefaultTask {
 	@Optional
 	public abstract RegularFileProperty getServerJar();
 
-	/** 映射服务配置：产出 jar 的重映射、coremod 重映射与 dist 清单都读它. */
+	/**
+	 * 映射服务配置：产出 jar 的重映射、coremod 重映射与 dist 清单都读它.
+	 *
+	 * <p>disableObfuscation 形态下项目根本没有映射配置（{@code getMappingConfiguration()} 会直接抛
+	 * {@code Cannot get mappings configuration in a non-obfuscated environment}），因此此处不设置：
+	 * 那个形态下最终 jar 走 {@code mergeUnobfuscatedPatchedJar}，不读映射树，dist 清单也用空映射树。
+	 */
 	@Nested
+	@Optional
 	public abstract Property<TinyMappingsService.Options> getMappingsServiceOptions();
 
 	/** 本配置是否产出 client-extra（与配置期 {@code providesClientJar()} 同判据）. */
@@ -199,10 +206,17 @@ public abstract class GenerateForgePatchedJarTask extends DefaultTask {
 	public void generate() throws Exception {
 		try (var serviceFactory = new ScopedServiceFactory()) {
 			// 映射树在执行期从本任务声明的映射配置取：它与配置期路径
-			// （MinecraftPatchedProvider.getMappingTree）用的是同一个映射选项
-			final TinyMappingsService.Options mappingsOptions = getMappingsServiceOptions().get();
-			final TinyMappingsService mappingsService = serviceFactory.get(mappingsOptions);
-			final MemoryMappingTree mappings = mappingsService.getMappingTree();
+			// （MinecraftPatchedProvider.getMappingTree）用的是同一个映射选项。
+			// 无混淆形态没有映射配置，此时不给映射树（生产实现按同一判据置 null）。
+			final MemoryMappingTree mappings;
+
+			if (getMappingsServiceOptions().isPresent()) {
+				final TinyMappingsService.Options mappingsOptions = getMappingsServiceOptions().get();
+				final TinyMappingsService mappingsService = serviceFactory.get(mappingsOptions);
+				mappings = mappingsService.getMappingTree();
+			} else {
+				mappings = null;
+			}
 
 			final var options = new MinecraftPatchedProvider.ProductionOptions(
 					path(getAtPatchedJar()),

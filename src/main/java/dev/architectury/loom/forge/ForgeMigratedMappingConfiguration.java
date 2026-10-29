@@ -101,9 +101,11 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
 			return "legacy Forge（1.8-1.16）不做映射迁移";
 		}
 
-		if (extension.getMixin().getUseLegacyMixinAp().get()) {
-			return "legacy mixin AP 开启：getReplacedTarget 在配置期读平台映射文件并派生 mappings-mixin-<ns>.tiny";
-		}
+		// legacy mixin AP 原本也在这里整段回退，理由是「getReplacedTarget 在配置期读平台映射文件
+		// 并派生 mappings-mixin-<ns>.tiny」。该依赖已解除：mixin 映射改由
+		// GenerateMixinMappingsTask 产出，编译任务依赖它（见 AnnotationProcessorInvoker
+		// 的 registerMixinMappingsTask），因此迁移产物不再需要在配置期就位。
+		// 产物路径与配置期完全一致，Mixin AP 收到的 -A 参数值不变。
 
 		return null;
 	}

@@ -42,6 +42,7 @@ import org.gradle.api.tasks.Input;
 import org.gradle.api.tasks.InputFile;
 import org.gradle.api.tasks.Internal;
 import org.gradle.api.tasks.Nested;
+import org.gradle.api.tasks.Optional;
 import org.gradle.api.tasks.OutputFile;
 import org.gradle.api.tasks.PathSensitive;
 import org.gradle.api.tasks.PathSensitivity;
@@ -173,7 +174,18 @@ public abstract class ProcessMinecraftJarTask extends DefaultTask {
 	@Input
 	public abstract Property<MappingsNamespace> getIntermediaryNamespace();
 
-	/** 映射服务配置；执行期据此取出映射树. */
+	/**
+	 * 映射服务配置；执行期据此取出映射树.
+	 *
+	 * <h4>为何标为可选</h4>
+	 * 直通形态（{@code disableObfuscation}）没有 {@code MappingConfiguration}，构建里不存在
+	 * 可供装配的映射树。而该形态下处理器拿到的 spec 来自 {@code DeobfSpecContext}，
+	 * 那个上下文本身就不提供映射（实际也不读）。把它定为必填会让该形态永远进不了任务路径。
+	 *
+	 * <p>故改为可选；真正读映射（{@code getMappings()}）时才报错，由
+	 * {@link ExecutionProcessorContext} 负责给出可读的失败信息。
+	 */
+	@Optional
 	@Nested
 	public abstract Property<TinyMappingsService.Options> getMappingsServiceOptions();
 
@@ -221,7 +233,7 @@ public abstract class ProcessMinecraftJarTask extends DefaultTask {
 					getDisableObfuscation().get(),
 					getProductionNamespace().get(),
 					getIntermediaryNamespace().get(),
-					getMappingsServiceOptions().get(),
+					getMappingsServiceOptions().getOrNull(),
 					getRemapperServiceOptions().get()
 			);
 

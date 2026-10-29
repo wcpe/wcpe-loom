@@ -125,7 +125,7 @@ import net.fabricmc.tinyremapper.extension.mixin.MixinExtension;
 
 public class MinecraftPatchedProvider {
 	private static final String LOOM_PATCH_VERSION_KEY = "Loom-Patch-Version";
-	private static final String CURRENT_LOOM_PATCH_VERSION = "10";
+	protected static final String CURRENT_LOOM_PATCH_VERSION = "10";
 	private static final String NAME_MAPPING_SERVICE_PATH = "/inject/META-INF/services/cpw.mods.modlauncher.api.INameMappingService";
 
 	// The version where the bug was introduced.
@@ -333,9 +333,11 @@ public class MinecraftPatchedProvider {
 	 * </ul>
 	 */
 	protected @Nullable String provideProjectionBlocker() {
-		if (getExtension().disableObfuscation()) {
-			return "disableObfuscation / unobfuscated Forge 的 pre-patch jar 与最终 jar 都走 userdev 合并分支，形态不同";
-		}
+		// disableObfuscation / unobfuscated 原本在这里整批回退，理由是「pre-patch jar 走 userdev 合并分支，
+		// 且 remapJar 也在配置期生产最终 jar」。前半句已不成立：pre-patch jar 与常规形态共用同一个
+		// McpExecutor，只是排的是 merge / preProcessJar 而不是 rename（见
+		// createUnobfuscatedPrePatchJarMcpOptions），已可由 BRANCH_MCP_UNOBFUSCATED 在任务里跑。
+		// 后半句（最终 patched jar 的合并）另有判据与留痕，见 remapJarProjectionBlocker。
 
 		final String migrationBlocker = ForgeMigratedMappingConfiguration.mappingsMigrationProjectionBlocker(getExtension());
 
@@ -362,8 +364,13 @@ public class MinecraftPatchedProvider {
 		final Path patchedIntermediate = minecraftPatchedIntermediateJar.toAbsolutePath().normalize();
 		final Path atPatched = minecraftPatchedIntermediateAtJar.toAbsolutePath().normalize();
 
-		// 分支判据与配置期 createPrePatchJar 逐字一致（unobfuscated 已由 provideProjectionBlocker 排除）
+		// 分支判据与配置期 createPrePatchJar 逐字一致
 		final boolean installerTools = shouldUseNeoForgeInstallerToolsToCreatePrePatchJar();
+		// unobfuscated 形态排的是 merge / preProcessJar 而不是 rename（与配置期同名分支逐字一致）
+		final boolean unobfuscated = getExtension().disableObfuscation();
+		final String prePatchBranch = installerTools ? GenerateForgePrePatchJarTask.BRANCH_NEOFORGE_INSTALLER_TOOLS
+				: unobfuscated ? GenerateForgePrePatchJarTask.BRANCH_MCP_UNOBFUSCATED
+				: GenerateForgePrePatchJarTask.BRANCH_MCP_RENAME;
 		// MCP 执行链的工作目录：配置期路径用随机临时目录，任务路径用项目内的固定目录，两者都「本次执行即用即删」
 		final Path mcpWorkDir = project.getLayout().getBuildDirectory()
 				.dir("tmp/" + GenerateForgePrePatchJarTask.NAME + "/" + type.id).get().getAsFile().toPath();
@@ -373,8 +380,7 @@ public class MinecraftPatchedProvider {
 				"mcVersion", extension.getMinecraftProvider().minecraftVersion(),
 				"forgeVersion", extension.getForgeProvider().getVersion().getCombined(),
 				"type", type.id,
-				"branch", installerTools ? GenerateForgePrePatchJarTask.BRANCH_NEOFORGE_INSTALLER_TOOLS
-						: GenerateForgePrePatchJarTask.BRANCH_MCP_RENAME
+				"branch", prePatchBranch
 		), () -> project.getTasks().register(GenerateForgePrePatchJarTask.NAME, GenerateForgePrePatchJarTask.class, task -> {
 			task.setGroup(Constants.TaskGroup.FABRIC);
 			task.setDescription("Produces the pre-patch Minecraft jar for %s".formatted(
@@ -391,10 +397,13 @@ public class MinecraftPatchedProvider {
 						minecraftProvider.getVersionInfo().download("client_mappings"),
 						"client_mappings download is not available for this Minecraft version").url());
 			} else {
-				task.getBranch().set(GenerateForgePrePatchJarTask.BRANCH_MCP_RENAME);
+				task.getBranch().set(prePatchBranch);
 
 				try {
-					task.getMcpOptions().set(createPrePatchJarMcpOptions(mcpWorkDir));
+					// 两条 MCP 分支只差排队哪一步：rename vs merge/preProcessJar
+					task.getMcpOptions().set(unobfuscated
+							? createUnobfuscatedPrePatchJarMcpOptions(mcpWorkDir)
+							: createPrePatchJarMcpOptions(mcpWorkDir));
 				} catch (IOException e) {
 					throw new UncheckedIOException("无法声明 pre-patch jar 的 MCP 执行器选项", e);
 				}
@@ -453,13 +462,16 @@ public class MinecraftPatchedProvider {
 			});
 
 			// AT 规则在 SRG 命名空间，而本链路的 AT 作用对象是 notch jar（见 AccessTransformerRuleTranslator）
-			task.getMappings().set(mappingsFile(project).toFile());
-			// 映射文件在投影形态下由迁移任务在执行期产出（manipulateForgeMappings），
-			// 而上面只按路径声明成 @InputFile——不带任务依赖。缺这条接线时 Gradle 会直接拒绝构建：
-			// 「accessTransformForgeJar uses this output of task manipulateForgeMappings without
-			// declaring an explicit or implicit dependency」。接线方式与同类消费方一致（见下方
-			// registerPatchedJarTask 里 migrateForgeJar 那处）。
-			extension.getMappingConfiguration().addMappingsProducerDependency(task);
+			// 无混淆形态没有映射配置，也不需要翻译（见下方 atSourceNamespace 的分流），此时不声明映射输入
+			if (!extension.disableObfuscation()) {
+				task.getMappings().set(mappingsFile(project).toFile());
+				// 映射文件在投影形态下由迁移任务在执行期产出（manipulateForgeMappings），
+				// 而上面只按路径声明成 @InputFile——不带任务依赖。缺这条接线时 Gradle 会直接拒绝构建：
+				// 「accessTransformForgeJar uses this output of task manipulateForgeMappings without
+				// declaring an explicit or implicit dependency」。接线方式与同类消费方一致（见下方
+				// registerPatchedJarTask 里 migrateForgeJar 那处）。
+				extension.getMappingConfiguration().addMappingsProducerDependency(task);
+			}
 
 			// AT 规则是否需要翻译，取决于「规则的书写命名空间」与「AT 作用对象的命名空间」是否一致。
 			// 只有 legacy Forge 不一致：userdev 的 AT 用 srg 成员名，而作用对象是 official（notch）jar，
@@ -654,9 +666,6 @@ public class MinecraftPatchedProvider {
 	 *   <li><b>legacy Forge（1.8-1.16）</b>：它的产物是一组 FG2 工作目录下的 jar
 	 *       （{@code client/server/merged-patched.jar}、{@code forge.jar}），且 {@code remapJar} 是与父类
 	 *       不同的整链实现（见 {@code MinecraftLegacyPatchedProvider.remapJar}），形态与 modern 不同。</li>
-	 *   <li><b>disableObfuscation / unobfuscated Forge</b>：最终 jar 走
-	 *       {@code mergeUnobfuscatedPatchedJar}（把 userdev jar 合进 AT 后的 jar）且映射树为空，
-	 *       同样不在本次迁移的形态之内。</li>
 	 * </ul>
 	 */
 	protected @Nullable String remapJarProjectionBlocker() {
@@ -664,9 +673,10 @@ public class MinecraftPatchedProvider {
 			return "legacy Forge（1.8-1.16）的 patched jar 是 FG2 工作目录下的一组产物，生产链与 modern 不同";
 		}
 
-		if (getExtension().disableObfuscation()) {
-			return "disableObfuscation / unobfuscated Forge 的最终 jar 走 userdev 合并分支，形态不同";
-		}
+		// disableObfuscation / unobfuscated 原本在这里整段回退，理由是「最终 jar 走
+		// mergeUnobfuscatedPatchedJar（把 userdev jar 合进 AT 后的 jar）且映射树为空」。
+		// 两者现在都已由 GenerateForgePatchedJarTask 承担：它的 getUnobfuscatedForge() 就是切换这条
+		// 合并分支的开关（与配置期 productionOptions 同一判据），映射树为空的情形也在任务里按同一判据取值。
 
 		return null;
 	}
@@ -717,9 +727,13 @@ public class MinecraftPatchedProvider {
 		final Path patchedJar = minecraftPatchedJar.toAbsolutePath().normalize();
 		final Path clientExtra = providesClientJar() ? minecraftClientExtra.toAbsolutePath().normalize() : null;
 		final var extension = getExtension();
-		final var mappingConfiguration = extension.getMappingConfiguration();
+		// 无混淆形态没有映射配置（getMappingConfiguration() 会抛异常），而那个形态下最终 jar 走
+		// mergeUnobfuscatedPatchedJar、不读映射树，故两条映射相关声明都按空处理
+		final boolean unobfuscated = extension.disableObfuscation();
+		final var mappingConfiguration = unobfuscated ? null : extension.getMappingConfiguration();
 		// 与 buildRemapper / remapCoreMods / generateNeoForgeDistManifest 取映射树用的是同一个映射选项
-		final var mappingsOptions = mappingConfiguration.getMappingsServiceOptions(project, MappingOption.forPlatform(extension));
+		final var mappingsOptions = unobfuscated ? null
+				: mappingConfiguration.getMappingsServiceOptions(project, MappingOption.forPlatform(extension));
 		// 平台开关与命名空间：与 productionOptions 同一处取值，保证任务声明与配置期实现逐项同源
 		final String remapNamespace = IntermediaryNamespaces.intermediary(project);
 		final String coreModNamespace = extension.getProductionNamespace().get();
@@ -741,9 +755,13 @@ public class MinecraftPatchedProvider {
 			task.getAtPatchedJar().set(minecraftPatchedIntermediateAtJar.toFile());
 			task.getForgeJar().set(getForgeJar());
 			task.getForgeUserdevJar().set(getForgeUserdevJar());
-			task.getMappingsServiceOptions().set(mappingsOptions);
-			// 映射树取自迁移产物：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
-			mappingConfiguration.addMappingsProducerDependency(task);
+
+			if (mappingsOptions != null) {
+				task.getMappingsServiceOptions().set(mappingsOptions);
+				// 映射树取自迁移产物：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
+				mappingConfiguration.addMappingsProducerDependency(task);
+			}
+
 			task.getClientExtraEnabled().set(providesClientJar());
 			task.getPatchVersion().set(CURRENT_LOOM_PATCH_VERSION);
 			task.getNeoForge().set(extension.isNeoForge());
@@ -1176,6 +1194,21 @@ public class MinecraftPatchedProvider {
 	public Provider<McpExecutor.Options> createPrePatchJarMcpOptions(Path mcpCache) throws IOException {
 		McpExecutorBuilder builder = createMcpExecutor(mcpCache);
 		builder.enqueue("rename");
+		return builder.build();
+	}
+
+	/**
+	 * {@return disableObfuscation / unobfuscated 形态的 pre-patch jar 声明（排 MCP 的 merge / preProcessJar 步）}.
+	 *
+	 * <p>与 {@link #createPrePatchJarMcpOptions(Path)} 形状完全一致：只排队哪一步不同。
+	 * 步进名字的选择与配置期 {@code createUnobfuscatedPrePatchJar} 逐字一致
+	 * （{@code isNeoForge() ? "preProcessJar" : "merge"}），故两条路径的 MCP 步进集合相同。
+	 *
+	 * @param mcpCache MCP 执行链的工作目录（由调用方负责创建与清理）
+	 */
+	public Provider<McpExecutor.Options> createUnobfuscatedPrePatchJarMcpOptions(Path mcpCache) throws IOException {
+		McpExecutorBuilder builder = createMcpExecutor(mcpCache);
+		builder.enqueue(getExtension().isNeoForge() ? "preProcessJar" : "merge");
 		return builder.build();
 	}
 
@@ -1842,7 +1875,7 @@ public class MinecraftPatchedProvider {
 		}
 	}
 
-	static void walkFileSystems(Path source, Path target, Predicate<Path> filter, FsPathConsumer action) throws IOException {
+	public static void walkFileSystems(Path source, Path target, Predicate<Path> filter, FsPathConsumer action) throws IOException {
 		walkFileSystems(source, target, filter, FileSystem::getRootDirectories, action);
 	}
 
@@ -1851,7 +1884,7 @@ public class MinecraftPatchedProvider {
 	}
 
 	/** 与 {@link #copyMissingClasses(Path, Path)} 同一处实现；静态供执行期任务复用. */
-	static void copyMissingClassesStatic(Path source, Path target) throws IOException {
+	public static void copyMissingClassesStatic(Path source, Path target) throws IOException {
 		walkFileSystems(source, target, it -> it.toString().endsWith(".class"), (sourceFs, targetFs, sourcePath, targetPath) -> {
 			if (Files.exists(targetPath)) return;
 			Path parent = targetPath.getParent();
@@ -1873,7 +1906,7 @@ public class MinecraftPatchedProvider {
 		walkFileSystems(source, target, filter, MinecraftPatchedProvider::copyReplacing);
 	}
 
-	static void copyReplacing(FileSystem sourceFs, FileSystem targetFs, Path sourcePath, Path targetPath) throws IOException {
+	public static void copyReplacing(FileSystem sourceFs, FileSystem targetFs, Path sourcePath, Path targetPath) throws IOException {
 		Path parent = targetPath.getParent();
 
 		if (parent != null) {
@@ -1901,7 +1934,7 @@ public class MinecraftPatchedProvider {
 		});
 	}
 
-	static void applyLoomPatchVersion(Path target) throws IOException {
+	public static void applyLoomPatchVersion(Path target) throws IOException {
 		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(target, false)) {
 			Path manifestPath = delegate.get().getPath("META-INF/MANIFEST.MF");
 

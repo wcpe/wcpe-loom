@@ -40,6 +40,7 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -47,9 +48,11 @@ import java.util.jar.Attributes;
 import java.util.jar.Manifest;
 import java.util.stream.Stream;
 
+import dev.architectury.loom.accesstransformer.AccessTransformerService;
 import dev.architectury.loom.forge.CoreModManagerTransformer;
 import dev.architectury.loom.forge.dependency.ForgeProvider;
 import dev.architectury.loom.forge.dependency.PatchProvider;
+import dev.architectury.loom.forge.tool.ForgeExternalToolService;
 import dev.architectury.loom.util.Stopwatch;
 import dev.architectury.loom.util.ThreadingUtils;
 import org.gradle.api.Project;
@@ -63,6 +66,11 @@ import org.objectweb.asm.Opcodes;
 
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+import net.fabricmc.loom.pipeline.AccessTransformForgeJarTask;
+import net.fabricmc.loom.pipeline.GenerateLegacyForgeJarTask;
+import net.fabricmc.loom.pipeline.MergeLegacyPatchedJarTask;
+import net.fabricmc.loom.pipeline.PatchLegacyMinecraftJarsTask;
+import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.FileSystemUtil;
 import net.fabricmc.loom.util.Pair;
@@ -87,6 +95,9 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 
 	private Path forgeJar;
 
+	/** forge.jar 是否由执行期任务产出（投影形态）；false 时本类在配置期就地生产. */
+	private boolean forgeJarProjected;
+
 	public MinecraftLegacyPatchedProvider(Project project, MinecraftProvider minecraftProvider, Type type) {
 		super(project, minecraftProvider, type);
 	}
@@ -107,6 +118,11 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 		minecraftMergedPatchedJar = forgeWorkingDir.resolve("merged-patched.jar");
 		minecraftPatchedAtJar = forgeWorkingDir.resolve(type.id + "-at-patched.jar");
 		forgeJar = forgeWorkingDir.resolve("forge.jar");
+
+		// forge.jar 能被投影成执行期任务：它的全链（重映射 → 删 binpatches/签名 → 补 log4j 辅助类 →
+		// 改造 CoreModManager → 写补丁标记）只读输入 jar，不依赖配置期产物。
+		// 投影后本类不再在配置期碰它，下游阶段按路径读（任务依赖由消费方接线）。
+		forgeJarProjected = registerLegacyForgeJarTask();
 
 		// 无锁快路径：产物齐备且补丁版本最新时，本次仅做内存配置，不触碰共享缓存，不取锁
 		if (!needsWork()) {
@@ -214,6 +230,12 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 
 	@Override
 	public void remapJar(ServiceFactory serviceFactory) throws Exception {
+		// 整链已投成执行期任务（见 registerLegacyForgeJarTask）：配置期不再生产、也不在配置期读这批产物。
+		// 任务图负责顺序与就绪，下游消费方经 registerTaskProducedArtifact 接上任务依赖。
+		if (forgeJarProjected) {
+			return;
+		}
+
 		// 无锁快路径：provide 已判定产物齐备（needsWork=false → dirty=false）时，本方法的全链
 		// 可复用性判定（存在 + 不是空 zip／截断文件）都会短路，无需取锁；仅当 provide 判定需要工作才进锁。
 		// 注意必须带上 !dirty：显式刷新与「补丁版本过期」不再通过删除产物表达，
@@ -227,7 +249,11 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 
 		withPatchedLock(() -> {
 			// 锁内二次确认：等锁期间其它进程可能已完成生产；所有产物均以「临时文件 + 原子落位」生成
-			if (dirty || !isReusableJar(forgeJar)) {
+			if (forgeJarProjected) {
+				// 投影形态：forge.jar 由执行期任务产出，本方法不在配置期读或写它。
+				// 下游阶段（patchJars/mergeJars/accessTransform）仍留在配置期，它们按路径读该产物，
+				// 任务依赖在消费方那边统一接线（见 registerLegacyForgeJarTask）。
+			} else if (dirty || !isReusableJar(forgeJar)) {
 				dirty = true;
 				publishAtomically(forgeJar, output -> patchForge(output, serviceFactory));
 			}
@@ -259,6 +285,195 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 
 			return null;
 		});
+	}
+
+	/**
+	 * 把 {@code forge.jar} 的生产登记成执行期任务.
+	 *
+	 * <p>与配置期 {@code patchForge} 共用同一条链（重映射 → 删 binpatches/签名 → 补 log4j 辅助类 →
+	 * 改造 CoreModManager → 写补丁标记），产物路径也完全一致；区别只在文件什么时候写出。
+	 *
+	 * <p>本方法只做「配置期已知量 → 任务输入」的映射，不写任何产物。CURRENT_LOOM_PATCH_VERSION 和
+	 * forge universal jar 都是配置期就确定的纯值 / 已解析路径；唯一可能由执行期产出的是 vanilla jar
+	 * （client/server）与 srg tiny，两者都按路径声明并显式接线依赖。
+	 *
+	 * @return 是否登记成功（投影形态）
+	 */
+	private boolean registerLegacyForgeJarTask() {
+		final var extension = getExtension();
+
+		final String taskPath = RemapMinecraftTaskRegistry.claim(project, forgeJar, Map.of(
+				"stage", "legacy-forge-jar",
+				"forgeVersion", extension.getForgeProvider().getVersion().getCombined(),
+				"unobfuscated", Boolean.toString(extension.isUnobfuscatedForge())
+		), () -> project.getTasks().register(GenerateLegacyForgeJarTask.NAME, GenerateLegacyForgeJarTask.class, task -> {
+			task.setGroup(Constants.TaskGroup.FABRIC);
+			task.setDescription("Produces the named legacy Forge jar for %s".formatted(
+					extension.getMinecraftProvider().minecraftVersion()));
+			task.getOutputJar().set(forgeJar.toFile());
+			task.getForgeUniversalJar().set(extension.getForgeUniversalProvider().getForge().toPath().toFile());
+
+			// 四列 tiny（official/srg/intermediary/named），方向 official -> named。
+			// unobfuscated Forge 没有映射配置，与配置期 remapForgeToNamed 的早返回同判据。
+			if (!extension.isUnobfuscatedForge()) {
+				task.getMappings().set(extension.getMappingConfiguration().tinyMappingsWithSrg.toFile());
+				// 映射产物由迁移任务/合并产出，按路径声明输入不带任务依赖，必须显式接线
+				extension.getMappingConfiguration().addMappingsProducerDependency(task);
+			}
+
+			// remap 的外部 classpath：未打补丁的干净 vanilla jar（只读成员签名，不输出）
+			Arrays.stream(minecraftClassPath()).forEach(task.getMinecraftClasspath()::from);
+
+			// 旧版 Forge 依赖 log4j-core 2.0-beta9 的 helpers 包；不在依赖里时不设置
+			project.getConfigurations().getByName(Constants.Configurations.MINECRAFT_COMPILE_LIBRARIES).getFiles().stream()
+					.map(File::toPath)
+					.filter(it -> it.getFileName().toString().equals("log4j-core-2.0-beta9.jar"))
+					.findAny()
+					.ifPresent(jar -> task.getLog4jBeta9Jar().set(jar.toFile()));
+
+			task.getPatchVersion().set(MinecraftPatchedProvider.CURRENT_LOOM_PATCH_VERSION);
+		})).taskPath();
+
+		if (taskPath == null) {
+			return false;
+		}
+
+		// 下游阶段（patchJars / mergeJars / accessTransform）仍在配置期，它们按路径读 forge.jar：
+		// 登记成本 provider 的产物，消费方经 addProducerDependency 接上同一条任务依赖
+		minecraftProvider.registerTaskProducedArtifact(forgeJar, new RemapMinecraftTaskRegistry.Producer(forgeJar, taskPath));
+		project.getLogger().lifecycle("legacy Forge 的 forge.jar 由执行期任务承担：{}", taskPath);
+
+		// 后续三段：client/server 打补丁 → 合并 → AT（含合入 forge.jar 与写就绪标记）。
+		// 它们以前留在配置期、按路径读 forge.jar；现在整链都是任务，靠任务依赖串起来。
+		final String[] patchedPaths = registerClientServerPatchedTasks(taskPath);
+		final String mergedPath = registerMergeTask(patchedPaths[0], patchedPaths[1]);
+		registerAccessTransformTask(mergedPath, taskPath);
+
+		return true;
+	}
+
+	/**
+	 * 登记 client / server 两件打补丁产物（两个任务实例，同一个类型）.
+	 *
+	 * @param forgeJarTaskPath forge.jar 的产出任务；两件产物都要依赖它（remap 的 classpath 就是它重映射后的结果）
+	 * @return {client, server} 两个产出任务路径；合并任务必须两个都依赖，
+	 *         否则 server 侧不会被调度，合并时会因输入不存在而失败
+	 */
+	private String[] registerClientServerPatchedTasks(String forgeJarTaskPath) {
+		final var extension = getExtension();
+		final PatchProvider patchProvider = extension.getPatchProvider();
+		final ForgeExternalToolService.Options binpatcher = createBinpatcherTool();
+		final Path serverJar = extension.getMinecraftProvider().getMinecraftServerJar().toPath();
+		final Path clientJar = extension.getMinecraftProvider().getMinecraftClientJar().toPath();
+
+		final String serverTask = claimPatchedTask(PatchLegacyMinecraftJarsTask.NAME_SERVER, minecraftServerPatchedJar,
+				serverJar, patchProvider.extractServerPatches(), binpatcher, forgeJarTaskPath);
+		final String clientTask = claimPatchedTask(PatchLegacyMinecraftJarsTask.NAME_CLIENT, minecraftClientPatchedJar,
+				clientJar, patchProvider.extractClientPatches(), binpatcher, forgeJarTaskPath);
+
+		minecraftProvider.registerTaskProducedArtifact(minecraftServerPatchedJar,
+				new RemapMinecraftTaskRegistry.Producer(minecraftServerPatchedJar, serverTask));
+		minecraftProvider.registerTaskProducedArtifact(minecraftClientPatchedJar,
+				new RemapMinecraftTaskRegistry.Producer(minecraftClientPatchedJar, clientTask));
+
+		project.getLogger().lifecycle("legacy Forge 的 patched client/server jar 由执行期任务承担：{} / {}", clientTask, serverTask);
+		return new String[] {clientTask, serverTask};
+	}
+
+	private String claimPatchedTask(String taskName, Path outputJar, Path cleanJar, Path patches,
+			ForgeExternalToolService.Options binpatcher, String forgeJarTaskPath) {
+		return RemapMinecraftTaskRegistry.claim(project, outputJar, Map.of(
+				"stage", "legacy-patched-jar",
+				"taskName", taskName,
+				"clean", cleanJar.toAbsolutePath().normalize().toString()
+		), () -> project.getTasks().register(taskName, PatchLegacyMinecraftJarsTask.class, task -> {
+			task.setGroup(Constants.TaskGroup.FABRIC);
+			task.setDescription("Patches the legacy Minecraft jar (%s)".formatted(taskName));
+			task.getOutputJar().set(outputJar.toFile());
+			task.getCleanJar().set(cleanJar.toFile());
+			task.getPatches().set(patches.toFile());
+			task.getBinpatcherTool().set(binpatcher);
+			task.dependsOn(forgeJarTaskPath);
+		})).taskPath();
+	}
+
+	/** 登记合并任务（client-patched + server-patched → merged-patched）.
+	 *
+	 * @param clientTaskPath client 侧产出任务
+	 * @param serverTaskPath server 侧产出任务（两者都要依赖：合并同时读这两件产物）
+	 * @return 合并产物的产出任务路径
+	 */
+	private String registerMergeTask(String clientTaskPath, String serverTaskPath) {
+		final String taskPath = RemapMinecraftTaskRegistry.claim(project, minecraftMergedPatchedJar, Map.of(
+				"stage", "legacy-merged-patched-jar"
+		), () -> project.getTasks().register(MergeLegacyPatchedJarTask.NAME, MergeLegacyPatchedJarTask.class, task -> {
+			task.setGroup(Constants.TaskGroup.FABRIC);
+			task.setDescription("Merges the legacy patched Minecraft jars");
+			task.getOutputJar().set(minecraftMergedPatchedJar.toFile());
+			task.getClientPatchedJar().set(minecraftClientPatchedJar.toFile());
+			task.getServerPatchedJar().set(minecraftServerPatchedJar.toFile());
+			// 两个产出方都要接：只接 client 会让 server 侧不被调度（实测：合并时报 server-patched.jar 不存在）。
+			// 用 project.provider 惰性取 TaskProvider：字符串 dependsOn 对「非根项目里的任务」
+			// 找不到时是静默忽略（实测 server 侧的字符串依赖没生效，dry-run 里该任务根本没入图）。
+			// 惰性取值：本回调在 claim 里执行，两个产出任务可能尚未注册完，直接 named() 会抛未知任务
+			task.dependsOn(task.getProject().provider(() -> List.of(clientTaskPath, serverTaskPath)));
+		})).taskPath();
+
+		minecraftProvider.registerTaskProducedArtifact(minecraftMergedPatchedJar,
+				new RemapMinecraftTaskRegistry.Producer(minecraftMergedPatchedJar, taskPath));
+		project.getLogger().lifecycle("legacy Forge 的 merged patched jar 由执行期任务承担：{}", taskPath);
+		return taskPath;
+	}
+
+	/** 登记 AT 任务（merged-patched + AT + 合入 forge.jar + 写标记 → at-patched）.
+	 *
+	 * @param mergedTaskPath 合并产物任务
+	 * @param forgeJarTaskPath forge.jar 任务（要合进最终产物）
+	 */
+	private void registerAccessTransformTask(String mergedTaskPath, String forgeJarTaskPath) {
+		final var extension = getExtension();
+		final AccessTransformerService.Tool atTool = AccessTransformerService.resolveTool(project);
+
+		final String taskPath = RemapMinecraftTaskRegistry.claim(project, minecraftPatchedAtJar, Map.of(
+				"stage", "legacy-at-patched-jar",
+				"type", type.id
+		), () -> project.getTasks().register(AccessTransformForgeJarTask.NAME + "Legacy", AccessTransformForgeJarTask.class, task -> {
+			task.setGroup(Constants.TaskGroup.FABRIC);
+			task.setDescription("Access transforms the legacy patched Minecraft jar");
+			task.getOutputJar().set(minecraftPatchedAtJar.toFile());
+			task.getPatchedIntermediateJar().set(minecraftMergedPatchedJar.toFile());
+			task.getForgeUserdevJar().set(extension.getForgeUserdevProvider().getUserdevJar().toPath().toFile());
+
+			// legacy 的 AT 规则写 SRG 名，而作用对象是 notch 后的合并 jar：必须翻译
+			task.getMappings().set(extension.getMappingConfiguration().tinyMappingsWithSrg.toFile());
+			task.getAtSourceNamespace().set("srg");
+			task.getAtTargetNamespace().set("official");
+			extension.getMappingConfiguration().addMappingsProducerDependency(task);
+
+			extension.getForgeUserdevProvider().getConfig().ats().visit(directory -> {
+				task.getAtDirectory().set(directory);
+				return null;
+			}, paths -> {
+				task.getAtPaths().set(paths);
+				return null;
+			});
+
+			task.getAtMainClass().set(atTool.mainClass());
+			task.getAtClasspath().from(atTool.classpath());
+			task.getAtJavaExecutable().set(atTool.javaExecutable());
+			task.getAtVerboseStdout().set(atTool.verboseStdout());
+			task.getAtVerboseStderr().set(atTool.verboseStderr());
+
+			// legacy 专用：合入 forge.jar 并写就绪标记（该 jar 不再经下游 remap 任务）
+			task.getMergeForgeJar().set(forgeJar.toFile());
+			task.getPatchVersion().set(MinecraftPatchedProvider.CURRENT_LOOM_PATCH_VERSION);
+
+			task.dependsOn(mergedTaskPath, forgeJarTaskPath);
+		})).taskPath();
+
+		minecraftProvider.registerTaskProducedArtifact(minecraftPatchedAtJar,
+				new RemapMinecraftTaskRegistry.Producer(minecraftPatchedAtJar, taskPath));
+		project.getLogger().lifecycle("legacy Forge 的 at-patched jar 由执行期任务承担：{}", taskPath);
 	}
 
 	private void patchForge(Path output, ServiceFactory serviceFactory) throws Exception {
@@ -531,7 +746,7 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 		walkFileSystems(clean, output, file -> !file.toString().endsWith(".class"), MinecraftPatchedProvider::copyReplacing);
 
 		// Workaround Forge patches apparently violating the JVM spec (see ParameterAnnotationsFixer for details)
-		modifyClasses(output, ParameterAnnotationsFixer::new);
+		modifyClassesStatic(output, ParameterAnnotationsFixer::new);
 	}
 
 	private void mergeJars(Path output) throws Exception {
@@ -546,12 +761,46 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
 
 		// The JarMerger adds Sided annotations but so do the Forge patches. The latter doesn't require extra
 		// dependencies beyond Forge, so we'll keep those and convert any non-redundant Fabric ones.
-		modifyClasses(output, SideAnnotationMerger::new);
+		modifyClassesStatic(output, SideAnnotationMerger::new);
 
 		logger.info(":merged jars in " + stopwatch);
 	}
 
-	private void modifyClasses(Path jarFile, Function<ClassVisitor, ClassVisitor> func) throws Exception {
+	/**
+	 * 对合并产物应用 {@code SideAnnotationMerger}（供执行期任务复用）.
+	 *
+	 * <p>合并后的 jar 会同时带 JillMerger 写的 Fabric 风格 Sided 注解与 Forge 补丁自己写的，
+	 * 前者中非冗余的要转换成 Forge 形式、冗余的直接丢弃（详见该 visitor 的说明）。
+	 *
+	 * @param jarFile 合并后的 jar（就地修改）
+	 */
+	public static void modifySideAnnotations(Path jarFile) throws Exception {
+		modifyClassesStatic(jarFile, SideAnnotationMerger::new);
+	}
+
+	/**
+	 * 对打完补丁的 jar 应用 {@code ParameterAnnotationsFixer}（供执行期任务复用）.
+	 *
+	 * <p>Forge 补丁产出的 class 里，{@code Runtime[In]VisibleParameterAnnotation.num_parameters}
+	 * 可能小于方法形参个数（最后一个参数无注解时），会让编译器读到表尾而报错。
+	 * 这个 visitor 忽略原值、让 ASM 按签名重算（详见内部类的说明）。
+	 *
+	 * @param jarFile 打完补丁的 jar（就地修改）
+	 */
+	public static void modifyParameterAnnotations(Path jarFile) throws Exception {
+		modifyClassesStatic(jarFile, ParameterAnnotationsFixer::new);
+	}
+
+	/**
+	 * 用 ASM 逐类改写一个 jar 内的 class（与配置期 {@code modifyClasses} 同一条实现）.
+	 *
+	 * <p>是静态且不读项目模型：它只看 jar 文件与 visitor 工厂，因此执行期任务与配置期路径
+	 * 可以共用同一处实现，不会出现两份逐类改写逻辑。
+	 *
+	 * @param jarFile 待改写的 jar（就地修改）
+	 * @param func 每个类构造 visitor 的函数
+	 */
+	public static void modifyClassesStatic(Path jarFile, Function<ClassVisitor, ClassVisitor> func) throws Exception {
 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jarFile, false)) {
 			// best-effort：逐类改写注解，单个类失败时保留该类原样即可，不应该让整个合并流程失败。
 			ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter().tolerateFailures();

@@ -49,6 +49,8 @@ import net.fabricmc.loom.build.IntermediaryNamespaces;
 import net.fabricmc.loom.configuration.ide.idea.IdeaUtils;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftSourceSets;
 import net.fabricmc.loom.extension.MixinExtension;
+import net.fabricmc.loom.pipeline.GenerateMixinMappingsTask;
+import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.LoomVersions;
 
@@ -71,6 +73,8 @@ public abstract class AnnotationProcessorInvoker<T extends Task> {
 	protected final Map<SourceSet, TaskProvider<T>> invokerTasks;
 	private final String name;
 	private final Collection<Configuration> apConfigurations;
+	/** 源集 → Mixin 映射产出路径；在 configureMixin() 里一次性登记，供 passMixinArguments 取用. */
+	private final Map<SourceSet, Path> mixinMappingsOutputs = new HashMap<>();
 
 	protected AnnotationProcessorInvoker(Project project,
 											Collection<Configuration> apConfigurations,
@@ -100,7 +104,15 @@ public abstract class AnnotationProcessorInvoker<T extends Task> {
 		try {
 			LoomGradleExtension loom = LoomGradleExtension.get(project);
 			String refmapName = Objects.requireNonNull(MixinExtension.getMixinInformationContainer(sourceSet)).refmapNameProvider().get();
-			Path mappings = loom.getMappingConfiguration().getReplacedTarget(loom, loom.getMixin().getRefmapTargetNamespace().get());
+
+			// 映射文件改由任务产出，而不是在配置期现场写：
+			// getReplacedTarget 会立即读平台映射文件并写产物，把它放在这里就等于要求整条 mappings
+			// 迁移在配置期完成。改为任务后，参数里给的仍是同一个路径，但文件何时落盘交给任务图。
+			//
+			// 注意：产出任务已在 configureMixin() 里、早于本方法登记好（见那里的注释）。
+			// 这里不能再 register——本方法跑在任务的 configure 动作里，那个上下文禁止创建新任务。
+			final Path mappings = Objects.requireNonNull(mixinMappingsOutputs.get(sourceSet),
+					"Mixin mappings 产出任务未登记：" + sourceSet.getName());
 
 			final File mixinMappings = getMixinMappingsForSourceSet(project, sourceSet);
 
@@ -139,6 +151,16 @@ public abstract class AnnotationProcessorInvoker<T extends Task> {
 		ConfigurationContainer configs = project.getConfigurations();
 		MinecraftSourceSets minecraftSourceSets = MinecraftSourceSets.get(project);
 
+		// 先在本方法里（仍在配置期、且不在任何任务的 configure 动作内）登记 mappings 产出任务。
+		// 不能推迟到下面的 passMixinArguments：那里跑在任务 configure 动作中，
+		// Gradle 9 会以「DefaultTaskContainer#register(...) cannot be executed in the current context」拒绝。
+		final LoomGradleExtension loom = LoomGradleExtension.get(project);
+		final String targetNamespace = loom.getMixin().getRefmapTargetNamespace().get();
+
+		for (Map.Entry<SourceSet, TaskProvider<T>> entry : invokerTasks.entrySet()) {
+			mixinMappingsOutputs.put(entry.getKey(), registerMixinMappingsTask(loom, entry.getValue(), targetNamespace));
+		}
+
 		if (!IdeaUtils.isIdeaSync()) {
 			for (Configuration processorConfig : apConfigurations) {
 				project.getLogger().info("Adding mixin to classpath of AP config: " + processorConfig.getName());
@@ -165,6 +187,46 @@ public abstract class AnnotationProcessorInvoker<T extends Task> {
 		if (!matcher.find()) {
 			throw new IllegalArgumentException("Mixin argument (%s) does not match pattern (%s)".formatted(input, pattern.toString()));
 		}
+	}
+
+	/**
+	 * 登记（或复用）产出 {@code mappings-mixin-<ns>.tiny} 的任务，并把本编译任务依赖它.
+	 *
+	 * <p>返回的路径与配置期 {@code getReplacedTarget} 完全一致（{@code <mappingsWorkingDir>/mappings-mixin-<ns>.tiny}），
+	 * 保证 Mixin AP 拿到的仍是同一个位置；区别只在文件何时写出。
+	 *
+	 * <p>用 {@code RemapMinecraftTaskRegistry.claim} 而不是直接 register：同一产物路径在本构建内
+	 * 只能有一个生产者（多个子项目可能算出同一条路径），且产出方可能来自另一份 Loom classloader。
+	 *
+	 * @param loom          当前项目的 loom 扩展
+	 * @param compileTask   要接线依赖的编译任务
+	 * @param namespace     refmap 目标命名空间
+	 * @return 产物路径（供 {@code -AinMapFileNamed<Ns>=} 参数使用）
+	 */
+	private Path registerMixinMappingsTask(LoomGradleExtension loom, TaskProvider<T> compileTask, String namespace) {
+		final var mappingConfiguration = loom.getMappingConfiguration();
+		final Path output = mappingConfiguration.mappingsWorkingDir().resolve("mappings-mixin-" + namespace + ".tiny").toAbsolutePath().normalize();
+
+		final String taskPath = RemapMinecraftTaskRegistry.claim(project, output, Map.of(
+				"stage", "mixin-mappings",
+				"namespace", namespace,
+				"mappingsIdentifier", mappingConfiguration.mappingsIdentifier
+		), () -> project.getTasks().register(GenerateMixinMappingsTask.NAME, GenerateMixinMappingsTask.class, task -> {
+			task.setGroup(Constants.TaskGroup.FABRIC);
+			task.setDescription("Generates the Mixin mappings for namespace %s".formatted(namespace));
+			task.getPlatformMappings().set(loom.getMappingConfiguration().getPlatformMappingFile(loom).toFile());
+			task.getNamespace().set(namespace);
+			task.getOutputMappings().set(output.toFile());
+			// 平台映射文件自身可能由迁移任务产出：按路径声明输入不会带任务依赖，必须显式接线
+			loom.getMappingConfiguration().addMappingsProducerDependency(task);
+		})).taskPath();
+
+		if (taskPath != null) {
+			// 仍在配置期（本方法只从 configureMixin 的循环里调用），可以在任务 configure 动作里接线依赖
+			compileTask.configure(t -> t.dependsOn(taskPath));
+		}
+
+		return output;
 	}
 
 	public static File getMixinMappingsForSourceSet(Project project, SourceSet sourceSet) {

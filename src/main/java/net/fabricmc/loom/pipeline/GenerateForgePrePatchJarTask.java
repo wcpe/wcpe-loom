@@ -91,6 +91,16 @@ public abstract class GenerateForgePrePatchJarTask extends DefaultTask {
 	/** 分支：跑 MCP 的 {@code rename} 步（现代 Forge / NeoForge 的常规形态）. */
 	public static final String BRANCH_MCP_RENAME = "mcp-rename";
 
+	/**
+	 * 分支：跑 MCP 的 {@code merge} / {@code preProcessJar} 步（disableObfuscation / unobfuscated 形态）.
+	 *
+	 * <p>与 {@link #BRANCH_MCP_RENAME} 共用同一个 {@code McpExecutor} 实现与同一条落位路径，
+	 * 唯一区别是排队哪一步：配置期的 {@code createUnobfuscatedPrePatchJar} 排的是
+	 * {@code isNeoForge() ? "preProcessJar" : "merge"}（1.7-1.16 的 FG2 形态另有实现，不走这里）。
+	 * 步进集合因此仍只有一处定义，两条路径不会分叉。
+	 */
+	public static final String BRANCH_MCP_UNOBFUSCATED = "mcp-unobfuscated";
+
 	/** 分支：NeoForge installer tools 的 {@code PROCESS_MINECRAFT_JAR}（见 NeoForge#2848 的绕行）. */
 	public static final String BRANCH_NEOFORGE_INSTALLER_TOOLS = "neoforge-installer-tools";
 
@@ -98,7 +108,7 @@ public abstract class GenerateForgePrePatchJarTask extends DefaultTask {
 	@Input
 	public abstract Property<String> getBranch();
 
-	/** MCP 执行器选项（{@link #BRANCH_MCP_RENAME}）；另一条分支下不设置. */
+	/** MCP 执行器选项（{@link #BRANCH_MCP_RENAME} / {@link #BRANCH_MCP_UNOBFUSCATED}）；其余分支下不设置. */
 	@Nested
 	@Optional
 	public abstract Property<McpExecutor.Options> getMcpOptions();
@@ -146,7 +156,8 @@ public abstract class GenerateForgePrePatchJarTask extends DefaultTask {
 		final String branch = getBranch().get();
 
 		try (var serviceFactory = new ScopedServiceFactory()) {
-			if (BRANCH_MCP_RENAME.equals(branch)) {
+			if (BRANCH_MCP_RENAME.equals(branch) || BRANCH_MCP_UNOBFUSCATED.equals(branch)) {
+				// 两条分支只差排队的 MCP 步进（rename vs merge/preProcessJar），执行与落位完全共用
 				produceWithMcp(output, serviceFactory);
 			} else if (BRANCH_NEOFORGE_INSTALLER_TOOLS.equals(branch)) {
 				produceWithInstallerTools(output, serviceFactory);

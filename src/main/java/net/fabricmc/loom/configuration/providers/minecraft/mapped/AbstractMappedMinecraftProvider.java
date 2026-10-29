@@ -793,7 +793,13 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		final RemapperHookKind hookKind = resolveRemapperHookKind();
 
 		final Project project = getProject();
-		final MappingConfiguration mappingConfiguration = extension.getMappingConfiguration();
+		// 直通形态（disableObfuscation）没有 MappingConfiguration，而 getMappingConfiguration() 在该环境下
+		// 直接抛异常（"Cannot get mappings configuration in a non-obfuscated environment"）。
+		// 用 findMappingConfiguration() 取：它不抛、缺失时返回 null，正是任务侧「有就接线、没有就跳过」
+		// 所需的话义（见 LoomGradleExtension.findMappingConfiguration 的注释）。
+		// 下面仅当它存在时才装配 mappingsServiceOptions；任务协议已将该输入标为可选，
+		// 而 remap() 里对非直通路径加了“必须有映射”的断言，两条一起保住了正确性。
+		final @Nullable MappingConfiguration mappingConfiguration = extension.findMappingConfiguration();
 		final String fromNamespace = remappedJars.sourceNamespace().toString();
 		final String toNamespace = getTargetNamespace().toString();
 
@@ -821,15 +827,25 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 			objectHolderSourceNamespace = null;
 		}
 
-		final AnnotationsData remappedAnnotations = AnnotationsData.getRemappedAnnotations(
-				getTargetNamespace(), mappingConfiguration, project, configContext.serviceFactory(), toNamespace);
+		// 直通形态下 mappingConfiguration 为 null：它的产物是对输入 jar 的原字节复制，不做任何重映射，
+		// 因此 annotations 与 signature fixes 也无从谈起（两者都从映射树派生）。
+		// 这里给空值，与配置期 remapJar 的 disableObfuscation 分支（直接 copy + savePom 就返回）
+		// 在语义上一致：那一条路径根本不读这两项。
+		final AnnotationsData remappedAnnotations = mappingConfiguration == null
+				? null
+				: AnnotationsData.getRemappedAnnotations(
+						getTargetNamespace(), mappingConfiguration, project, configContext.serviceFactory(), toNamespace);
 		final Map<String, String> remappedSignatures;
 
-		try {
-			remappedSignatures = SignatureFixerApplyVisitor.getRemappedSignatures(
-					getTargetNamespace() == MappingsNamespace.INTERMEDIARY, mappingConfiguration, project, configContext.serviceFactory(), toNamespace);
-		} catch (IOException e) {
-			throw new UncheckedIOException("Failed to compute signature fixes for " + remappedJars.outputJarPath(), e);
+		if (mappingConfiguration == null) {
+			remappedSignatures = Map.of();
+		} else {
+			try {
+				remappedSignatures = SignatureFixerApplyVisitor.getRemappedSignatures(
+						getTargetNamespace() == MappingsNamespace.INTERMEDIARY, mappingConfiguration, project, configContext.serviceFactory(), toNamespace);
+			} catch (IOException e) {
+				throw new UncheckedIOException("Failed to compute signature fixes for " + remappedJars.outputJarPath(), e);
+			}
 		}
 
 		// 构件落位：jar / pom / backup 三个文件同处一个 maven 构件目录，pom 与 backup 都由 maven 助手的
@@ -862,7 +878,12 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		// 由 RemapMinecraftTask 在执行期现算（见 resolveInnerClassNames）。这两个判据都已经在上面
 		// ——inputJar 的路径与 forgeLike 的布尔值——同一对取值必然算出同一个集合，故指纹的判别力不变；
 		// 记一个常量反而会让人误以为它参与了判定。
-		identity.put("knownIndyBsms", fingerprintValues(extension.getKnownIndyBsms().get()));
+		// knownIndyBsms 在无混淆形态（disableObfuscation）下取不到：
+		// LoomGradleExtensionApiImpl 在该环境下抛 "Cannot configure known indyBsms in a non-obfuscated environment"。
+		// 而它只在重映射路径（RemapMinecraftTask 的 remapJar）被读，直通形态不读，故那里给空集即可。
+		// 指纹这里同理只记实际取得的值，保证「同一输入→同一指纹」。
+		final Set<String> knownIndyBsms = extension.disableObfuscation() ? Set.of() : extension.getKnownIndyBsms().get();
+		identity.put("knownIndyBsms", fingerprintValues(knownIndyBsms));
 		identity.put("signatureFixes", fingerprintEntries(remappedSignatures));
 		identity.put("annotationsJson", remappedAnnotations == null ? "" : remappedAnnotations.toJson().toString());
 		identity.put("objectHolderClassName", orEmpty(objectHolderClassName));
@@ -909,10 +930,16 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 					final boolean useInheritedMappings = !extension.isModernForgeLike()
 							&& extension.shouldGenerateSrgTiny();
 
-					task.getMappingsServiceOptions().set(mappingConfiguration.getMappingsServiceOptions(project,
-							useInheritedMappings ? MappingOption.WITH_SRG_INHERITED : MappingOption.forPlatform(extension)));
-					// 映射树取自迁移产物：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
-					mappingConfiguration.addMappingsProducerDependency(task);
+					// 直通形态（disableObfuscation）没有映射树可接：其产物是对输入 jar 的原字节复制。
+					// mappingsServiceOptions 在任务协议里已标为可选，这里就不提供；remap() 对非直通路径
+					// 保留了「必须有映射」的断言，因此不会出现“以为配了其实没配”的静默情况。
+					if (mappingConfiguration != null) {
+						task.getMappingsServiceOptions().set(mappingConfiguration.getMappingsServiceOptions(project,
+								useInheritedMappings ? MappingOption.WITH_SRG_INHERITED : MappingOption.forPlatform(extension)));
+						// 映射树取自迁移产物：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
+						mappingConfiguration.addMappingsProducerDependency(task);
+					}
+
 					task.getFromNamespace().set(fromNamespace);
 					task.getToNamespace().set(toNamespace);
 					task.getFixRecords().set(fixRecords);
@@ -937,7 +964,7 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 					// 现算（RemapMinecraftTask.resolveInnerClassNames）。此处曾用惰性 provider 登记「怎么算」，
 					// 但 SetProperty 是托管属性、配置缓存写入任务状态时会求值并序列化它，于是读 jar 落在
 					// 配置缓存序列化期——那时输入 jar 的产出任务还没跑，冷缓存下直接让整次配置缓存写入失败。
-					task.getKnownIndyBsms().set(extension.getKnownIndyBsms());
+					task.getKnownIndyBsms().set(knownIndyBsms);
 					task.getSignatureFixes().set(remappedSignatures);
 					// object holder 改写只在「官方命名空间」下需要，其目标命名空间是字面量 named，
 					// 与本 provider 的目标命名空间无关（与 remapJar 一致）
@@ -1029,17 +1056,18 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 	private void verifyProjectable(RemappedJars remappedJars) {
 		verifyRemapperHookProjectable(remappedJars);
 
-		// disableObfuscation 下 remapJar 不改写字节码，而是把输入 jar 原子复制到产物位置（再写 pom）。
-		// 任务侧已有对应入口且本次已接线（registerRemapTask 里 task.getCopyOnly().set(extension.disableObfuscation())），
-		// 但该形态**没有取得等价性证据**：本次的验收基线只覆盖「official → named 的重映射」，
-		// 直通形态（loom-no-remap 插件）既不在基线覆盖内，也没被本次实测过。因此仍拒绝投影，
-		// 而不是凭「看起来等价」放行——直通形态的产物就是输入 jar 的副本，一旦投影写错（例如漏了 backup、
-		// 或把 deobf 的 pom 写到了别处），产物仍是「构建成功」，静默损坏的代价远高于一次回退。
-		// 解除条件：为 disableObfuscation 形态补一份与 RemapMinecraftTaskEquivalenceTest 同口径的对照。
-		if (extension.disableObfuscation()) {
-			throw new UnsupportedOperationException("disableObfuscation 下 remapJar 走的是「原子复制」而非重映射，"
-					+ "该形态的投影（RemapMinecraftTask.getCopyOnly()）尚未取得等价性证据，本次不切换，保持配置期生产。");
-		}
+		// disableObfuscation 形态（直通）原本在这里被拒绝，理由是「该形态的投影尚未取得等价性证据」。
+		// 该证据现已补齐：{@code DisableObfuscationRemapEquivalenceTest} 按
+		// {@code RemapMinecraftTaskEquivalenceTest} 同口径对照了任务产出与配置期产出——
+		// 逐 class 条目内容一致，且 jar / pom / backup 三个产出物都就位。
+		// 因此这一形态正式进入任务路径（{@code copyOnly = true}，见 registerRemapTask）。
+		//
+		// 它当初被拒的真正理由值得留档：直通形态的产物是输入 jar 的副本，一旦投影写错（例如漏了 backup、
+		// 或把 deobf 的 pom 写到别处），产物仍是「构建成功」，静默损坏的代价远高于一次回退。
+		// 两份验证保住了这一点：
+		//   · 任务侧 writePom / writeBackupJar 的路径断言（pom 必须是 jar 的同名兄弟且与
+		//     LocalMavenHelper 算出的一致；backup 必须是 <jar>.backup）；
+		//   · 上述等价性测试同时验证三个产出物都就位。
 
 		// 曾经这里只警告 NeoForge（配置期把 isNeoForge() 当 injectMixinExtension 传给 L4，而任务侧固定传 false）。
 		// 该缺口已关闭：registerRemapTask 用 independent 输入承载了它（task.getInjectMixinExtension()，与

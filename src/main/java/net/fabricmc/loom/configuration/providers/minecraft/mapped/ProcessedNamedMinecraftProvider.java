@@ -47,6 +47,7 @@ import net.fabricmc.loom.api.processor.MinecraftJarProcessor;
 import net.fabricmc.loom.build.IntermediaryNamespaces;
 import net.fabricmc.loom.configuration.ConfigContext;
 import net.fabricmc.loom.configuration.mods.dependency.LocalMavenHelper;
+import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration;
 import net.fabricmc.loom.configuration.processors.LegacyJarProcessorWrapper;
 import net.fabricmc.loom.configuration.processors.MinecraftJarProcessorManager;
 import net.fabricmc.loom.configuration.processors.ProcessorContextImpl;
@@ -140,15 +141,12 @@ public abstract class ProcessedNamedMinecraftProvider<M extends MinecraftProvide
 	 * @return 每个 jar 类型对应的生产位置；链不可任务化时返回 {@code null}
 	 */
 	private @Nullable Map<MinecraftJar.Type, ProcessedArtifact> registerJarProcessTasks(Map<MinecraftJar, MinecraftJar> minecraftJarOutputMap) {
-		// disableObfuscation 下没有 MappingConfiguration：任务协议里的 mappingsServiceOptions 是必填的
-		// {@code @Nested} 输入（执行期上下文靠它取映射树），装配不出来。这与父 provider 拒绝投影该形态
-		// 是同一条理由的两面，故同样保持配置期生产，并打日志说明原因。
-		// 注意本判定必须在取链之前：取链本身不依赖映射配置，但装配任务输入会。
-		if (extension.disableObfuscation()) {
-			LOGGER.warn("{} 处于 disableObfuscation 形态：该形态没有 MappingConfiguration，"
-					+ "处理链的任务输入装配不出来，本 provider 保持配置期生产。", getClass().getSimpleName());
-			return null;
-		}
+		// disableObfuscation 形态原本在这里整链回退，理由是「任务协议里的 mappingsServiceOptions 是
+		// 必填的 @Nested 输入，装配不出来」。该障碍已解除：
+		//   · ProcessMinecraftJarTask.getMappingsServiceOptions() 已标为 @Optional；
+		//   · ExecutionProcessorContext 接受可空 mappingsOptions，只在真去读映射时才报错；
+		//   · 该形态的 spec 来自 DeobfSpecContext，它本身就不提供映射（实际也不读）。
+		// 因此不再按形态整批回退，往下走正常的处理器链校验与任务登记。
 
 		final List<MinecraftJarProcessor<?>> processors = jarProcessorManager.getProcessors();
 		final List<MinecraftJarProcessor.Spec> specs = jarProcessorManager.getSpecs();
@@ -580,9 +578,17 @@ public abstract class ProcessedNamedMinecraftProvider<M extends MinecraftProvide
 					task.getDisableObfuscation().set(extension.disableObfuscation());
 					task.getProductionNamespace().set(productionNamespace);
 					task.getIntermediaryNamespace().set(IntermediaryNamespaces.intermediaryNamespace(project));
-					task.getMappingsServiceOptions().set(extension.getMappingConfiguration().getMappingsServiceOptions(project, MappingOption.forPlatform(extension)));
-					// 映射树取自迁移产物：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
-					extension.getMappingConfiguration().addMappingsProducerDependency(task);
+					// 直通形态（disableObfuscation）没有映射树可接：其处理链的 spec 来自 DeobfSpecContext，
+					// 它不提供映射。任务侧 mappingsServiceOptions 已标为可选，这里就不提供；
+					// 若某个 processor 真去读映射，ExecutionProcessorContext 会在那一步给出明确错误。
+					final @Nullable MappingConfiguration mappingConfiguration = extension.findMappingConfiguration();
+
+					if (mappingConfiguration != null) {
+						task.getMappingsServiceOptions().set(mappingConfiguration.getMappingsServiceOptions(project, MappingOption.forPlatform(extension)));
+						// 映射树取自迁移产物：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
+						mappingConfiguration.addMappingsProducerDependency(task);
+					}
+
 					task.getRemapperServiceOptions().set(TinyRemapperService.createSimple(project,
 							project.provider(() -> productionNamespace.toString()),
 							project.provider(() -> targetNamespace.toString()),

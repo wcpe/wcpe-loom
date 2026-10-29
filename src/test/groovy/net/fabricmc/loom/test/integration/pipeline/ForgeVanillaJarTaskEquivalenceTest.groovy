@@ -257,8 +257,8 @@ class ForgeVanillaJarTaskEquivalenceTest extends Specification implements Gradle
 		report.PRE_PATCH_DEPS.contains(DOWNLOAD_SERVER_TASK)
 	}
 
-	def "legacy Forge（FG2 1.12.2）的 vanilla jar 仍整批留在配置期"() {
-		setup: "真 legacy Forge 的 patch 流程（MinecraftLegacyPatchedProvider）在配置期按路径读 vanilla jar"
+	def "legacy Forge（FG2 1.12.2）的整条 patch 链由执行期任务承担"() {
+		setup: "真 legacy Forge 的 patch 链（MinecraftLegacyPatchedProvider）已整链任务化，与 modern 车道同一判据进入投影路径"
 		def gradle = legacyForgeProject()
 		gradle.buildGradle << probeScript()
 
@@ -269,19 +269,24 @@ class ForgeVanillaJarTaskEquivalenceTest extends Specification implements Gradle
 		])
 		def report = parseReport(new File(gradle.projectDir, "probe-report.properties"))
 
-		then: "留痕是「保持配置期生产」，且判据确实认出这是 legacy Forge"
-		result.output.contains("Minecraft 1.12.2 " + CONFIGURATION_PRODUCTION_LIFECYCLE)
-		!result.output.contains("Minecraft 1.12.2 " + TASK_PRODUCTION_LIFECYCLE)
+		then: "判据确实认出这是 legacy Forge，且 vanilla 链已切到执行期任务"
 		report.LEGACY_FORGE == "true"
+		result.output.contains("Minecraft 1.12.2 " + TASK_PRODUCTION_LIFECYCLE)
 
-		and: "vanilla 链一件产物都没被切到任务"
-		report.CLIENT_TASK_FOUND == "false"
-		report.SERVER_TASK_FOUND == "false"
-		report.EXTRACT_TASK_FOUND == "false"
-		report.MERGE_TASK_FOUND == "false"
+		and: "vanilla 链的下载/抽取产物由任务承担"
+		report.CLIENT_TASK_FOUND == "true"
+		report.SERVER_TASK_FOUND == "true"
 
-		and: "补丁链同样留在配置期（legacy patched provider 不登记任务）"
-		report.PATCHED_TASK_FOUND == "false"
+		and: "FG2 patch 链四级全部登记为任务"
+		report.LEGACY_FORGE_TASK_FOUND == "true"
+		report.LEGACY_CLIENT_TASK_FOUND == "true"
+		report.LEGACY_SERVER_TASK_FOUND == "true"
+		report.LEGACY_MERGE_TASK_FOUND == "true"
+		report.LEGACY_AT_TASK_FOUND == "true"
+
+		and: "合并任务对 client 与 server 两个产出方都建了依赖"
+		report.LEGACY_MERGE_DEPS.contains("patchLegacyMinecraftClientJar")
+		report.LEGACY_MERGE_DEPS.contains("patchLegacyMinecraftServerJar")
 	}
 
 	/**
@@ -402,6 +407,20 @@ class ForgeVanillaJarTaskEquivalenceTest extends Specification implements Gradle
 
 			lines << 'PRE_PATCH_DEPS=' + dependencyNames(prePatchTask)
 			lines << 'PATCHED_DEPS=' + dependencyNames(patchedTask)
+
+			// legacy FG2 链的四个任务（1.12.2 是另一套实现，任务名与 modern 不同）
+			def legacyForgeTask = project.tasks.findByName('generateLegacyForgeJar')
+			def legacyClientTask = project.tasks.findByName('patchLegacyMinecraftClientJar')
+			def legacyServerTask = project.tasks.findByName('patchLegacyMinecraftServerJar')
+			def legacyMergeTask = project.tasks.findByName('mergeLegacyPatchedJar')
+			def legacyAtTask = project.tasks.findByName('accessTransformForgeJarLegacy')
+
+			lines << 'LEGACY_FORGE_TASK_FOUND=' + (legacyForgeTask != null)
+			lines << 'LEGACY_CLIENT_TASK_FOUND=' + (legacyClientTask != null)
+			lines << 'LEGACY_SERVER_TASK_FOUND=' + (legacyServerTask != null)
+			lines << 'LEGACY_MERGE_TASK_FOUND=' + (legacyMergeTask != null)
+			lines << 'LEGACY_AT_TASK_FOUND=' + (legacyAtTask != null)
+			lines << 'LEGACY_MERGE_DEPS=' + dependencyNames(legacyMergeTask)
 
 			reportFile.text = lines.join(System.lineSeparator()) + System.lineSeparator()
 		}

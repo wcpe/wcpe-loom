@@ -27,6 +27,8 @@ package net.fabricmc.loom.pipeline;
 import java.util.Objects;
 import java.util.function.Supplier;
 
+import org.jspecify.annotations.Nullable;
+
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.api.processor.ProcessorContext;
 import net.fabricmc.loom.configuration.providers.mappings.TinyMappingsService;
@@ -81,7 +83,7 @@ public final class ExecutionProcessorContext implements ProcessorContext {
 	private final boolean disableObfuscation;
 	private final MappingsNamespace productionNamespace;
 	private final MappingsNamespace intermediaryNamespace;
-	private final TinyMappingsService.Options mappingsOptions;
+	private final TinyMappingsService.@Nullable Options mappingsOptions;
 	private final TinyRemapperService.Options remapperOptions;
 	private final Supplier<MemoryMappingTree> mappings;
 
@@ -97,7 +99,7 @@ public final class ExecutionProcessorContext implements ProcessorContext {
 	 */
 	public ExecutionProcessorContext(ServiceFactory serviceFactory, JarConfigurationKind jarConfiguration,
 			MinecraftJar.Type jarType, boolean disableObfuscation, MappingsNamespace productionNamespace,
-			MappingsNamespace intermediaryNamespace, TinyMappingsService.Options mappingsOptions,
+			MappingsNamespace intermediaryNamespace, TinyMappingsService.@Nullable Options mappingsOptions,
 			TinyRemapperService.Options remapperOptions) {
 		this.serviceFactory = Objects.requireNonNull(serviceFactory, "serviceFactory");
 		this.jarConfiguration = Objects.requireNonNull(jarConfiguration, "jarConfiguration");
@@ -105,13 +107,21 @@ public final class ExecutionProcessorContext implements ProcessorContext {
 		this.disableObfuscation = disableObfuscation;
 		this.productionNamespace = Objects.requireNonNull(productionNamespace, "productionNamespace");
 		this.intermediaryNamespace = Objects.requireNonNull(intermediaryNamespace, "intermediaryNamespace");
-		this.mappingsOptions = Objects.requireNonNull(mappingsOptions, "mappingsOptions");
+		this.mappingsOptions = mappingsOptions;
 		this.remapperOptions = Objects.requireNonNull(remapperOptions, "remapperOptions");
-		// 映射树只在真正被读时才解析；处理器可能整轮都不需要它
+		// 映射树只在真正被读时才解析；处理器可能整轮都不需要它。
+		// 直通形态没有 mappingsOptions：到那一步再报错（而不是在构造期），否则
+		// 「根本不读映射」的处理器链也会因为这个未赋值的输入而无法投影。
 		this.mappings = Lazy.of(() -> getMappingsService().getMappingTree());
 	}
 
 	private TinyMappingsService getMappingsService() {
+		if (mappingsOptions == null) {
+			throw new IllegalStateException(
+					"本 processor 上下文没有映射服务配置（直通形态 / disableObfuscation），无法提供映射树。"
+							+ "若某个 processor 确实需要 getMappings()，它在直通形态下无法任务化。");
+		}
+
 		return serviceFactory.get(mappingsOptions);
 	}
 
