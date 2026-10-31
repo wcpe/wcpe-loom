@@ -31,6 +31,7 @@ import net.fabricmc.loom.test.util.GradleProjectTestTrait
 
 import static net.fabricmc.loom.test.LoomTestConstants.DEFAULT_GRADLE
 import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
+import static org.gradle.testkit.runner.TaskOutcome.UP_TO_DATE
 
 class PatchedDecompileTest extends Specification implements GradleProjectTestTrait {
 	@Unroll
@@ -45,11 +46,16 @@ class PatchedDecompileTest extends Specification implements GradleProjectTestTra
 				.replace('@JAVA_VERSION@', javaVersion)
 
 		when:
-		// TODO: Enable configuration cache if/when the task supports it
-		def result = gradle.run(task: "genForgePatchedSources", configurationCache: false, args: jdk21Args())
+		def result = gradle.run(task: "genForgePatchedSources", configurationCache: true, args: withBuildCache())
 
 		then:
 		result.task(":genForgePatchedSources").outcome == SUCCESS
+
+		when: '重跑一次：入参未变，任务必须被判定为最新'
+		def rerun = gradle.run(task: "genForgePatchedSources", configurationCache: true, args: withBuildCache())
+
+		then: '配置了 configurationCache: true 也能跑，且入参未变时任务被判定为最新'
+		rerun.task(":genForgePatchedSources").outcome == UP_TO_DATE
 
 		where:
 		mcVersion | forgeVersion | javaVersion
@@ -57,6 +63,29 @@ class PatchedDecompileTest extends Specification implements GradleProjectTestTra
 		'1.18.1'  | "39.0.63"    | '17'
 		'1.17.1'  | "37.0.67"    | '16'
 	}
+
+	/** 本任务的缓存验证需要构建缓存，与 JDK 入参叠加. */
+	private static List<String> withBuildCache() {
+		return jdk21Args() + ["--build-cache"]
+	}
+
+	/*
+	 * 为什么这里只断言 up-to-date，不断言 FROM-CACHE：
+	 *
+	 * 1) 构建缓存要能建键，本任务的产物必须在任务开始时**不存在**。可本任务的源码包产物落在跨项目共享的
+	 *    loom 缓存里（named MC jar 旁的 -sources.jar），执行前往往已经被上一次构建或另一个工程造好；
+	 *    对「已存在、又不是本任务创建」的输出，Gradle 会直接关掉该任务的构建缓存，原文：
+	 *    Gradle does not know how file ... was created (output property ...). Task output caching requires
+	 *    exclusive access to output paths to guarantee correctness。
+	 *    实测证据（--info，Forge 1.18.1）：generateForgePrePatchJar / downloadMinecraftClientJar /
+	 *    downloadMinecraftServerJar 都是这一句（产物同样在共享 loom 缓存里）；而同轮 extractForgeSources
+	 *    （产物在项目 build 目录里）正常 FROM-CACHE 并打印 Build cache key 与 Loaded cache entry。
+	 *
+	 * 2) 本地试过「先删掉两个声明产物（含共享缓存里那份）再跑」的三段验法：前两段（SUCCESS、UP_TO_DATE）
+	 *    稳定通过，但第三段（删掉产物后重跑）仍然重新执行而不是 FROM-CACHE；在当时的机器条件
+	 *    （load 50+、外层 Gradle daemon 反复被其它构建 --stop 掉）下没能在时限内定位到直接原因，
+	 *    因此这里不写一条自己都没跑通的断言——留给后续用 --info 定位，确认后再加回来。
+	 */
 
 	/**
 	 * Forge 自带的 ForgeFlower 解析不了 JDK 25 类文件中的常量池项（CONSTANT_Dynamic），
