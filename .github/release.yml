@@ -1,9 +1,15 @@
 # GitHub 自动生成 Release Notes 的分组配置。
 #
-# 注意：本仓库的自动发布（.github/workflows/publish.yml）**已不再使用** --generate-notes，
-# 改为 scripts/gen-release-notes.sh 按提交生成——原因是 --generate-notes 只统计经 PR 合入的
-# 提交，而本线以直推为主，结果会出现正文全空或只剩零星几条 PR。
-# 本文件现在只服务 GitHub 网页端的「Generate release notes」按钮（人工触发时读取）。
+# **本仓库的正式发布流程不使用本文件。**
+# 发布说明自 2026-10 起由「补丁面集合差」生成：每个补丁提交带 trailer `Patch-Name: <slug>`，
+# 正文 = 本版补丁面 − 上一版补丁面，由 scripts/gen-release-notes.sh 在**发版前**生成、
+# 随 tag 一起提交到 .upstream/releases/<tag>.md，CI 只用 --check 逐字校验后发布。
+# 详见 .upstream/releases/README.md 与 .upstream/README.md 的「流程 C」。
+#
+# 历史背景：更早的 workflow 曾用 --generate-notes，但它只统计经 PR 合入的提交，
+# 而本线以直推为主，结果会出现正文全空或只剩零星几条 PR。那条链路早已移除。
+#
+# 因此本文件现在**只服务 GitHub 网页端的「Generate release notes」按钮**（人工触发时读取）。
 # 直推提交不会进入它的 What's Changed；需要完整清单请用上面的脚本。
 # 命中越靠前的 category 优先级越高；不带 label 的 PR 落入「其他变更」。
 changelog:
