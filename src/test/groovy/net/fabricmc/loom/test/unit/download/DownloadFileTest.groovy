@@ -25,10 +25,14 @@
 package net.fabricmc.loom.test.unit.download
 
 import java.nio.file.Files
+import java.nio.file.Path
 import java.nio.file.Paths
 import java.nio.file.attribute.FileTime
 import java.time.Duration
 import java.time.Instant
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 import io.javalin.http.HttpStatus
 import spock.lang.IgnoreIf
@@ -483,6 +487,125 @@ class DownloadFileTest extends DownloadTest {
 
 		then:
 		Files.readAllBytes(output) == data
+	}
+
+	def "Lock: 残留锁被接管，既不抛异常也不强制重下"() {
+		setup:
+		int requestCount = 0
+
+		server.get("/staleLock.txt") {
+			it.result("Hello World")
+			requestCount ++
+		}
+
+		def dir = File.createTempDir().toPath()
+		def output = dir.resolve("file.txt")
+		def lockFile = dir.resolve("file.txt.lock")
+		Files.writeString(output, "Hello World")
+		// 造一个「持有者进程早已不在」的残留锁：用一个肯定不存在的 PID（模拟被杀掉的构建）
+		writeStaleLock(lockFile)
+
+		when: "本地文件完好，但上次构建留下的锁文件还在"
+		def result = Download.create("$PATH/staleLock.txt")
+				.sha1("0a4d55a8d778e5022fab701977c5d840bbc486d0")
+				.downloadPath(output)
+
+		then: "不抛异常、也不重下：锁只说明“曾经有人写过”，与本地文件是否可用无关"
+		!result.didDownload()
+		requestCount == 0
+		Files.readString(output) == "Hello World"
+
+		when: "同一个残留锁 + 目标文件缺失：必需接管而不是抛 DownloadException"
+		Files.delete(output)
+		def second = Download.create("$PATH/staleLock.txt")
+				.sha1("0a4d55a8d778e5022fab701977c5d840bbc486d0")
+				.downloadPath(output)
+
+		then:
+		second.didDownload()
+		requestCount == 1
+		Files.readString(output) == "Hello World"
+		// 自己那一轮收尾时释放掉，不把残留留给下一个构建
+		Files.notExists(lockFile)
+	}
+
+	def "Lock: 两个线程并发下载同一文件都能成功，且只下载一次"() {
+		setup:
+		int requestCount = 0
+		byte[] data = new byte[1024 * 512]
+		new Random().nextBytes(data)
+
+		server.get("/concurrentLock.bin") {
+			it.result(data)
+			requestCount ++
+		}
+
+		def dir = File.createTempDir().toPath()
+		def output = dir.resolve("concurrent.bin")
+		def pool = Executors.newFixedThreadPool(2)
+		def ready = new CountDownLatch(2)
+		def start = new CountDownLatch(1)
+		def sha1 = Checksum.of(data).sha1().hex()
+
+		when:
+		// maxRetries(1)：证明「并发下也能成功」不靠外部重试兜底
+		def futures = (1..2).collect {
+			pool.submit {
+				ready.countDown()
+				start.await()
+				return Download.create("$PATH/concurrentLock.bin")
+						.sha1(sha1)
+						.maxRetries(1)
+						.downloadPath(output)
+			}
+		}
+		ready.await()
+		start.countDown()
+		def results = futures.collect { it.get(60, TimeUnit.SECONDS) }
+		pool.shutdown()
+
+		then:
+		// 两个调用都成功，且文件内容完整
+		results.size() == 2
+		Arrays.equals(Files.readAllBytes(output), data)
+		Files.notExists(dir.resolve("concurrent.bin.lock"))
+		// 后到者等锁期间前一个已把文件落位，锁内重检直接复用，不需要第二趟网络
+		requestCount == 1
+	}
+
+	def "Lock: 热路径不取锁"() {
+		setup:
+		int requestCount = 0
+
+		server.get("/hotPath.txt") {
+			it.result("Hello World")
+			requestCount ++
+		}
+
+		def dir = File.createTempDir().toPath()
+		def output = dir.resolve("hot.txt")
+		Download.create("$PATH/hotPath.txt")
+				.sha1("0a4d55a8d778e5022fab701977c5d840bbc486d0")
+				.downloadPath(output)
+
+		when:
+		def result = Download.create("$PATH/hotPath.txt")
+				.sha1("0a4d55a8d778e5022fab701977c5d840bbc486d0")
+				.downloadPath(output)
+
+		then:
+		!result.didDownload()
+		requestCount == 1
+		// 热路径连锁文件都没碰过
+		Files.notExists(dir.resolve("hot.txt.lock"))
+		// 也不再留下 .part
+		dir.toFile().listFiles().every { !it.name.endsWith(".part") }
+	}
+
+	// 造一个「持有者进程早已不在」的残留锁：PID 用一个肯定不存在的值（模拟被 kill 掉的构建）
+	private static void writeStaleLock(Path lockFile) {
+		Files.writeString(lockFile, "pid=2147483647 start=0 host=${InetAddress.getLocalHost().getHostName()} token=stale since=0")
+		Files.setLastModifiedTime(lockFile, FileTime.from(Instant.now() - Duration.ofHours(1)))
 	}
 
 	def "File: Insecure protocol"() {

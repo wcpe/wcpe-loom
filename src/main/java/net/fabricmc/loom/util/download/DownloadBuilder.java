@@ -110,12 +110,12 @@ public class DownloadBuilder {
 		return this;
 	}
 
-	private Download build(int downloadAttempt) {
+	private Download build() {
 		if (!allowInsecureProtocol && !isSecureUrl(url)) {
 			throw new IllegalArgumentException("Cannot create download for url (%s) with insecure protocol".formatted(url.toString()));
 		}
 
-		return new Download(this.url, this.expectedHash, this.useEtag, this.forceDownload, this.offline, maxAge, progressListener, httpVersion, downloadAttempt);
+		return new Download(this.url, this.expectedHash, this.useEtag, this.forceDownload, this.offline, maxAge, progressListener, httpVersion);
 	}
 
 	public CompletableFuture<DownloadResult> downloadPathAsync(Path path, DownloadExecutor executor) {
@@ -156,7 +156,7 @@ public class DownloadBuilder {
 					httpVersion(HttpClient.Version.HTTP_1_1);
 				}
 
-				return supplier.get(build(i));
+				return supplier.get(build());
 			} catch (DownloadException e) {
 				if (e.getStatusCode() == 404) {
 					// Don't retry on 404's

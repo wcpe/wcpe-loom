@@ -46,6 +46,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.IntConsumer;
@@ -62,6 +63,14 @@ import net.fabricmc.loom.util.cache.AtomicFiles;
 public final class Download {
 	private static final String E_TAG = "ETag";
 	private static final Logger LOGGER = LoggerFactory.getLogger(Download.class);
+
+	// 等待「另一个进程/线程正在写同一文件」的上限。超时后不再失败，而是接管锁继续下载：
+	// 内容由「本次尝试专用的唯一临时文件 + 原子落位」保证完整，多一个写入者最多重复一次网络传输。
+	// 实测正常热路径（文件已存在）根本不会走到这里，冷下载的典型耗时在秒级。
+	private static final Duration LOCK_WAIT_TIMEOUT = Duration.ofMinutes(2);
+
+	// 陈旧临时文件的回收阈值（仅用于清理被 kill 掉的构建留下的 .part，不影响热路径）
+	private static final Duration PART_RETENTION = Duration.ofHours(1);
 	private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
 			.executor(Executors.newVirtualThreadPerTaskExecutor())
 			.followRedirects(HttpClient.Redirect.ALWAYS)
@@ -81,9 +90,8 @@ public final class Download {
 	private final Duration maxAge;
 	private final DownloadProgressListener progressListener;
 	private final HttpClient.Version httpVersion;
-	private final int downloadAttempt;
 
-	Download(URI url, @Nullable String expectedHash, boolean useEtag, boolean forceDownload, boolean offline, Duration maxAge, DownloadProgressListener progressListener, HttpClient.Version httpVersion, int downloadAttempt) {
+	Download(URI url, @Nullable String expectedHash, boolean useEtag, boolean forceDownload, boolean offline, Duration maxAge, DownloadProgressListener progressListener, HttpClient.Version httpVersion) {
 		this.url = url;
 		this.expectedHash = expectedHash;
 		this.useEtag = useEtag;
@@ -92,7 +100,6 @@ public final class Download {
 		this.maxAge = maxAge;
 		this.progressListener = progressListener;
 		this.httpVersion = httpVersion;
-		this.downloadAttempt = downloadAttempt;
 	}
 
 	private HttpRequest.Builder requestBuilder() {
@@ -156,99 +163,124 @@ public final class Download {
 		}
 
 		try {
-			doDownload(output);
+			return new DownloadResultImpl(doDownload(output));
 		} catch (Throwable throwable) {
-			tryCleanup(output);
 			throw error(throwable, "Failed to download file from (%s) to (%s)", url, output);
 		} finally {
 			progressListener.onEnd();
 		}
-
-		return new DownloadResultImpl(true);
 	}
 
-	private void doDownload(Path output) throws DownloadException {
-		Optional<String> eTag = Optional.empty();
-
-		if (!forceDownload && useEtag && exists(output)) {
-			eTag = readEtag(output);
-		}
-
+	/**
+	 * {@return 本次调用是否真的写了文件（并发去重时可能由另一个写入者代劳）}.
+	 */
+	private boolean doDownload(Path output) throws DownloadException {
 		try {
 			Files.createDirectories(output.getParent());
 		} catch (IOException e) {
 			throw error(e, "Failed to create parent directories");
 		}
 
-		final HttpRequest httpRequest = eTag
-				.map(this::getETagRequest)
-				.orElseGet(this::getRequest);
+		// <name>.lock 只负责「同一个文件不并发写」，持有者信息写在锁文件里；
+		// 残留锁（持有者已不在）由 DownloadLock 判活后直接接管，既不报错也不触发重下。
+		// 下载全程持锁：后到者不为同一个文件重复走一趟网络。
+		final DownloadLock lock;
 
-		// Create a .lock file, this allows us to re-download if the download was forcefully aborted part way through.
-		createLock(output);
-		HttpResponse<InputStream> response = send(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
-		getAndResetLock(output);
+		try {
+			lock = DownloadLock.acquire(getLockFile(output), LOCK_WAIT_TIMEOUT);
+		} catch (IOException e) {
+			throw error(e, "Failed to acquire lock on %s", getLockFile(output));
+		}
 
-		final int statusCode = response.statusCode();
-		boolean success = statusCode == HttpURLConnection.HTTP_NOT_MODIFIED || (statusCode >= 200 && statusCode < 300);
-
-		if (statusCode == HttpURLConnection.HTTP_NOT_MODIFIED) {
-			try {
-				// Update the last modified time so we don't retry the request until the max age has passed again.
-				Files.setLastModifiedTime(output, FileTime.from(Instant.now()));
-			} catch (IOException e) {
-				throw error(e, "Failed to update last modified time");
+		try (lock) {
+			// 锁内重检（只在真的等过锁时才做）：持锁者在此期间可能已经把完整文件落位（同一 URL、
+			// 同一期望 hash）。没等过就不可能有人写过，重检只会白多一次 IO，热路径不受影响。
+			if (lock.waitedForLock() && !requiresDownload(output)) {
+				LOGGER.debug("等待下载锁期间 {} 已由其它写入者完成，直接复用", output);
+				return false;
 			}
 
-			// Success, etag matched.
-			return;
-		}
+			// etag 在锁内读：锁外读到的是另一个写入者落位之前的旧文件，拿它当 If-None-Match
+			// 只会得到一个毫无意义的 304
+			final Optional<String> eTag = !forceDownload && useEtag && exists(output) ? readEtag(output) : Optional.empty();
+			final HttpRequest httpRequest = eTag
+					.map(this::getETagRequest)
+					.orElseGet(this::getRequest);
 
-		if (!success) {
-			throw statusError("HTTP request returned unsuccessful status (%d)", statusCode);
-		}
+			final HttpResponse<InputStream> response = send(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
+			final int statusCode = response.statusCode();
+			boolean success = statusCode == HttpURLConnection.HTTP_NOT_MODIFIED || (statusCode >= 200 && statusCode < 300);
 
-		downloadToPath(output, response);
-
-		if (useEtag) {
-			final HttpHeaders headers = response.headers();
-			final String responseETag = headers.firstValue(E_TAG.toLowerCase(Locale.ROOT)).orElse(null);
-
-			if (responseETag != null) {
-				writeEtag(output, responseETag);
-			}
-		}
-
-		if (expectedHash != null) {
-			// Ensure we downloaded the expected hash.
-			if (!isHashValid(output)) {
-				String downloadedHash;
-
+			if (statusCode == HttpURLConnection.HTTP_NOT_MODIFIED) {
 				try {
-					downloadedHash = Checksum.of(output).sha1().hex();
-					Files.deleteIfExists(output);
+					// Update the last modified time so we don't retry the request until the max age has passed again.
+					Files.setLastModifiedTime(output, FileTime.from(Instant.now()));
 				} catch (IOException e) {
-					downloadedHash = "unknown hash";
+					throw error(e, "Failed to update last modified time");
 				}
 
-				throw error("Failed to download (%s) with expected hash: %s got %s", url, expectedHash, downloadedHash);
+				// Success, etag matched.
+				return false;
 			}
+
+			if (!success) {
+				throw statusError("HTTP request returned unsuccessful status (%d)", statusCode);
+			}
+
+			downloadToPath(output, response);
+
+			if (useEtag) {
+				final HttpHeaders headers = response.headers();
+				final String responseETag = headers.firstValue(E_TAG.toLowerCase(Locale.ROOT)).orElse(null);
+
+				if (responseETag != null) {
+					writeEtag(output, responseETag);
+				}
+			}
+
+			if (expectedHash != null) {
+				// Ensure we downloaded the expected hash.
+				if (!isHashValid(output)) {
+					String downloadedHash;
+
+					try {
+						downloadedHash = Checksum.of(output).sha1().hex();
+						Files.deleteIfExists(output);
+					} catch (IOException e) {
+						downloadedHash = "unknown hash";
+					}
+
+					throw error("Failed to download (%s) with expected hash: %s got %s", url, expectedHash, downloadedHash);
+				}
+			}
+
+			return true;
 		}
 	}
 
 	private void downloadToPath(Path output, HttpResponse<InputStream> response) throws DownloadException {
-		// Download the file initially to a .part file
-		final Path partFile = getPartFile(output);
-
 		// 刻意不在下载前删除 output：那会留下「文件不存在」的窗口，而 output 是可以被并发读取的共享缓存产物
 		// （依赖 jar 就是被 remap classpath 读的）。读方在窗口里打开它，关闭时就会因 toRealPath() 失败而把该
 		// 路径的 zipfs 登记簿条目永久留成死实例（JDK-8291712）。old output 由下载完成后的原子 move 覆盖。
-		try {
-			Files.deleteIfExists(partFile);
-		} catch (IOException e) {
-			throw error(e, "Failed to delete existing file");
-		}
+		//
+		// 临时文件按「每次尝试唯一」命名：两个写入者重叠时（锁被超时接管、上一轮的临时文件未清）各写各的，
+		// 写完再原子落位，谁也覆盖不了谁。
+		deleteStalePartFiles(output);
+		final Path partFile = getUniquePartFile(output);
 
+		try {
+			writeToPath(output, partFile, response);
+		} finally {
+			// 成功时 partFile 已被原子 move 走，这里是空操作；失败时不留半成品给下一次构建
+			try {
+				Files.deleteIfExists(partFile);
+			} catch (IOException ignored) {
+				// ignored
+			}
+		}
+	}
+
+	private void writeToPath(Path output, Path partFile, HttpResponse<InputStream> response) throws DownloadException {
 		final long length = Long.parseLong(response.headers().firstValue("Content-Length").orElse("-1"));
 		AtomicLong totalBytes = new AtomicLong(0);
 
@@ -312,8 +344,6 @@ public final class Download {
 	}
 
 	private boolean requiresDownload(Path output) throws DownloadException {
-		final boolean locked = getAndResetLock(output);
-
 		if (forceDownload || !exists(output)) {
 			// 内容寻址下载的快路径：带期望 hash 的文件（如 vanilla jar）内容永不改变，
 			// 本地 hash 匹配 = 重下结果必然一字节不差。即使 --refresh-dependencies 强制刷新，
@@ -328,11 +358,9 @@ public final class Download {
 			return true;
 		}
 
-		if (locked && downloadAttempt == 1) {
-			LOGGER.warn("Forcing downloading {} as existing lock file was found. This may happen if the gradle build was forcefully canceled.", output);
-			return true;
-		}
-
+		// 这里刻意**不看** <name>.lock：锁文件存在只说明「有人正在写」或「写的人崩了」，与本地已有文件
+		// 是否可用无关。前者由 DownloadLock 串行化，后者由 DownloadLock 的判活逻辑接管；把锁当成
+		// 「必须重下」的信号，等于让进程被 kill 后的残留锁白白触发一次完整下载。
 		if (offline) {
 			// We know the file exists, nothing more we can do.
 			return false;
@@ -399,26 +427,6 @@ public final class Download {
 		}
 	}
 
-	private void tryCleanup(Path output) {
-		try {
-			Files.deleteIfExists(output);
-		} catch (IOException ignored) {
-			// ignored
-		}
-
-		try {
-			Files.deleteIfExists(getLockFile(output));
-		} catch (IOException ignored) {
-			// ignored
-		}
-
-		try {
-			Files.deleteIfExists(getPartFile(output));
-		} catch (IOException ignored) {
-			// ignored
-		}
-	}
-
 	// A faster exists check
 	private static boolean exists(Path path) {
 		return path.getFileSystem() == FileSystems.getDefault() ? path.toFile().exists() : Files.exists(path);
@@ -428,32 +436,46 @@ public final class Download {
 		return output.resolveSibling(output.getFileName() + ".lock");
 	}
 
-	private Path getPartFile(Path output) {
-		return output.resolveSibling(output.getFileName() + ".part");
+	// 临时文件名带唯一后缀：并发写同一目标时各自写各自的临时文件，最后原子 move 落位
+	private Path getUniquePartFile(Path output) {
+		return output.resolveSibling(output.getFileName() + "." + UUID.randomUUID() + ".part");
 	}
 
-	private boolean getAndResetLock(Path output) throws DownloadException {
-		final Path lock = getLockFile(output);
-		final boolean exists = exists(lock);
+	/**
+	 * 清掉同一目标遗留的陈旧临时文件.
+	 *
+	 * <p>临时文件名带唯一后缀后，被 kill 掉的构建不会再被下一次下载「顺手删掉」；这里在下一次真正要下载
+	 * 同一个文件时回收它们。<b>只在冷路径（已经决定要下载）调用</b>，热路径一次目录 IO 都不会多。
+	 *
+	 * <p>只删一小时以前的：锁可能被超时接管，此时另一个写入者正在写它的临时文件，删掉它会让那一次
+	 * 下载白做。一小时遠超过任何单文件的下载耗时，这个阈值把误删的可能降到可以忽略。
+	 */
+	private void deleteStalePartFiles(Path output) {
+		final Path parent = output.getParent();
 
-		if (exists) {
-			try {
-				Files.delete(lock);
-			} catch (IOException e) {
-				throw error(e, "Failed to release lock on %s", lock);
-			}
+		if (parent == null || !Files.isDirectory(parent)) {
+			return;
 		}
 
-		return exists;
-	}
+		final String prefix = output.getFileName() + ".";
+		final Instant cutoff = Instant.now().minus(PART_RETENTION);
 
-	private void createLock(Path output) throws DownloadException {
-		final Path lock = getLockFile(output);
-
-		try {
-			Files.createFile(lock);
+		try (var entries = Files.newDirectoryStream(parent, entry -> {
+			final String name = entry.getFileName().toString();
+			return name.startsWith(prefix) && name.endsWith(".part");
+		})) {
+			for (Path entry : entries) {
+				try {
+					if (Files.getLastModifiedTime(entry).toInstant().isBefore(cutoff)) {
+						Files.deleteIfExists(entry);
+					}
+				} catch (IOException e) {
+					// 回收临时文件是尽力而为：删不掉不影响本次下载
+					LOGGER.debug("清理旧临时文件失败：{}", entry, e);
+				}
+			}
 		} catch (IOException e) {
-			throw error(e, "Failed to acquire lock on %s", lock);
+			LOGGER.debug("枚举临时文件失败：{}", parent, e);
 		}
 	}
 
