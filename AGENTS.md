@@ -72,10 +72,10 @@ dev/1.17-wcpe                     默认分支 = HEAD
 ### 改代码（补丁段）
 
 ```bash
-scripts/sync-upstream.sh add-patch <名字>   # 起点是 patch-queue/1.17，不是默认分支 HEAD
-# …改代码、提交（末尾带溯源块）…
+bash scripts/sync-upstream.sh add-patch <名字>   # 起点是 patch-queue/1.17，不是默认分支 HEAD
+# …改代码、提交（末尾带溯源块 + Patch-Name）…
 git checkout dev/1.17-wcpe
-scripts/sync-upstream.sh add-patch finish <名字>
+bash scripts/sync-upstream.sh add-patch finish <名字>
 ```
 
 提交信息末尾必须有溯源块：
@@ -87,10 +87,13 @@ fix(forge): 修掉 xxx
 
 Origin: vendor, wcpe-loom
 Forwarded: no
+Patch-Name: <slug>
 ```
 
 - `Origin`：`vendor, wcpe-loom` / `backport, <上游版本>` / `upstream, <URL>`
 - `Forwarded`：`no`（该反馈上游）/ `not-needed`（本仓库专属）/ `<URL>`（已反馈）
+- `Patch-Name`：`<slug>`（`^[a-z0-9]+(-[a-z0-9]+)*$`，≤ 48 字符，补丁段内唯一）。发布说明按它做集合差，
+  重写队列换了 SHA 也能认出「本版新增」——所以打上去就别再改；历史补丁不回填，元数据提交不带它。
 
 ### 改 CI / 文档 / 脚本（元数据段）
 
@@ -105,14 +108,20 @@ Forwarded: no
 
 - 插补丁、压缩元数据都放在**发版之前**
 - 打完 tag 之后只用普通提交，直到下次发版前再整理
-- 万一已发生：把该 tag 的主线等价提交补进 `.upstream/release-anchors.txt`
+- 万一已发生：发布说明不受影响（它按 `Patch-Name` 补丁面算，与 SHA/拓扑无关）；
+  锚点表 `.upstream/release-anchors.txt` 已废弃，不必再补
+
+**发布清单随 tag 一起提交**：打 tag 前先 `bash scripts/gen-release-notes.sh --tag wcpe-v1.17.N` 生成
+`.upstream/releases/wcpe-v1.17.N.md`，人工审阅后用普通提交（元数据段）提交，再打 tag。CI 用
+`--check <tag>` 严格校验，清单缺失或不一致会让 Release 作业失败——它不现生成，也不回退旧区间引擎。
+锚点表只对 `--legacy` 重算 1.17.19 及更早版本有用，已冻结。
 
 ### 校验与同步上游
 
 ```bash
-scripts/sync-upstream.sh verify     # 只读自检：线性、无 merge、溯源齐备、基于队列末端
-scripts/sync-upstream.sh status     # 只读：基底/队列/元数据/远端一览
-scripts/sync-upstream.sh rebase <新基底sha> [tag]   # 整条队列重放到新基底
+bash scripts/sync-upstream.sh verify     # 只读自检：线性、无 merge、溯源与 Patch-Name 齐备、基于队列末端
+bash scripts/sync-upstream.sh status     # 只读：基底/队列/元数据/远端一览
+bash scripts/sync-upstream.sh rebase <新基底sha> [tag]   # 整条队列重放到新基底
 ```
 
 **首次同步上游前必须先配置远端**——仓库只带 `origin`，脚本默认的上游名 `architectury`
@@ -202,7 +211,8 @@ Groovy 行宽，`build` 作业在 `:spotlessGroovyCheck` 处挂掉，后续整�
   返回「Temporary shutdown」页面，导致 `build` 失败。`build.gradle` 已把源映射到可达镜像，
   可用 `-Ploom.eclipseP2Mirror=<URL>` 覆盖，传空值回退官方源。
 - **不能指望 `--generate-notes`**：它只统计经 PR 合入的提交，而本仓库以直推为主。
-  发布说明由 `scripts/gen-release-notes.sh` 按提交生成。
+  发布说明由 `scripts/gen-release-notes.sh --tag` 按 `Patch-Name` 补丁面生成，清单在发版前提交到
+  `.upstream/releases/<tag>.md`，CI 只校验并发布它（见第 3 节「发版纪律」）。
 
 ## 7. 临时文件
 
