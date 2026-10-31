@@ -26,6 +26,7 @@ package net.fabricmc.loom.configuration.providers.minecraft;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -630,9 +631,14 @@ public abstract class MinecraftProvider {
 	private void produceJarsInConfiguration(String blocker) throws Exception {
 		getProject().getLogger().lifecycle("Minecraft {} 的 jar 保持配置期生产：{}", minecraftVersion(), blocker);
 
+		// 本次是否真的下载了 jar：只有下载过才需要签名校验（暖缓存下不重复校验）。
+		// 用字段而不是锁内局部变量，是因为校验已移到锁外执行，见下面的说明。
+		final AtomicBoolean didDownload = new AtomicBoolean(false);
+
 		// 无锁快路径：未要求刷新且所有产物已就绪时，不获取任何文件锁
 		if (jarsRequireProduction()) {
-			// 产文件部分（下载/抽取/校验）用 per-key 锁保护，按 mcVersion 串行、不同版本可并行
+			// 产文件部分（下载/抽取）用 per-key 锁保护，按 mcVersion 串行、不同版本可并行；
+			// 合并/拆分/env-only 各写自己的产物，用各自的 key，不排在这一把锁后面（见 cacheKey）
 			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
 			final Path lockRoot = getExtension().getFiles().getCacheLocks().toPath();
 
@@ -642,7 +648,7 @@ public abstract class MinecraftProvider {
 					return null;
 				}
 
-				boolean didDownload = downloadJars();
+				didDownload.set(downloadJars());
 
 				if (provideServer()) {
 					// 锁内读取 bundle 元数据用于决定是否抽取（extractBundledServerJar 依赖该字段）
@@ -651,10 +657,6 @@ public abstract class MinecraftProvider {
 					if (serverBundleMetadata != null) {
 						extractBundledServerJar();
 					}
-				}
-
-				if (didDownload) {
-					verifyJars();
 				}
 
 				return null;
@@ -666,6 +668,14 @@ public abstract class MinecraftProvider {
 		// 该读取走 L2 缓存（按制品 sha1），稳定命中时不会打开 jar，配置期也就不再观察它。
 		if (provideServer() && serverBundleMetadata == null) {
 			serverBundleMetadata = readServerBundleMetadata();
+		}
+
+		// 签名校验在锁外做：它只读已落位的 jar（见 verifyJars），不参与产物生产，却要逐条读完整份 jar
+		// 做内容与证书链校验，耗时可达秒级。把它留在下载锁内，等于让其它项目为「本进程的 CPU 计算」排队——
+		// 而同版本的其它进程此时需要的只是「jar 已在盘上」，那件事在锁释放时就已经成立。
+		// 顺序上放在 bundle 元数据落定之后：verifyJars 按它决定校验哪个 server jar。
+		if (didDownload.get()) {
+			verifyJars();
 		}
 	}
 
@@ -683,15 +693,28 @@ public abstract class MinecraftProvider {
 		return BundleMetadata.fromJarCached(store, minecraftServerJar.toPath(), sha1);
 	}
 
-	// 下载/抽取产物的跨进程锁 key：始终按版本，确保同一 mcVersion 的所有 jar 配置共享同一把下载锁、只下载一次。
-	// 不可用会被子类覆写的 cacheKey()，否则不同 jar 配置（如 server-only/client-only single jar）会用不同 key 并发下载同一批共享 jar。
+	// 下载/抽取产物的跨进程锁 key：按「产物批次 + 版本」分片。
+	//
+	// 分片的唯一依据是产物批次，不是「谁在跑」：同一个 mcVersion 的下载/抽取产物（client jar、server jar、
+	// 抽取出的 server jar）始终只由这一个 key 保护，因此同一版本的所有 jar 配置仍共享同一把锁、只下载一次。
+	// 合并、拆分、env-only 透传各自写自己的产物，用各自的 key（见 cacheKey 与各子类覆写）——
+	// 于是「一个项目在合并」不会再堵住「另一个项目在下载」。
+	//
+	// 不可用会被子类覆写的 cacheKey()，否则不同 jar 配置（如 server-only/client-only single jar）会分片到不同锁上。
 	private String downloadLockKey() {
-		return "minecraft:" + minecraftVersion();
+		return "minecraft-download:" + minecraftVersion();
 	}
 
-	// 跨进程互斥 key：用于子类自身产物（merge/split/env-only jar）的生产锁，子类可覆写以区分不同产物
+	// 跨进程互斥 key：用于子类自身产物（merge/split/env-only jar）的生产锁。
+	//
+	// 各产出自己产物的 provider 都必须覆写它并按产物批次分片（见 MergedMinecraftProvider /
+	// SplitMinecraftProvider / SingleJarMinecraftProvider）。分片只要求「同一产物始终由同一个 key 保护」；
+	// 不同产物共用一把锁只会白白排队——下载、合并、拆分互不依赖对方的输出，本可以各自独立进行。
+	//
+	// 这里的默认值只作兜底：落到它上面的形态维持「同版本共用一把锁」的保守语义
+	// （宁可多排一点队，也不要两种产物共用一把锁却不自知）。
 	protected String cacheKey() {
-		return "minecraft:" + minecraftVersion();
+		return "minecraft-jars:" + minecraftVersion();
 	}
 
 	// 无锁快路径：判断下载/抽取产物是否需要生产。返回 false 即所有产物已就绪，可走无锁快路径。
@@ -761,6 +784,12 @@ public abstract class MinecraftProvider {
 		}
 	}
 
+	/**
+	 * 校验已落位的 jar 的签名与完整性.
+	 *
+	 * <p>校验本身只读，因此跑在下载锁之外（见 {@link #produceJarsInConfiguration}）；唯一的副作用是
+	 * 「把判定为无效的 jar 从共享缓存里删掉」，那一步交给 {@link #discardRejectedJars(List)} 在锁内做。
+	 */
 	private void verifyJars() throws IOException, SignatureVerificationFailure {
 		if (!GradleUtils.getBooleanProperty(getProject(), Constants.Properties.ENABLE_MINECRAFT_VERIFICATION)) {
 			LOGGER.info("Skipping Minecraft jar verification!");
@@ -771,19 +800,61 @@ public abstract class MinecraftProvider {
 
 		MinecraftJarVerification verification = getProject().getObjects().newInstance(MinecraftJarVerification.class, minecraftVersion());
 
-		if (provideClient()) {
-			verification.verifyClientJar(minecraftClientJar.toPath());
-		}
-
-		if (provideServer()) {
-			if (serverBundleMetadata == null) {
-				verification.verifyServerJar(minecraftServerJar.toPath());
-			} else {
-				verification.verifyServerJar(getMinecraftExtractedServerJar().toPath());
+		try {
+			if (provideClient()) {
+				verification.verifyClientJar(minecraftClientJar.toPath());
 			}
+
+			if (provideServer()) {
+				if (serverBundleMetadata == null) {
+					verification.verifyServerJar(minecraftServerJar.toPath());
+				} else {
+					verification.verifyServerJar(getMinecraftExtractedServerJar().toPath());
+				}
+			}
+		} finally {
+			// 被判定为无效的 jar 要从共享缓存里摘掉（否则下一次会把它当就绪产物直接用，而校验只在
+			// 「本次下载过」时跑，不会再被拦一次）；全部通过时这里是空操作。
+			discardRejectedJars(verification.rejectedJars());
 		}
 
 		LOGGER.info("Jar verification complete");
+	}
+
+	/**
+	 * 把签名校验判定为无效的 jar 从共享缓存里删掉.
+	 *
+	 * <p>这是一次对共享缓存产物的<b>写</b>，因此必须回到下载锁内做，与下载/抽取同一把锁
+	 * （{@link #downloadLockKey()}）：锁外删文件会让正好在读该产物的其它进程失败，在 Windows 上还会让
+	 * 它们的原子替换持续撞上共享冲突。
+	 *
+	 * <p>这并不推翻「校验在锁外」——校验本身只读且耗时，不该占着锁；只有真正需要改盘上内容的那一步
+	 * 才去取锁，而且只在失败路径上发生。
+	 */
+	private void discardRejectedJars(List<Path> rejected) {
+		if (rejected.isEmpty()) {
+			return;
+		}
+
+		try {
+			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
+			final Path lockRoot = getExtension().getFiles().getCacheLocks().toPath();
+
+			cacheService.runExclusive(lockRoot, downloadLockKey(), LoomCacheService.defaultTimeout(), () -> {
+				for (Path path : rejected) {
+					try {
+						Files.deleteIfExists(path);
+					} catch (IOException e) {
+						LOGGER.error("Failed to delete invalid Minecraft jar: {}", path, e);
+					}
+				}
+
+				return null;
+			});
+		} catch (Exception e) {
+			// 删不掉不影响抛出原始校验异常（与改造前一致：删除失败只记日志）
+			LOGGER.error("Failed to discard invalid Minecraft jars", e);
+		}
 	}
 
 	// Returns true when a file was downloaded

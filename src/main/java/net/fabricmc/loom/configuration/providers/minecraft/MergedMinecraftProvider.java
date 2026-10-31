@@ -115,6 +115,16 @@ public class MergedMinecraftProvider extends MinecraftProvider {
 		}
 	}
 
+	// 合并产物（minecraft-merged.jar）的跨进程互斥 key，与下载/抽取分片。
+	//
+	// 合并只写自己的产物、并把基类产物当只读输入：它和「下载」之间没有共享的写目标，
+	// 共用一把锁只会让「一个项目在合并」堵住「另一个项目在下载」，冷启动时二者排在一条队上。
+	// 基类默认值（minecraft-jars:<mc>）对合并并不合用，故在此显式按产物批次命名。
+	@Override
+	protected String cacheKey() {
+		return "minecraft-merge:" + minecraftVersion();
+	}
+
 	/**
 	 * 注册合并任务：产物生产交给执行期任务，产物路径与配置期一致.
 	 *

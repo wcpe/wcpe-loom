@@ -109,6 +109,15 @@ public final class SplitMinecraftProvider extends MinecraftProvider {
 		});
 	}
 
+	// 拆分产物（minecraft-client-only.jar / minecraft-common.jar）的跨进程互斥 key，与下载/抽取分片。
+	//
+	// 两个产物由同一次拆分一起落位，所以它们共用这一个 key（与 SingleJarMinecraftProvider 按 type() 分片同理：
+	// 分片的单位是产物批次，不是单个文件）。拆分只读基类产物、只写自己的两件产物，不需要和下载排队。
+	@Override
+	protected String cacheKey() {
+		return "minecraft-split:" + minecraftVersion();
+	}
+
 	/**
 	 * 注册拆分任务：产物生产交给执行期任务，产物路径与配置期一致.
 	 *

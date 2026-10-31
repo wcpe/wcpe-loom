@@ -119,4 +119,69 @@ class LoomCacheServiceTest extends Specification {
 		!overlapDetected.get()
 		totalRuns.get() == threads
 	}
+
+	def "不同分片 key 的并发 runExclusive 可同时进入临界区（下载与合并不再互阻）"() {
+		// 背景：同一 MC 版本的「下载/抽取」「合并」「拆分」曾经共用一把锁（key = minecraft:<mc>），
+		// 于是冷启动时全部排成一条队。分片后三者各用各的 key，本用例直接验证这一点。
+		//
+		// 断言不靠墙钟阈值，而是靠两个 latch 互相确认：两边都必须先进入临界区、再等对方进入；
+		// 只要有一边被挡在锁外，等对方的那个 latch 就永远不会归零。如果锁被合并回去，本用例会卡住
+		// 到上限后判 sawOther == false 而失败，而不是靠「跑得快不快」猜。
+		given:
+		CountDownLatch downloadInside = new CountDownLatch(1)
+		CountDownLatch mergeInside = new CountDownLatch(1)
+		AtomicBoolean downloadSawMerge = new AtomicBoolean(false)
+		AtomicBoolean mergeSawDownload = new AtomicBoolean(false)
+		def pool = Executors.newFixedThreadPool(2)
+
+		// 失败上限，不是断言依据：成功路径上两个 latch 毫秒级归零
+		long boundSeconds = 30
+
+		when:
+		def downloadFuture = pool.submit {
+			service.runExclusive(lockRoot, "minecraft-download:1.20.1", Duration.ofSeconds(60)) {
+				downloadInside.countDown()
+				downloadSawMerge.set(mergeInside.await(boundSeconds, TimeUnit.SECONDS))
+				return null
+			}
+		}
+		def mergeFuture = pool.submit {
+			service.runExclusive(lockRoot, "minecraft-merge:1.20.1", Duration.ofSeconds(60)) {
+				mergeInside.countDown()
+				mergeSawDownload.set(downloadInside.await(boundSeconds, TimeUnit.SECONDS))
+				return null
+			}
+		}
+		downloadFuture.get(boundSeconds * 2, TimeUnit.SECONDS)
+		mergeFuture.get(boundSeconds * 2, TimeUnit.SECONDS)
+
+		then: "两个临界区确实重叠过（各自看到了对方在内）"
+		downloadSawMerge.get()
+		mergeSawDownload.get()
+
+		cleanup:
+		pool.shutdownNow()
+	}
+
+	def "不同分片 key 的锁文件互不相同（分片不会退化成共用一把锁）"() {
+		// 与上一个用例互补：那里验「能并行」，这里验「锁文件确实分开了」。
+		// 只看行为的话，两个 key 里只要有一个被哈希碰撞撞到同一文件就会误判；这里直接看目录里落了几把锁。
+		given:
+		def keys = [
+			"minecraft-download:1.20.1",
+			"minecraft-merge:1.20.1",
+			"minecraft-split:1.20.1"
+		]
+
+		when:
+		keys.forEach { key ->
+			service.runExclusive(lockRoot, key, Duration.ofSeconds(30)) {
+				-> null
+			}
+		}
+		def lockFiles = lockRoot.toFile().listFiles().findAll { it.name.endsWith(".lock") }*.name.sort()
+
+		then:
+		lockFiles.size() == keys.size()
+	}
 }

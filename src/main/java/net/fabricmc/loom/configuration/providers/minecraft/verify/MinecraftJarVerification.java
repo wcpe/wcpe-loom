@@ -25,8 +25,10 @@
 package net.fabricmc.loom.configuration.providers.minecraft.verify;
 
 import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 
@@ -43,12 +45,25 @@ public abstract class MinecraftJarVerification {
 
 	private final String minecraftVersion;
 
+	/**
+	 * 被判定为无效、待从缓存里摘掉的 jar.
+	 *
+	 * <p>本类<b>不自己删文件</b>：删除是对共享缓存产物的写，必须由调用方在它自己的跨进程锁内完成
+	 * （见 {@code MinecraftProvider#verifyJars}）。校验本身只读，才能搬到锁外跑。
+	 */
+	private final List<Path> rejectedJars = new ArrayList<>();
+
 	@Inject
 	protected abstract Project getProject();
 
 	@Inject
 	public MinecraftJarVerification(String minecraftVersion) {
 		this.minecraftVersion = minecraftVersion;
+	}
+
+	/** {@return 已被判定为无效、待调用方在锁内删除的 jar 列表} */
+	public List<Path> rejectedJars() {
+		return Collections.unmodifiableList(rejectedJars);
 	}
 
 	public void verifyClientJar(Path path) throws IOException, SignatureVerificationFailure {
@@ -73,13 +88,8 @@ public abstract class MinecraftJarVerification {
 			}
 
 			LOGGER.error("Verification of Minecraft {} signature failed: {}", path.getFileName(), e.getMessage());
-
-			try {
-				Files.delete(path);
-			} catch (IOException ioe) {
-				LOGGER.error("Failed to delete invalid Minecraft jar: {}", path, ioe);
-			}
-
+			// 只登记，不在这里删：删除是对共享缓存的写，必须回到调用方的跨进程锁内（见类注释）
+			rejectedJars.add(path);
 			throw e;
 		}
 	}
