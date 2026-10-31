@@ -28,6 +28,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.jar.Manifest;
 
@@ -58,14 +59,26 @@ public final class ModJarPostProcess {
 	}
 
 	/**
-	 * 把重映射后的 access widener 写回 jar.
+	 * 把重映射后的 class tweaker 文件逐个写回 jar.
 	 *
-	 * <p>{@code accessWidener} 为「已重映射的字节 + jar 内路径」；为空表示该 mod 不含 AW。
+	 * <p>{@code accessWideners} 是「已重映射的字节 + jar 内路径」的列表；为空（含 {@code null}）
+	 * 表示该 mod 不含声明。一个 mod 可以声明多个文件（schema v2 的 {@code classTweakers} 是映射），
+	 * 它们各有各的路径，所以必须一个条目写一次——把多条内容合成一份再写回，会让后写的那份盖掉
+	 * 前一份，jar 里只剩一个规则文件。
 	 */
-	public static void replaceAccessWidener(Path jar, @Nullable Pair<byte[], String> accessWidener) throws IOException {
-		if (accessWidener != null) {
+	public static void replaceAccessWideners(Path jar, @Nullable List<Pair<byte[], String>> accessWideners) throws IOException {
+		if (accessWideners == null) {
+			return;
+		}
+
+		for (Pair<byte[], String> accessWidener : accessWideners) {
 			ZipUtils.replace(jar, accessWidener.right(), accessWidener.left());
 		}
+	}
+
+	/** 单条声明的便捷形式：语义与 {@link #replaceAccessWideners} 完全相同，为既有调用方保留. */
+	public static void replaceAccessWidener(Path jar, @Nullable Pair<byte[], String> accessWidener) throws IOException {
+		replaceAccessWideners(jar, accessWidener == null ? List.of() : List.of(accessWidener));
 	}
 
 	/**

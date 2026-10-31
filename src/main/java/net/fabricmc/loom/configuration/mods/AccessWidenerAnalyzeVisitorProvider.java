@@ -51,14 +51,13 @@ public record AccessWidenerAnalyzeVisitorProvider(ClassTweaker accessWidener) im
 		accessWidener.visitHeader(namespace);
 
 		for (Path modJar : modJars) {
-			final var accessWidenerData = AccessWidenerUtils.readAccessWidenerData(modJar, platform);
-
-			if (accessWidenerData == null) {
-				continue;
+			// 一个 mod 可声明多条 class tweaker（schema v2），它们都要进同一份分析器：
+			// 分析阶段只回答「哪些成员必须保持可访问」，与环境无关，且允许多条声明覆盖同一成员。
+			// 每个文件各自建一个 reader：reader 只读一条流，读完即终止。
+			for (AccessWidenerUtils.AccessWidenerData accessWidenerData : AccessWidenerUtils.readAccessWideners(modJar, platform)) {
+				final var reader = ClassTweakerReader.create(new ClassTweakerRemapFilter(accessWidener));
+				reader.read(accessWidenerData.content());
 			}
-
-			final var reader = ClassTweakerReader.create(new ClassTweakerRemapFilter(accessWidener));
-			reader.read(accessWidenerData.content());
 		}
 
 		return new AccessWidenerAnalyzeVisitorProvider(accessWidener);

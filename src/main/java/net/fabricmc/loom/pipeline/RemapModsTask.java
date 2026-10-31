@@ -371,7 +371,8 @@ public abstract class RemapModsTask extends DefaultTask {
 		final Map<ModSpec, Path> outputs = new HashMap<>();
 		// 拆分依赖的另一半落位；只有 SPLIT 目标的 mod 在这张表里
 		final Map<ModSpec, Path> splitClients = new HashMap<>();
-		final Map<ModSpec, Pair<byte[], String>> accessWideners = new HashMap<>();
+		// 一个 mod 可以声明多个 class tweaker（schema v2 的 classTweakers 是映射），因此是列表
+		final Map<ModSpec, List<Pair<byte[], String>>> accessWideners = new HashMap<>();
 
 		for (ModSpec mod : mods) {
 			outputs.put(mod, outputPath(mod));
@@ -418,12 +419,24 @@ public abstract class RemapModsTask extends DefaultTask {
 				try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(output).build()) {
 					outputConsumer.addNonClassFiles(input, NonClassCopyMode.FIX_META_INF, remapper);
 
-					final AccessWidenerUtils.AccessWidenerData awData = AccessWidenerUtils.readAccessWidenerData(input, getPlatform().get());
+					// 逐条重映射、逐条写回自己的路径：多条声明各有各的 jar 内路径，合成一份会把彼此覆盖。
+					//
+					// 这里**不**按环境筛选。产物是一份与项目无关、客户端与服务端开发环境共用的整体 jar
+					// （落在构建根共享的 remapped_mods 仓库，可能被其它项目直接复用），按单侧筛掉声明会让
+					// 另一侧读不到规则。环境的意义在「应用时」而不是「重映射时」：Minecraft jar 的处理链
+					// 与 loader 都按声明里的环境决定生效与否，规则文件本身只是名字改写。
+					final List<AccessWidenerUtils.AccessWidenerData> awData = AccessWidenerUtils.readAccessWideners(input, getPlatform().get());
 
-					if (awData != null) {
-						accessWideners.put(mod, new Pair<>(
-								AccessWidenerUtils.remapAccessWidener(awData.content(), remapper.getEnvironment().getRemapper(), sourceNamespace, targetNamespace),
-								awData.path()));
+					if (!awData.isEmpty()) {
+						final List<Pair<byte[], String>> remappedWideners = new ArrayList<>(awData.size());
+
+						for (AccessWidenerUtils.AccessWidenerData data : awData) {
+							remappedWideners.add(new Pair<>(
+									AccessWidenerUtils.remapAccessWidener(data.content(), remapper.getEnvironment().getRemapper(), sourceNamespace, targetNamespace),
+									data.path()));
+						}
+
+						accessWideners.put(mod, remappedWideners);
 					}
 
 					remapper.apply(outputConsumer, tags.get(mod));
@@ -449,7 +462,7 @@ public abstract class RemapModsTask extends DefaultTask {
 			}
 
 			remappedMods++;
-			ModJarPostProcess.replaceAccessWidener(output, accessWideners.get(mod));
+			ModJarPostProcess.replaceAccessWideners(output, accessWideners.get(mod));
 
 			final ModProcessorExtension.ModInfo modInfo = modInfos.get(mod);
 

@@ -49,6 +49,20 @@ public final class ModEnvironment {
 		return server;
 	}
 
+	/**
+	 * {@return 该环境在「包含客户端 / 包含服务端」这样的组合下是否生效}.
+	 *
+	 * <p>规则只有一条：上下文包含的那一侧出现在环境里，声明就生效。合并 jar（两侧都在）因此对
+	 * universal / client / server 全部生效；而 server-only 的上下文里 client 声明不生效——
+	 * 这正是 schema v2 允许每条 class tweaker 单独声明环境的意义。
+	 *
+	 * <p>集中在这里是为了让环境语义只有一份实现：{@code AccessWidenerJarProcessor} 的筛选与
+	 * 任何日后需要按侧筛选声明的地方都应当问同一个方法，而不是各写一遍。
+	 */
+	public boolean appliesTo(boolean includeClient, boolean includeServer) {
+		return (includeClient && client) || (includeServer && server);
+	}
+
 	@Override
 	public boolean equals(Object o) {
 		if (this == o) return true;

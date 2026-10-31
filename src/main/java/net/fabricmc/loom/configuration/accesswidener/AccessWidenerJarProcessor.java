@@ -124,16 +124,9 @@ public class AccessWidenerJarProcessor implements MinecraftJarProcessor<AccessWi
 				return true;
 			}
 
-			if (context.includesClient() && modEnvironment.isClient()) {
-				return true;
-			}
-
-			if (context.includesServer() && modEnvironment.isServer()) {
-				return true;
-			}
-
-			// Universal supports all jars
-			return modEnvironment == ModEnvironment.UNIVERSAL;
+			// 环境语义只在 ModEnvironment#appliesTo 里实现一份：client / server 声明的取舍规则
+			// 与「合并 jar 全放行」是同一件事（合并 jar 两侧都在），别在这里再展开一遍。
+			return modEnvironment.appliesTo(context.includesClient(), context.includesServer());
 		}
 	}
 
