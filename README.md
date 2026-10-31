@@ -1,6 +1,6 @@
 # WCPE Loom
 
-[![CI 发布状态](https://github.com/wcpe/wcpe-loom/actions/workflows/publish.yml/badge.svg?branch=dev/1.17-wcpe)](https://github.com/wcpe/wcpe-loom/actions/workflows/publish.yml)
+[![CI 发布状态](https://github.com/wcpe/wcpe-loom/actions/workflows/test-push.yml/badge.svg?branch=dev/1.17-wcpe)](https://github.com/wcpe/wcpe-loom/actions/workflows/test-push.yml)
 [![最新正式版](https://img.shields.io/github/v/release/wcpe/wcpe-loom?filter=wcpe-v*&label=正式版)](https://github.com/wcpe/wcpe-loom/releases/latest)
 [![Maven 仓库](https://img.shields.io/badge/Maven-maven.wcpe.top-orange)](https://maven.wcpe.top/repository/maven-releases/dev/architectury/architectury-loom/)
 [![License](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
@@ -13,7 +13,7 @@
 |---|---|
 | Gradle | 9.x（本项目 CI 与端到端测试使用 9.5.0） |
 | JDK | 21 及以上（插件构建、测试与发布统一使用 JDK 21） |
-| 仓库凭据 | **无需**——`maven.wcpe.top` 的正式版产物匿名可读 |
+| 仓库凭据 | **无需**——`maven.wcpe.top` 的正式版与开发版快照均匿名可读 |
 
 > 这里的 JDK 要求针对 Loom 插件自身的构建、测试与发布；下游 Minecraft 项目的 Java 版本仍可按目标版本在 Loom 配置中单独设置。
 
@@ -170,12 +170,13 @@ dependencies {
 
 | 写法 | 解析到 | 适用场景 |
 |---|---|---|
-| `1.17-latest` | 最新正式版（当前 `1.17.7`） | 自动跟随更新，推荐 |
-| `1.17.7` | 固定正式版 | 需要可复现的构建 |
-| `1.17-dev-latest` | 开发线最新构建（`1.17-dev.<运行号>`） | 抢先验证未发布的改动 |
-| `1.17-dev.<运行号>` | 固定开发版 | 复现某个开发构建 |
+| `1.17-latest` | 最新正式版（当前 `1.17.19`） | 自动跟随更新，推荐 |
+| `1.17.19` | 固定正式版 | 需要可复现的构建 |
+| `1.17-SNAPSHOT` | 开发线最新构建（版本号固定，内容随每次推送替换） | 抢先验证未发布的改动 |
 
-两个 `*-latest` 是仓库中的**指针产物**：其插件标记 POM 指向当时的具体版本号，随每次发布自动前移，因此不会解析失败。
+`1.17-latest` 是仓库中的**指针产物**：其插件标记 POM 指向当时的具体版本号，随每次正式版发布自动前移，因此不会解析失败。
+
+开发线没有指针版本号：写 `1.17-SNAPSHOT` 就是最新开发版，它发布在 `maven-snapshots` 仓库——用它在上面 ① 的仓库清单里再加一条 `maven("https://maven.wcpe.top/repository/maven-snapshots/")`。历史上「每次构建一份固定版号」的 `1.17-dev.<运行号>` 及其指针 `1.17-dev-latest` 均已废弃。
 
 ## 当前使用哪个上游
 
@@ -192,7 +193,7 @@ dependencies {
 | **`dev/1.17-wcpe`**（默认分支） | **开发主线**，基于 architectury 1.17 上游 | 活跃开发 |
 | `1.15-wcpe` | 1.15 代系（Essential Loom `dev/1.15` + WCPE 补丁），已归档 | 冻结保留 |
 
-- 1.17 线不走 quilt 式补丁队列，而是把原 1.15 线上的 WCPE 补丁**重放到** architectury 1.17 基底之上（上游相隔约 5 个月，两线同一项目的不同历史点）。
+- 1.17 线是一条**线性补丁队列**：`base/architectury-1.17-026ce830`（上游基底，不可变 tag）→ 补丁段（每个补丁一个提交，带 DEP-3 溯源块）→ `patch-queue/1.17`（队列末端 tag）→ 元数据段（CI / 文档 / 脚本 / 队列规范）→ 默认分支 `dev/1.17-wcpe`。1.15 线的 WCPE 补丁即按此**重放**到 architectury 1.17 基底之上（上游相隔约 5 个月，两线同一项目的不同历史点）；维护手册见 [`.upstream/README.md`](./.upstream/README.md)。
 - 正式版以 tag 标记：`wcpe-v1.17.1`、`wcpe-v1.17.2`…（不用 `v1.17.*`，该前缀已被上游 release tag 占用）。
 
 ## 插件 id
@@ -213,22 +214,30 @@ dependencies {
 
 | 目的 | 版本号 | 说明 |
 |---|---|---|
-| 正式版 | `1.17.<补丁号>`（取自 tag，如 `wcpe-v1.17.7` → `1.17.7`） | 打 tag 推送后自动构建发布，并创建 GitHub Release |
-| 日常推送 | `1.17.<运行号>`（自动递增、不可覆盖） | 推送到 `dev/1.17-wcpe` 即触发，属于开发线命名空间 |
+| 正式版 | `1.17.<补丁号>`（取自 tag，如 `wcpe-v1.17.19` → `1.17.19`） | 打 tag 推送后自动构建发布，并创建 GitHub Release（正文取自随 tag 提交的 `.upstream/releases/<tag>.md`） |
+| 日常推送 | `1.17-SNAPSHOT`（版本号固定，内容随每次推送替换） | 推送到 `dev/1.17-wcpe` 即触发，发布到 `maven-snapshots` 仓库 |
 
-产物坐标：`dev.architectury:architectury-loom:<版本>`（Gradle 插件标记为 `top.wcpe.loom:top.wcpe.loom.gradle.plugin`），仓库 `maven.wcpe.top/repository/maven-releases/`。
+产物坐标：`dev.architectury:architectury-loom:<版本>`（Gradle 插件标记为 `top.wcpe.loom:top.wcpe.loom.gradle.plugin`）；正式版在 `maven.wcpe.top/repository/maven-releases/`，开发版快照在 `maven.wcpe.top/repository/maven-snapshots/`。
 
 <details>
 <summary><b>维护者：发布一个版本</b></summary>
 
-正式版（自动更新 `1.17-latest` 指针 + 创建 GitHub Release，变更清单按 `.github/release.yml` 分组生成，基点取上一个 `wcpe-v*` tag）：
+正式版（自动更新 `1.17-latest` 指针 + 创建 GitHub Release；发布说明不再按提交区间现生成，而是取自**随 tag 一起提交**的 `.upstream/releases/<tag>.md`）：
 
 ```bash
-git tag -a wcpe-v1.17.8 -m "WCPE Loom 1.17.8"
-git push origin wcpe-v1.17.8
+# 1) 发版前生成发布清单，审阅后按普通提交（元数据段）提交
+bash scripts/gen-release-notes.sh --tag wcpe-v1.17.20
+git add .upstream/releases/wcpe-v1.17.20.md
+git commit -m "docs: 补 1.17.20 的发布说明归档"
+
+# 2) 清单进历史之后再打 tag
+git tag -a wcpe-v1.17.20 -m "WCPE Loom 1.17.20"
+git push origin wcpe-v1.17.20
 ```
 
-开发版（不创建 Release，只更新 `1.17-dev-latest` 指针）：
+顺序不能反：**清单必须在打 tag 之前提交**。CI 用 `bash scripts/gen-release-notes.sh --check <tag>` 对 tag 那份树里的清单做逐字校验，缺失或不一致时 Release 作业直接以 `::error::` 失败（补清单后要删掉 tag、重新打同一个 tag）。正文只列本版**新增补丁**——按补丁提交的 `Patch-Name` trailer 做集合差，不含元数据段提交，因此补丁队列被重写也不影响它。
+
+开发版（不创建 Release，也不更新任何指针——版本号恒为 `1.17-SNAPSHOT`，每次推送覆盖 `maven-snapshots` 里的同名快照）：
 
 ```bash
 git push origin dev/1.17-wcpe
