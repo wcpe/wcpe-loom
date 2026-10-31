@@ -1,0 +1,21 @@
+// 本夹具用于验证：一个 mod 声明**多个** class tweaker 时，依赖它的工程仍能构建。
+// 改造前 AccessWidenerUtils 会抛 UnsupportedOperationException("TODO: support multiple class tweakers")。
+plugins {
+	id 'dev.architectury.loom'
+}
+
+version = "1.0.0"
+group = "com.example"
+
+dependencies {
+	minecraft "com.mojang:minecraft:1.17.1"
+	mappings "net.fabricmc:yarn:1.17.1+build.59:v2"
+	modImplementation "net.fabricmc:fabric-loader:0.11.6"
+
+	// dummy.jar 由测试在 setup 里用 ZipUtils.pack 从 dummyDependency/ 打包
+	modImplementation files("dummy.jar")
+}
+
+base {
+	archivesName = "multi-class-tweaker-mod"
+}

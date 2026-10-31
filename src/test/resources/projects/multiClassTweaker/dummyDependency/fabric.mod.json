@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 2,
+  "id": "dummy",
+  "version": "1",
+  "name": "Dummy Mod With Two Class Tweakers",
+  "classTweakers": [
+    { "config": "client.accesswidener", "environment": "client" },
+    "universal.accesswidener"
+  ]
+}

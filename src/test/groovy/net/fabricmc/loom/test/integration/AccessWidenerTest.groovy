@@ -101,6 +101,27 @@ class AccessWidenerTest extends Specification implements GradleProjectTestTrait 
 	}
 
 	@Unroll
+	def "multiple class tweakers in a dependency (gradle #version)"() {
+		setup: '一个 mod 带两个 class tweaker：一个只在 client 生效，一个 universal'
+		def gradle = gradleProject(project: "multiClassTweaker", version: version)
+		ZipUtils.pack(new File(gradle.projectDir, "dummyDependency").toPath(), new File(gradle.projectDir, "dummy.jar").toPath())
+
+		when:
+		def result = gradle.run(task: "build")
+
+		then: '改造前这里会在 AccessWidenerUtils 抛 UnsupportedOperationException("TODO: support multiple class tweakers")，走不到 SUCCESS'
+		result.task(":build").outcome == SUCCESS
+
+		// 内容级正确性（两个声明各自重映射成 named、逐个写回不互相覆盖）由单元测试
+		// AccessWidenerUtilsTest 覆盖（它造 jar 直接验字节）。
+		// 本用例只需证明：真实的 remapMods 链路在多声明下能跑完 —— 旧的单声明路径
+		// 在读到第二个声明时就会抛异常，因此“构建成功”本身就是回归判据。
+
+		where:
+		version << STANDARD_TEST_VERSIONS
+	}
+
+	@Unroll
 	def "invalid (#awLine)"() {
 		setup:
 		def gradle = gradleProject(project: "accesswidener", version: version)
