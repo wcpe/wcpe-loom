@@ -10,7 +10,11 @@
 | `PATCH-QUEUE.md` | 队列**规范**（结构、补丁判定标准、DEP-3 溯源标注、维护纪律） |
 | `migration-1.17.md` | **谱系清单**（基底、补丁与来源对照、例外说明、审计方法、已知遗留） |
 | `README.md` | 本文件：**操作手册** |
+| `releases/` | 每个正式版的**发布清单**（`<tag>.md`，随 tag 提交、CI 校验；见该目录的 README） |
 | `../scripts/sync-upstream.sh` | 维护脚本：`status` / `verify` / `add-patch` / `rebase` |
+
+> `scripts/sync-upstream.sh` 没有执行位，示例统一写成 `bash scripts/...`；
+> `scripts/gen-release-notes.sh` 有执行位，但同样写 `bash`，免得读者记两套。
 
 ## 一、两段结构（最重要的概念）
 
@@ -47,18 +51,26 @@ HEAD = dev/1.17-wcpe（默认分支）
 | 发版区间错 | `git describe` 按祖先关系找上一版，孤立 tag 会被跳过、直接退到更早的版本，多算一整版内容 |
 | 溯源混乱 | 同一个版本号对应两份不同的历史，事后无法确定哪份才是真正发布的代码 |
 
+> 前两条在新机制下只影响 GitHub 网页端的 compare 与 `git describe` 这类**按拓扑**的工具；
+> **发布说明已不再受它们影响**（它按补丁面算，不按提交区间算，见流程 C）。
+> 第三条（同版本号两份历史）依然成立，所以铁律本身不变。
+
 **三条纪律**：
 
 1. **插补丁、压缩元数据都放在发版之前**。想发的版本攒齐了再整理队列，然后打 tag。
 2. **打完 tag 之后只能用普通提交**（元数据直推不受影响），直到下次发版前再一并整理。
-3. **万一已经发生**（发版后又重写了队列）：立即把该 tag 的主线等价提交补进
-   [`release-anchors.txt`](release-anchors.txt)，否则下次发版就会算错区间。
-   脚本检测到「端点不在主线且未收录」时会打印告警并提示补哪一行。
+3. **万一已经发生**（发版后又重写了队列）——分两层看：
+   - **发布说明不受影响**。新机制按提交 trailer `Patch-Name` 的**补丁面**做集合差（见流程 C），
+     只认 trailer、不认 SHA 与拓扑，跨分叉也能算准「本版新增」，因此不需要为它补任何锚点。
+   - **锚点只对 `--legacy` 重算历史版本有用，且已废弃**。
+     [`release-anchors.txt`](release-anchors.txt) 的条目冻结保留，供
+     `bash scripts/gen-release-notes.sh --legacy <上一版> <本版>` 重算 1.17.19 及更早版本的说明；
+     **不要再为新版本补锚点**——新补丁都带 `Patch-Name`，锚点对它们没有意义。
 
 > 已发生过的实例：`1.17.13` 发版后又为合入 jar processor 哈希修复重写了一次队列，
-> 它因此变成孤立 tag；若不补锚点，`1.17.14` 的变更清单会退到 `1.17.11` 开始算（多算一整版）。
-> 锚点补好后，发版区间恢复正确——但 GitHub 网页端的 compare 对这两个版本仍会失真，
-> 这是历史改写的既成后果，只能靠对照表在生成侧兜住。
+> 它因此变成孤立 tag；当时（旧机制）若不补锚点，`1.17.14` 的变更清单会退到 `1.17.11` 开始算
+> （多算一整版）。锚点补好后，发版区间恢复正确——但 GitHub 网页端的 compare 对这两个版本仍会失真，
+> 这是历史改写的既成后果。新机制下同类重写不必再补表：说明由补丁面算出，与端点落在哪条分叉无关。
 
 ## 一之三、全景图与四种流程
 
@@ -109,12 +121,12 @@ HEAD = dev/1.17-wcpe（默认分支）
 ### 流程 A：加代码补丁（重写历史）
 
 ```bash
-scripts/sync-upstream.sh add-patch my-feature
+bash scripts/sync-upstream.sh add-patch my-feature
 #   起点是 patch-queue/1.17，**不是**默认分支 HEAD —— 这点与普通 Git 流程相反
 #   …改代码…
-git commit          # 一个逻辑变更一个提交，末尾带 Origin: / Forwarded:
-scripts/sync-upstream.sh add-patch finish
-#   校验溯源块 → 把元数据重放到新队列末端之后 → 生成 candidate/ 分支
+git commit          # 一个逻辑变更一个提交，末尾带 Origin: / Forwarded: / Patch-Name:
+bash scripts/sync-upstream.sh add-patch finish
+#   校验溯源块与 Patch-Name → 把元数据重放到新队列末端之后 → 生成 candidate/ 分支
 ```
 
 然后**人工三步**（脚本刻意不代劳）：
@@ -122,7 +134,7 @@ scripts/sync-upstream.sh add-patch finish
 ```bash
 git tag -f -a patch-queue/1.17 <新队列末端>
 # 临时放开 allow_force_pushes → git push --force → 立即还原保护
-scripts/sync-upstream.sh verify
+bash scripts/sync-upstream.sh verify
 ```
 
 ⚠️ 这一步重写历史，**必须在发版之前做**（见「一之二、发版纪律」）。
@@ -137,23 +149,44 @@ git push origin dev/1.17-wcpe
 ### 流程 C：发正式版
 
 ```bash
-scripts/sync-upstream.sh verify          # 先确认队列干净
+bash scripts/sync-upstream.sh verify          # 先确认队列干净
+
+# 1) 发版前生成发布清单，人工审阅后按普通提交（元数据段）提交
+bash scripts/gen-release-notes.sh --tag wcpe-v1.17.N
+#   落盘 .upstream/releases/wcpe-v1.17.N.md 并打印一份到终端
+git add .upstream/releases/wcpe-v1.17.N.md
+git commit -m "docs: 补 1.17.N 的发布说明归档"
+
+# 2) 清单进历史之后再打 tag
 git tag -a wcpe-v1.17.N -m "WCPE Loom 1.17.N"
 git push origin wcpe-v1.17.N
 ```
 
-推送后 CI 自动完成：取消同提交的开发版构建 → 跑回归门禁（约 40 分钟）→
-build + publish 到 Maven → 生成 Release 正文。
+清单**必须在打 tag 之前**提交：CI 不现生成正文，只做 `--check <tag>` 严格校验并发布归档的那份。
 
-正文生成的两个要点（都在 `scripts/gen-release-notes.sh` 里）：
-- 上一版按**版本号顺序**取，不用 `git describe`（后者按祖先关系找，孤立 tag 会被跳过）
-- 端点先查 `release-anchors.txt` 换算到主线提交，避免跨分叉重复计算
+推送后 CI 自动完成：取消同提交的开发版构建 → 跑回归门禁（约 40 分钟）→
+build + publish 到 Maven → 校验清单并据此建 Release。
+
+**清单缺失或与重算结果不一致 → Release 作业直接失败**（`::error::` + `exit 1`），
+不会回退到旧的区间引擎。漏提交的代价是这一版没有 Release（补上清单后重跑作业即可），
+而不是发出一份算错的清单。
+
+正文生成的三条要点：
+
+| 要点 | 含义 |
+|---|---|
+| **补丁面** | 每个补丁提交末尾带 `Patch-Name: <slug>`；说明只认这个 trailer，不认 SHA、不认标题、不认 patch-id |
+| **集合差** | 说明 = `patches(本版) - patches(上一版)`；上一版按**版本号顺序**取（`sort -V`），与拓扑无关 |
+| **清单随 tag 固化** | 清单在发版前生成、随 tag 一起进历史；`--check` 只做逐字比对，同一 tag 每次重算必须一致 |
+
+一个必须知道的后果：**1.17.19 及更早的补丁没有 `Patch-Name`，也不回填**（回填等于重写已发布历史）。
+它们因此永远不出现在「新增补丁」里——那些说明已经在历史 Release 中，符合预期。
 
 ### 流程 D：同步上游新基底
 
 ```bash
 git fetch architectury
-scripts/sync-upstream.sh rebase <新基底sha> base/architectury-1.17-<新sha>
+bash scripts/sync-upstream.sh rebase <新基底sha> base/architectury-1.17-<新sha>
 ```
 
 在**临时分支**上把整条队列重放到新基底，冲突逐补丁解决（每个补丁单一逻辑，归因容易）。
@@ -175,13 +208,14 @@ scripts/sync-upstream.sh rebase <新基底sha> base/architectury-1.17-<新sha>
 ### 1. 加一个新补丁
 
 ```bash
-scripts/sync-upstream.sh add-patch my-fix     # 1) 建工作分支（起点=队列末端）
+bash scripts/sync-upstream.sh add-patch my-fix    # 1) 建工作分支（起点=队列末端）
 #     …改代码…
-git commit                                    # 2) 一个逻辑变更一个提交，带溯源块
-scripts/sync-upstream.sh add-patch finish     # 3) 校验溯源块 + 元数据重放到新队列之后
+git commit                                        # 2) 一个逻辑变更一个提交，带溯源块 + Patch-Name
+bash scripts/sync-upstream.sh add-patch finish    # 3) 校验溯源块与 Patch-Name + 元数据重放
 ```
 
-`finish` 会：校验新提交是否都带 `Origin:`（缺了直接拒绝）→ 生成候选分支并把元数据提交重放到
+`finish` 会：校验新提交是否都带 `Origin:`（缺了直接拒绝）、`Patch-Name` 是否等于分支名去掉
+`add-patch/` 前缀（缺了或与既有 slug 重名同样拒绝）→ 生成候选分支并把元数据提交重放到
 新队列末端之后 → 打印校对命令与后续人工步骤。它**不会**代你前移 tag、切换分支或推送。
 
 **溯源块写法**（提交信息末尾）：
@@ -193,6 +227,7 @@ fix(forge): 修掉 xxx
 
 Origin: vendor, wcpe-loom
 Forwarded: no
+Patch-Name: legacy-forge-at-translate
 ```
 
 | 字段 | 取值 |
@@ -200,6 +235,7 @@ Forwarded: no
 | `Origin` | `vendor, wcpe-loom`（本项目自研）· `backport, <上游版本>`（从别的代系移植）· `upstream, <提交URL>`（取自上游） |
 | `Forwarded` | `no`（该反馈上游但还没）· `not-needed`（本仓库专属）· `<URL>`（已反馈） |
 | `Applied-Upstream` | 可选；上游已收录 → 换基底时**直接删掉该补丁** |
+| `Patch-Name` | `<slug>`：小写字母/数字/连字符，≤ 48 字符，补丁段内唯一。发布说明按它做集合差，**打完不要再改**；元数据提交不带它 |
 
 ### 2. 改文档 / CI / 脚本（元数据）
 
@@ -210,8 +246,8 @@ Forwarded: no
 ### 3. 校验
 
 ```bash
-scripts/sync-upstream.sh verify    # 只读：线性无 merge、补丁数、溯源块齐备、分支基于队列末端
-scripts/sync-upstream.sh status    # 只读：基底/队列/元数据/远端状态一览
+bash scripts/sync-upstream.sh verify    # 只读：线性无 merge、补丁数、溯源块与 Patch-Name、分支基于队列末端
+bash scripts/sync-upstream.sh status    # 只读：基底/队列/元数据/远端状态一览
 ```
 
 ### 4. 同步上游
@@ -236,7 +272,7 @@ git rev-list --count base/architectury-1.17-026ce830..architectury/dev/1.17
 换基底：
 
 ```bash
-scripts/sync-upstream.sh rebase <新基底sha> base/architectury-1.17-<新sha>
+bash scripts/sync-upstream.sh rebase <新基底sha> base/architectury-1.17-<新sha>
 ```
 
 在**临时分支**上重放整条队列；冲突逐补丁解决（每个补丁单一逻辑，归因容易）。完成后还要把
@@ -248,7 +284,7 @@ scripts/sync-upstream.sh rebase <新基底sha> base/architectury-1.17-<新sha>
 |---|---|
 | 把代码改动当普通提交**丢在队列末端之后** | 下次 `rebase` 只重放 `base..patch-queue/1.17` → **你的补丁不会跟上新上游** |
 | **amend 队列内的补丁**（`patch-queue/1.17` 之前的提交） | 队列被改写 → 必须前移 tag 并重新证明内容等价；若队列已被 rebase 或他人引用，牵连一片 |
-| 已发布版本之后**改写该发布点之前的历史** | 已发布的 `wcpe-v*` tag 会被留在分支历史之外（GitHub 显示"不在默认分支上"）；compare 退到共同祖先重算、发版区间跳版多算、同版本号对应两份历史。**详见「一之二、发版纪律」** |
+| 已发布版本之后**改写该发布点之前的历史** | 已发布的 `wcpe-v*` tag 会被留在分支历史之外（GitHub 显示"不在默认分支上"）；compare 退到共同祖先重算、同版本号对应两份历史（发布说明已不受影响——它按 `Patch-Name` 补丁面算，与拓扑无关）。**详见「一之二、发版纪律」** |
 | 用 `merge` 把上游合进队列 | 规范禁止队列出现 merge 提交（`verify` 会报错），且队列无法线性 rebase |
 
 ## 五、改写队列 / 压缩元数据的正确姿势
@@ -281,12 +317,19 @@ gh api -X PUT "repos/wcpe/wcpe-loom/branches/dev%2F1.17-wcpe/protection" \
 ## 六、命令速查
 
 ```bash
-scripts/sync-upstream.sh status                    # 状态一览（只读）
-scripts/sync-upstream.sh verify                    # 规范自检（只读）
-scripts/sync-upstream.sh add-patch <名>            # 开补丁工作分支
-scripts/sync-upstream.sh add-patch finish          # 校验 + 元数据重放 + 打印后续步骤
-scripts/sync-upstream.sh rebase <新基底sha> [tag]  # 整条队列重放到新基底（临时分支）
+bash scripts/sync-upstream.sh status                    # 状态一览（只读）
+bash scripts/sync-upstream.sh verify                    # 规范自检（只读）
+bash scripts/sync-upstream.sh add-patch <名>            # 开补丁工作分支
+bash scripts/sync-upstream.sh add-patch finish          # 校验 + 元数据重放 + 打印后续步骤
+bash scripts/sync-upstream.sh rebase <新基底sha> [tag]  # 整条队列重放到新基底（临时分支）
+
+bash scripts/gen-release-notes.sh --tag <tag>           # 生成 .upstream/releases/<tag>.md（发版前）
+bash scripts/gen-release-notes.sh --check <tag>         # 严格校验归档清单
+bash scripts/gen-release-notes.sh --legacy <prev> <curr>  # 旧区间引擎，仅用于重算历史版本
 ```
 
 环境变量可覆盖默认边界（换基底/测试用）：`WCPE_BASE_TAG`、`WCPE_QUEUE_TAG`、
 `WCPE_DEFAULT_BRANCH`、`WCPE_UPSTREAM_REMOTE`。
+
+发布清单相关（`gen-release-notes.sh`）：`WCPE_BASE_TAG`（基底）、`WCPE_RELEASE_DIR`（默认
+`.upstream/releases`）、`WCPE_REPO_SLUG`（生成 compare 链接，默认 `wcpe/wcpe-loom`）。
