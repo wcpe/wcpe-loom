@@ -1335,9 +1335,10 @@ public class MappingConfiguration {
 	 */
 	private void writeReplacedTarget(LoomGradleExtension loom, String namespace, Path path) throws Exception {
 		// 此处拿不到 Project（无法用 LoomCacheService 的 JVM 内监视器），直接用同一 key 的跨进程锁。
-		// 该锁不可重入：同一 JVM 内已有线程持有同一 key 时，CacheEntryLock.acquireFileLockWithTimeout
-		// 只在 OverlappingFileLockException 之后空等轮询，直到 LoomCacheService.defaultTimeout() 超时。
-		// 因此调用点必须保证不会在已持有该 key 的锁内再次进入（尤其是与 produceMappings 的重入）；
+		// 该锁同线程可重入（CacheEntryLock 维护线程内重入计数），因此即使调用点已在同一 key
+		// 的锁内（例如与 produceMappings / runWithMappingsLock 的重入）也不会再等自己。
+		// 但跨线程仍然互斥：其它线程持同一 key 时会一直等到 LoomCacheService.defaultTimeout()，
+		// 所以不要因为「可重入」就把这把锁当作可跨线程嵌套使用的递归锁。
 		// 本方法自身不调用任何需要同一把锁的代码。
 		final Path lockRoot = loom.getFiles().getCacheLocks().toPath();
 

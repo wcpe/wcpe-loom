@@ -34,6 +34,8 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.time.LocalTime;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.Callable;
 
 import org.gradle.api.GradleException;
@@ -49,6 +51,11 @@ import net.fabricmc.loom.util.Checksum;
  * 通过该锁串行化，避免重复或损坏的写入。读已发布缓存的路径不应使用此工具（读路径无锁）。
  */
 public final class CacheEntryLock {
+	// 本线程已持有的锁文件（绝对路径）→ 重入层数。只在当前线程内可见，因此不会削弱任何互斥：
+	// 跨线程仍靠 NIO 文件锁（OverlappingFileLockException 分支继续轮询），跨进程仍靠文件锁本身。
+	// 用锁文件路径而不是 key 作身份：不同 lockRoot 下同名 key 指向不同锁文件，本就不该算重入。
+	private static final ThreadLocal<Map<String, Integer>> HELD_LOCKS = ThreadLocal.withInitial(HashMap::new);
+
 	private CacheEntryLock() {
 	}
 
@@ -59,6 +66,9 @@ public final class CacheEntryLock {
 	 * 供其它等待进程读取并播报「锁被谁持有」；释放锁时删除旁文件。持有者信息不写入锁文件本体，
 	 * 因为 Windows 的文件锁是强制锁，其它进程读被锁文件会被拒绝。
 	 *
+	 * <p><b>可重入性</b>：同一线程已持有同一锁文件时，内层调用<b>不再抢锁</b>，直接执行
+	 * {@code action}，退出时只递减重入计数。仅同线程同锁文件可重入；跨线程、跨进程仍完全互斥。
+	 *
 	 * @param lockRoot 锁文件所在目录，会按需创建
 	 * @param key      缓存条目的逻辑 key，内部以其 sha256 命名锁文件
 	 * @param timeout  等待锁的最长时间，超时抛出 {@link GradleException}
@@ -68,18 +78,47 @@ public final class CacheEntryLock {
 	 * @throws Exception action 自身抛出的异常会原样向上传播
 	 */
 	public static <T> T withLock(Path lockRoot, String key, Duration timeout, Callable<T> action) throws Exception {
-		Files.createDirectories(lockRoot);
 		// 锁文件长期复用，不在结束时删除，避免「删文件」与「持锁」之间的竞态
 		final Path lockFile = lockRoot.resolve(Checksum.of(key).sha256().hex() + ".lock");
 		final Path ownerFile = lockFile.resolveSibling(lockFile.getFileName() + ".owner");
+		// 以绝对规范化路径作为重入身份，避开 "a/../b" 与相对路径对不上同一文件的问题
+		final String lockId = lockFile.toAbsolutePath().normalize().toString();
+		final Map<String, Integer> held = HELD_LOCKS.get();
 
-		try (FileChannel channel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.READ)) {
-			FileLock lock = acquireFileLockWithTimeout(channel, key, ownerFile, timeout);
-			writeOwnerInfo(ownerFile, key);
+		if (held.containsKey(lockId)) {
+			// 重入：外层已持有该文件锁，内层不得再碰 channel/lock，只把层数 +1
+			held.put(lockId, held.get(lockId) + 1);
 
 			try {
 				return action.call();
 			} finally {
+				// 递归只减计数，绝不删旁文件、绝不 release（那些归最外层）
+				decrement(held, lockId);
+			}
+		}
+
+		// createDirectories 放在重入判定之后：内层路径完全不做 IO，与「取得锁后直接执行」的语义一致
+		Files.createDirectories(lockRoot);
+
+		try (FileChannel channel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.READ)) {
+			FileLock lock = acquireFileLockWithTimeout(channel, key, ownerFile, timeout);
+			writeOwnerInfo(ownerFile, key);
+			// 必须在拿到文件锁之后才记账：抢锁失败/超时抛异常时不会留下脏计数，也就不会被误判成重入
+			held.put(lockId, 1);
+
+			try {
+				return action.call();
+			} finally {
+				// 先清本线程的持有记录，再删旁文件、最后 release。可重入性只靠本线程的计数，
+				// 而本线程此刻尚在 finally 里，不可能并发地重入同一个 key，所以这个顺序是安全的。
+				held.remove(lockId);
+
+				// 本线程已不持任何锁时把整个 map 从 ThreadLocal 摘掉，
+				// 避免长命线程（Gradle daemon 的 worker 线程）永久挂着一个空 map
+				if (held.isEmpty()) {
+					HELD_LOCKS.remove();
+				}
+
 				// 先删持有者旁文件再释放锁：等待者只在拿不到锁时才读旁文件，
 				// 此顺序保证旁文件存在时其内容必出自当前（或刚释放的）持有者，不会长期误导
 				try {
@@ -92,6 +131,20 @@ public final class CacheEntryLock {
 					lock.release();
 				}
 			}
+		}
+	}
+
+	// 重入计数递减一层；归零时直接移除条目.
+	//
+	// 不用 merge(key, -1, Integer::sum)：那样归零后条目会以值 0 留下，而且一旦被减成负数，
+	// 条目就永远清不掉，后续调用会把它误判为「已持有」而不取锁。
+	private static void decrement(Map<String, Integer> held, String lockId) {
+		final Integer depth = held.get(lockId);
+
+		if (depth == null || depth <= 1) {
+			held.remove(lockId);
+		} else {
+			held.put(lockId, depth - 1);
 		}
 	}
 
