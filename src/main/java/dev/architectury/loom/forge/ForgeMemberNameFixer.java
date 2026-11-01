@@ -92,9 +92,9 @@ public final class ForgeMemberNameFixer {
 	 * @throws IOException 读写失败
 	 */
 	public static Stats fix(Path targetJar, Path srgForgeJar, Path namedForgeJar) throws IOException {
-		final Map<String, String> byOwnerAndName = buildMapping(srgForgeJar, namedForgeJar);
+		final MemberMapping mapping = buildMapping(srgForgeJar, namedForgeJar);
 
-		if (byOwnerAndName.isEmpty()) {
+		if (mapping.isEmpty()) {
 			// 映射为空说明两份 Forge jar 缺失或对不上：改写没有意义，跳过而不是产出半成品
 			return new Stats(0, 0);
 		}
@@ -102,12 +102,15 @@ public final class ForgeMemberNameFixer {
 		final Remapper remapper = new Remapper() {
 			@Override
 			public String mapMethodName(String owner, String name, String descriptor) {
-				return byOwnerAndName.getOrDefault(owner + "." + name, name);
+				return mapping.methods().getOrDefault(owner + "." + name, name);
 			}
 
 			@Override
 			public String mapFieldName(String owner, String name, String descriptor) {
-				return byOwnerAndName.getOrDefault(owner + "." + name, name);
+				// 只查字段表：字段与方法共用一张表时，同名的字段引用会被方法的目标名覆盖。
+				// 实测 1.12.2：`World.initCapabilities` 读的是父类 `WorldSavedData.mapName`（notch 名 `a`），
+				// 却命中了方法条目 `a -> readFromNBT`，运行期 NoSuchFieldError: readFromNBT。
+				return mapping.fields().getOrDefault(owner + "." + name, name);
 			}
 		};
 
@@ -152,7 +155,7 @@ public final class ForgeMemberNameFixer {
 		}
 
 		Files.move(tmp, targetJar, StandardCopyOption.REPLACE_EXISTING);
-		return new Stats(byOwnerAndName.size(), changed);
+		return new Stats(mapping.size(), changed);
 	}
 
 	/** {@return 改写后的字节；未发生改动时返回 {@code null}} */
@@ -170,45 +173,78 @@ public final class ForgeMemberNameFixer {
 	}
 
 	/**
-	 * 按「同类内成员顺序对齐」建立 owner+name → named 名的映射.
+	 * 按「同类内、同种类成员的顺序对齐」建立 srg 名 → named 名的映射.
+	 *
+	 * <p><b>字段与方法必须分表</b>：srg 空间里 Forge 自己的方法名也被 srg 化（`a` / `b` / `d`），
+	 * 与 named 空间按下标对齐后会得到 `a → readFromNBT` 这类**方法**映射；若字段与方法共用一张表，
+	 * 引用父类字段的 `getfield Owner.a` 会命中这张表并改写成方法名，运行期 NoSuchFieldError。
+	 * （实测 1.12.2：`World.initCapabilities` 引用 `WorldSavedData.mapName`，被改成 `readFromNBT`。）
 	 *
 	 * <p>只收录名字确实发生变化的成员；名字相同的无需改写。
 	 */
-	private static Map<String, String> buildMapping(Path srgForgeJar, Path namedForgeJar) throws IOException {
+	private static MemberMapping buildMapping(Path srgForgeJar, Path namedForgeJar) throws IOException {
 		if (!Files.isRegularFile(srgForgeJar) || !Files.isRegularFile(namedForgeJar)) {
-			return Map.of();
+			return MemberMapping.EMPTY;
 		}
 
-		final Map<String, List<String>> srgClasses = readMemberNames(srgForgeJar);
-		final Map<String, List<String>> namedClasses = readMemberNames(namedForgeJar);
-		final Map<String, String> mapping = new HashMap<>();
+		final Map<String, ClassMembers> srgClasses = readMemberNames(srgForgeJar);
+		final Map<String, ClassMembers> namedClasses = readMemberNames(namedForgeJar);
+		final Map<String, String> fields = new HashMap<>();
+		final Map<String, String> methods = new HashMap<>();
 
-		for (Map.Entry<String, List<String>> entry : srgClasses.entrySet()) {
+		for (Map.Entry<String, ClassMembers> entry : srgClasses.entrySet()) {
 			final String owner = entry.getKey();
-			final List<String> srgMembers = entry.getValue();
-			final List<String> namedMembers = namedClasses.get(owner);
+			final ClassMembers srg = entry.getValue();
+			final ClassMembers named = namedClasses.get(owner);
 
-			if (namedMembers == null || namedMembers.size() != srgMembers.size()) {
-				// 对不上（极少数类在两版间增删过成员）：跳过，宁可不改也不改错
+			if (named == null) {
 				continue;
 			}
 
-			for (int i = 0; i < srgMembers.size(); i++) {
-				final String srgName = srgMembers.get(i);
-				final String namedName = namedMembers.get(i);
-
-				if (!srgName.equals(namedName)) {
-					mapping.put(owner + "." + srgName, namedName);
-				}
-			}
+			// 字段只与字段对齐、方法只与方法对齐；两侧数量不等时整组跳过（宁可不改也不改错）
+			collect(srg.fieldNames(), named.fieldNames(), owner, fields);
+			collect(srg.methodNames(), named.methodNames(), owner, methods);
 		}
 
-		return mapping;
+		return new MemberMapping(fields, methods);
 	}
 
-	/** 读一个 jar 内全部 Forge 类的成员名（字段与方法，按 class 文件中的声明顺序）. */
-	private static Map<String, List<String>> readMemberNames(Path jar) throws IOException {
-		final Map<String, List<String>> result = new HashMap<>();
+	/** 把一组同种类成员按下标对齐后写入映射表；两侧数量不等时跳过该组. */
+	private static void collect(List<String> srgNames, List<String> namedNames, String owner, Map<String, String> out) {
+		if (srgNames.size() != namedNames.size()) {
+			return;
+		}
+
+		for (int i = 0; i < srgNames.size(); i++) {
+			final String srgName = srgNames.get(i);
+			final String namedName = namedNames.get(i);
+
+			if (!srgName.equals(namedName)) {
+				out.put(owner + "." + srgName, namedName);
+			}
+		}
+	}
+
+	/** 一个类在两份 Forge jar 里的成员名（按 class 文件声明顺序，字段与方法分开）. */
+	private record ClassMembers(List<String> fieldNames, List<String> methodNames) {
+	}
+
+	/** 字段与方法分开的两张映射表. */
+	private record MemberMapping(Map<String, String> fields, Map<String, String> methods) {
+		static final MemberMapping EMPTY = new MemberMapping(Map.of(), Map.of());
+
+		boolean isEmpty() {
+			return fields.isEmpty() && methods.isEmpty();
+		}
+
+		int size() {
+			return fields.size() + methods.size();
+		}
+	}
+
+	/** 读一个 jar 内全部 Forge 类的成员名（字段与方法分开，各自按 class 文件中的声明顺序）. */
+	private static Map<String, ClassMembers> readMemberNames(Path jar) throws IOException {
+		final Map<String, ClassMembers> result = new HashMap<>();
 
 		try (ZipFile zip = new ZipFile(jar.toFile())) {
 			final Enumeration<? extends ZipEntry> entries = zip.entries();
@@ -223,23 +259,24 @@ public final class ForgeMemberNameFixer {
 
 				try (InputStream in = zip.getInputStream(entry)) {
 					final ClassReader reader = new ClassReader(readAll(in));
-					final List<String> members = new ArrayList<>();
+					final List<String> fields = new ArrayList<>();
+					final List<String> methods = new ArrayList<>();
 
 					reader.accept(new ClassVisitor(Opcodes.ASM9) {
 						@Override
 						public FieldVisitor visitField(int access, String fieldName, String descriptor, String signature, Object value) {
-							members.add(fieldName);
+							fields.add(fieldName);
 							return null;
 						}
 
 						@Override
 						public MethodVisitor visitMethod(int access, String methodName, String descriptor, String signature, String[] exceptions) {
-							members.add(methodName);
+							methods.add(methodName);
 							return null;
 						}
 					}, 0);
 
-					result.put(reader.getClassName(), members);
+					result.put(reader.getClassName(), new ClassMembers(fields, methods));
 				} catch (RuntimeException e) {
 					// 单个类解析失败只跳过该类
 				}
