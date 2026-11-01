@@ -140,10 +140,16 @@ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
 			repo.setName("MojangArtifactFallback");
 			repo.setUrl(ArtifactRepositoryContainer.MAVEN_CENTRAL_URL);
 
-			// 与 Mojang 仓库保持同一套 metadataSources：回退只负责补上缺失的构件文件，
-			// 不引入 Gradle module metadata（避免 Mojang 制品被 GMM 重定向）。
+			// 回退仓库指向 Maven Central，**必须**启用 Gradle Module Metadata：关掉它会让
+			// Central 上依赖 GMM capability 的制品选不到变体（典型：Kotlin 2.3 的 kotlin-test
+			// 的 kotlin-test-framework-junit5 变体只声明在 .module 里，POM 中没有），报
+			// 「Unable to find a variant ... with the requested capability」。
+			//
+			// 它只补 Central 上的构件，与 Mojang 制品无关，因此不存在「Mojang 制品被 GMM
+			// 重定向」的风险——那正是上面 Mojang 仓库自身关掉 GMM 所要防的。
 			repo.metadataSources(sources -> {
 				sources.mavenPom();
+				sources.gradleMetadata();
 				sources.artifact();
 				sources.ignoreGradleMetadataRedirection();
 			});
