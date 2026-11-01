@@ -24,6 +24,9 @@
 
 package net.fabricmc.loom.pipeline;
 
+import java.nio.file.Path;
+import java.util.List;
+
 import org.gradle.api.DefaultTask;
 import org.gradle.api.file.RegularFileProperty;
 import org.gradle.api.tasks.CacheableTask;
@@ -34,6 +37,7 @@ import org.gradle.api.tasks.PathSensitivity;
 import org.gradle.api.tasks.TaskAction;
 
 import net.fabricmc.loom.configuration.providers.minecraft.SplitMinecraftProvider;
+import net.fabricmc.loom.util.cache.ArtifactReuse;
 
 /**
  * L3 流水线：把 client 与 server jar 拆成 client-only 与 common 两个 jar.
@@ -62,9 +66,23 @@ import net.fabricmc.loom.configuration.providers.minecraft.SplitMinecraftProvide
  * 能拆分的前提是「该版本的 server 下载是 bootstrap jar」，其真身在抽取产物里；
  * 因此 {@link #getServerJar()} 直接是抽取任务的输出，而非抽取前的 bootstrap jar。
  * 「不是 bootstrap 版本却要求拆分」在配置期就已经拒绝（判据同样来自不打开 jar 的 L2 元数据）。
+ *
+ * <h2>为什么 action 自己还要判一次复用</h2>
+ * 与 {@link MergeMinecraftJarsTask} 同理：两件产物都在跨项目共享的 {@code <userCache>/<mcVersion>/} 下，
+ * 对别的项目而言是 unknown output——既不会 up-to-date，也进不了构建缓存。前置判据由
+ * {@link ArtifactReuse} 提供：**两件产物都完好** + 拆分规则未换代 + 两个输入的内容指纹未变，
+ * 才整体复用；任一件不符即照常执行整次拆分（与配置期「任一半不可复用即重建」同一口径）。
  */
 @CacheableTask
 public abstract class SplitMinecraftJarsTask extends DefaultTask {
+	/**
+	 * 拆分规则的版本（参与复用判据）.
+	 *
+	 * <p>{@link SplitMinecraftProvider#splitJars} 的**实现**或共享条目清单一旦变化就要递增它：
+	 * 输入没变而产出规则变了，复用就等于拿旧规则的产物充当新规则的产物。
+	 */
+	static final String RECIPE = "split-minecraft-jars/v1";
+
 	/** 待拆分的 client jar. */
 	@InputFile
 	@PathSensitive(PathSensitivity.NONE)
@@ -85,10 +103,29 @@ public abstract class SplitMinecraftJarsTask extends DefaultTask {
 
 	@TaskAction
 	public void split() throws Exception {
+		final Path clientOnlyJar = getClientOnlyJar().get().getAsFile().toPath();
+		final Path commonJar = getCommonJar().get().getAsFile().toPath();
+		final List<Path> outputs = List.of(clientOnlyJar, commonJar);
+		final List<Path> inputs = List.of(
+				getClientJar().get().getAsFile().toPath(),
+				getServerJar().get().getAsFile().toPath());
+
+		// 前置判据：两个产物都在跨项目共享的 <userCache>/<mcVersion> 下，对别的项目而言是 unknown output，
+		// Gradle 的 up-to-date 与构建缓存都不会帮它跳过。两件都完好 + 拆分规则未换代 + 两个输入指纹未变
+		// → 整体复用；任一件不符即照常整次拆分（与配置期「任一半不可复用即重建」同一口径）。
+		if (ArtifactReuse.isReusable(clientOnlyJar, RECIPE, outputs, inputs)) {
+			ArtifactReuse.reportReused(clientOnlyJar, RECIPE);
+			return;
+		}
+
 		SplitMinecraftProvider.splitJars(
 				getClientJar().get().getAsFile().toPath(),
 				getServerJar().get().getAsFile().toPath(),
-				getClientOnlyJar().get().getAsFile().toPath(),
-				getCommonJar().get().getAsFile().toPath());
+				clientOnlyJar,
+				commonJar);
+
+		// 标记写在两件产物都已原子落位**之后**（splitJars 内部对两个目标各做一次原子 move）：
+		// 中断只会留下「有内容、没标记」的产物，下次判为不可复用并重算。
+		ArtifactReuse.record(clientOnlyJar, RECIPE, outputs, inputs);
 	}
 }
