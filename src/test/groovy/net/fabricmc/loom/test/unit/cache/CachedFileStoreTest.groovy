@@ -118,6 +118,84 @@ class CachedFileStoreTest extends Specification {
 		Files.notExists(root.resolve("test_300"))
 	}
 
+	/**
+	 * The eviction order has to survive the switch from insert-as-you-go to sort-once: it is the oldest
+	 * files (by last modified time) that get dropped, and the newest that stay.
+	 *
+	 * <p>The mtimes are fixed rather than relative to {@code now} so the case is fully deterministic,
+	 * and they are deliberately *not* in walk order: entries arrive in whatever order the file system
+	 * hands them out, so an implementation that relied on insertion order instead of on the mtime
+	 * would fail here.
+	 *
+	 * <p>Note the count: when the cache is over the limit the existing rule deletes exactly
+	 * {@code maxFiles} of the oldest entries (not {@code size - maxFiles}), so 9 files with a limit of
+	 * 5 leaves the 4 newest ones. That is upstream behaviour and is pinned here on purpose — this
+	 * test is about keeping the eviction *rule* unchanged while the sorting changes.
+	 */
+	def "pruneEvictsOldestFilesFirst"() {
+		given:
+		final int maxFiles = 5
+		final Instant base = Instant.parse("2024-01-01T00:00:00Z")
+		def cacheRules = new CachedFileStoreImpl.CacheRules(maxFiles, Duration.ofDays(36500))
+		def store = new CachedFileStoreImpl(root, BYTE_ARRAY_SERIALIZER, cacheRules)
+
+		// Key -> how many seconds older it is than `base`; a larger number means an older entry.
+		def ages = [
+			"f_now": 0,
+			"f_10s": 10,
+			"f_20s": 20,
+			"f_30s": 30,
+			"f_40s": 40,
+			"f_50s": 50,
+			"f_60s": 60,
+			"f_70s": 70,
+			"f_80s": 80,
+		]
+
+		when:
+		ages.each { key, age ->
+			store.putEntry(key, "Hello world".bytes)
+			Files.setLastModifiedTime(root.resolve(key), FileTime.from(base.minusSeconds(age)))
+		}
+
+		store.prune()
+
+		then: "only the newest entries survive, and the oldest ones are gone"
+		Files.newDirectoryStream(root).withCloseable { it.toList().size() } == 4
+
+		Files.exists(root.resolve("f_now"))
+		Files.exists(root.resolve("f_10s"))
+		Files.exists(root.resolve("f_20s"))
+		Files.exists(root.resolve("f_30s"))
+
+		Files.notExists(root.resolve("f_40s"))
+		Files.notExists(root.resolve("f_50s"))
+		Files.notExists(root.resolve("f_60s"))
+		Files.notExists(root.resolve("f_70s"))
+		Files.notExists(root.resolve("f_80s"))
+	}
+
+	/**
+	 * When the cache is within its size limit nothing may be deleted.
+	 */
+	def "pruneKeepsEverythingUnderTheLimit"() {
+		given:
+		final Instant base = Instant.parse("2024-01-01T00:00:00Z")
+		def cacheRules = new CachedFileStoreImpl.CacheRules(10, Duration.ofDays(36500))
+		def store = new CachedFileStoreImpl(root, BYTE_ARRAY_SERIALIZER, cacheRules)
+
+		when:
+		for (i in 0..<4) {
+			store.putEntry("f_" + i, "Hello world".bytes)
+			Files.setLastModifiedTime(root.resolve("f_" + i), FileTime.from(base.minusSeconds((i + 1) * 10)))
+		}
+
+		store.prune()
+
+		then:
+		Files.newDirectoryStream(root).withCloseable { it.toList().size() } == 4
+	}
+
 	private static CachedFileStore.EntrySerializer<byte[]> BYTE_ARRAY_SERIALIZER = new CachedFileStore.EntrySerializer<byte[]>() {
 		@Override
 		byte[] read(Path path) throws IOException {

@@ -31,7 +31,6 @@ import java.nio.file.attribute.FileTime;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
@@ -70,10 +69,13 @@ public record CachedFileStoreImpl<T>(Path root, EntrySerializer<T> entrySerializ
 	}
 
 	public void prune() throws IOException {
-		// Sorted oldest -> newest
 		List<PathEntry> entries = new ArrayList<>();
 
-		// Iterate over all the files in the cache, and store them into the sorted list.
+		// Iterate over all the files in the cache, and collect them.
+		// The list is sorted once afterwards, which is O(n log n). Inserting every entry into an
+		// already sorted list as it is found (binary search + ArrayList.add(index, ...)) is O(n²):
+		// every insert shifts the tail of the list, and the cache can hold up to 50000 files, so
+		// the whole thing is paid again on every warm run.
 		try (Stream<Path> walk = Files.walk(root)) {
 			Iterator<Path> iterator = walk.iterator();
 
@@ -84,9 +86,12 @@ public record CachedFileStoreImpl<T>(Path root, EntrySerializer<T> entrySerializ
 					continue;
 				}
 
-				insertSorted(entries, new PathEntry(entry));
+				entries.add(new PathEntry(entry));
 			}
 		}
+
+		// Sorted oldest -> newest
+		entries.sort(Comparator.comparing(PathEntry::lastModified));
 
 		// Delete the oldest files to get under the max file limit
 		if (entries.size() > cacheRules.maxFiles) {
@@ -112,16 +117,6 @@ public record CachedFileStoreImpl<T>(Path root, EntrySerializer<T> entrySerializ
 			iterator.remove();
 			Files.delete(entry.path);
 		}
-	}
-
-	private void insertSorted(List<PathEntry> list, PathEntry entry) {
-		int index = Collections.binarySearch(list, entry, Comparator.comparing(PathEntry::lastModified));
-
-		if (index < 0) {
-			index = -index - 1;
-		}
-
-		list.add(index, entry);
 	}
 
 	/**
