@@ -257,13 +257,14 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 	private void produceInConfiguration(ProvideContext context, List<RemappedJars> remappedJars, List<MinecraftJar> minecraftJars) throws Exception {
 		// 无锁快路径：shouldRefreshOutputs 只做只读检查（产物存在且内容可复用），缓存就绪时不会进入下面的锁
 		final boolean refresh = shouldRefreshOutputs(context);
+		final MemoryMappingTree mappings = getMappingsForRemap(context.configContext());
 
 		if (!refresh) {
 			// 产物已就绪、走快路径时也要补做 Forge 成员名改写：本工序在产物生成之后才引入，
 			// 而已存在的产物不会因为本工序新增而失效，故必须在这里补一次（幂等：已改写的引用
 			// 名字已是目标名，再次扫描不会命中）。
 			for (RemappedJars remappedJar : remappedJars) {
-				fixForgeMemberNames(remappedJar);
+				fixForgeMemberNames(remappedJar, mappings, remappedJar.sourceNamespace().toString(), getTargetNamespace().toString());
 			}
 
 			return;
@@ -524,9 +525,7 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		// 主重映射与 object holder 改写用的是同一套按平台选出的映射树。
 		// legacy Forge 的补全版由 MappingConfiguration 在 WITH_SRG 上直接提供（见那边的接线），
 		// 这里不必再区分——MappingOption.forPlatform 已对 Forge 返回 WITH_SRG。
-		final MemoryMappingTree mappings = mappingConfiguration
-				.getMappingsService(getProject(), configContext.serviceFactory(), MappingOption.forPlatform(extension))
-				.getMappingTree();
+		final MemoryMappingTree mappings = getMappingsForRemap(configContext);
 
 		try {
 			MinecraftJarRemap.run(new MinecraftJarRemap.Options(
@@ -560,7 +559,19 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		// 「对 Forge 成员的 srg 名引用」不会被翻译（如 ModelLoader.a → setupModelRegistry），
 		// 运行期抛 NoSuchMethodError。这里用 Forge 自身两份 jar 的成员差异做一次补充改写。
 		// 现代 Forge 的 universal jar 本身在 named 空间、没有 named 版产物，工序整体跳过。
-		fixForgeMemberNames(remappedJars);
+		fixForgeMemberNames(remappedJars, mappings, fromM, toM);
+	}
+
+	/**
+	 * {@return 本次重映射用的映射树}（主重映射与 Forge 成员名补充改写共用同一套）
+	 *
+	 * <p>legacy Forge 的补全版由 {@code MappingConfiguration} 在 WITH_SRG 上直接提供，
+	 * 调用方不必再区分——{@link MappingOption#forPlatform} 已对 Forge 返回 WITH_SRG。
+	 */
+	private MemoryMappingTree getMappingsForRemap(ConfigContext configContext) {
+		return extension.getMappingConfiguration()
+				.getMappingsService(getProject(), configContext.serviceFactory(), MappingOption.forPlatform(extension))
+				.getMappingTree();
 	}
 
 	/**
@@ -568,8 +579,11 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 	 *
 	 * <p>见 {@link dev.architectury.loom.forge.ForgeMemberNameFixer} 的类注释。
 	 * 拿不到两份 Forge jar 时静默跳过——现代 Forge 车道本就无需这一步。
+	 *
+	 * <p>{@code mappings} 用于解析「引用到继承字段」的名字：Forge 类不在 MC 映射表里，
+	 * TinyRemapper 解析不到这类引用，需要本工序补上。
 	 */
-	private void fixForgeMemberNames(RemappedJars remappedJars) throws IOException {
+	private void fixForgeMemberNames(RemappedJars remappedJars, MemoryMappingTree mappings, String fromM, String toM) throws IOException {
 		final Path[] referenceJars = getForgeReferenceJars();
 
 		if (referenceJars == null) {
@@ -577,11 +591,11 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		}
 
 		final var stats = dev.architectury.loom.forge.ForgeMemberNameFixer.fix(
-				remappedJars.outputJarPath(), referenceJars[0], referenceJars[1]);
+				remappedJars.outputJarPath(), referenceJars[0], referenceJars[1], mappings, fromM, toM);
 
 		if (stats.changedClasses() > 0) {
-			LOGGER.info(":fixed Forge member names in {} class(es) ({} mappings) for {}",
-					stats.changedClasses(), stats.mappingCount(), remappedJars.outputJarPath().getFileName());
+			LOGGER.info(":fixed Forge member names in {} class(es) ({} mappings, {} inherited field(s)) for {}",
+					stats.changedClasses(), stats.mappingCount(), stats.resolvedInheritedFields(), remappedJars.outputJarPath().getFileName());
 		}
 	}
 

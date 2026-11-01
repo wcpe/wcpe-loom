@@ -482,9 +482,10 @@ public abstract class RemapMinecraftTask extends DefaultTask {
 					getObjectHolderTargetNamespace().get(),
 					extraRemapperConfig
 			));
-		}
 
-		fixForgeMemberNames(outputJar);
+			// 放在 service 作用域内：继承字段解析要用刚加载的映射树
+			fixForgeMemberNames(outputJar, mappings);
+		}
 	}
 
 	/**
@@ -493,7 +494,7 @@ public abstract class RemapMinecraftTask extends DefaultTask {
 	 * <p>两个参考 jar 缺一就跳过：只有 legacy Forge 才有 srg + named 两份，其余车道拿不到，
 	 * 那时本工序是空操作（不是失败）。
 	 */
-	private void fixForgeMemberNames(Path outputJar) throws IOException {
+	private void fixForgeMemberNames(Path outputJar, MemoryMappingTree mappings) throws IOException {
 		final Path srgJar = getForgeSrgJar().getOrNull() == null
 				? null : getForgeSrgJar().get().getAsFile().toPath();
 		final Path namedJar = getForgeNamedJar().getOrNull() == null
@@ -503,9 +504,10 @@ public abstract class RemapMinecraftTask extends DefaultTask {
 			return;
 		}
 
-		final ForgeMemberNameFixer.Stats stats = ForgeMemberNameFixer.fix(outputJar, srgJar, namedJar);
-		LOGGER.info("补充翻译 Forge 成员名：映射 {} 条，改写 {} 个 class（产物 {}）",
-				stats.mappingCount(), stats.changedClasses(), outputJar.getFileName());
+		final ForgeMemberNameFixer.Stats stats = ForgeMemberNameFixer.fix(outputJar, srgJar, namedJar,
+				mappings, getFromNamespace().get(), getToNamespace().get());
+		LOGGER.info("补充翻译 Forge 成员名：映射 {} 条，继承解析 {} 处，改写 {} 个 class（产物 {}）",
+				stats.mappingCount(), stats.resolvedInheritedFields(), stats.changedClasses(), outputJar.getFileName());
 	}
 
 	/**
