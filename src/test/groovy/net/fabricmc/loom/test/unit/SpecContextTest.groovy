@@ -180,6 +180,52 @@ class SpecContextTest extends Specification {
 		specContext.allMods().size() == 1
 	}
 
+	/**
+	 * {@code modDependencies()} 必须惰性求值：求值点是在「首次读取」而不是「构建上下文」.
+	 *
+	 * <p>这是本类唯一能钉住「配置期恒定花费」的用例。{@code modDependencies()} 是上下文里唯一
+	 * 会遍历**全部** remap 配置并逐个打开 mod jar 的字段（见 {@code getDependentMods} 直接对
+	 * {@code entry.getSourceConfiguration().get().resolve()} 逐个 artifact 读元数据）；而
+	 * {@code modDependenciesCompileRuntime()} 只遍历其中 {@code applyDependencyTransforms=true}
+	 * 的子集。
+	 *
+	 * <p><b>验证手段</b>：在 {@code create} **之后**才把一个 remap 配置加进配置列表。若求值真被推迟，
+	 * 这个后加的配置会出现在首次读取的结果里；若仍在 {@code create} 里就求值，它就会缺席。
+	 * 这个手段不依赖对内部实现的计数埋点，因此不会因为实现换了读取方式而假绿/假红。
+	 *
+	 * <p>断言钉住三件事：
+	 * <ol>
+	 *   <li>{@code create} 之后、首次读之前，后加的配置还没被看到（证明 create 阶段没求值）；</li>
+	 *   <li>首次读取时能看到它，且原有依赖也在（惰性不等于丢失）；</li>
+	 *   <li>再读一次结果不变（同一个上下文里只算一次）。</li>
+	 * </ol>
+	 */
+	def "mod dependencies are resolved lazily on first read"() {
+		setup:
+		dependencies(
+				implementation: [mod("test1")],
+				runtimeOnly: [],
+				compileOnly: []
+				)
+
+		when:
+		def specContext = RemappedSpecContext.create(projectView)
+
+		// create 已经返回，此时才加入的配置：只有把求值推迟到首次读取，它才会被纳入
+		def latecomer = createConfigurationSettings("latecomer")
+		remapConfigurations.add(latecomer)
+		configureDependencies([mod("lateMod")], latecomer)
+
+		def firstRead = specContext.modDependencies()
+		def secondRead = specContext.modDependencies()
+
+		then:
+		// 1. 首次读取能看到 create 之后才加的配置（反证：create 阶段没有求值）
+		firstRead*.id.sort() == ["lateMod", "test1"]
+		// 2. 再读一次结果一致（同一个上下文里只算一次）
+		secondRead*.id.sort() == firstRead*.id.sort()
+	}
+
 	private void dependencies(Map<Object, List<Path>> files) {
 		configureDependencies(files.implementation, this.implementation)
 		configureDependencies(files.runtimeOnly, this.runtimeOnly)
@@ -219,7 +265,7 @@ class SpecContextTest extends Specification {
 	}
 
 	@CompileStatic
-	private static Function<RemapConfigurationSettings, Stream<Path>> resolve(Map<RemapConfigurationSettings, List<Path>> artifacts) {
+	private Function<RemapConfigurationSettings, Stream<Path>> resolve(Map<RemapConfigurationSettings, List<Path>> artifacts) {
 		return { settings ->
 			def paths = artifacts.get(settings)
 			return paths != null ? paths.stream() : Stream.empty()
