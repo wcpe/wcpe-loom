@@ -244,7 +244,7 @@ class MinecraftJarsReuseTaskTest extends Specification {
 	}
 
 	private static Set<String> zipEntries(Path jar) {
-		def entries = new HashSet<String>()
+		def entries = [] as Set<String>
 
 		FileSystemUtil.getReadOnlyJarFileSystem(jar).withCloseable { zip ->
 			Files.walk(zip.getPath("/")).withCloseable { stream ->
