@@ -24,9 +24,16 @@
 
 package net.fabricmc.loom.test.unit.cache
 
+import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.Paths
+import java.nio.file.StandardWatchEventKinds
+import java.nio.file.WatchEvent
+import java.nio.file.WatchKey
+import java.nio.file.WatchService
 import java.time.Duration
+import java.util.concurrent.TimeUnit
 
 import org.objectweb.asm.ClassWriter
 import org.objectweb.asm.Opcodes
@@ -56,6 +63,14 @@ class CachedJarProcessorTest extends Specification {
 	static String ExampleHash = "abc123/db5c3a2d04e0c6ea03aef0d217517aa0233f9b8198753d3c96574fe5825a13c4"
 	static String TestHash = "abc123/62db36eda67a8bdb19626126176aa0fccc64a509ac808db166e9795caac5a784"
 	static String TestDanglingHash = "abc123/6659d90f0ac7ee783c8b44e51c08d4388477ef3fa998f1d6d4fc95f4adf628ca"
+
+	// The temporary jars prepareJob creates, by createTempFile prefix.
+	static final List<String> CACHE_JAR_PREFIXES = [
+		"loom-cache-incomplete",
+		"loom-cache-existingClasses",
+		"loom-cache-existingSources",
+		"loom-cache-output",
+	]
 
 	static CachedData ExampleCachedData = new CachedData("net/fabricmc/Example", "Example sources", lineNumber("net/fabricmc/Example"))
 	static CachedData TestCachedData = new CachedData("net/fabricmc/other/Test", "Test sources", lineNumber("net/fabricmc/other/Test"))
@@ -228,6 +243,90 @@ class CachedJarProcessorTest extends Specification {
 		0 * _ // Strict mock
 	}
 
+	/**
+	 * When every class is a cache hit nothing is going to be decompiled, so the jar holding the cached
+	 * classes — which the partial branch hands to the decompiler as its classpath — is never read.
+	 * Copying the whole set of classes into it is pure waste (the jar was discarded again right away),
+	 * so it must not be created at all.
+	 */
+	def "prepare job does not create the existing classes jar when every class is a cache hit"() {
+		given:
+		def jar = ZipTestUtils.createZipFromBytes(jarEntries)
+		def cache = Mock(CachedFileStore)
+		def processor = new CachedJarProcessor(cache, "abc123")
+
+		when:
+		def createdJars = createJarsOf(processor, jar)
+
+		then: "no classes jar is created, only the ones the completed branch still uses"
+		createdJars.sort() == [
+			"loom-cache-existingSources",
+			"loom-cache-incomplete",
+			"loom-cache-output"
+		]
+
+		and: "the cache is still consulted for every class"
+		1 * cache.getEntry(ExampleHash) >> ExampleCachedData
+		1 * cache.getEntry(TestHash) >> TestCachedData
+		1 * cache.getEntry(TestDanglingHash) >> TestDanglingCachedData
+
+		0 * _ // Strict mock
+	}
+
+	/**
+	 * A full miss needs no classes jar either: the whole input jar is decompiled, so nothing from the
+	 * cache has to be put on the decompiler classpath.
+	 */
+	def "prepare job does not create the existing classes jar on a full miss"() {
+		given:
+		def jar = ZipTestUtils.createZipFromBytes(jarEntries)
+		def cache = Mock(CachedFileStore)
+		def processor = new CachedJarProcessor(cache, "abc123")
+
+		when:
+		def createdJars = createJarsOf(processor, jar)
+
+		then:
+		createdJars.sort() == [
+			"loom-cache-existingSources",
+			"loom-cache-incomplete",
+			"loom-cache-output"
+		]
+
+		3 * cache.getEntry(_) >> null
+
+		0 * _ // Strict mock
+	}
+
+	/**
+	 * The partial branch still has to hand the decompiler the classes that came from the cache, so the
+	 * jar is created there and contains them.
+	 */
+	def "prepare job creates the existing classes jar when some classes are left to decompile"() {
+		given:
+		def jar = ZipTestUtils.createZipFromBytes(jarEntries)
+		def cache = Mock(CachedFileStore)
+		def processor = new CachedJarProcessor(cache, "abc123")
+
+		when:
+		def createdJars = createJarsOf(processor, jar)
+		def workJob = processor.prepareJob(jar).job() as CachedJarProcessor.PartialWorkJob
+
+		then:
+		createdJars.sort() == [
+			"loom-cache-existingClasses",
+			"loom-cache-existingSources",
+			"loom-cache-incomplete",
+			"loom-cache-output"
+		]
+		ZipUtils.unpackNullable(workJob.existingClasses(), "net/fabricmc/Example.class") == newClass("net/fabricmc/Example")
+
+		2 * cache.getEntry(ExampleHash) >> ExampleCachedData
+		4 * cache.getEntry(_) >> null
+
+		0 * _ // Strict mock
+	}
+
 	def "complete completed work job"() {
 		given:
 		def jar = ZipTestUtils.createZipFromBytes(jarEntries)
@@ -314,6 +413,53 @@ class CachedJarProcessorTest extends Specification {
 
 		then:
 		newWorkJob instanceof CachedJarProcessor.FullWorkJob
+	}
+
+	/**
+	 * Run {@code prepareJob} while watching the temporary directory, and return which of the cache jars
+	 * it created. The expected names are reported by prefix, as every one of them is a
+	 * {@code createTempFile} temp file with a random suffix.
+	 *
+	 * <p>Watched rather than asserted by path because all of these jars are deleted again before
+	 * {@code prepareJob} returns, so listing the directory before/after cannot see them; watching is
+	 * done from the outside so the code under test needs no test hook. The watch is non-recursive, which
+	 * is all {@code createTempFile} in the temp dir itself needs.
+	 */
+	private Set<String> createJarsOf(CachedJarProcessor processor, Path jar) {
+		def tempDir = Paths.get(System.getProperty("java.io.tmpdir"))
+		def created = new LinkedHashSet<String>()
+		def watchService = FileSystems.getDefault().newWatchService()
+
+		try {
+			tempDir.register(watchService, StandardWatchEventKinds.ENTRY_CREATE)
+			processor.prepareJob(jar)
+
+			// Drain everything the watch service queued up while the job was being prepared.
+			WatchKey key
+
+			while ((key = watchService.poll(500, TimeUnit.MILLISECONDS)) != null) {
+				for (WatchEvent<?> event : key.pollEvents()) {
+					def name = event.context()?.toString()
+
+					if (name == null) {
+						// Overflow event, nothing to identify.
+						continue
+					}
+
+					def prefix = CACHE_JAR_PREFIXES.find { name.startsWith(it) }
+
+					if (prefix != null) {
+						created.add(prefix)
+					}
+				}
+
+				key.reset()
+			}
+		} finally {
+			watchService.close()
+		}
+
+		return created
 	}
 
 	private static ClassLineNumbers lineNumbers(List<String> names) {

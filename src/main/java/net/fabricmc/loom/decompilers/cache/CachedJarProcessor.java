@@ -27,6 +27,7 @@ package net.fabricmc.loom.decompilers.cache;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -49,25 +50,30 @@ public record CachedJarProcessor(CachedFileStore<CachedData> fileStore, String b
 		boolean hasSomeExisting = false;
 
 		Path incompleteJar = Files.createTempFile("loom-cache-incomplete", ".jar");
-		Path existingClassesJar = Files.createTempFile("loom-cache-existingClasses", ".jar");
 		Path existingSourcesJar = Files.createTempFile("loom-cache-existingSources", ".jar");
 
 		// We must delete the empty files, so they can be created as a zip
 		Files.delete(incompleteJar);
-		Files.delete(existingClassesJar);
 		Files.delete(existingSourcesJar);
 
 		// Sources name -> hash
 		Map<String, String> outputNameMap = new HashMap<>();
 		Map<String, ClassLineNumbers.Entry> lineNumbersMap = new HashMap<>();
+		// Classes that came from the cache, kept around to be copied into the existing classes jar
+		// only if there is some work left to do (see below).
+		List<ClassEntry> cachedClasses = new ArrayList<>();
+
+		// A jar containing the classes that came from the cache, used as the classpath of the classes
+		// that still have to be decompiled. Left null when there is nothing to decompile, in which
+		// case nothing would ever read it (see the CompletedWorkJob branch below).
+		Path existingClassesJar = null;
 
 		int hits = 0;
 		int misses = 0;
 
 		try (FileSystemUtil.Delegate inputFs = FileSystemUtil.getReadOnlyJarFileSystem(inputJar);
 				FileSystemUtil.Delegate incompleteFs = FileSystemUtil.getJarFileSystem(incompleteJar, true);
-				FileSystemUtil.Delegate existingSourcesFs = FileSystemUtil.getJarFileSystem(existingSourcesJar, true);
-				FileSystemUtil.Delegate existingClassesFs = FileSystemUtil.getJarFileSystem(existingClassesJar, true)) {
+				FileSystemUtil.Delegate existingSourcesFs = FileSystemUtil.getJarFileSystem(existingSourcesJar, true)) {
 			final List<ClassEntry> inputClasses = JarWalker.findClasses(inputFs);
 			final Map<String, String> rawEntryHashes = getEntryHashes(inputClasses, inputFs.getRoot());
 
@@ -90,7 +96,9 @@ public record CachedJarProcessor(CachedFileStore<CachedData> fileStore, String b
 					createParentDirectories(outputPath);
 					Files.writeString(outputPath, entryData.sources());
 
-					entry.copyTo(inputFs.getRoot(), existingClassesFs.getRoot());
+					// The copy into the existing classes jar is deferred until we know whether anything
+					// is left to decompile.
+					cachedClasses.add(entry);
 
 					if (entryData.lineNumbers() != null) {
 						lineNumbersMap.put(entryData.className(), entryData.lineNumbers());
@@ -104,6 +112,12 @@ public record CachedJarProcessor(CachedFileStore<CachedData> fileStore, String b
 					hits++;
 				}
 			}
+
+			if (isIncomplete && hasSomeExisting) {
+				// Some classes still have to be decompiled, and they need the cached classes as their
+				// classpath.
+				existingClassesJar = writeExistingClassesJar(cachedClasses, inputFs.getRoot());
+			}
 		}
 
 		// A jar file that will be created by the work action, containing the newly processed items.
@@ -116,7 +130,6 @@ public record CachedJarProcessor(CachedFileStore<CachedData> fileStore, String b
 		if (isIncomplete && !hasSomeExisting) {
 			// The cache contained nothing of use, fully process the input jar
 			Files.delete(incompleteJar);
-			Files.delete(existingClassesJar);
 			Files.delete(existingSourcesJar);
 
 			LOGGER.info("No cached entries found, going to process the whole jar");
@@ -131,10 +144,35 @@ public record CachedJarProcessor(CachedFileStore<CachedData> fileStore, String b
 			// The cached contained everything we need, so the existing jar is the output
 			LOGGER.info("All cached entries found, using completed work job");
 			Files.delete(incompleteJar);
-			Files.delete(existingClassesJar);
 			return new CompletedWorkJob(existingSourcesJar)
 					.asRequest(stats, lineNumbers);
 		}
+	}
+
+	/**
+	 * Write the given classes (copied from the input jar) into a fresh temporary jar.
+	 *
+	 * <p>Only called when at least one class still has to be decompiled, in which case the jar is used
+	 * as the classpath of the decompiler. When every class was a cache hit nobody would ever read the
+	 * jar, so copying the whole set of classes into it is pure waste.
+	 *
+	 * @param entries the classes to copy
+	 * @param inputRoot the root of the jar the classes are read from
+	 * @return the path of the written jar
+	 */
+	private static Path writeExistingClassesJar(List<ClassEntry> entries, Path inputRoot) throws IOException {
+		Path existingClassesJar = Files.createTempFile("loom-cache-existingClasses", ".jar");
+
+		// We must delete the empty file, so it can be created as a zip
+		Files.delete(existingClassesJar);
+
+		try (FileSystemUtil.Delegate existingClassesFs = FileSystemUtil.getJarFileSystem(existingClassesJar, true)) {
+			for (ClassEntry entry : entries) {
+				entry.copyTo(inputRoot, existingClassesFs.getRoot());
+			}
+		}
+
+		return existingClassesJar;
 	}
 
 	private static Map<String, String> getEntryHashes(List<ClassEntry> entries, Path root) throws IOException {
