@@ -24,6 +24,7 @@
 
 package net.fabricmc.loom.pipeline;
 
+import java.io.File;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.file.FileVisitResult;
@@ -31,6 +32,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
@@ -38,6 +41,7 @@ import dev.architectury.loom.forge.tool.ForgeExternalToolService;
 import dev.architectury.loom.mcpconfig.McpExecutor;
 import dev.architectury.loom.util.TempFiles;
 import org.gradle.api.DefaultTask;
+import org.gradle.api.file.ConfigurableFileCollection;
 import org.gradle.api.file.DirectoryProperty;
 import org.gradle.api.file.RegularFileProperty;
 import org.gradle.api.provider.Property;
@@ -62,7 +66,7 @@ import net.fabricmc.loom.util.service.ScopedServiceFactory;
  *   <caption>旧路径 vs 本任务</caption>
  *   <tr><th></th><th>旧路径</th><th>本任务</th></tr>
  *   <tr><td>是否需要生产</td><td>配置期 {@code needsWork()} 设的 {@code dirty} + 锁内二次确认</td>
- *       <td>Gradle up-to-date 检查（输入内容 + 输出快照）</td></tr>
+ *       <td>Gradle up-to-date 检查（输入内容 + 输出快照），叠加「产物已就绪且身份相符就跳过」的前置判据</td></tr>
  *   <tr><td>并发保护</td><td>跨进程文件锁</td><td>任务图 + 跨进程文件锁（产物仍在共享缓存）</td></tr>
  *   <tr><td>执行时机</td><td>配置期（{@code CompileConfiguration.setupMinecraft}）</td><td>执行期</td></tr>
  * </table>
@@ -82,6 +86,24 @@ import net.fabricmc.loom.util.service.ScopedServiceFactory;
  * 因此改由 {@link #getMcpWorkDir()} 给出（{@code build/tmp/<任务名>/mcp}），由本任务在执行期创建、
  * 结束即删——对 MCP 执行链而言与配置期的 {@code TempFiles} 语义完全一致。
  * 目录路径不参与产物内容（旧路径每次都是随机路径而产物不变），故它是 {@code @Internal}。
+ *
+ * <h2>产物就绪就跳过整条链（前置判据）</h2>
+ * 产物落在跨项目共享的 forge 缓存目录，属于「执行前就已存在、又不是本任务创建的」输出。
+ * Gradle 对这种输出的口径是 {@code Gradle does not know how file … was created}：
+ * <b>构建缓存被直接关掉</b>（见 {@code GenerateForgePatchedSourcesTask} 类注释第 4 条），up-to-date 在跨工作树 / 跨
+ * loom 版本时也不可靠；而整条 MCP 链是十余个外部进程、分钟到十分钟级。
+ *
+ * <p>于是 {@link #generate()} 的第一件事是判「产物已就绪且身份与本次输入逐项相符」，命中即直接返回，
+ * 不启动任何外部进程；判据与身份的完整说明见 {@link ForgePrePatchJarReuse}。要点：
+ * <ul>
+ *   <li>判据是纯读的（stat + 小文件内容摘要），不解压 jar、不改写产物；</li>
+ *   <li>身份记在产物**旁边**的旁车文件里，而不是产物自己的 manifest——往产物里写清单会改变它的字节，
+ *       而那正是本仓库逐字节等价性用例所钉住的东西；</li>
+ *   <li>旁车只在生产成功后写（{@link ForgePrePatchJarReuse#record}），因此旁车永远描述一份真实存在的产物；</li>
+ *   <li>不命中时行为与改造前完全一致：照常跑链、原子落位。</li>
+ * </ul>
+ *
+ * <p>它不影响 Gradle 的缓存口径：输入输出声明一个未改，{@link #getReuseInputs()} 是 {@code @Internal}。
  */
 @CacheableTask
 public abstract class GenerateForgePrePatchJarTask extends DefaultTask {
@@ -144,12 +166,56 @@ public abstract class GenerateForgePrePatchJarTask extends DefaultTask {
 	@OutputFile
 	public abstract RegularFileProperty getOutputJar();
 
+	/**
+	 * 本次执行的身份前缀：决定「该产出什么」的那些纯值（分支、平台、MC/Forge 版本、side、命名空间）.
+	 *
+	 * <p>{@code @Input} 而不只是「日志用」：它参与 Gradle 的 up-to-date 判定，也参与下面那条复用判据的键
+	 * （见 {@link ForgePrePatchJarReuse}）。配置期拼好，执行期不再回读项目模型。
+	 */
+	@Input
+	public abstract Property<String> getReuseIdentity();
+
+	/**
+	 * 本次执行的输入文件：它们的内容决定产物内容，因而参与复用判据的键.
+	 *
+	 * <p>这些路径**不**作为 {@code @InputFile} 声明（除了下面已经声明过的输入）：它们在任务里本以「路径」形式
+	 * 出现（{@code McpExecutor.Options} 的初始配置、installer tools 的参数模板），并不等价于「本任务的输入」——
+	 * 两条分支读的集合不同，误声明会让任务在 1.17 及更早的非 bundle 版本上以「输入文件不存在」失败。
+	 * 故它们只用于复用判据：{@code @Internal}，不影响 Gradle 的输入快照与缓存键。
+	 */
+	@Internal
+	public abstract ConfigurableFileCollection getReuseInputs();
+
 	@TaskAction
 	public void generate() throws Exception {
 		final Path output = getOutputJar().get().getAsFile().toPath();
+		final String reuseKey = ForgePrePatchJarReuse.fingerprint(getReuseIdentity().get(), reuseInputs());
+
+		// 前置判据：产物已就绪且身份与本次输入逐项相符 → 直接返回，不启动任何外部进程。
+		// 这条判据存在的理由见 ForgePrePatchJarReuse 的类注释（unknown-output 规则让本任务永远拿不到
+		// 构建缓存，而整条 MCP 链是分钟到十分钟级）。
+		if (ForgePrePatchJarReuse.tryReuse(output, reuseKey, getLogger())) {
+			return;
+		}
+
 		// 原子发布：产物位于跨 daemon 共享的 forge 缓存目录，配置期路径同样是「临时文件 + 原子落位」，
 		// 否则锁外读方会看到半截 jar
 		MinecraftPatchedProvider.publishAtomically(output, this::produce);
+
+		// 生产成功后记录本次身份：下一次构建因此可以走上面的前置判据。
+		// 只写旁车、不碰产物本身（产物字节必须与配置期路径逐字节一致）。
+		ForgePrePatchJarReuse.record(output, reuseKey, getLogger());
+	}
+
+	/** {@return 复用判据要统计的输入文件列表（去重由判据内部做）} */
+	private List<Path> reuseInputs() {
+		final List<Path> inputs = new ArrayList<>(getReuseInputs().getFiles().size());
+
+		for (File file : getReuseInputs().getFiles()) {
+			inputs.add(file.toPath());
+		}
+
+		return inputs;
 	}
 
 	private void produce(Path output) throws Exception {

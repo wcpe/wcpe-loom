@@ -389,10 +389,17 @@ public class MinecraftPatchedProvider {
 			task.getOffline().set(project.getGradle().getStartParameter().isOffline());
 			task.getManualRefreshDeps().set(extension.manualRefreshDeps());
 			task.getMcpWorkDir().set(mcpWorkDir.toFile());
+			// 复用判据的身份与输入（见 GenerateForgePrePatchJarTask#generate）：配置期算成纯值，
+			// 执行期只做比对。installer tools 的声明只组装一次：它既进任务的 @Nested 输入，
+			// 也进复用判据的输入指纹（工具 classpath 换了，产物就可能变）
+			final ForgeExternalToolService.Options installerToolsOptions = installerTools
+					? createNeoForgeInstallerTools() : null;
+			task.getReuseIdentity().set(prePatchReuseIdentity(extension, installerTools, unobfuscated));
+			task.getReuseInputs().from(prePatchReuseInputs(installerToolsOptions, unobfuscated));
 
 			if (installerTools) {
 				task.getBranch().set(GenerateForgePrePatchJarTask.BRANCH_NEOFORGE_INSTALLER_TOOLS);
-				task.getInstallerTools().set(createNeoForgeInstallerTools());
+				task.getInstallerTools().set(installerToolsOptions);
 				task.getClientMappingsUrl().set(Objects.requireNonNull(
 						minecraftProvider.getVersionInfo().download("client_mappings"),
 						"client_mappings download is not available for this Minecraft version").url());
@@ -530,6 +537,82 @@ public class MinecraftPatchedProvider {
 		if (type == Type.MERGED || type == Type.SERVER_ONLY) {
 			minecraftProvider.addProducerDependency(task, minecraftProvider.getMinecraftServerJar().toPath());
 		}
+	}
+
+	/**
+	 * {@return pre-patch jar 的复用身份前缀（决定「该产出什么」的那些纯值）}.
+	 *
+	 * <p>它只用于「产物已就绪就跳过整条 MCP 链」的判据（见 {@code GenerateForgePrePatchJarTask}），不参与产物
+	 * 字节：与产物内容有关的细节（步进集合、工具版本）由 {@link #prePatchReuseInputs} 的文件指纹覆盖。
+	 *
+	 * <p>逐项都是「换了就必须重建」的量：
+	 * <ul>
+	 *   <li>{@code patchVersion}：Loom 链路算法版本，与 patched jar 的 manifest 标记同源；</li>
+	 *   <li>{@code branch}：rename / merge-preProcessJar / installer tools 三条分支产物不同；</li>
+	 *   <li>{@code platform} / {@code mcVersion} / {@code forgeVersion}：换了就是另一份产物（产物路径本身也按
+	 *       forge 版本分段，这里是第二道锁）；</li>
+	 *   <li>{@code type} / {@code namespace}：side 与中间命名空间写进了产物文件名与重映射目标。</li>
+	 * </ul>
+	 *
+	 * <p>MCPConfig 的版本标识不必单列：它的落位路径 {@code <mc>/mcp/<version>/mcp.zip} 本身就是输入指纹的
+	 * 一部分（{@link #prePatchReuseInputs}）。
+	 */
+	private String prePatchReuseIdentity(LoomGradleExtension extension, boolean installerTools, boolean unobfuscated) {
+		return "patchVersion=" + CURRENT_LOOM_PATCH_VERSION
+				+ "|branch=" + (installerTools ? GenerateForgePrePatchJarTask.BRANCH_NEOFORGE_INSTALLER_TOOLS
+						: unobfuscated ? GenerateForgePrePatchJarTask.BRANCH_MCP_UNOBFUSCATED
+						: GenerateForgePrePatchJarTask.BRANCH_MCP_RENAME)
+				+ "|platform=" + extension.getPlatform().get().id()
+				+ "|mcVersion=" + extension.getMinecraftProvider().minecraftVersion()
+				+ "|forgeVersion=" + extension.getForgeProvider().getVersion().getCombined()
+				+ "|type=" + type.id
+				+ "|namespace=" + intermediateNamespace;
+	}
+
+	/**
+	 * {@return pre-patch jar 的复用输入文件（内容决定产物内容的那些）}.
+	 *
+	 * <p>与两条分支实际读入的文件集合逐项对应：
+	 * <ul>
+	 *   <li><b>共同</b>：MCPConfig 的 {@code mcp.zip} 与解包出的 {@code config.json}——后者决定步进集合、工具坐标、
+	 *       函数参数，是「MCPConfig 换了一份」最直接的证据（它是几 KB 的纯文本，指纹会取内容摘要）；</li>
+	 *   <li><b>MCP 分支</b>：解包目录里那份静态映射（{@code config.json} 的 {@code data.mappings}，{@code mergeMappings} 步的
+	 *       输入），以及本形态要读的 vanilla jar（{@code downloadClient} / {@code downloadServer} 的输出）；</li>
+	 *   <li><b>unobfuscated 分支</b>：只有 vanilla jar（{@code merge} / {@code preProcessJar} 不读映射）；</li>
+	 *   <li><b>installer tools 分支</b>：工具 classpath 与 vanilla jar（两者都定死在参数模板里）。</li>
+	 * </ul>
+	 *
+	 * <p>注意这里取的是**链真正读入的**文件，不是 loom 自己的映射产物（{@code rename} 步的 {@code --map} 指向 MCP
+	 * 链自己算出的 {@code mergeMappings} 输出，其上游就是上面那份静态映射）。
+	 *
+	 * @param installerToolsOptions installer tools 分支的工具声明；其余分支为 {@code null}
+	 * @param unobfuscated 是否无混淆形态（该形态没有映射配置，不能读 {@code getMappingConfiguration()}）
+	 */
+	private List<Object> prePatchReuseInputs(ForgeExternalToolService.@Nullable Options installerToolsOptions,
+			boolean unobfuscated) {
+		final List<Object> inputs = new ArrayList<>();
+		final McpConfigProvider mcpConfigProvider = getExtension().getMcpConfigProvider();
+		inputs.add(mcpConfigProvider.getMcp());
+		inputs.add(mcpConfigProvider.getUnpackedZip().resolve("config.json"));
+
+		if (!unobfuscated && mcpConfigProvider.hasMappings()) {
+			inputs.add(mcpConfigProvider.getMappings());
+		}
+
+		if (type == Type.MERGED || type == Type.CLIENT_ONLY) {
+			inputs.add(minecraftProvider.getMinecraftClientJar());
+		}
+
+		if (type == Type.MERGED || type == Type.SERVER_ONLY) {
+			inputs.add(minecraftProvider.getMinecraftServerJar());
+		}
+
+		if (installerToolsOptions != null) {
+			// 工具 classpath 是惰性文件集合（配置期尚未解析），直接作为输入交给任务，执行期取值
+			inputs.add(installerToolsOptions.getClasspath());
+		}
+
+		return inputs;
 	}
 
 	/** 把上一级产物的产出方登记成任务依赖；未建任务（已有其它生产者）时什么也不做. */
