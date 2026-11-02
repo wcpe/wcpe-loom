@@ -69,6 +69,10 @@ public abstract class LoomTasks implements Runnable {
 			registerMigrateMappingsTasks();
 		}
 
+		// 配置期拉不到版本清单时会降级用本地副本（见 MinecraftMetadataProvider），
+		// 代价是清单可能长期停在旧版本。这个任务给出显式刷新入口。
+		getTasks().register("refreshVersionsManifest", RefreshVersionsManifestTask.class);
+
 		var generateLog4jConfig = getTasks().register("generateLog4jConfig", GenerateLog4jConfigTask.class, t -> {
 			t.setDescription("Generate the log4j config file");
 		});

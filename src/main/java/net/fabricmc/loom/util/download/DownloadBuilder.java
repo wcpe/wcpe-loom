@@ -47,6 +47,8 @@ public class DownloadBuilder {
 	private boolean forceDownload = false;
 	private boolean offline = false;
 	private Duration maxAge = Duration.ZERO;
+	private Duration connectTimeout = Download.DEFAULT_CONNECT_TIMEOUT;
+	private Duration requestTimeout = Download.DEFAULT_REQUEST_TIMEOUT;
 	private DownloadProgressListener progressListener = DownloadProgressListener.NONE;
 	private int maxRetries = 3;
 	private boolean allowInsecureProtocol = false;
@@ -100,6 +102,27 @@ public class DownloadBuilder {
 		return maxAge(ONE_DAY);
 	}
 
+	/**
+	 * 覆盖连接超时.
+	 *
+	 * <p>默认值见 {@link Download#DEFAULT_CONNECT_TIMEOUT}。给「拉不到就快速过去」的探测型下载
+	 * 用更短的值，避免一次网络抖动把整个构建挂上数分钟。
+	 */
+	public DownloadBuilder connectTimeout(Duration duration) {
+		this.connectTimeout = duration;
+		return this;
+	}
+
+	/**
+	 * 覆盖单次请求超时（不含重试）.
+	 *
+	 * <p>默认值见 {@link Download#DEFAULT_REQUEST_TIMEOUT}。
+	 */
+	public DownloadBuilder requestTimeout(Duration duration) {
+		this.requestTimeout = duration;
+		return this;
+	}
+
 	public DownloadBuilder allowInsecureProtocol() {
 		this.allowInsecureProtocol = true;
 		return this;
@@ -115,7 +138,8 @@ public class DownloadBuilder {
 			throw new IllegalArgumentException("Cannot create download for url (%s) with insecure protocol".formatted(url.toString()));
 		}
 
-		return new Download(this.url, this.expectedHash, this.useEtag, this.forceDownload, this.offline, maxAge, progressListener, httpVersion);
+		return new Download(this.url, this.expectedHash, this.useEtag, this.forceDownload, this.offline, maxAge,
+				connectTimeout, requestTimeout, progressListener, httpVersion);
 	}
 
 	public CompletableFuture<DownloadResult> downloadPathAsync(Path path, DownloadExecutor executor) {

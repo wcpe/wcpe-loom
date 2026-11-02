@@ -71,12 +71,41 @@ public final class Download {
 
 	// 陈旧临时文件的回收阈值（仅用于清理被 kill 掉的构建留下的 .part，不影响热路径）
 	private static final Duration PART_RETENTION = Duration.ofHours(1);
-	private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
-			.executor(Executors.newVirtualThreadPerTaskExecutor())
-			.followRedirects(HttpClient.Redirect.ALWAYS)
-			.proxy(ProxySelector.getDefault())
-			.connectTimeout(Duration.ofMinutes(2))
-			.build();
+
+	/** 默认连接超时. */
+	public static final Duration DEFAULT_CONNECT_TIMEOUT = Duration.ofMinutes(2);
+
+	/** 默认单次请求超时. */
+	public static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofMinutes(10);
+
+	private static final HttpClient HTTP_CLIENT = newClient(DEFAULT_CONNECT_TIMEOUT);
+
+	/**
+	 * 按连接超时值缓存客户端.
+	 *
+	 * <p>{@link HttpClient} 的连接超时只能在构建时定下，而本类允许单次下载覆盖它
+	 * （见 {@link DownloadBuilder#connectTimeout(Duration)}）。这里按超时值分流，避免
+	 * 为每一次下载都新建一个客户端（那会各自持有独立的线程池与连接）。
+	 */
+	private static final java.util.concurrent.ConcurrentHashMap<Duration, HttpClient> CLIENT_CACHE =
+			new java.util.concurrent.ConcurrentHashMap<>();
+
+	private static HttpClient newClient(Duration connectTimeout) {
+		return HttpClient.newBuilder()
+				.executor(Executors.newVirtualThreadPerTaskExecutor())
+				.followRedirects(HttpClient.Redirect.ALWAYS)
+				.proxy(ProxySelector.getDefault())
+				.connectTimeout(connectTimeout)
+				.build();
+	}
+
+	private static HttpClient clientFor(Duration connectTimeout) {
+		if (DEFAULT_CONNECT_TIMEOUT.equals(connectTimeout)) {
+			return HTTP_CLIENT;
+		}
+
+		return CLIENT_CACHE.computeIfAbsent(connectTimeout, Download::newClient);
+	}
 
 	public static DownloadBuilder create(String url) throws URISyntaxException {
 		return DownloadBuilder.create(url);
@@ -88,23 +117,28 @@ public final class Download {
 	private final boolean forceDownload;
 	private final boolean offline;
 	private final Duration maxAge;
+	private final Duration connectTimeout;
+	private final Duration requestTimeout;
 	private final DownloadProgressListener progressListener;
 	private final HttpClient.Version httpVersion;
 
-	Download(URI url, @Nullable String expectedHash, boolean useEtag, boolean forceDownload, boolean offline, Duration maxAge, DownloadProgressListener progressListener, HttpClient.Version httpVersion) {
+	Download(URI url, @Nullable String expectedHash, boolean useEtag, boolean forceDownload, boolean offline, Duration maxAge,
+			Duration connectTimeout, Duration requestTimeout, DownloadProgressListener progressListener, HttpClient.Version httpVersion) {
 		this.url = url;
 		this.expectedHash = expectedHash;
 		this.useEtag = useEtag;
 		this.forceDownload = forceDownload;
 		this.offline = offline;
 		this.maxAge = maxAge;
+		this.connectTimeout = connectTimeout;
+		this.requestTimeout = requestTimeout;
 		this.progressListener = progressListener;
 		this.httpVersion = httpVersion;
 	}
 
 	private HttpRequest.Builder requestBuilder() {
 		return HttpRequest.newBuilder(url)
-				.timeout(Duration.ofMinutes(10))
+				.timeout(requestTimeout)
 				.version(httpVersion)
 				.GET();
 	}
@@ -128,7 +162,7 @@ public final class Download {
 		progressListener.onStart();
 
 		try {
-			return HTTP_CLIENT.send(httpRequest, bodyHandler);
+			return clientFor(connectTimeout).send(httpRequest, bodyHandler);
 		} catch (IOException | InterruptedException e) {
 			throw error(e, "Failed to download (%s)", url);
 		}

@@ -26,7 +26,10 @@ package net.fabricmc.loom.configuration.providers.minecraft;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Function;
@@ -50,6 +53,17 @@ import net.fabricmc.loom.util.download.DownloadBuilder;
 public final class MinecraftMetadataProvider {
 	/** L2 规格层命名空间：版本清单的「目标版本条目」缓存. */
 	private static final String NAMESPACE_VERSIONS_MANIFEST = "versions-manifest";
+
+	/**
+	 * 元数据类下载的连接超时.
+	 *
+	 * <p>取得很短：这类下载失败时只影响「能不能拿到最新的版本清单」，不影响构建能否开始（
+	 * 有本地副本就降级）。默认的 2 分钟会让一次网络抖动把整个构建挂上数分钟。
+	 */
+	private static final Duration METADATA_CONNECT_TIMEOUT = Duration.ofSeconds(15);
+
+	/** 元数据类下载的单次请求超时. */
+	private static final Duration METADATA_REQUEST_TIMEOUT = Duration.ofSeconds(30);
 
 	private static final Logger LOGGER = LoggerFactory.getLogger(MinecraftMetadataProvider.class);
 
@@ -149,15 +163,69 @@ public final class MinecraftMetadataProvider {
 			builder = builder.defaultCache();
 		}
 
-		final Path cacheFile = location.cacheFile(options.userCache());
-		final String versionManifest = builder.downloadString(cacheFile);
-		final VersionsManifest.Version version = findVersion(versionManifest, cacheFile);
+		// 元数据下载是「拿不到就让构建起不来」的强依赖，因此把超时压到「快速失败」的量级：
+		// 默认的 2 分钟连接 + 10 分钟请求 × 3 次重试，在网络抖动的环境下实测单次配置要 8~9 分钟，
+		// 而且最终仍然失败。压到 15s / 30s 后最坏情况在 45s 量级内落定，要么成功要么降级。
+		builder = builder.connectTimeout(METADATA_CONNECT_TIMEOUT)
+				.requestTimeout(METADATA_REQUEST_TIMEOUT);
 
-		if (version != null) {
-			return new ManifestEntryLocation(location, version);
+		final Path cacheFile = location.cacheFile(options.userCache());
+
+		try {
+			final String versionManifest = builder.downloadString(cacheFile);
+			final VersionsManifest.Version version = findVersion(versionManifest, cacheFile);
+
+			if (version != null) {
+				return new ManifestEntryLocation(location, version);
+			}
+
+			return null;
+		} catch (IOException e) {
+			// 下载失败且本地已有可用的旧清单时降级：元数据只用来「选侧/找版本 URL」，
+			// 不是产物本身。本地副本完全够用，不该因为拉不到新版就把整个构建打死。
+			//
+			// 注意：必须捕 IOException —— DownloadException 继承自它而不是 RuntimeException，
+			// 写成 catch (RuntimeException) 会让异常直接冒泡、降级分支永不执行。
+			final ManifestEntryLocation fallback = readManifestEntryFromCache(location, cacheFile);
+
+			if (fallback != null) {
+				LOGGER.warn(
+						"无法刷新 Minecraft 版本清单（{}），本次改用本地已有副本：{}",
+						location.url(),
+						e.getMessage()
+				);
+				return fallback;
+			}
+
+			// 本地也没有可用的旧副本——退回到原始失败，不掩盖真正的问题。
+			throw e;
+		}
+	}
+
+	/**
+	 * 从已落盘的清单副本里取目标版本条目，供「下载失败时降级」使用.
+	 *
+	 * <p>不校验 maxAge、不联网：本地文件存在且能解析出目标版本就够。
+	 */
+	@Nullable
+	private ManifestEntryLocation readManifestEntryFromCache(ManifestLocation location, Path cacheFile) {
+		if (!Files.isRegularFile(cacheFile)) {
+			return null;
 		}
 
-		return null;
+		try {
+			final String json = Files.readString(cacheFile, StandardCharsets.UTF_8);
+			final VersionsManifest.Version version = findVersion(json, cacheFile);
+
+			if (version == null) {
+				return null;
+			}
+
+			return new ManifestEntryLocation(location, version);
+		} catch (RuntimeException | IOException e) {
+			LOGGER.debug("本地版本清单副本不可用：{}", cacheFile, e);
+			return null;
+		}
 	}
 
 	/**
