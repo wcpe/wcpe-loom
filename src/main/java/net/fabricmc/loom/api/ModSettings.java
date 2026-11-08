@@ -70,17 +70,24 @@ public abstract class ModSettings implements Named {
 
 	/**
 	 * Add {@link SourceSet}'s output directories from the current project to be grouped with the named mod.
+	 *
+	 * <p>Isolated Projects：本重载**只接受本项目的 sourceSet**。当传入的 sourceSet 不属于本项目时，
+	 * 不再像以前那样反推它的所有者项目：旧实现靠
+	 * {@code sourceSet.getOutput().getBuildDependencies().getDependencies(null)} 拿到其他项目的 Task
+	 * 再取 {@code getProject()}，在 IP 下就是跨项目访问，会报
+	 * {@code cannot access 'Project.<x>' functionality on another project}。
+	 *
+	 * <p>要跨项目挂源集请用 {@link #sourceSet(String, String)}（传项目路径字符串）。
 	 */
 	public void sourceSet(SourceSet sourceSet) {
 		Project project = getProject();
 
 		if (!SourceSetHelper.isSourceSetOfProject(sourceSet, project)) {
-			getProject().getLogger().info("Computing owner project for SourceSet {} as it is not a sourceset of {}", sourceSet.getName(), project.getPath());
-			project = SourceSetHelper.getSourceSetProject(sourceSet);
-
-			if (project == getProject()) {
-				throw new IllegalStateException("isSourceSetOfProject lied, report to loom devs.");
-			}
+			throw new IllegalArgumentException(
+				("SourceSet '%s' 不属于当前项目 %s。Isolated Projects 下不再反推所有者项目（那会造成跨项目访问）；"
+					+ "请改用 sourceSet(sourceSetName, projectPath) 重载。")
+					.formatted(sourceSet.getName(), project.getPath())
+			);
 		}
 
 		sourceSet(sourceSet, project);

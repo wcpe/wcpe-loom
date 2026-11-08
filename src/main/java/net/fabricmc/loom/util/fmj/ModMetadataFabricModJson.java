@@ -35,11 +35,8 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import dev.architectury.loom.metadata.JsonBackedModMetadataFile;
 import dev.architectury.loom.metadata.ModMetadataFile;
-import org.gradle.api.Project;
 import org.gradle.api.tasks.SourceSet;
 import org.jspecify.annotations.Nullable;
-
-import net.fabricmc.loom.util.gradle.SourceSetHelper;
 
 public final class ModMetadataFabricModJson extends FabricModJson {
 	private static final int FABRIC_SCHEMA_VERSION = -1;
@@ -78,10 +75,12 @@ public final class ModMetadataFabricModJson extends FabricModJson {
 			return Optional.of(directory.directoryPath().toAbsolutePath().toString());
 		} else if (source instanceof FabricModJsonSource.SourceSetSource sourceSets) {
 			final StringJoiner joiner = new StringJoiner("+");
+			// Isolated Projects：用 SourceSetSource 自带的 project，不再反推。
+			// 原先对每个 sourceSet 调 SourceSetHelper.getSourceSetProject(sourceSet)，那是靠
+			// getBuildDependencies() 拿其他项目的 Task 再取 getProject()，IP 下会报跨项目访问。
+			final String path = sourceSets.project().getPath();
 
 			for (SourceSet sourceSet : sourceSets.sourceSets()) {
-				final Project project = SourceSetHelper.getSourceSetProject(sourceSet);
-				final String path = project.getPath();
 				final StringBuilder sb = new StringBuilder(path);
 
 				if (!path.endsWith(":")) {

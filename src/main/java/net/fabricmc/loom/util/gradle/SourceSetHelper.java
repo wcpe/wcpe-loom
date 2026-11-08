@@ -100,7 +100,17 @@ public final class SourceSetHelper {
 	 * Attempts to compute the owning project for the {@link SourceSet}
 	 *
 	 * <p>A bit of a hack, would be nice for this to be added to the Gradle API.
+	 *
+	 * @deprecated Isolated Projects 不兼容：本方法靠
+	 * {@code sourceSet.getOutput().getBuildDependencies().getDependencies(null)}
+	 * 拿到**其他项目**的 Task 再取 {@code getProject()}，在 IP 下会被判为跨项目访问并报
+	 * {@code cannot access 'Project.<x>' functionality on another project}。
+	 * 需要项目路径的调用方请改用 {@code ModSettings.sourceSet(String, String)}。
+	 * 本项目内的 sourceSet 直接用 {@code ModSettings.sourceSet(SourceSet)} 即可。
+	 *
+	 * <p>保留而不删除，是因为 {@code net.fabricmc.loom.api} 是公开 API：删掉会破坏外部插件的编译。
 	 */
+	@Deprecated
 	public static Project getSourceSetProject(SourceSet sourceSet) {
 		final Project project = getProjectFromSourceSetOutput(sourceSet.getOutput());
 
@@ -111,6 +121,10 @@ public final class SourceSetHelper {
 		return project;
 	}
 
+	/**
+	 * @deprecated 参见 {@link #getSourceSetProject(SourceSet)}：Isolated Projects 下不能使用。
+	 */
+	@Deprecated
 	@Nullable
 	private static Project getProjectFromSourceSetOutput(SourceSetOutput sourceSetOutput) {
 		Set<? extends Task> dependencies = sourceSetOutput.getBuildDependencies().getDependencies(null);
