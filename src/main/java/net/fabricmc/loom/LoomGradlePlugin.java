@@ -24,12 +24,9 @@
 
 package net.fabricmc.loom;
 
-import java.util.Arrays;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -55,6 +52,7 @@ import net.fabricmc.loom.task.RemapTaskConfiguration;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.LibraryLocationLogger;
 import net.fabricmc.loom.util.OneDrive;
+import net.fabricmc.loom.util.gradle.LoomVersionLogService;
 
 public class LoomGradlePlugin implements Plugin<PluginAware> {
 	public static final String NAME = Constants.PLUGIN_ID;
@@ -97,19 +95,7 @@ public class LoomGradlePlugin implements Plugin<PluginAware> {
 	}
 
 	private void apply(Project project) {
-		Set<String> loggedVersions = new HashSet<>(Arrays.asList(System.getProperty("loom.printed.logged", "").split(",")));
-
-		if (!loggedVersions.contains(LOOM_VERSION)) {
-			loggedVersions.add(LOOM_VERSION);
-			System.setProperty("loom.printed.logged", String.join(",", loggedVersions));
-			project.getLogger().lifecycle("Architectury Loom: " + LOOM_VERSION);
-
-			if (Constants.PLUGIN_BETA) {
-				project.getLogger().lifecycle("This version of Architectury Loom is in beta! Please report any issues you encounter: https://github.com/architectury/architectury-loom/issues");
-			} else if (Constants.PLUGIN_DEPRECATED) {
-				project.getLogger().lifecycle("You are using an outdated version of Architectury Loom! This version will not receive any support, please consider updating!");
-			}
-		}
+		LoomVersionLogService.logVersion(project);
 
 		LibraryLocationLogger.logLibraryVersions();
 		OneDrive.verify(project);
