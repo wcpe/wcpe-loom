@@ -36,6 +36,7 @@ import java.util.function.Function;
 
 import org.gradle.api.Project;
 import org.gradle.api.provider.Property;
+import org.gradle.api.provider.Provider;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -47,6 +48,7 @@ import net.fabricmc.loom.configuration.DependencyInfo;
 import net.fabricmc.loom.configuration.providers.minecraft.ManifestLocations.ManifestLocation;
 import net.fabricmc.loom.configuration.providers.minecraft.VersionsManifest.Version;
 import net.fabricmc.loom.spec.SpecStore;
+import net.fabricmc.loom.util.Checksum;
 import net.fabricmc.loom.util.Constants;
 import net.fabricmc.loom.util.download.DownloadBuilder;
 
@@ -69,25 +71,31 @@ public final class MinecraftMetadataProvider {
 
 	private final Options options;
 	private final Function<String, DownloadBuilder> download;
+	private final @Nullable Provider<String> metadataSource;
 
 	private ManifestEntryLocation versionEntry;
 	private MinecraftVersionMeta versionMeta;
 
-	private MinecraftMetadataProvider(Options options, Function<String, DownloadBuilder> download) {
+	// 原始解析器只由 ValueSource 内部与独立下载测试使用，不把派生缓存 I/O 暴露给配置输入跟踪。
+	MinecraftMetadataProvider(Options options, Function<String, DownloadBuilder> download) {
+		this(options, download, null);
+	}
+
+	private MinecraftMetadataProvider(Options options, Function<String, DownloadBuilder> download, @Nullable Provider<String> metadataSource) {
 		this.options = options;
 		this.download = download;
+		this.metadataSource = metadataSource;
 	}
 
 	public static MinecraftMetadataProvider create(ConfigContext configContext) {
-		final String minecraftVersion = resolveMinecraftVersion(configContext.project());
-
-		return new MinecraftMetadataProvider(
-				MinecraftMetadataProvider.Options.create(
-						minecraftVersion,
-						configContext.project()
-				),
-				configContext.extension()::download
+		final Project project = configContext.project();
+		final Options options = Options.create(resolveMinecraftVersion(project), project);
+		final Provider<String> metadataSource = MinecraftMetadataValueSource.create(
+				project.getProviders(), options,
+				project.getGradle().getStartParameter().isOffline(), configContext.extension().manualRefreshDeps()
 		);
+
+		return new MinecraftMetadataProvider(options, configContext.extension()::download, metadataSource);
 	}
 
 	private static String resolveMinecraftVersion(Project project) {
@@ -100,6 +108,14 @@ public final class MinecraftMetadataProvider {
 	}
 
 	public MinecraftVersionMeta getVersionMeta() {
+		if (metadataSource != null) {
+			if (versionMeta == null) {
+				versionMeta = LoomGradlePlugin.GSON.fromJson(metadataSource.get(), MinecraftVersionMeta.class);
+			}
+
+			return versionMeta;
+		}
+
 		try {
 			if (versionEntry == null) {
 				versionEntry = getVersionEntry();
@@ -229,46 +245,40 @@ public final class MinecraftMetadataProvider {
 	}
 
 	/**
-	 * 从版本清单中取出目标版本，解析结果按清单文件的内容身份落盘.
+	 * 从版本清单中取出目标版本，解析结果按实际读取内容的 SHA-256 身份落盘.
 	 *
-	 * <p>版本清单是**全部** Minecraft 版本的清单（数百 KB ～ MB），而每次配置只需要其中一条。
-	 * 逐次全文 GSON 解析是不必要的重复：清单内容一旦下载完成就不再变化，因此把「目标版本在这一代
-	 * 清单中的条目」缓存下来，后续配置只解析这一条。
+	 * <p>版本清单包含全部 Minecraft 版本，每次配置只需要其中一条。派生缓存以已经读取的 JSON
+	 * 内容为键，不再重新 stat 文件：HTTP 304 更新时间戳不会产生新条目，并发替换文件也不会把
+	 * 旧 JSON 的结果错误地写入新一代文件的身份下。配置输入隔离由外层 ValueSource 承担。
 	 *
-	 * <p>缓存键含清单文件的内容身份（大小 + mtime），清单被刷新（含 {@code forceDownload}）后
-	 * 身份变化、自然失效，不会读到过期条目。缓存只存派生数据，丢失仅意味着多解析一次。
-	 *
-	 * @param manifestJson 清单的原始 JSON（已确保为最新一代）
-	 * @param manifestFile 清单的落盘位置，用于取内容身份
+	 * @param manifestJson 清单的原始 JSON
+	 * @param manifestFile 清单的落盘位置，用于损坏缓存的诊断
 	 * @return 目标版本条目；清单中不存在该版本时为空
 	 */
 	private @Nullable Version findVersion(String manifestJson, Path manifestFile) {
 		final SpecStore store = new SpecStore(options.userCache());
-		final var identity = SpecStore.inputIdentity(manifestFile);
+		final String identity = Checksum.of(manifestJson).sha256().hex();
+		final var cached = store.load(NAMESPACE_VERSIONS_MANIFEST, identity, options.minecraftVersion());
 
-		if (identity.isPresent()) {
-			final var cached = store.load(NAMESPACE_VERSIONS_MANIFEST, identity.get(), options.minecraftVersion());
+		if (cached.isPresent()) {
+			// 空内容表示「这一代清单里确实没有该版本」，是已解析过的结论，不是缓存缺失
+			if (cached.get().isEmpty()) {
+				return null;
+			}
 
-			if (cached.isPresent()) {
-				// 空内容表示「这一代清单里确实没有该版本」，是已解析过的结论，不是缓存缺失
-				if (cached.get().isEmpty()) {
-					return null;
-				}
-
-				try {
-					return LoomGradlePlugin.GSON.fromJson(cached.get(), Version.class);
-				} catch (RuntimeException e) {
-					// 缓存条目损坏：退回全文解析，本轮顺带把它覆盖成正确内容
-					LOGGER.debug("Corrupt spec cache entry for manifest {}, re-parsing", manifestFile, e);
-				}
+			try {
+				return LoomGradlePlugin.GSON.fromJson(cached.get(), Version.class);
+			} catch (RuntimeException e) {
+				// 缓存条目损坏：退回全文解析，本轮顺带把它覆盖成正确内容
+				LOGGER.debug("Corrupt spec cache entry for manifest {}, re-parsing", manifestFile, e);
 			}
 		}
 
 		final VersionsManifest manifest = LoomGradlePlugin.GSON.fromJson(manifestJson, VersionsManifest.class);
 		final VersionsManifest.Version version = manifest.getVersion(options.minecraftVersion());
 
-		identity.ifPresent(id -> store.store(NAMESPACE_VERSIONS_MANIFEST, id, options.minecraftVersion(),
-				version != null ? LoomGradlePlugin.GSON.toJson(version) : ""));
+		store.store(NAMESPACE_VERSIONS_MANIFEST, identity, options.minecraftVersion(),
+				version != null ? LoomGradlePlugin.GSON.toJson(version) : "");
 
 		return version;
 	}
