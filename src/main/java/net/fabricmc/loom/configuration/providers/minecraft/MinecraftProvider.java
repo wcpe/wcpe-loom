@@ -50,6 +50,7 @@ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.ConfigContext;
 import net.fabricmc.loom.configuration.DependencyInfo;
 import net.fabricmc.loom.configuration.providers.BundleMetadata;
+import net.fabricmc.loom.configuration.providers.BundleMetadataValueSource;
 import net.fabricmc.loom.configuration.providers.mappings.LayeredMappingsFactory;
 import net.fabricmc.loom.configuration.providers.minecraft.verify.MinecraftJarVerification;
 import net.fabricmc.loom.configuration.providers.minecraft.verify.SignatureVerificationFailure;
@@ -369,8 +370,8 @@ public abstract class MinecraftProvider {
 	private boolean isServerBundleMetadataCached() {
 		final MinecraftVersionMeta.Download serverDownload = getVersionInfo().download("server");
 		final String sha1 = serverDownload != null ? serverDownload.sha1() : null;
-		final var store = new net.fabricmc.loom.spec.SpecStore(getExtension().getFiles().getUserCache().toPath());
-		return BundleMetadata.isCached(store, sha1);
+		return BundleMetadataValueSource.isCached(
+				getProject().getProviders(), getExtension().getFiles().getUserCache().toPath(), sha1);
 	}
 
 	/**
@@ -689,8 +690,8 @@ public abstract class MinecraftProvider {
 	private BundleMetadata readServerBundleMetadata() throws IOException {
 		final MinecraftVersionMeta.Download serverDownload = getVersionInfo().download("server");
 		final String sha1 = serverDownload != null ? serverDownload.sha1() : null;
-		final var store = new net.fabricmc.loom.spec.SpecStore(getExtension().getFiles().getUserCache().toPath());
-		return BundleMetadata.fromJarCached(store, minecraftServerJar.toPath(), sha1);
+		return BundleMetadataValueSource.fromJarCached(
+				getProject().getProviders(), getExtension().getFiles().getUserCache().toPath(), minecraftServerJar.toPath(), sha1);
 	}
 
 	// 下载/抽取产物的跨进程锁 key：按「产物批次 + 版本」分片。

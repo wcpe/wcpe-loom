@@ -87,8 +87,8 @@ public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String
 	 * 不需要碰磁盘。于是把结果按 {@code sha1} 缓存后，后续构建可以完全跳过「打开服务端 jar
 	 * 读内部清单」这一步，配置期也就不再观察该 jar。这是把服务端下载搬到执行期的**先决条件**。
 	 *
-	 * <p>首次构建仍须真实读取（此时无缓存），并因此付出一次配置期文件观察；
-	 * 之后稳定命中。
+	 * <p>本方法是原始缓存解析器；配置期调用须经 {@link BundleMetadataValueSource}，
+	 * 将缓存查询、重算与写回一起隔离，只观察可用状态和有效元数据。
 	 *
 	 * @param store L2 规格存储
 	 * @param jar 服务端 jar
@@ -101,19 +101,10 @@ public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String
 			return fromJar(jar);
 		}
 
-		final Optional<String> cached = store.load(NAMESPACE_BUNDLE_METADATA, artifactSha1, "server-bundle");
+		final Optional<CachedMetadata> cached = loadCached(store, artifactSha1);
 
 		if (cached.isPresent()) {
-			// 空内容表示「上次已判定为旧版 jar（无 bundle）」，是结论而非缺失
-			if (cached.get().isEmpty()) {
-				return null;
-			}
-
-			try {
-				return LoomGradlePlugin.GSON.fromJson(cached.get(), BundleMetadata.class);
-			} catch (RuntimeException e) {
-				LOGGER.debug("Corrupt bundle metadata cache for sha1 {}, re-reading jar", artifactSha1, e);
-			}
+			return cached.get().metadata();
 		}
 
 		final BundleMetadata metadata = fromJar(jar);
@@ -146,35 +137,58 @@ public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String
 	/**
 	 * {@return 该制品是否已有 bundle 元数据缓存}.
 	 *
-	 * <p>命中判定只看缓存条目是否存在：条目里的空内容表示「上次已判定为旧版 jar（无 bundle）」，
-	 * 那是**结论**而不是缺失，同样算命中。本方法不打开 jar，因此可以安全地在配置期用于判定
-	 * 「元数据是否已可无 jar 读取地拿到」——这正是 {@code MinecraftProvider} 决定能否把下载搬到
-	 * 执行期任务的判据（见 {@link #fromJarCached}）。
+	 * <p>缓存必须包含有效元数据；精确空字符串表示已确认的 legacy。损坏条目按未命中处理。
+	 * 本方法不打开 jar；配置期须经 {@link BundleMetadataValueSource} 观察该语义结果，
+	 * 不直接把派生 JSON 的排版等维护信息记录为配置输入。
 	 *
 	 * @param store L2 规格存储
 	 * @param artifactSha1 该制品在 version json 中声明的 sha1，作为缓存身份；为空时必然未命中
 	 */
 	public static boolean isCached(SpecStore store, @Nullable String artifactSha1) {
+		return loadCached(store, artifactSha1).isPresent();
+	}
+
+	// 同时供可用性判定和实际读取使用，避免两条入口对损坏缓存作出不同结论。
+	static Optional<CachedMetadata> loadCached(SpecStore store, @Nullable String artifactSha1) {
 		if (artifactSha1 == null) {
-			return false;
+			return Optional.empty();
 		}
 
 		final Optional<String> cached = store.load(NAMESPACE_BUNDLE_METADATA, artifactSha1, "server-bundle");
 
-		if (cached.isEmpty() || cached.get().isEmpty()) {
-			// 未命中，或命中「已判定为非 bundler」的结论——两者都不需要打开 jar
-			return cached.isPresent();
+		if (cached.isEmpty()) {
+			return Optional.empty();
+		}
+
+		if (cached.get().isEmpty()) {
+			// 只有精确空字符串才是已确认的 legacy；JSON null 与纯空白都属于损坏缓存。
+			return Optional.of(new CachedMetadata(null));
 		}
 
 		try {
-			LoomGradlePlugin.GSON.fromJson(cached.get(), BundleMetadata.class);
-			return true;
+			final BundleMetadata metadata = LoomGradlePlugin.GSON.fromJson(cached.get(), BundleMetadata.class);
+
+			if (metadata == null || metadata.mainClass() == null || metadata.mainClass().isBlank()
+					|| !validEntries(metadata.libraries()) || !validEntries(metadata.versions())) {
+				return Optional.empty();
+			}
+
+			return Optional.of(new CachedMetadata(metadata));
 		} catch (RuntimeException e) {
-			// 条目损坏：缓存不可用，让调用方回退到「读 jar」的那条路径（它会顺带覆盖成正确内容）
 			LOGGER.debug("Corrupt bundle metadata cache for sha1 {}, treating as cache miss", artifactSha1, e);
-			return false;
+			return Optional.empty();
 		}
 	}
+
+	private static boolean validEntries(@Nullable List<Entry> entries) {
+		return entries != null && entries.stream().allMatch(entry -> entry != null
+				&& entry.sha1() != null && !entry.sha1().isBlank()
+				&& entry.name() != null && !entry.name().isBlank()
+				&& entry.path() != null && !entry.path().isBlank());
+	}
+
+	// 包装实例表示缓存可用；其中 metadata 为空则是有效的 legacy 结论。
+	record CachedMetadata(@Nullable BundleMetadata metadata) { }
 
 	/**
 	 * 从 bootstrap jar 中抽取一个内嵌条目到目标位置.
