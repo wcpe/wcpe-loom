@@ -425,11 +425,42 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 	}
 
 	/**
-	 * {@return 产物是否已就绪（无需重建）}.
+	 * {@return 本轮能否只在配置期接线，而不生产共享产物}.
 	 *
-	 * <p>供外部（如 {@code minecraft-provision} 事务锁的无锁快路径）在锁外做只读判定；
-	 * 实现即 {@link #shouldRefreshOutputs} 的取反，判定产物存在且内容可复用（见下）。
+	 * <p>可任务化时不观察 jar、POM 或 backup 是否已存在：它们的有效性由执行期任务保证。
+	 * 必须在配置期生产的形态仍按实际产物就绪状态进入原有事务锁，不能放松回退的互斥协议。
 	 */
+	public boolean isReadyForConfiguration(ProvideContext context) {
+		if (taskProduction && usesProvisioningImplementation(AbstractMappedMinecraftProvider.class)) {
+			try {
+				for (RemappedJars remappedJar : getRemappedJars()) {
+					verifyProjectable(remappedJar);
+				}
+
+				return true;
+			} catch (UnsupportedOperationException e) {
+				// 实际 provide 会说明回退原因；这里只保留配置期生产的就绪检查。
+			}
+		}
+
+		return isUpToDate(context);
+	}
+
+	/**
+	 * {@return provide 是否仍由已审核的实现承担}.
+	 *
+	 * <p>只检查方法的声明者，不调用钩子。第三方覆写 provide 后可能在配置期写盘，
+	 * 不能仅凭基类的任务开关就绕过原有事务锁；需由其显式覆写 readiness 说明契约。
+	 */
+	protected final boolean usesProvisioningImplementation(Class<?> implementation) {
+		try {
+			return getClass().getMethod("provide", ProvideContext.class).getDeclaringClass() == implementation;
+		} catch (NoSuchMethodException e) {
+			throw new IllegalStateException("Minecraft provider 缺少 provide 方法", e);
+		}
+	}
+
+	/** {@return 产物是否已就绪，无需配置期重建} 仅用于配置期回退形态的就绪判定. */
 	public boolean isUpToDate(ProvideContext context) {
 		return !shouldRefreshOutputs(context);
 	}

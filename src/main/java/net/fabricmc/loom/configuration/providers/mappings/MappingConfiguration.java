@@ -311,13 +311,14 @@ public class MappingConfiguration {
 	 *
 	 * <p>放宽的只有**迁移产物**这一族；其余选项（原始 mappings、mixin 派生映射）仍按存在性拒绝，
 	 * 因为那些文件在配置期结束时必定已由本类的 setup/setupPost 落位，缺失说明配置流程本身出了问题。
+	 * 必须先判断是否为任务产物再检查文件，否则首轮任务生成文件本身就会使下一轮配置缓存失效。
 	 */
 	public Path getMappingsPath(MappingOption mappingOption) {
 		Supplier<Path> mappingsSupplier = this.mappingOptions.get(mappingOption);
 
 		if (mappingsSupplier == null) {
 			throw new UnsupportedOperationException("Unsupported mapping option: " + mappingOption + ", it is possible that this option is not supported by this project / platform!");
-		} else if (Files.notExists(mappingsSupplier.get()) && !isTaskProducedMappings(mappingOption)) {
+		} else if (!isTaskProducedMappings(mappingOption) && Files.notExists(mappingsSupplier.get())) {
 			throw new UnsupportedOperationException("Mapping option " + mappingOption + " found but file does not exist!");
 		}
 

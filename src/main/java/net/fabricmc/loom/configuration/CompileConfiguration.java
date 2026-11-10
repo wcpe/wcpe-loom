@@ -334,25 +334,12 @@ public abstract class CompileConfiguration implements Runnable {
 		final String key = "minecraft-provision:" + extension.getMinecraftProvider().minecraftVersion() + ":" + mappingsIdentifier;
 		final LoomCacheService cacheService = LoomCacheService.get(project).get();
 
-		// 无锁快路径：所有 mapped provider 的产物均已就绪（shouldRefreshOutputs 为纯只读的
-		// 存在性/脏标志检查）时，本次供给不含任何共享缓存写入，内部 provide 各自的快路径
-		// 也不会取锁，故整段事务可无锁执行。
+		// 可任务化的 provider 只接线，不提前观察其 jar/POM/backup；共享产物由任务检查和生产。
+		// 仍需配置期生产的形态沿用双检事务锁，保持跨进程供给的互斥边界。
 		final var warmContext = new AbstractMappedMinecraftProvider.ProvideContext(true, extension.refreshDeps(), configContext);
 
-		// 用双检锁形式供给 mapped jar：
-		//
-		// 干净环境（CI 首次构建）下，多个共享同一份 Minecraft 的项目会算出同一个 key；
-		// 而 isMappedJarsWarm 在冷构建时全部为 false。若直接进 runExclusive，第 2..N 个项目
-		// 必须先拿到锁才能做那次检查，于是就各自白等「第一个项目做完整条 download→remap」
-		// 的时间（实测在 CI runner 上远超锁超时）。
-		//
-		// runExclusiveChecking 把就绪检查提到取锁之前，并在锁内重检：第一个项目持锁生产，
-		// 其余项目只需等它做完，拿到锁后立刻发现产物已就绪而秒退，不会再重建一遍。
-		//
-		// 两次检查都是纯只读的（shouldRefreshOutputs / 存在性与脏标志），不含共享缓存写入，
-		// 因此放在锁外安全；产物本身的写入仍由锁内的 provideMappedProviders 完成。
 		cacheService.runExclusiveChecking(lockRoot, key, LoomCacheService.defaultTimeout(),
-				() -> isMappedJarsWarm(extension, project, jarConfiguration, intermediaryMinecraftProvider,
+				() -> areMappedProvidersReadyForConfiguration(extension, project, jarConfiguration, intermediaryMinecraftProvider,
 						namedMinecraftProvider, warmContext),
 				() -> {
 					// 已就绪（无需生产）：照旧读已发布的产物。这一步不含共享缓存写入。
@@ -369,30 +356,30 @@ public abstract class CompileConfiguration implements Runnable {
 	}
 
 	/**
-	 * {@return 所有 mapped provider 的产物是否已就绪（无需重建）}.
+	 * {@return 所有 mapped provider 是否均无需在配置期写共享产物}.
 	 *
-	 * <p>shouldRefreshOutputs 仅做文件存在性与脏标志检查，不写入任何共享缓存，可安全在锁外调用。
+	 * <p>优先按任务投影的纯模型条件判断；只有配置期回退形态才检查实际产物状态。
 	 */
-	private boolean isMappedJarsWarm(LoomGradleExtension extension, Project project, MinecraftJarConfiguration<?, ?, ?> jarConfiguration,
+	private boolean areMappedProvidersReadyForConfiguration(LoomGradleExtension extension, Project project, MinecraftJarConfiguration<?, ?, ?> jarConfiguration,
 			IntermediaryMinecraftProvider<?> intermediaryMinecraftProvider,
 			NamedMinecraftProvider<?> namedMinecraftProvider,
 			AbstractMappedMinecraftProvider.ProvideContext context) {
-		if (intermediaryMinecraftProvider != null && !intermediaryMinecraftProvider.isUpToDate(context)) {
+		if (intermediaryMinecraftProvider != null && !intermediaryMinecraftProvider.isReadyForConfiguration(context)) {
 			return false;
 		}
 
-		if (!namedMinecraftProvider.isUpToDate(context)) {
+		if (!namedMinecraftProvider.isReadyForConfiguration(context)) {
 			return false;
 		}
 
 		if (extension.isForge()) {
-			if (!jarConfiguration.createSrgMinecraftProvider(project).isUpToDate(context)) {
+			if (!jarConfiguration.createSrgMinecraftProvider(project).isReadyForConfiguration(context)) {
 				return false;
 			}
 		}
 
 		if (extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime() && !extension.isUnobfuscatedForge()) {
-			if (!jarConfiguration.createMojangMappedMinecraftProvider(project).isUpToDate(context)) {
+			if (!jarConfiguration.createMojangMappedMinecraftProvider(project).isReadyForConfiguration(context)) {
 				return false;
 			}
 		}

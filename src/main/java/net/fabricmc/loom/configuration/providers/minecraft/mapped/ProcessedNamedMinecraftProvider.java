@@ -132,6 +132,32 @@ public abstract class ProcessedNamedMinecraftProvider<M extends MinecraftProvide
 		return List.copyOf(minecraftJarOutputMap.values());
 	}
 
+	/** {@return 父供给与处理器链是否均无需配置期生产} 与实际任务注册共用 descriptor 判据. */
+	@Override
+	public boolean isReadyForConfiguration(ProvideContext context) {
+		if (!usesProvisioningImplementation(ProcessedNamedMinecraftProvider.class)) {
+			return isUpToDate(context);
+		}
+
+		if (!parentMinecraftProvider.isReadyForConfiguration(context)) {
+			return false;
+		}
+
+		return processorProjectionBlocker() == null || isUpToDate(context);
+	}
+
+	private @Nullable String processorProjectionBlocker() {
+		for (MinecraftJarProcessor<?> processor : jarProcessorManager.getProcessors()) {
+			try {
+				requireDescriptor(processor);
+			} catch (UnsupportedOperationException e) {
+				return e.toString();
+			}
+		}
+
+		return null;
+	}
+
 	/**
 	 * 为每个命名 jar 注册「processor 链处理」任务，并注册补出 pom / backup 的伴随任务.
 	 *
@@ -148,18 +174,16 @@ public abstract class ProcessedNamedMinecraftProvider<M extends MinecraftProvide
 		//   · 该形态的 spec 来自 DeobfSpecContext，它本身就不提供映射（实际也不读）。
 		// 因此不再按形态整批回退，往下走正常的处理器链校验与任务登记。
 
+		final String blocker = processorProjectionBlocker();
+
+		if (blocker != null) {
+			LOGGER.warn("{} 的 jar processor 链无法投影成任务，本 provider 保持配置期生产：{}",
+					getClass().getSimpleName(), blocker);
+			return null;
+		}
+
 		final List<MinecraftJarProcessor<?>> processors = jarProcessorManager.getProcessors();
 		final List<MinecraftJarProcessor.Spec> specs = jarProcessorManager.getSpecs();
-
-		for (MinecraftJarProcessor<?> processor : processors) {
-			try {
-				requireDescriptor(processor);
-			} catch (UnsupportedOperationException e) {
-				LOGGER.warn("{} 的 jar processor 链无法投影成任务，本 provider 保持配置期生产：{}",
-						getClass().getSimpleName(), e.getMessage());
-				return null;
-			}
-		}
 
 		final Map<MinecraftJar.Type, ProcessedArtifact> tasks = new LinkedHashMap<>();
 
