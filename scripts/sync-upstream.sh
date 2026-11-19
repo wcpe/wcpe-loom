@@ -4,6 +4,12 @@
 # 用法：
 #   scripts/sync-upstream.sh status                     # 查看基底/队列末端/提交数（只读）
 #   scripts/sync-upstream.sh verify                     # 校验队列是否符合规范（只读，默认）
+#   scripts/sync-upstream.sh pull-queue                 # 把本地队列末端对齐到远端（会备份旧值）
+#   scripts/sync-upstream.sh setup-mirror               # 配置远端 tag 镜像引用（一次即可）
+#
+# 队列末端的真源是**远端**，本地 tag 只是缓存：队列 tag 会随改写前移（非快进），而
+# git fetch 不会覆盖与远端分叉的本地 tag，各人的本地值于是越走越远。所以 verify 会把
+# 远端值一起比，add-patch / rebase 在本地落后时直接拒绝执行。
 #   scripts/sync-upstream.sh add-patch <补丁名>          # 开一个补丁工作分支（起点=队列末端）
 #   scripts/sync-upstream.sh add-patch finish           # 校验溯源块与补丁面 + 把元数据重放到新队列之后
 #   scripts/sync-upstream.sh rebase <新基底sha> [tag名]  # 把整条队列重放到新基底（临时分支上）
@@ -26,11 +32,76 @@ BASE_TAG="${WCPE_BASE_TAG:-base/architectury-1.17-026ce830}"
 QUEUE_TAG="${WCPE_QUEUE_TAG:-patch-queue/1.17}"
 DEFAULT_BRANCH="${WCPE_DEFAULT_BRANCH:-dev/1.17-wcpe}"
 UPSTREAM_REMOTE="${WCPE_UPSTREAM_REMOTE:-architectury}"
+# 本仓库自身的远端（队列 tag 的真源所在）。注意与 UPSTREAM_REMOTE（architectury）区分。
+ORIGIN_REMOTE="${WCPE_ORIGIN_REMOTE:-origin}"
+# 询问远端队列末端时的超时秒数；设 WCPE_SKIP_REMOTE=1 可完全跳过（离线环境）。
+REMOTE_TIMEOUT="${WCPE_REMOTE_TIMEOUT:-15}"
 
 die() { echo "错误: $*" >&2; exit 1; }
 
 base_commit() { git rev-parse -q --verify "refs/tags/${BASE_TAG}^{commit}" 2>/dev/null || die "找不到基底 tag ${BASE_TAG}"; }
 queue_commit() { git rev-parse -q --verify "refs/tags/${QUEUE_TAG}^{commit}" 2>/dev/null || echo ""; }
+
+# 远端队列末端：${ORIGIN_REMOTE} 上队列 tag 解引用后的 commit；取不到时输出空行。
+#
+# 为什么必须问远端而不是读本地 tag：队列末端是**可移动 tag**，插补丁 / 换基底 / 压缩元数据
+# 都用 `git tag -f` 前移它，而前移是**非快进更新**——git fetch 遇到与远端分叉的本地 tag
+# 默认不覆盖，于是每个人的本地 tag 都停在自己上次同步的位置。有人基于旧末端 add-patch，
+# 补丁就会挂到不同位置，队列重写后互不相认。所以远端值是唯一真源，本地 tag 只是缓存。
+#
+# 取值顺序：实时 ls-remote（权威）→ 镜像引用（setup-mirror 配置后由 fetch 自动维护）→ 空。
+# 结果缓存，一次调用内不重复询问远端（add-patch 会连着校验与解析）。
+REMOTE_QUEUE_CACHE=""
+REMOTE_QUEUE_QUERIED=0
+remote_queue_commit() {
+	if [ "${REMOTE_QUEUE_QUERIED}" = "1" ]; then
+		printf '%s\n' "${REMOTE_QUEUE_CACHE}"
+		return 0
+	fi
+	REMOTE_QUEUE_QUERIED=1
+	REMOTE_QUEUE_CACHE=""
+
+	if [ "${WCPE_SKIP_REMOTE:-0}" != "1" ]; then
+		local to=() out=""
+		command -v timeout >/dev/null 2>&1 && to=(timeout "${REMOTE_TIMEOUT}")
+		# 管道末端是 awk，git 失败也会被吞成「无输出」，正好走下面的回退。
+		out="$(${to[@]+"${to[@]}"} git ls-remote --tags "${ORIGIN_REMOTE}" \
+			"refs/tags/${QUEUE_TAG}^{}" 2>/dev/null | awk 'NR==1{print $1}' || true)"
+		REMOTE_QUEUE_CACHE="${out}"
+	fi
+
+	# 联网取不到（离线 / WCPE_SKIP_REMOTE=1）就回退到镜像引用：它是最近一次成功同步的
+	# 权威副本，比本地 tag 可靠——本地 tag 可能停在很久以前。
+	if [ -z "${REMOTE_QUEUE_CACHE}" ]; then
+		REMOTE_QUEUE_CACHE="$(git rev-parse -q --verify \
+			"refs/remotes/${ORIGIN_REMOTE}/tags/${QUEUE_TAG}^{commit}" 2>/dev/null || true)"
+	fi
+
+	printf '%s\n' "${REMOTE_QUEUE_CACHE}"
+}
+
+# 门禁：本地队列末端必须与远端一致，否则拒绝写补丁 / 重放队列。
+# 取不到远端时只警告——离线不该让日常操作完全停摆，但要把风险说出来。
+require_queue_synced() {
+	local queue remote
+	queue="$(queue_commit)"
+	remote="$(remote_queue_commit)"
+
+	if [ -z "${remote}" ]; then
+		echo "· 警告：未能获取远端队列末端（${ORIGIN_REMOTE} 不可达或未配置），跳过一致性校验" >&2
+		return 0
+	fi
+
+	# 不能写成 `[ ... ] && return 0`：条件为假时整条语句返回非 0，set -e 会直接静默退出。
+	if [ "${queue}" = "${remote}" ]; then
+		return 0
+	fi
+
+	die "本地队列末端 ${queue:0:8} 与远端 ${remote:0:8} 不一致（本地 tag 只是缓存）。
+  以远端为准先对齐，再重来：
+      bash scripts/sync-upstream.sh pull-queue
+  否则补丁会挂到旧末端的位置上，重写后与远端已有的补丁互不相认。"
+}
 
 # 检查某范围内的提交是否都带溯源块，输出缺失项
 missing_origin() {
@@ -82,11 +153,23 @@ slug_error() {
 }
 
 cmd_status() {
-	local base queue
-	base="$(base_commit)"; queue="$(queue_commit)"
+	local base queue remote
+	base="$(base_commit)"; queue="$(queue_commit)"; remote="$(remote_queue_commit)"
 	echo "基底 tag    : ${BASE_TAG} -> ${base:0:8}"
-	echo "队列末端 tag: ${QUEUE_TAG} -> ${queue:0:8}"
-	echo "当前 HEAD   : $(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD))"
+
+	# 队列末端是**可移动 tag**，本地只是缓存：改写队列后它会与远端分叉，而 fetch 不会
+	# 覆盖分叉的本地 tag。所以这里始终把远端真源一起打出来，过期就直说。
+	if [ -z "${remote}" ]; then
+		echo "队列末端 tag: ${QUEUE_TAG} -> ${queue:0:8}（本地缓存）"
+		echo "队列末端远端: 无法获取（${ORIGIN_REMOTE} 不可达或未配置；上面可能是旧值）"
+	elif [ "${queue}" = "${remote}" ]; then
+		echo "队列末端 tag: ${QUEUE_TAG} -> ${queue:0:8}（本地缓存，与远端一致）"
+	else
+		echo "队列末端 tag: ${QUEUE_TAG} -> ${queue:0:8}（本地缓存，已过期！）"
+		echo "队列末端远端: ${remote:0:8}  ← 真源"
+		echo "             先对齐: bash scripts/sync-upstream.sh pull-queue"
+	fi
+
 	if [ -n "${queue}" ]; then
 		echo "查询队列提交数: $(git rev-list --count "${base}..${queue}")"
 		echo "队列是否含 merge: $(git rev-list --merges --count "${base}..${queue}") 个"
@@ -166,6 +249,20 @@ ${pn_slug}  <- $(git log -1 --format='%h %s' "${pn_first[${pn_slug}]}")  ×  $(g
 	fi
 
 	if git merge-base --is-ancestor "${queue}" HEAD 2>/dev/null; then
+
+	# 队列末端一致性：本地 tag 是可移动缓存，各人停在自己上次 fetch 的位置。
+	# 不一致意味着有人会基于旧末端写补丁，必须拦住；取不到远端（离线）只警告。
+	local remote_queue
+	remote_queue="$(remote_queue_commit)"
+	if [ -z "${remote_queue}" ]; then
+		echo "· 警告：未能获取远端队列末端（${ORIGIN_REMOTE} 不可达或未配置），跳过一致性校验"
+	elif [ "${remote_queue}" = "${queue}" ]; then
+		echo "✓ 队列末端与远端一致（${remote_queue:0:8}）"
+	else
+		echo "✗ 队列末端与远端不一致：本地 ${queue:0:8} ≠ 远端 ${remote_queue:0:8}（本地 tag 只是缓存）"
+		echo "    先对齐： bash scripts/sync-upstream.sh pull-queue"
+		rc=1
+	fi
 		echo "✓ 当前分支基于队列末端"
 	else
 		echo "· 当前分支与队列末端无祖先关系（改写进行中？）"
@@ -196,6 +293,10 @@ cmd_add_patch() {
 	local queue branch
 	queue="$(queue_commit)"
 	[ -n "${queue}" ] || die "找不到队列末端 tag ${QUEUE_TAG}"
+
+	# 起点是本地 tag，而它只是缓存：远端已前移时基于它建分支，补丁会挂到旧末端的位置上，
+	# 重写后与远端已有的补丁互不相认。所以建分支之前先与远端比对。
+	require_queue_synced
 	[ -z "$(git status --porcelain)" ] || die "工作区不干净，请先提交或清理"
 
 	branch="add-patch/${arg}"
@@ -342,12 +443,81 @@ $(git log -1 --format='%h %s' "${tsha}")"
 	echo "    3) 自检：         scripts/sync-upstream.sh verify"
 }
 
+# 把本地队列末端对齐到远端（本地 tag 会被覆盖；旧值先备份到 backup/pq-local-*）。
+#
+# 这是「队列末端以远端为唯一真源」的落地动作：队列 tag 前移必然是非快进更新，
+# 普通 fetch / push 都会被拒，所以必须用带 + 的 refspec 显式覆盖本地。
+cmd_pull_queue() {
+	local queue remote backup
+	queue="$(queue_commit)"
+	remote="$(remote_queue_commit)"
+	[ -n "${remote}" ] || die "取不到远端队列末端（${ORIGIN_REMOTE} 不可达或未配置）"
+
+	if [ "${queue}" = "${remote}" ]; then
+		echo "✓ 本地队列末端已与远端一致（${remote:0:8}）"
+		return 0
+	fi
+
+	if [ -n "${queue}" ]; then
+		backup="backup/pq-local-$(date +%Y%m%d-%H%M%S)-${queue:0:8}"
+		git branch -f "${backup}" "${queue}"
+		echo "已把本地旧末端 ${queue:0:8} 备份到分支 ${backup}"
+	fi
+
+	# 本地领先远端（远端是本地的祖先）说明本地有没推出去的补丁。这时「对齐」等于把本地
+	# 队列回退、静默丢掉那些提交，所以必须先拦下来，让人决定是推上去还是真回退。
+	if [ -n "${queue}" ] && git merge-base --is-ancestor "${remote}" "${queue}" 2>/dev/null; then
+		die "本地队列末端 ${queue:0:8} 领先远端 ${remote:0:8}——本地有未推送的补丁，拒绝回退。
+  确认要发布这些补丁： git push -f ${ORIGIN_REMOTE} refs/tags/${QUEUE_TAG}
+  确认要丢弃它们：     git tag -f ${QUEUE_TAG} ${remote:0:8}"
+	fi
+
+	# --no-tags：显式 refspec 之外一个 tag 都不要。否则 fetch 会顺带把指向已取提交的
+	# 所有 tag 拉进来，把别人的 release tag 塞进本地（`--tags --force` 时甚至能改写远端）。
+	git fetch --no-tags "${ORIGIN_REMOTE}" "+refs/tags/${QUEUE_TAG}:refs/tags/${QUEUE_TAG}" \
+		|| die "fetch 失败：${ORIGIN_REMOTE} refs/tags/${QUEUE_TAG}"
+
+	echo "✓ 本地队列末端已对齐到远端 ${remote:0:8}"
+	echo "  接着复核： bash scripts/sync-upstream.sh verify"
+}
+
+# 把远端队列 tag 镜像成 refs/remotes/<origin>/tags/<tag>，由每次 fetch 自动维护。
+#
+# 为什么要镜像：refs/tags/ 下的本地 tag 在「与远端分叉」时 fetch 默认不覆盖，永远停在
+# 自己上次同步的位置；而 refs/remotes/ 下的引用每次 fetch 都强制更新。于是镜像引用
+# 天然是一份「无需联网也读得到最近一次同步结果」的权威副本，供 status/verify 回退使用。
+cmd_setup_mirror() {
+	local spec="+refs/tags/${QUEUE_TAG}:refs/remotes/${ORIGIN_REMOTE}/tags/${QUEUE_TAG}"
+	local mirrored
+
+	git remote get-url "${ORIGIN_REMOTE}" >/dev/null 2>&1 || die "没有远端 ${ORIGIN_REMOTE}"
+
+	if git config --get-all "remote.${ORIGIN_REMOTE}.fetch" | grep -qxF "${spec}"; then
+		echo "✓ 镜像 refspec 已配置：${spec}"
+	else
+		git config --add "remote.${ORIGIN_REMOTE}.fetch" "${spec}"
+		echo "已添加镜像 refspec：${spec}"
+	fi
+
+	# --no-tags：只取这一条 refspec。否则 fetch 会顺带把指向已取提交的所有 tag 拉进本地，
+	# 把别人的 release tag 塞进你的仓库（曾因此引入多余的 wcpe-v* tag）。
+	git fetch --no-tags "${ORIGIN_REMOTE}" "${spec}" || die "fetch 失败：${ORIGIN_REMOTE}"
+
+	mirrored="$(git rev-parse -q --verify "refs/remotes/${ORIGIN_REMOTE}/tags/${QUEUE_TAG}^{commit}" 2>/dev/null || true)"
+	[ -n "${mirrored}" ] || die "fetch 完成但镜像引用不存在，检查 refspec：${spec}"
+
+	echo "✓ 镜像引用 refs/remotes/${ORIGIN_REMOTE}/tags/${QUEUE_TAG} -> ${mirrored:0:8}"
+	echo "  之后每次 git fetch ${ORIGIN_REMOTE} 都会更新它；离线时 status/verify 回退读这份副本。"
+}
 cmd_rebase() {
 	local new_base="${1:-}" new_tag="${2:-}"
 	[ -n "${new_base}" ] || die "用法: scripts/sync-upstream.sh rebase <新基底sha> [新基底tag名]"
 
 	local base branch
 	base="$(base_commit)"
+
+	# 重放的起点同样是本地 tag；过期会把远端已合入的补丁整段丢在重放之外。
+	require_queue_synced
 	git rev-parse -q --verify "${new_base}^{commit}" >/dev/null || die "新基底 ${new_base} 不存在（先 fetch ${UPSTREAM_REMOTE}）"
 
 	if [ -n "${new_tag}" ]; then
@@ -375,7 +545,9 @@ cmd_rebase() {
 case "${1:-verify}" in
 	status) cmd_status ;;
 	verify) cmd_verify ;;
+	pull-queue) cmd_pull_queue ;;
+	setup-mirror) cmd_setup_mirror ;;
 	add-patch) shift; cmd_add_patch "$@" ;;
 	rebase) shift; cmd_rebase "$@" ;;
-	*) echo "用法: scripts/sync-upstream.sh {status|verify|add-patch <名>|add-patch finish|rebase <新基底sha> [tag名]}"; exit 2 ;;
+	*) echo "用法: scripts/sync-upstream.sh {status|verify|pull-queue|setup-mirror|add-patch <名>|add-patch finish|rebase <新基底sha> [tag名]}"; exit 2 ;;
 esac

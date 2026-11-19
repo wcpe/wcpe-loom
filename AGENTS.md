@@ -119,10 +119,18 @@ Patch-Name: <slug>
 ### 校验与同步上游
 
 ```bash
-bash scripts/sync-upstream.sh verify     # 只读自检：线性、无 merge、溯源与 Patch-Name 齐备、基于队列末端
-bash scripts/sync-upstream.sh status     # 只读：基底/队列/元数据/远端一览
+bash scripts/sync-upstream.sh verify     # 只读自检：线性、无 merge、溯源与 Patch-Name 齐备、与远端队列末端一致
+bash scripts/sync-upstream.sh status     # 只读：基底/队列/元数据/远端一览（本地与远端末端并列）
+bash scripts/sync-upstream.sh pull-queue # 以远端为准对齐本地队列末端（旧值备份到 backup/pq-local-*）
+bash scripts/sync-upstream.sh setup-mirror  # 一次性：把远端队列 tag 镜像到 refs/remotes/，供离线回退
 bash scripts/sync-upstream.sh rebase <新基底sha> [tag]   # 整条队列重放到新基底
 ```
+
+**队列末端的真源是远端，本地 tag 只是缓存。** `patch-queue/1.17` 是可移动 tag（远端没有同名分支），
+每次改写都前移，而前移是非快进更新——`git fetch` 遇到与远端分叉的本地 tag 不会覆盖，于是各人的
+本地 tag 停在自己上次同步的位置。**动手前先 `status`，本地落后就 `pull-queue`**：`verify` 把不一致
+当 error，`add-patch` / `rebase` 会直接拒绝执行（否则补丁会挂到旧末端，把远端已有补丁挤掉）。
+反过来，**绝不要在落后的克隆上 `git push --tags --force`**——那会把远端队列 tag 回退。
 
 **首次同步上游前必须先配置远端**——仓库只带 `origin`，脚本默认的上游名 `architectury`
 需要自己添加，否则 `fetch` 会失败、`status` 会显示「上游远端: architectury -> (未 fetch)」：
