@@ -246,9 +246,38 @@ Patch-Name: legacy-forge-at-translate
 ### 3. 校验
 
 ```bash
-bash scripts/sync-upstream.sh verify    # 只读：线性无 merge、补丁数、溯源块与 Patch-Name、分支基于队列末端
+bash scripts/sync-upstream.sh verify    # 只读：线性无 merge、补丁数、溯源块与 Patch-Name、与远端末端一致、分支基于队列末端
 bash scripts/sync-upstream.sh status    # 只读：基底/队列/元数据/远端状态一览
 ```
+
+### 3.5 多人协作 / 换机器：先把队列末端对齐
+
+`patch-queue/1.17` 是**可移动 tag**，不是分支（远端没有 `refs/heads/patch-queue/1.17`）。
+它每次改写都会前移，而前移是**非快进更新**——`git fetch` 遇到与远端分叉的本地 tag
+**不会覆盖**，所以每个人的本地 tag 都停在自己上次同步的位置。拿到别人的仓库、换机器、
+或隔了几天再动手，第一步永远是：
+
+```bash
+bash scripts/sync-upstream.sh status        # 本地 vs 远端末端并列，过期直接标出来
+bash scripts/sync-upstream.sh pull-queue    # 以远端为准对齐；旧值自动备份到 backup/pq-local-*
+```
+
+不跑也能被拦住：`verify` 把「本地末端 = 远端末端」当 error；`add-patch` 与 `rebase` 的起点
+都是本地 tag，两者在本地落后时**直接拒绝执行**（否则补丁会挂到旧末端，把远端已有补丁挤掉）。
+
+想在离线时也能读到「最近一次同步的远端值」，跑一次 `setup-mirror`：
+
+```bash
+bash scripts/sync-upstream.sh setup-mirror  # 幂等；写进 .git/config 的 fetch refspec
+# → refs/remotes/origin/tags/patch-queue/1.17，每次 git fetch 自动更新
+```
+
+镜像走 `refs/remotes/`，不受上面那条「分叉不覆盖」规则限制，因此比本地 tag 可靠；
+`status` / `verify` 在联网取不到远端时会回退读它。
+
+> 注意：`git push --tags --force` 是唯一能把远端队列 tag **回退**的操作。在落后的克隆上
+> 执行它，会把远端末端退回旧提交、连带让别人的补丁从队列里消失。队列 tag 的推送一律
+> 只在确认领先时用 `git push -f origin refs/tags/patch-queue/1.17`。
 
 ### 4. 同步上游
 
