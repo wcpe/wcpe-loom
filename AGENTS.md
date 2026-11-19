@@ -193,6 +193,9 @@ Groovy 行宽，`build` 作业在 `:spotlessGroovyCheck` 处挂掉，后续整�
 
 它同时能拦住另一类只有本地才便宜的问题（同一轮之后又补修过一次）：
 
+- **强制项。** 判据与风险见上一段：只改 `scripts/**` 的推送，CI 只跑 `scripts` 作业
+  （发布说明引擎回归），不编译、不跑矩阵、不发快照。也就是说**这类改动的静态检查
+  完全依赖你在本地跑完这一步**——CI 不会替你兜底。
 - `:spotlessGroovyCheck` / `:spotlessJavaCheck`：`./gradlew spotlessApply` 可自动修。
 - `:checkstyleMain` / `:checkstyleTest`：**Javadoc 首句必须以 `.` 结尾，不是 `。`**
   （中文注释也适用）；把注解从 `@Input` 改成 `@Internal` 之后容易留下 unused import。

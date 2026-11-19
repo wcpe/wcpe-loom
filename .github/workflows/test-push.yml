@@ -12,6 +12,10 @@ name: CI
 #   · 分支推送 → 测试矩阵 → 发布开发版（**必须等测试通过**）
 #   · tag 推送 → 直接发布正式版（矩阵只在分支上跑：该提交推到分支时已被测过，
 #     打 tag 再跑一遍 78 个作业纯属浪费）
+#
+# 例外：**只动了 `scripts/` 下运维脚本的推送**只跑 `scripts` 作业（发布说明引擎的
+# 回归），跳过 build 及其之后的测试矩阵与开发版发布。判据由 `detect` 作业计算，
+# 拿不准时一律跑全量。注意 `**.md` 已经在 paths-ignore 里——纯文档改动根本不触发。
 on:
   push:
     branches:
@@ -65,7 +69,63 @@ jobs:
       - name: 发布说明引擎回归测试
         run: bash scripts/tests/gen-release-notes-test.sh
 
+  # 判断本次推送是否「只动了 scripts/ 下的运维脚本」。
+  #
+  # 动机：paths-ignore 只能整条工作流一起跳过，而 scripts/ 里的东西既不该完全不测
+  # （`scripts` 作业要跑发布说明引擎的回归），也不该为一个纯 bash 改动拉起 78 个集成
+  # 测试作业并发布一份 1.17-SNAPSHOT。所以这里算出「纯脚本改动」，让下游的 build
+  # 及其之后的作业整体跳过，只留 scripts 作业。
+  #
+  # 判据刻意保守：任何拿不准的情形（非 push、新分支 before 全零、改动为空、force push
+  # 后两点不可比）都返回 false，也就是**照常跑全量**。宁可多跑一次，不可漏测。
+  detect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      scripts-only: ${{ steps.filter.outputs.scripts-only }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # 需要 base..head 的两端点，浅克隆取不到 base。
+          fetch-depth: 0
+      - id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" != "push" ]]; then
+            echo "scripts-only=false" >> "$GITHUB_OUTPUT"
+            echo "非 push 事件，跑全量"
+            exit 0
+          fi
+          base="${GITHUB_EVENT_BEFORE:-}"
+          if [[ -z "${base}" || "${base}" =~ ^0+$ ]]; then
+            echo "scripts-only=false" >> "$GITHUB_OUTPUT"
+            echo "base 为空或全零（新分支/首次推送），跑全量"
+            exit 0
+          fi
+          # 用 --no-renames 保持直白：改名会同时出现删除与新增两条路径，仍落在 scripts/ 下。
+          changed="$(git diff --name-only --no-renames "${base}" "${GITHUB_SHA}" || true)"
+          if [[ -z "${changed}" ]]; then
+            echo "scripts-only=false" >> "$GITHUB_OUTPUT"
+            echo "改动集为空（空提交或 base 不可比），跑全量"
+            exit 0
+          fi
+          echo "本次改动文件："
+          printf '%s\n' "${changed}" | sed 's/^/  /'
+          if printf '%s\n' "${changed}" | grep -qv '^scripts/'; then
+            echo "scripts-only=false" >> "$GITHUB_OUTPUT"
+            echo "含 scripts/ 之外的改动，跑全量"
+          else
+            echo "scripts-only=true" >> "$GITHUB_OUTPUT"
+            echo "只动了 scripts/，跳过 build 及之后的测试矩阵与发布"
+          fi
+
   build:
+    needs: detect
+    # 纯 scripts/ 改动不编译、不测矩阵、不发快照：它碰不到 Java/Groovy 产物。
+    # 下游（prepare_test_matrix / run_tests / reproducible_build_test / publish / release）
+    # 都以 build 为 needs，这里跳过会顺着 needs 级联，无需逐个加条件。
+    if: ${{ needs.detect.outputs.scripts-only != 'true' }}
     runs-on: ubuntu-24.04
     # 单作业超时。GitHub 默认是 6 小时——曾有一个用例在内层 Gradle daemon OOM 后挂死，
     # 把整条工作流拖到 361 分钟才被上限杀掉。这里按实测耗时给足余量后显式封顶。
