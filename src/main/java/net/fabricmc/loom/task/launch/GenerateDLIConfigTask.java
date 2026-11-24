@@ -291,11 +291,14 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
 
 				if (hasPlatformMappingFile) {
 					if (forgeInputs.useCustomMixin()) {
-						// See mixin remapper service in forge-runtime
+						// Architectury 的 Mixin 重映射服务读取这两个属性。
 						launchConfig
 								.property("architectury.mixinRemapper.sourceNamespace", Objects.requireNonNull(intermediateNs))
 								.property("architectury.mixinRemapper.mappingsPath", Objects.requireNonNull(mappingsPath));
-					} else {
+					}
+
+					// FG2 自身也读取该映射来查找开发环境中的类，与 Mixin 实现无关。
+					if (forgeInputs.legacyForge() || !forgeInputs.useCustomMixin()) {
 						launchConfig.property("net.minecraftforge.gradle.GradleStart.srg.srg-mcp", Objects.requireNonNull(forgeInputs.srgToNamedSrg()));
 					}
 				}
@@ -401,6 +404,7 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
 			String legacyDataGenDir,
 			Set<String> mixinConfigs,
 			boolean useCustomMixin,
+			boolean legacyForge,
 			@Nullable String srgToNamedSrg
 	) implements Serializable {
 		public ForgeInputs(Project project, LoomGradleExtension extension) {
@@ -409,6 +413,7 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
 					project.file("src/generated/resources").getAbsolutePath(),
 					extension.getForge().getMixinConfigs().get(),
 					extension.getForge().getUseCustomMixin().get(),
+					extension.isLegacyForge(),
 					!extension.disableObfuscation() ? extension.getMappingConfiguration().srgToNamedSrg.toAbsolutePath().toString() : null
 			);
 		}
