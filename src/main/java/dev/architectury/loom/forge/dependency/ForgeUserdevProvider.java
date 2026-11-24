@@ -61,12 +61,10 @@ public class ForgeUserdevProvider extends DependencyProvider {
 	private static final String LEGACY_SOURCES_FILE = "sources.zip";
 
 	/**
-	 * userdev3 归一后使用的 libraries 清单.
+	 * userdev3 归一后的基础运行库.
 	 *
-	 * <p>取消费方实测可用的 7 条精简集合（构建与校验所需的公共库），而非 userdev3 自带的 22 条：
-	 * 后者含 scala/akka 与 {@code net.minecraftforge:legacydev} 等只在 Gradle 启动器里用到的库，
-	 * 其中 scala 系的 {@code *_mc} 版本已从 mavenCentral 下架，只有 forge 仓库的 artifact-only
-	 * 形态才能解析。锁定这份固定清单可让产物字节不随上游 libraries 列表漂移。
+	 * <p>不继承整份上游 libraries：其中含 Scala、Akka 和 {@code net.minecraftforge:legacydev} 等
+	 * 只在原 Gradle 启动器中使用的依赖。旧版运行时直接需要的额外库在对应版本单独恢复。
 	 */
 	private static final List<String> LEGACY_LIBRARIES = List.of(
 			"net.minecraft:launchwrapper:1.12",
@@ -291,7 +289,7 @@ public class ForgeUserdevProvider extends DependencyProvider {
 	 * 只替换 userdev3 特有的差异：
 	 * <ul>
 	 *     <li>配置里没有 {@code inheritsFrom}，MC 版本改由 Forge 版本推导</li>
-	 *     <li>{@code libraries} 是纯字符串数组，且改用 {@link #LEGACY_LIBRARIES} 精简清单</li>
+	 *     <li>{@code libraries} 用精简清单保留游戏直接需要的库，不引入原 Gradle 启动器</li>
 	 * </ul>
 	 *
 	 * @param userdevJarPath 已归一的 FG2 形态 jar（sources.zip 由 {@link #createNormalizedUserdev3Jar} 放进去）
@@ -310,6 +308,13 @@ public class ForgeUserdevProvider extends DependencyProvider {
 		json.add("binpatcher", createLegacyBinpatcher());
 		JsonArray libraries = new JsonArray();
 		LEGACY_LIBRARIES.forEach(libraries::add);
+
+		if ("1.12.2".equals(mcVersion)) {
+			// 恢复 1.12.2 原始 userdev3 声明：服务端控制台使用 JLine，客户端模型加载使用 vecmath。
+			libraries.add("org.jline:jline:3.5.1");
+			libraries.add("java3d:vecmath:1.5.2");
+		}
+
 		json.add("libraries", libraries);
 		json.add("runs", createLegacyRuns());
 		json.add("ats", createLegacyAts());
