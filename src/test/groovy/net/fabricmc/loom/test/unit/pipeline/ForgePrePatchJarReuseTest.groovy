@@ -27,6 +27,8 @@ package net.fabricmc.loom.test.unit.pipeline
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.FileTime
+import java.util.zip.Deflater
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -35,6 +37,7 @@ import spock.lang.Specification
 import spock.lang.TempDir
 
 import net.fabricmc.loom.pipeline.ForgePrePatchJarReuse
+import net.fabricmc.loom.util.Checksum
 
 /**
  * 「pre-patch jar 已就绪且身份相符就跳过整条 MCP 链」的判据边界.
@@ -123,6 +126,41 @@ class ForgePrePatchJarReuseTest extends Specification {
 		!ForgePrePatchJarReuse.tryReuse(output, key(IDENTITY, [input]), Logging.getLogger("test"))
 	}
 
+	def "超过一 MiB 的输入只变修改时间时仍可复用"() {
+		given:
+		def largeInput = Files.write(tempDir.resolve("vanilla-client.jar"), new byte[1024 * 1024 + 1])
+		def originalTime = Files.getLastModifiedTime(largeInput)
+		ForgePrePatchJarReuse.record(output, key(IDENTITY, [input, largeInput]), Logging.getLogger("test"))
+
+		when:
+		Files.setLastModifiedTime(largeInput, FileTime.fromMillis(originalTime.toMillis() - 60_000L))
+
+		then:
+		Files.size(largeInput) > 1024 * 1024
+		Files.getLastModifiedTime(largeInput) != originalTime
+		ForgePrePatchJarReuse.tryReuse(output, key(IDENTITY, [input, largeInput]), Logging.getLogger("test"))
+	}
+
+	def "超过一 MiB 的输入大小和修改时间相同但字节变了时拒绝复用"() {
+		given:
+		def bytes = new byte[1024 * 1024 + 1]
+		def largeInput = Files.write(tempDir.resolve("vanilla-client.jar"), bytes)
+		def originalSize = Files.size(largeInput)
+		def originalTime = Files.getLastModifiedTime(largeInput)
+		ForgePrePatchJarReuse.record(output, key(IDENTITY, [input, largeInput]), Logging.getLogger("test"))
+
+		when:
+		bytes[bytes.length - 1] = (byte) 1
+		Files.write(largeInput, bytes)
+		Files.setLastModifiedTime(largeInput, originalTime)
+
+		then:
+		originalSize > 1024 * 1024
+		Files.size(largeInput) == originalSize
+		Files.getLastModifiedTime(largeInput) == originalTime
+		!ForgePrePatchJarReuse.tryReuse(output, key(IDENTITY, [input, largeInput]), Logging.getLogger("test"))
+	}
+
 	def "产物在记录之后被改写时照常执行"() {
 		given:
 		record()
@@ -132,6 +170,62 @@ class ForgePrePatchJarReuseTest extends Specification {
 
 		then:
 		!ForgePrePatchJarReuse.tryReuse(output, key(IDENTITY, [input]), Logging.getLogger("test"))
+	}
+
+	def "大产物仍是有效 jar 且大小和修改时间未变时也要验证内容"() {
+		given:
+		def content = "a" * (1024 * 1024 + 1)
+		writeJar(output, ["net/minecraft/Client.class": content], Deflater.NO_COMPRESSION)
+		def originalSize = Files.size(output)
+		def originalTime = Files.getLastModifiedTime(output)
+		record()
+
+		when:
+		writeJar(output, ["net/minecraft/Client.class": "b" + content.substring(1)], Deflater.NO_COMPRESSION)
+		Files.setLastModifiedTime(output, originalTime)
+
+		then:
+		originalSize > 1024 * 1024
+		Files.size(output) == originalSize
+		Files.getLastModifiedTime(output) == originalTime
+		!ForgePrePatchJarReuse.tryReuse(output, key(IDENTITY, [input]), Logging.getLogger("test"))
+	}
+
+	def "旧旁车不推断历史字节，只在该产物成功重建后写当前格式"() {
+		given:
+		def largeInput = Files.write(tempDir.resolve("vanilla-client.jar"), new byte[1024 * 1024 + 1])
+		def oldKey = "loom-forge-pre-patch-jar-v1|${IDENTITY}|${largeInput}=" +
+				"${Files.size(largeInput)}-mtime:${Files.getLastModifiedTime(largeInput).toMillis()}"
+		def oldProduct = "${Files.size(output)}-sha256:${Checksum.of(output).sha256().hex(16)}"
+		def oldContent = "key=${oldKey}\nproduct=${oldProduct}\n"
+		def sidecar = writeFile(ForgePrePatchJarReuse.sidecar(output), oldContent)
+		def originalProduct = Checksum.of(output).sha256().hex()
+		def unrelatedJar = tempDir.resolve("other/minecraft-merged-srg.jar")
+		Files.createDirectories(unrelatedJar.parent)
+		Files.copy(output, unrelatedJar)
+		def unrelatedSidecar = writeFile(ForgePrePatchJarReuse.sidecar(unrelatedJar), oldContent)
+		def expectedKey = key(IDENTITY, [largeInput])
+		def logger = Logging.getLogger("test")
+
+		when: "旧指纹与当前文件元数据完全吻合"
+		def reusedOld = ForgePrePatchJarReuse.tryReuse(output, oldKey, logger)
+		def reused = ForgePrePatchJarReuse.tryReuse(output, expectedKey, logger)
+
+		then: "也不能采信 v1，且判断过程不改旧产物或旧旁车"
+		!reusedOld
+		!reused
+		Checksum.of(output).sha256().matchesStr(originalProduct)
+		Files.readString(sidecar) == oldContent
+
+		when: "模拟任务成功产出后才调用 record"
+		writeJar(output, ["net/minecraft/Client.class": "重建产物"])
+		ForgePrePatchJarReuse.record(output, expectedKey, logger)
+
+		then:
+		Files.readString(sidecar).contains("key=loom-forge-pre-patch-jar-v2|")
+		ForgePrePatchJarReuse.tryReuse(output, expectedKey, logger)
+		Checksum.of(unrelatedJar).sha256().matchesStr(originalProduct)
+		Files.readString(unrelatedSidecar) == oldContent
 	}
 
 	def "产物是残骸（空 zip）时照常执行"() {
@@ -159,12 +253,13 @@ class ForgePrePatchJarReuseTest extends Specification {
 		!Files.exists(ForgePrePatchJarReuse.sidecar(output))
 	}
 
-	def "输入顺序不影响键"() {
+	def "输入顺序和同一路径的重复写法不影响键"() {
 		given:
 		def second = writeFile(tempDir.resolve("mcp/joined.tsrg"), "tsrg2 内容")
+		def duplicate = input.parent.resolve("../mcp/config.json")
 
 		expect:
-		key(IDENTITY, [input, second]) == key(IDENTITY, [second, input])
+		key(IDENTITY, [input, second]) == key(IDENTITY, [second, duplicate, input])
 	}
 
 	def "旁车与产物同名不同后缀，不落在产物路径上"() {
@@ -188,11 +283,12 @@ class ForgePrePatchJarReuseTest extends Specification {
 		return path
 	}
 
-	private static Path writeJar(Path path, Map<String, String> entries) {
+	private static Path writeJar(Path path, Map<String, String> entries, int level = Deflater.DEFAULT_COMPRESSION) {
 		Files.createDirectories(path.parent)
 		def jar = new ZipOutputStream(Files.newOutputStream(path))
 
 		try {
+			jar.setLevel(level)
 			entries.each { String name, String content ->
 				jar.putNextEntry(new ZipEntry(name))
 				jar.write(content.getBytes(StandardCharsets.UTF_8))
