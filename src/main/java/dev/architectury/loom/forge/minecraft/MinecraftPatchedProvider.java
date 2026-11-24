@@ -38,6 +38,8 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -133,13 +135,21 @@ import net.fabricmc.tinyremapper.extension.mixin.MixinExtension;
 
 public class MinecraftPatchedProvider {
 	private static final String LOOM_PATCH_VERSION_KEY = "Loom-Patch-Version";
-	protected static final String CURRENT_LOOM_PATCH_VERSION = "11";
+	protected static final String CURRENT_LOOM_PATCH_VERSION = "12";
 	private static final String NAME_MAPPING_SERVICE_PATH = "/inject/META-INF/services/cpw.mods.modlauncher.api.INameMappingService";
 
 	// The version where the bug was introduced.
 	private static final String MIN_NEOFORGE_MANUAL_CLEAN_JAR_CREATION_VERSION = "21.10.57-beta";
 	// The version where the bug was fixed.
 	private static final String MAX_NEOFORGE_MANUAL_CLEAN_JAR_CREATION_VERSION = "21.10.64";
+
+	/**
+	 * 判定「两侧同一命名空间」的类名重合率下限.
+	 *
+	 * <p>同一命名空间下补丁只改动少部分类名，重合率接近 1；跨命名空间（重映射前后）接近 0。
+	 * 取 0.3 这种保守值：宁可跳过纠正（保留缺陷、由警告暴露），也不要误改。
+	 */
+	private static final double SAME_NAMESPACE_THRESHOLD = 0.3;
 
 	// 对子类开放：legacy Forge（1.8-1.16）支持的 MinecraftLegacyPatchedProvider 需要访问这些成员
 	protected final Project project;
@@ -1967,6 +1977,336 @@ public class MinecraftPatchedProvider {
 	}
 
 	/**
+	 * 从 {@code new} 之后顺找构造调用，判据是 owner 相同且方法名为 {@code <init>}.
+	 *
+	 * @return 找不到时返回 {@code null}
+	 */
+	@Nullable
+	private static MethodInsnNode findInitCall(TypeInsnNode start, String owner) {
+		AbstractInsnNode cursor = start.getNext();
+		int guard = 0;
+
+		while (cursor != null && guard++ < 512) {
+			if (cursor instanceof MethodInsnNode methodInsn && "<init>".equals(methodInsn.name)
+					&& methodInsn.getOpcode() == Opcodes.INVOKESPECIAL && methodInsn.owner.equals(owner)) {
+				return methodInsn;
+			}
+
+			// 遇到同一层级的另一个 new 说明已经越过本次实例化的范围。
+			if (cursor instanceof TypeInsnNode t && t.getOpcode() == Opcodes.NEW) {
+				return null;
+			}
+
+			cursor = cursor.getNext();
+		}
+
+		return null;
+	}
+
+	/** 读一个类里所有 {@code <init>} 的参数描述符. */
+	private static Set<String> readConstructorSigs(byte[] classBytes) {
+		final Set<String> sigs = new HashSet<>();
+
+		try {
+			final ClassNode node = new ClassNode();
+			new ClassReader(classBytes).accept(node, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+
+			for (MethodNode method : node.methods) {
+				if ("<init>".equals(method.name)) {
+					sigs.add(method.desc);
+				}
+			}
+		} catch (RuntimeException e) {
+			return Set.of();
+		}
+
+		return sigs;
+	}
+
+	/**
+	 * 把 binpatch 产物里错位的匿名类引用纠正回 pre-patch 的编号，并<b>逐处校验构造器签名</b>.
+	 *
+	 * <p>Forge 的 {@code .binpatch} 在重新编译宿主类时，会把 {@code <clinit>}（及普通方法）里
+	 * 「{@code new 匿名类}」的编号整体错开，而<b>构造器的调用签名沿用了旧编号</b>。实测
+	 * 1.21.11 + Forge 61.2.5 的 {@code ByteBufCodecs}：
+	 *
+	 * <pre>
+	 * patch 后：new ByteBufCodecs$19 ; invokespecial ByteBufCodecs$19.&lt;init&gt;(I)V
+	 * 但       ByteBufCodecs$19 实际只有 &lt;init&gt;()          ← 同类内部就错配
+	 * patch 前：new ByteBufCodecs$11 ; invokespecial ByteBufCodecs$11.&lt;init&gt;(I)V   ← 自洽
+	 * </pre>
+	 *
+	 * <p>运行到该类初始化即抛 {@code NoSuchMethodError: ByteBufCodecs$19: method 'void &lt;init&gt;()' not found}。
+	 * 匿名类文件本身是好的（{@code $11} 两侧都只有 {@code (int)}、{@code $19} 两侧都只有 {@code ()}），
+	 * 错的只是宿主类里的引用编号。
+	 *
+	 * <p>三种可能的判据，只有第三种可靠：
+	 * <ul>
+	 *   <li><b>按字段名</b>——混淆/重映射会改写字段名，两侧对不上（实测不可用）；</li>
+	 *   <li><b>按构造器签名反查</b>——签名不唯一：{@code (int)} 对应 3 个类、{@code ()} 对应 18 个，
+	 *       无法定位到具体哪个；</li>
+	 *   <li><b>按序位提议，再用签名校验</b>——序位给出唯一候选，签名给出「这个候选是否讲得通」的
+	 *       硬判据。实测 {@code ByteBufCodecs} 的 34 处配对里，pre 侧类的构造器签名与调用签名
+	 *       <b>34/34 全部一致</b>，而 post 侧大量不一致。这正是缺陷的特征。</li>
+	 * </ul>
+	 *
+	 * <p>校验是本方法安全的核心：<b>只有「替换后签名对得上、替换前对不上」才动手</b>。
+	 * 两边 {@code new} 数不同则跳过该方法，
+	 * 解析失败的构造器也不提供改写依据。签名一致不等于语义等价。
+	 *
+	 * @param prePatchJar binpatch 的输入 jar，提供「正确的编号 → 类」与各匿名类的构造器签名
+	 * @param patchedJar  binpatch 的产物，原地改写
+	 * @param info        日志出口
+	 * @return 实际纠正的引用处数
+	 */
+	public static int realignInnerClassNewSites(Path prePatchJar, Path patchedJar, Consumer<String> info) throws IOException {
+		// 前提校验：两侧必须处于同一命名空间。本方法的做法是「把 pre 侧第 N 个 new 的目标名
+		// 抄到产物侧」，一旦两侧命名空间不同（例如 pre 是混淆名、产物是重映射后的 srg 名），
+		// 就会把已正确重映射的类名改回旧名，产物里根本没有那个包，运行时直接
+		// NoClassDefFoundError。这个坑真实发生过（见 RemapMinecraftTask 里的注释）。
+		// 判据：产物里的类名必须能在 pre 侧找到同名条目；比例过低说明不是同一命名空间。
+		if (!sameNamespace(prePatchJar, patchedJar, info)) {
+			return 0;
+		}
+
+		// 类名 -> 构造器参数描述符集合（一个匿名类可能有多份重载构造器）。
+		final Map<String, Set<String>> preCtors = new HashMap<>();
+		// pre 侧「方法签名 -> 该方法里匿名类 new 的目标序列」，提供序位候选。
+		final Map<String, List<String>> preMethodNewTargets = new HashMap<>();
+
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(prePatchJar)) {
+			final List<Path> files = new ArrayList<>();
+			Files.walk(fs.get().getPath("/")).filter(Files::isRegularFile)
+					.filter(p -> p.toString().endsWith(".class")).forEach(files::add);
+
+			for (Path path : files) {
+				final String name = entryName(path);
+
+				final byte[] bytes = Files.readAllBytes(path);
+
+				if (name.contains("$")) {
+					final Set<String> sigs = readConstructorSigs(bytes);
+
+					if (!sigs.isEmpty()) {
+						preCtors.put(name, sigs);
+					}
+				}
+
+				// 每个类都要收「方法 -> 匿名类 new 序列」，纠正时按它提议候选。
+				collectMethodNewTargets(bytes, preMethodNewTargets);
+			}
+		}
+
+		int fixed = 0;
+
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(patchedJar, false)) {
+			final Path root = fs.get().getPath("/");
+			final List<Path> classes = new ArrayList<>();
+			try (var paths = Files.walk(root)) {
+				paths.filter(Files::isRegularFile).filter(p -> p.toString().endsWith(".class")).forEach(classes::add);
+			}
+
+			// 完整索引后再改写，避免 ZIP 遍历次序决定扫描结果。
+			final Map<String, Set<String>> patchedCtors = new HashMap<>();
+
+			for (Path path : classes) {
+				final String name = entryName(path);
+
+				if (name.contains("$")) {
+					final Set<String> signatures = readConstructorSigs(Files.readAllBytes(path));
+
+					if (!signatures.isEmpty()) {
+						patchedCtors.put(name, signatures);
+					}
+				}
+			}
+
+			for (Path path : classes) {
+				byte[] bytes;
+
+				try {
+					bytes = Files.readAllBytes(path);
+				} catch (IOException e) {
+					continue;
+				}
+
+				final ClassNode node = new ClassNode();
+
+				try {
+					new ClassReader(bytes).accept(node, 0);
+				} catch (RuntimeException e) {
+					continue; // 解析不了就不碰
+				}
+
+				final int n = realignClass(node, preMethodNewTargets, preCtors, patchedCtors);
+
+				if (n > 0) {
+					final ClassWriter writer = new ClassWriter(0);
+					node.accept(writer);
+					Files.write(path, writer.toByteArray(), StandardOpenOption.TRUNCATE_EXISTING);
+					fixed += n;
+				}
+			}
+		}
+
+		if (fixed > 0) {
+			info.accept(":纠正 " + fixed + " 处错位的匿名类引用");
+		}
+
+		return fixed;
+	}
+
+	/**
+	 * 判断两个 jar 是否处于同一命名空间，用作 {@link #realignInnerClassNewSites} 的前置闸门.
+	 *
+	 * <p>为什么需要它：realign 的判据建立在「两侧同名同编号位置指向同一个类」之上。若两侧
+	 * 命名空间不同（重映射前后、混淆名与 srg 名），序位候选会把产物里的正确类名改成 pre 侧的
+	 * 另一个名字，产物里根本没有那个包，运行时在类初始化处 {@code NoClassDefFoundError}。
+	 *
+	 * <p>判据取「产物类名能在 pre 侧找到同名条目的比例」。同一命名空间下这个比例接近 1
+	 * （补丁只改名少部分类）；跨命名空间时几乎为 0。取保守阈值 {@value #SAME_NAMESPACE_THRESHOLD}，
+	 * 宁可不动也不误改——不动只是保留原始缺陷（由警告暴露），误改则会让能跑的地方也崩掉。
+	 *
+	 * @return 同一命名空间（可以继续）时为 {@code true}
+	 */
+	private static boolean sameNamespace(Path prePatchJar, Path patchedJar, Consumer<String> info) throws IOException {
+		final Set<String> preNames = new HashSet<>();
+
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(prePatchJar)) {
+			Files.walk(fs.get().getPath("/")).filter(Files::isRegularFile)
+					.filter(p -> p.toString().endsWith(".class"))
+					.forEach(p -> preNames.add(entryName(p)));
+		}
+
+		if (preNames.isEmpty()) {
+			return false;
+		}
+
+		int total = 0;
+		int matched = 0;
+
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(patchedJar)) {
+			final List<Path> classes = new ArrayList<>();
+			Files.walk(fs.get().getPath("/")).filter(Files::isRegularFile)
+					.filter(p -> p.toString().endsWith(".class")).forEach(classes::add);
+
+			for (Path p : classes) {
+				total++;
+
+				if (preNames.contains(entryName(p))) {
+					matched++;
+				}
+			}
+		}
+
+		if (total == 0) {
+			return false;
+		}
+
+		final double ratio = (double) matched / total;
+
+		if (ratio < SAME_NAMESPACE_THRESHOLD) {
+			info.accept(":跳过匿名类引用纠正：产物与 pre-patch 的类名重合率仅 "
+					+ String.format("%.1f%%", ratio * 100)
+					+ "，两侧不在同一命名空间，强行对齐会把类名改坏");
+			return false;
+		}
+
+		return true;
+	}
+
+	private static int realignClass(ClassNode node, Map<String, List<String>> preMethodNewTargets,
+			Map<String, Set<String>> preCtors, Map<String, Set<String>> patchedCtors) {
+		int fixed = 0;
+
+		for (MethodNode method : node.methods) {
+			// 序位 -> 该位置在 pre-patch 侧对应的类名。只统计「带 $ 的 new」，两侧同一口径。
+			final List<String> wanted = preMethodNewTargets.get(node.name + "." + method.name + method.desc);
+
+			if (wanted == null || wanted.size() != Stream.of(method.instructions.toArray())
+					.filter(insn -> insn instanceof TypeInsnNode t && t.getOpcode() == Opcodes.NEW && t.desc.contains("$")).count()) {
+				continue;
+			}
+
+			int index = 0;
+
+			for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+				if (!(insn instanceof TypeInsnNode typeInsn) || typeInsn.getOpcode() != Opcodes.NEW
+						|| !typeInsn.desc.contains("$")) {
+					continue;
+				}
+
+				if (index >= wanted.size()) {
+					break;
+				}
+
+				final String candidate = wanted.get(index);
+				index++;
+
+				if (candidate.equals(typeInsn.desc)) {
+					continue;
+				}
+
+				// 顺找构造调用（中间可能隔着任意多条参数求值指令）。
+				final MethodInsnNode init = findInitCall(typeInsn, typeInsn.desc);
+
+				if (init == null) {
+					continue;
+				}
+
+				final String callSig = init.desc;
+				final Set<String> preCandidate = preCtors.get(candidate);
+				final Set<String> patchedCandidate = patchedCtors.get(candidate);
+				final Set<String> currentCtors = patchedCtors.get(typeInsn.desc);
+
+				// 两边的候选都须支持此签名；当前类无法解析时不猜测。
+				if (preCandidate == null || !preCandidate.contains(callSig)
+						|| patchedCandidate == null || !patchedCandidate.contains(callSig)
+						|| currentCtors == null || currentCtors.contains(callSig)) {
+					continue;
+				}
+
+				typeInsn.desc = candidate;
+				init.owner = candidate;
+				fixed++;
+			}
+		}
+
+		return fixed;
+	}
+
+	/** 收集一个类里「方法签名 -> 该方法内匿名类 new 的目标序列」. */
+	private static void collectMethodNewTargets(byte[] classBytes, Map<String, List<String>> sink) {
+		final ClassNode node = new ClassNode();
+
+		try {
+			new ClassReader(classBytes).accept(node, 0);
+		} catch (RuntimeException e) {
+			return;
+		}
+
+		for (MethodNode method : node.methods) {
+			List<String> sites = null;
+
+			for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+				if (insn instanceof TypeInsnNode t && t.getOpcode() == Opcodes.NEW && t.desc.contains("$")) {
+					if (sites == null) {
+						sites = new ArrayList<>();
+					}
+
+					sites.add(t.desc);
+				}
+			}
+
+			if (sites != null) {
+				// 键必须带类名：{@code <clinit>()V} 每个类都有，只按签名索引会被后扫描的类覆盖，
+				// 于是 ByteBufCodecs.<clinit> 会拿到别的类的序列，校验必然失败而被跳过（实测如此）。
+				sink.put(node.name + "." + method.name + method.desc, sites);
+			}
+		}
+	}
+
+	/**
 	 * 打补丁后的中间产物的生产实现（配置期路径与执行期任务共用）.
 	 *
 	 * <p>binpatcher 打补丁 → 补出 pre-patch jar 里存在而补丁结果里缺失的类
@@ -1998,6 +2338,12 @@ public class MinecraftPatchedProvider {
 		}
 
 		copyMissingClassesStatic(prePatchJar, output);
+
+		// 只在同一 binpatch 流程内对齐，不能在重映射后复制旧命名空间的类名。
+		if (runtimeInstaller != null) {
+			realignInnerClassNewSites(prePatchJar, output, info);
+		}
+
 		deleteParameterNames(output, info);
 
 		if (fixParameterAnnotations) {
