@@ -103,7 +103,7 @@ public class DefaultRunConfigurationSettings {
 		String environment = run.getRuntimeEnvironment().get().toLowerCase(Locale.ROOT);
 
 		run.getJvmArguments().add("-Dfabric.dli.config=" + encodeEscaped(extension.getFiles().getDevLauncherConfig().getAbsolutePath()));
-		run.getJvmArguments().add("-Dfabric.dli.env=" + environment);
+		run.getJvmArguments().add("-Dfabric.dli.env=" + (extension.isForgeLike() ? RunConfigUtils.getForgeDliEnvironment(environment) : environment));
 		run.getJvmArguments().add("-Dfabric.dli.main=" + run.getMainClass().get());
 
 		if (environment.equals("client")) {

@@ -26,8 +26,11 @@ package net.fabricmc.loom.configuration.ide;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HexFormat;
+import java.util.Locale;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -47,6 +50,19 @@ import net.fabricmc.loom.util.gradle.GradleUtils;
 
 public class RunConfigUtils {
 	private static final Logger LOGGER = LoggerFactory.getLogger(RunConfigUtils.class);
+
+	/**
+	 * {@return Forge 运行环境在 DLI 配置中使用的分段键}.
+	 *
+	 * <p>DLI 先按前缀匹配，再校验 Args 或 Properties 后缀；末尾分隔符使自定义环境的键互不为前缀。
+	 */
+	public static String getForgeDliEnvironment(String environment) {
+		final String normalized = environment.toLowerCase(Locale.ROOT);
+		return switch (normalized) {
+		case "common", "client", "server" -> normalized;
+		default -> "loom-" + HexFormat.of().formatHex(normalized.getBytes(StandardCharsets.UTF_8)) + "-";
+		};
+	}
 
 	public static void createRunDirectory(RunConfiguration runConfiguration) throws IOException {
 		Path runDirectory = runConfiguration.getRunDirectory().getAsFile().get().toPath();
