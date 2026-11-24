@@ -35,6 +35,7 @@ import org.gradle.api.tasks.CacheableTask;
 import org.gradle.api.tasks.Input;
 import org.gradle.api.tasks.InputFile;
 import org.gradle.api.tasks.Nested;
+import org.gradle.api.tasks.Optional;
 import org.gradle.api.tasks.OutputFile;
 import org.gradle.api.tasks.PathSensitive;
 import org.gradle.api.tasks.PathSensitivity;
@@ -80,6 +81,19 @@ public abstract class GenerateForgePatchedIntermediateJarTask extends DefaultTas
 	@Nested
 	public abstract Property<ForgeExternalToolService.Options> getBinpatcherTool();
 
+	/**
+	 * Forge 官方 installer jar，只用来读它的运行时补丁（{@code data/client.lzma}、{@code data/server.lzma}）.
+	 *
+	 * <p>userdev 发布的补丁（{@code joined.lzma}）不含内部类条目，缺失的类只能从这里取——
+	 * 两份补丁锚定同一份原版 jar、命名空间一致，所以类体可以直接搬。
+	 *
+	 * <p>可选：未配置时不运行补齐；配置的文件不存在或无法解析仍是错误。
+	 */
+	@Optional
+	@InputFile
+	@PathSensitive(PathSensitivity.NONE)
+	public abstract RegularFileProperty getRuntimeInstaller();
+
 	/** 是否在打补丁后修补参数注解（非 official 的 Forge 系）. */
 	@Input
 	public abstract Property<Boolean> getFixParameterAnnotations();
@@ -97,6 +111,7 @@ public abstract class GenerateForgePatchedIntermediateJarTask extends DefaultTas
 				tmp,
 				getPatches().get().getAsFile().toPath(),
 				getBinpatcherTool().get(),
+				getRuntimeInstaller().isPresent() ? getRuntimeInstaller().get().getAsFile().toPath() : null,
 				getFixParameterAnnotations().get(),
 				getLogger()::lifecycle,
 				getLogger()::info));

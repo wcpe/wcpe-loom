@@ -41,6 +41,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiFunction;
@@ -88,7 +90,13 @@ import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Label;
 import org.objectweb.asm.MethodVisitor;
+import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.FieldInsnNode;
+import org.objectweb.asm.tree.MethodInsnNode;
+import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.TypeInsnNode;
 
 import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
@@ -125,7 +133,7 @@ import net.fabricmc.tinyremapper.extension.mixin.MixinExtension;
 
 public class MinecraftPatchedProvider {
 	private static final String LOOM_PATCH_VERSION_KEY = "Loom-Patch-Version";
-	protected static final String CURRENT_LOOM_PATCH_VERSION = "10";
+	protected static final String CURRENT_LOOM_PATCH_VERSION = "11";
 	private static final String NAME_MAPPING_SERVICE_PATH = "/inject/META-INF/services/cpw.mods.modlauncher.api.INameMappingService";
 
 	// The version where the bug was introduced.
@@ -420,8 +428,10 @@ public class MinecraftPatchedProvider {
 			wireVanillaJarDependencies(task);
 		}));
 
+		final Path runtimeInstaller = runtimeInstaller();
 		final Producer patchedProducer = RemapMinecraftTaskRegistry.claim(project, patchedIntermediate, Map.of(
 				"stage", "forge-patched-intermediate-jar",
+				"runtimeInstaller", runtimeInstaller == null ? "" : runtimeInstaller.toString(),
 				"mcVersion", extension.getMinecraftProvider().minecraftVersion(),
 				"forgeVersion", extension.getForgeProvider().getVersion().getCombined(),
 				"type", type.id
@@ -435,6 +445,10 @@ public class MinecraftPatchedProvider {
 					// 补丁与工具声明都是配置期读项目模型得到的纯值/惰性声明（见 type.patches 与 createBinpatcherTool）
 					task.getPatches().set(type.patches.apply(extension.getPatchProvider(), extension.getForgeUserdevProvider()).toFile());
 					task.getBinpatcherTool().set(createBinpatcherTool());
+
+					if (runtimeInstaller != null) {
+						task.getRuntimeInstaller().set(runtimeInstaller.toFile());
+					}
 					task.getFixParameterAnnotations().set(extension.isForgeLikeAndNotOfficial() && !extension.isUnobfuscatedForge());
 					dependsOnProducer(task, prePatchProducer);
 				}));
@@ -1821,6 +1835,13 @@ public class MinecraftPatchedProvider {
 		CoreModClassRemapper.remapJar(runtimeMojang, patchedJar, mappings, sourceNamespace);
 	}
 
+	/** {@return 合包 Forge 已解析的 installer；其它车道返回 null}. */
+	private @Nullable Path runtimeInstaller() {
+		final LoomGradleExtension extension = getExtension();
+		return type == Type.MERGED && extension.isForge() && extension.isModernForgeLike()
+				? extension.getPatchProvider().getRuntimeInstaller() : null;
+	}
+
 	/**
 	 * 生产打补丁后的中间产物.
 	 *
@@ -1833,16 +1854,123 @@ public class MinecraftPatchedProvider {
 				output,
 				type.patches.apply(getExtension().getPatchProvider(), getExtension().getForgeUserdevProvider()),
 				createBinpatcherTool(),
+				runtimeInstaller(),
 				getExtension().isForgeLikeAndNotOfficial() && !getExtension().isUnobfuscatedForge(),
 				logger::lifecycle,
 				logger::info);
 	}
 
+	/** zip 条目路径去掉前导斜杠与 .class 后缀. */
+	private static String entryName(Path path) {
+		String name = path.toString().replace('\\', '/');
+
+		while (name.startsWith("/")) {
+			name = name.substring(1);
+		}
+
+		return name.endsWith(".class") ? name.substring(0, name.length() - ".class".length()) : name;
+	}
+
+	/**
+	 * 检测补丁产物里「被指令引用、但类条目不存在」的内部类，返回缺失条目.
+	 *
+	 * <p>为什么需要这一步：Forge 的 userdev 包只发布 <b>merged</b> 补丁（{@code joined.lzma}，
+	 * 实测 1.21.11 + Forge 61.2.5 共 7270 条，其中<b>零</b>条是含 {@code $} 的内部类），
+	 * 而官方 installer 的运行时补丁（{@code data/client.lzma}、{@code data/server.lzma}）
+	 * 各自含 810 / 809 条内部类补丁。也就是说补丁并非天生缺类，是 <b>userdev 这一路的材料不完整</b>：
+	 * 用 userdev 自建 dev 环境时，{@code Items.class} 会被打上活跃的 {@code new Items$1} 与
+	 * {@code invokespecial Items$1.<init>}，但 {@code Items$1.class} 无从产生。
+	 * 普通安装与服务端走运行时补丁，不受影响。
+	 *
+	 * <p>后果：运行到该类初始化时才抛 {@code NoClassDefFoundError}，栈上看到的却是触发方
+	 * （例如 {@code ComposterBlock.boot_strap} 里的 {@code getstatic Items.XXX}），
+	 * 与实际缺陷点相距很远，极难定位。所以在构建期就查出来，并交给
+	 * {@link RuntimeBinpatchExtractor} 从运行时补丁补齐。
+	 *
+	 * <h4>判据为什么以「指令引用」为准，而不是 {@code InnerClasses} 属性</h4>
+	 *
+	 * <p>{@code InnerClasses} 会大量引用<b>不在本 jar 内</b>的外部类（{@code java/util/Map$Entry}、
+	 * guava 的 {@code ImmutableList$Builder} 等），把它们算作缺失会产生成百上千条误报
+	 * （实测 166 条里 156 条属于此类）。而「被 {@code new}/{@code getstatic} 等指令实际引用」
+	 * 的类必然要在运行时被解析，缺失即为真缺陷。两个条件同时收窄到本 jar 应自带的命名空间。
+	 *
+	 * @return 被引用但条目缺失的类名集合（{@code net/minecraft/...} 形式）；为空表示自洽
+	 */
+	public static Set<String> verifyNoDanglingInnerClassReferences(Path patchedJar, Consumer<String> info) throws IOException {
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(patchedJar)) {
+			final Path root = fs.get().getPath("/");
+			final Set<String> present = new TreeSet<>();
+			final List<Path> classes = new ArrayList<>();
+			try (var paths = Files.walk(root)) {
+				paths.filter(Files::isRegularFile).filter(path -> path.toString().endsWith(".class")).forEach(path -> {
+					present.add(entryName(path));
+					classes.add(path);
+				});
+			}
+
+			// 缺失类 -> 引用它的类（去重后按名字排序，报错信息稳定可比对）。
+			final Map<String, Set<String>> missing = new java.util.TreeMap<>();
+
+			for (Path path : classes) {
+				final String own = entryName(path);
+
+				final List<String> refs = new ArrayList<>();
+
+				try {
+					ClassNode node = new ClassNode();
+					new ClassReader(Files.readAllBytes(path)).accept(node, 0);
+
+					for (MethodNode method : node.methods) {
+						for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+							// 只收「运行时会去解析某个类」的指令。InnerClasses 属性靠不住：
+							// 匿名类那条的 outer_class_info_index 是 0，按 outer 过滤会漏掉 Items$1 这类目标，
+							// 而 new/invokespecial 是实打实要加载该类的。
+							if (insn instanceof TypeInsnNode typeInsn) {
+								switch (typeInsn.getOpcode()) {
+								case Opcodes.NEW:
+								case Opcodes.CHECKCAST:
+								case Opcodes.ANEWARRAY:
+								case Opcodes.INSTANCEOF:
+									refs.add(typeInsn.desc);
+									break;
+								default:
+									break;
+								}
+							} else if (insn instanceof MethodInsnNode methodInsn) {
+								refs.add(methodInsn.owner);
+							} else if (insn instanceof FieldInsnNode fieldInsn) {
+								refs.add(fieldInsn.owner);
+							}
+						}
+					}
+				} catch (RuntimeException e) {
+					// 解析失败的类不参与判定：这里的目标是查缺失，不是校验字节码合法性。
+					continue;
+				}
+
+				for (String ref : refs) {
+					final String cls = ref.startsWith("[") ? org.objectweb.asm.Type.getType(ref).getElementType().getInternalName() : ref;
+
+					if (cls.startsWith("net/minecraft/") && cls.contains("$") && !present.contains(cls)) {
+						missing.computeIfAbsent(cls, k -> new TreeSet<>()).add(own);
+					}
+				}
+			}
+
+			if (missing.isEmpty()) {
+				info.accept(":no dangling inner-class references in patched jar");
+				return Set.of();
+			}
+
+			return missing.keySet();
+		}
+	}
+
 	/**
 	 * 打补丁后的中间产物的生产实现（配置期路径与执行期任务共用）.
 	 *
-	 * <p>顺序与改造前逐字一致：binpatcher 打补丁 → 补出 pre-patch jar 里存在而补丁结果里缺失的类
-	 * → 删除 vignette 参数名 → （非 official 的 Forge 系）修补参数注解。
+	 * <p>binpatcher 打补丁 → 补出 pre-patch jar 里存在而补丁结果里缺失的类
+	 * → 删除 vignette 参数名 → （非 official 的 Forge 系）修补参数注解 → 检查并补入缺失内部类。
 	 *
 	 * <p>静态：任务对象要能被配置缓存序列化，因此生产不能经由 provider 实例（见 {@link ProductionOptions}）。
 	 *
@@ -1856,9 +1984,11 @@ public class MinecraftPatchedProvider {
 	 * @param fixParameterAnnotations 是否修补参数注解
 	 * @param lifecycle lifecycle 日志出口（配置期是项目 logger，执行期是任务 logger）
 	 * @param info info 日志出口（同上）
+	 * @param runtimeInstaller Forge 官方 installer jar（用于补齐缺失内部类）；{@code null} 表示本车道不运行补齐
 	 */
 	public static void producePatchedIntermediateForTask(Path prePatchJar, Path output, Path patches,
-			ForgeExternalToolService.Options binpatcherTool, boolean fixParameterAnnotations,
+			ForgeExternalToolService.Options binpatcherTool, @Nullable Path runtimeInstaller,
+			boolean fixParameterAnnotations,
 			Consumer<String> lifecycle, Consumer<String> info) throws Exception {
 		Stopwatch stopwatch = Stopwatch.createStarted();
 		lifecycle.accept(":patching jars");
@@ -1874,7 +2004,68 @@ public class MinecraftPatchedProvider {
 			fixParameterAnnotation(output, info);
 		}
 
+		if (runtimeInstaller != null) {
+			final Set<String> dangling = verifyNoDanglingInnerClassReferences(output, info);
+
+			if (!dangling.isEmpty()) {
+				fillDanglingInnerClasses(output, dangling, runtimeInstaller, info);
+			}
+		}
+
 		lifecycle.accept(":patched jars in " + stopwatch.stop());
+	}
+
+	/**
+	 * 用官方 installer 的运行时补丁补齐缺失的内部类；缺条目只警告，读取失败仍传播.
+	 *
+	 * <p>警告而非中断：这是 Forge userdev 材料的上游缺口（见
+	 * {@link #verifyNoDanglingInnerClassReferences} 的说明），中断会把所有 Forge 开发环境卡死，
+	 * 而运行时产物走的是另一套完整补丁，实际部署不受影响。补齐失败时把事实讲清楚即可。
+	 *
+	 * @param patchedJar 待补齐的补丁产物
+	 * @param missing    缺失的类名集合
+	 * @param info       日志出口
+	 */
+	private static void fillDanglingInnerClasses(Path patchedJar, Set<String> missing, Path installer,
+			Consumer<String> info) throws IOException {
+		if (Files.notExists(installer)) {
+			info.accept(":警告：补丁产物缺 " + missing.size() + " 个内部类，且没有可用的 Forge installer 可用于补齐。\n"
+					+ "  Forge 的 userdev 补丁（joined.lzma）不含内部类条目，官方 installer 的运行时补丁才是完整的。\n"
+					+ "  运行到这些类会抛 NoClassDefFoundError。缺失清单：" + RuntimeBinpatchExtractor.sorted(missing));
+			return;
+		}
+
+		final Path tempDir = Files.createTempDirectory("loom-binpatch-fill");
+
+		try {
+			final int filled = RuntimeBinpatchExtractor.fillMissingInnerClasses(
+					installer, patchedJar, missing, tempDir, info);
+
+			if (filled < missing.size()) {
+				final Set<String> still = verifyNoDanglingInnerClassReferences(patchedJar, info);
+
+				if (!still.isEmpty()) {
+					info.accept(":警告：仍有 " + still.size() + " 个内部类无法补齐（installer 的运行时补丁里没有）："
+							+ RuntimeBinpatchExtractor.sorted(still));
+				}
+			}
+		} finally {
+			deleteRecursively(tempDir);
+		}
+	}
+
+	private static void deleteRecursively(Path dir) {
+		try (var paths = Files.walk(dir)) {
+			paths.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+				try {
+					Files.deleteIfExists(p);
+				} catch (IOException ignored) {
+					// 临时目录清理失败不影响构建结果。
+				}
+			});
+		} catch (IOException ignored) {
+			// 同上。
+		}
 	}
 
 	/**

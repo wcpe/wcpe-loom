@@ -281,6 +281,7 @@ class ForgePatchedChainTaskEquivalenceTest extends Specification implements Grad
 					referenceIntermediate.toPath(),
 					extension.forgeUserdevProvider.joinedPatches,
 					provider.createBinpatcherTool(),
+					extension.patchProvider.getRuntimeInstaller(),
 					intermediateTask.fixParameterAnnotations.get(),
 					lifecycle,
 					info)
