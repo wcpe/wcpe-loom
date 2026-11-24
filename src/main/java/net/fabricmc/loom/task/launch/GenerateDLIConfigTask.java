@@ -65,6 +65,7 @@ import net.fabricmc.loom.LoomGradleExtension;
 import net.fabricmc.loom.LoomGradlePlugin;
 import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.build.IntermediaryNamespaces;
+import net.fabricmc.loom.configuration.ide.RunConfigUtils;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftVersionMeta;
 import net.fabricmc.loom.configuration.providers.minecraft.mapped.MappedMinecraftProvider;
 import net.fabricmc.loom.task.AbstractLoomTask;
@@ -314,9 +315,7 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
 			}
 
 			for (ForgeRunTemplate.Resolved template : getRunTemplates().get()) {
-				// Note: lowercase to match DefaultRunConfigurationSettings which lowercases all user input for
-				// RunConfigSettings.environment
-				var env = template.name().toLowerCase(Locale.ROOT);
+				var env = template.name();
 
 				for (String argument : template.args()) {
 					launchConfig.argument(env, argument);
@@ -368,7 +367,7 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
 		}
 
 		public LaunchConfig property(String side, String key, String value) {
-			values.computeIfAbsent(side + "Properties", (s -> new ArrayList<>()))
+			values.computeIfAbsent(RunConfigUtils.getForgeDliEnvironment(side) + "Properties", (s -> new ArrayList<>()))
 					.add(String.format("%s=%s", key, value));
 			return this;
 		}
@@ -378,7 +377,7 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
 		}
 
 		public LaunchConfig argument(String side, String value) {
-			values.computeIfAbsent(side + "Args", (s -> new ArrayList<>()))
+			values.computeIfAbsent(RunConfigUtils.getForgeDliEnvironment(side) + "Args", (s -> new ArrayList<>()))
 					.add(value);
 			return this;
 		}

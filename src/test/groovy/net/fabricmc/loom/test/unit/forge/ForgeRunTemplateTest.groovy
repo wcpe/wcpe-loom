@@ -35,6 +35,7 @@ import spock.lang.Specification
 import spock.lang.TempDir
 import spock.lang.Unroll
 
+import net.fabricmc.loom.task.launch.GenerateDLIConfigTask.LaunchConfig
 import net.fabricmc.loom.util.ZipUtils
 import net.fabricmc.loom.util.download.Download
 
@@ -73,5 +74,33 @@ class ForgeRunTemplateTest extends Specification {
 		'1.17.1'    | '37.1.1'     | 'cpw.mods.bootstraplauncher.BootstrapLauncher'
 		'1.18.2'    | '40.1.80'    | 'cpw.mods.bootstraplauncher.BootstrapLauncher'
 		'1.19.2'    | '43.1.25'    | 'cpw.mods.bootstraplauncher.BootstrapLauncher'
+	}
+
+	def "DLI data 环境不会误匹配客户端或服务端数据段"() {
+		given:
+		def config = new LaunchConfig()
+				.argument('--common')
+				.argument('client', '--client')
+				.argument('server', '--server')
+				.argument('data', '--data')
+				.argument('dataClient', '--data-client')
+				.argument('dataServer', '--data-server')
+				.property('data', 'run.kind', 'data')
+				.property('dataClient', 'run.kind', 'client-data')
+		def lines = config.asString().readLines()
+		def headers = lines.findAll { !it.startsWith('\t') }
+		def dataHeader = lines[lines.indexOf('\t--data') - 1]
+		def environment = dataHeader.substring(0, dataHeader.length() - 'Args'.length())
+
+		expect:
+		headers.containsAll([
+			'commonArgs',
+			'clientArgs',
+			'serverArgs'
+		])
+		headers.findAll { it.startsWith(environment) }.toSet() == [
+			dataHeader,
+			environment + 'Properties'
+		].toSet()
 	}
 }
