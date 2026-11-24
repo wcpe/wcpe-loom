@@ -40,6 +40,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -2304,6 +2305,132 @@ public class MinecraftPatchedProvider {
 				sink.put(node.name + "." + method.name + method.desc, sites);
 			}
 		}
+	}
+
+	/**
+	 * 给「被 Forge 改名成 private」的方法补一个同签名的桥接方法，让旧调用点继续可用.
+	 *
+	 * <p><b>要解决的问题。</b>Forge 36.2.42（1.16.5）为了让 FG6 不做 reobf，把
+	 * {@code TransformationMatrix} 的 {@code func_227987_b_} / {@code func_227985_a_} 改名为
+	 * {@code inverseVanilla} / {@code composeVanilla} 并**降为 private**，同时在
+	 * {@code IForgeTransformationMatrix} 上提供公开的 {@code inverse()} / {@code compose()} 默认方法。
+	 * 配套的 {@code patches/UVTransformationUtil.java.patch} 本应把调用点改成接口方法，
+	 * 但该文本补丁在 userdev 的 binpatch 链里没有对应条目（实测 578 个文本补丁中唯它缺失），
+	 * 于是产物里出现「类已改名、调用点仍指旧名」的错位。
+	 *
+	 * <p>后果不是编译期能发现的：{@code BlockMath.<clinit>} 一初始化就抛
+	 * {@code NoSuchMethodError: Transformation.func_227987_b_}，客户端在资源重载阶段崩溃，
+	 * 栈上看不到 Forge 的补丁材料，极难归因。
+	 *
+	 * <p><b>为什么补方法而不是改调用点。</b>先试过把调用点改指接口默认方法
+	 * （{@code invokeinterface IForgeTransformationMatrix.inverse}），但映射表里
+	 * {@code func_227987_b_ → inverse} 的终点与接口默认方法同名同签名，重映射阶段会把这条
+	 * 调用内联回原样，改调用点等于与重映射对抗。补方法则完全不动调用点：旧名重新存在，
+	 * 链路自洽。
+	 *
+	 * <p><b>为什么在重映射之后补。</b>同上的名字冲突也发生在**方法定义**上：srg 阶段补出的
+	 * {@code func_227987_b_} 在重映射时又被映射成 {@code inverse}，与接口默认方法撞名后被丢弃。
+	 * 因此在最终 named 产物上补，名字不再经过映射。
+	 *
+	 * <p><b>判据必须条件触发。</b>只有「旧方法名不存在、且改名后的目标方法存在」时才补；
+	 * 否则会把本来正确的产物改坏（例如尚未改名的新版本 Forge）。判据取自产物本身，不读版本号。
+	 *
+	 * <p>两个命名空间都要认：srg 阶段类名是 {@code net/minecraft/util/math/vector/TransformationMatrix}，
+	 * named 阶段是 {@code com/mojang/math/Transformation}。
+	 *
+	 * @param patchedJar 产物（就地改写）
+	 * @param info       日志出口
+	 * @return 补出的桥接方法数
+	 */
+	public static int bridgeRenamedVanillaMethods(Path patchedJar, Consumer<String> info) throws IOException {
+		final String srgOwner = "net/minecraft/util/math/vector/TransformationMatrix";
+		final String namedOwner = "com/mojang/math/Transformation";
+
+		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(patchedJar, false)) {
+			final Path root = fs.get().getPath("/");
+			int added = 0;
+
+			for (String owner : List.of(srgOwner, namedOwner)) {
+				final Path targetPath = root.resolve(owner + ".class");
+
+				if (!Files.isRegularFile(targetPath)) {
+					continue;
+				}
+
+				added += bridgeOnClass(targetPath, owner, info);
+			}
+
+			return added;
+		}
+	}
+
+	/** 在单个目标类上补桥接；不适用时返回 0. */
+	private static int bridgeOnClass(Path targetPath, String targetOwner, Consumer<String> info) throws IOException {
+		final String selfType = "L" + targetOwner + ";";
+		// 旧方法名 -> {改名后的私有方法名, 描述符}
+		final Map<String, String[]> bridges = new LinkedHashMap<>();
+		bridges.put("func_227987_b_", new String[] {"inverseVanilla", "()" + selfType});
+		bridges.put("func_227985_a_", new String[] {"composeVanilla", "(" + selfType + ")" + selfType});
+
+		final ClassNode node = new ClassNode();
+		new ClassReader(Files.readAllBytes(targetPath)).accept(node, 0);
+
+		if (!targetOwner.equals(node.name) || (node.access & Opcodes.ACC_INTERFACE) != 0) {
+			return 0;
+		}
+
+		final Map<String, MethodNode> byName = new HashMap<>();
+		node.methods.forEach(m -> byName.putIfAbsent(m.name + m.desc, m));
+
+		int added = 0;
+
+		for (Map.Entry<String, String[]> entry : bridges.entrySet()) {
+			final String oldName = entry.getKey();
+			final String renamed = entry.getValue()[0];
+			final String desc = entry.getValue()[1];
+
+			// 旧名已在：无需补，也不能补（会重复定义）。
+			if (byName.containsKey(oldName + desc)) {
+				continue;
+			}
+
+			// 改名后的私有方法不在：该产物不是这个缺陷形态，什么都不做。
+			final MethodNode target = byName.get(renamed + desc);
+
+			if (target == null || (target.access & (Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_ABSTRACT)) != Opcodes.ACC_PRIVATE) {
+				continue;
+			}
+
+			final boolean takesArgument = org.objectweb.asm.Type.getArgumentTypes(desc).length == 1;
+			final MethodNode bridge = new MethodNode(Opcodes.ACC_PUBLIC, oldName, desc, null, null);
+			bridge.visitCode();
+			bridge.visitVarInsn(Opcodes.ALOAD, 0);
+
+			if (takesArgument) {
+				bridge.visitVarInsn(Opcodes.ALOAD, 1);
+			}
+
+			// 走 invokespecial 调同类私有方法：不经过虚分派，语义与原实现一致。
+			bridge.visitMethodInsn(Opcodes.INVOKESPECIAL, targetOwner, renamed, desc, false);
+			bridge.visitInsn(Opcodes.ARETURN);
+			bridge.visitMaxs(0, 0);
+			bridge.visitEnd();
+
+			node.methods.add(bridge);
+			// 同步进索引，避免同一轮里另一条桥接误判。
+			byName.put(oldName + desc, bridge);
+			added++;
+		}
+
+		if (added > 0) {
+			final ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+			node.accept(writer);
+			Files.write(targetPath, writer.toByteArray(), StandardOpenOption.TRUNCATE_EXISTING);
+			info.accept(":为 " + added + " 个被改名成 private 的宿主方法补回旧名桥接"
+					+ "（Forge 36.2.42 的补丁材料缺对应 binpatch 条目）");
+		}
+
+		return added;
 	}
 
 	/**

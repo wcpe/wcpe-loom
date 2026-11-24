@@ -46,6 +46,7 @@ import java.util.stream.Collectors;
 
 import dev.architectury.loom.forge.InnerClassRemapper;
 import dev.architectury.loom.forge.minecraft.ForgeMinecraftProvider;
+import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
 import dev.architectury.loom.mappings.MappingOption;
 import org.gradle.api.Project;
 import org.gradle.api.file.ConfigurableFileCollection;
@@ -417,10 +418,15 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 			return extension.getMinecraftProvider().minecraftVersion();
 		}
 
-		final String version = "%s-%s".formatted(extension.getMinecraftProvider().minecraftVersion(), extension.getMappingConfiguration().mappingsIdentifier());
+final String version = "%s-%s".formatted(extension.getMinecraftProvider().minecraftVersion(), extension.getMappingConfiguration().mappingsIdentifier());
 
-		// 旧 Legacy 产物可能只补译了继承字段，仍包含未翻译的 Forge 方法引用。
-		return extension.isLegacyForge() ? version + "-legacy-members-v2" : version;
+// 两项修复影响不同的输入产物，各自隔离旧缓存。
+return version + (extension.isLegacyForge() ? "-legacy-members-v2" : "")
+		+ (bridgeForgeRenamedMethods() ? "-forge-method-bridge-v1" : "");
+}
+
+private boolean bridgeForgeRenamedMethods() {
+return extension.isForge() && !extension.disableObfuscation() && "1.16.5".equals(minecraftProvider.minecraftVersion());
 	}
 
 	protected String getDependencyNotation(MinecraftJar.Type type) {
@@ -594,6 +600,10 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		// 运行期抛 NoSuchMethodError。这里用 Forge 自身两份 jar 的成员差异做一次补充改写。
 		// 现代 Forge 的 universal jar 本身在 named 空间、没有 named 版产物，工序整体跳过。
 		fixForgeMemberNames(remappedJars, mappings, fromM, toM);
+
+		if (bridgeForgeRenamedMethods()) {
+			MinecraftPatchedProvider.bridgeRenamedVanillaMethods(remappedJars.outputJarPath(), getProject().getLogger()::info);
+		}
 	}
 
 	/**
@@ -909,6 +919,8 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 		identity.put("fromNamespace", fromNamespace);
 		identity.put("toNamespace", toNamespace);
 		identity.put("fixRecords", Boolean.toString(fixRecords));
+		final boolean bridgeForgeRenamedMethods = bridgeForgeRenamedMethods();
+		identity.put("bridgeForgeRenamedMethods", Boolean.toString(bridgeForgeRenamedMethods));
 		identity.put("forgeLike", Boolean.toString(extension.isForgeLike()));
 		identity.put("validateTargetNamespace", Boolean.toString(validateTargetNamespace));
 		// innerClassNames 没有指纹项：它不再是配置期读出来的值，而是 (inputJar, forgeLike) 的纯函数，
@@ -986,6 +998,7 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 					task.getFromNamespace().set(fromNamespace);
 					task.getToNamespace().set(toNamespace);
 					task.getFixRecords().set(fixRecords);
+					task.getBridgeForgeRenamedMethods().set(bridgeForgeRenamedMethods);
 					task.getForgeLike().set(extension.isForgeLike());
 
 					// named 参考 jar 可能尚未落盘；冷缓存也必须由任务图保证它先产出。
