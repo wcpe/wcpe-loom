@@ -135,6 +135,7 @@ public abstract class RemapMinecraftTask extends DefaultTask {
 		// 理由见各输入的说明。
 		getCopyOnly().convention(false);
 		getBridgeForgeRenamedMethods().convention(false);
+		getCompleteForgeInput().convention(false);
 		getInjectClientSidedVisitor().convention(false);
 		getInjectMixinExtension().convention(false);
 	}
@@ -416,6 +417,10 @@ public abstract class RemapMinecraftTask extends DefaultTask {
 	@Input
 	public abstract Property<Boolean> getBridgeForgeRenamedMethods();
 
+	/** 完整源码重编译产物不需要二进制兼容修复. */
+	@Input
+	public abstract Property<Boolean> getCompleteForgeInput();
+
 	@TaskAction
 	public void remap() throws IOException {
 		final Path inputJar = getInputJar().get().getAsFile().toPath();
@@ -439,7 +444,7 @@ public abstract class RemapMinecraftTask extends DefaultTask {
 
 			remapJar(inputJar, outputJar);
 
-			if (getForgeLike().get() && getBridgeForgeRenamedMethods().get()) {
+			if (!getCompleteForgeInput().get() && getForgeLike().get() && getBridgeForgeRenamedMethods().get()) {
 				MinecraftPatchedProvider.bridgeRenamedVanillaMethods(outputJar, LOGGER::info);
 			}
 		}

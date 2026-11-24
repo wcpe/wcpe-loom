@@ -27,6 +27,7 @@ package net.fabricmc.loom.pipeline;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 import dev.architectury.loom.forge.ForgeMigratedMappingConfiguration;
 import dev.architectury.loom.forge.MappingsMigrator;
@@ -36,6 +37,7 @@ import org.gradle.api.provider.Property;
 import org.gradle.api.tasks.CacheableTask;
 import org.gradle.api.tasks.Input;
 import org.gradle.api.tasks.InputFile;
+import org.gradle.api.tasks.Optional;
 import org.gradle.api.tasks.OutputFile;
 import org.gradle.api.tasks.PathSensitive;
 import org.gradle.api.tasks.PathSensitivity;
@@ -96,11 +98,13 @@ public abstract class ManipulateForgeMappingsTask extends DefaultTask {
 	public abstract RegularFileProperty getPatchedIntermediateJar();
 
 	/** Forge 的 universal jar：{@code MethodInheritanceMappingsMigrator} 的继承关系来源之一. */
+	@Optional
 	@InputFile
 	@PathSensitive(PathSensitivity.NONE)
 	public abstract RegularFileProperty getForgeJar();
 
 	/** Forge 的 userdev jar：同上. */
+	@Optional
 	@InputFile
 	@PathSensitive(PathSensitivity.NONE)
 	public abstract RegularFileProperty getForgeUserdevJar();
@@ -142,15 +146,19 @@ public abstract class ManipulateForgeMappingsTask extends DefaultTask {
 		final Path cacheDir = Path.of(getMigratorCacheDir().get());
 		Files.createDirectories(cacheDir);
 
+		final Path patched = getPatchedIntermediateJar().get().getAsFile().toPath();
+		final List<Path> jars = getForgeJar().isPresent() || getForgeUserdevJar().isPresent()
+				? List.of(patched, getForgeJar().get().getAsFile().toPath(), getForgeUserdevJar().get().getAsFile().toPath())
+				: List.of(patched);
+
 		// 全程不触碰 Project：配置缓存开启时执行期调用 Task.project 会被 Gradle 直接拒绝。
 		// 因此生产实现只认这里构造的纯值输入，日志出口是任务自己的 logger。
 		ForgeMigratedMappingConfiguration.manipulate(
 				new MappingsMigrator.Inputs(
 						cacheDir,
 						getRawMappingsWithNs().get().getAsFile().toPath(),
-						getPatchedIntermediateJar().get().getAsFile().toPath(),
-						getForgeJar().get().getAsFile().toPath(),
-						getForgeUserdevJar().get().getAsFile().toPath(),
+						patched,
+						jars,
 						getHasSrg().get(),
 						getHasMojang().get(),
 						getRefreshDeps().get(),

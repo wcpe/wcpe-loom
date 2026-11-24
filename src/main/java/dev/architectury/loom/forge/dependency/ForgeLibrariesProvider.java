@@ -36,6 +36,7 @@ import java.util.concurrent.Callable;
 
 import dev.architectury.loom.forge.ModDirTransformerDiscovererPatch;
 import dev.architectury.loom.forge.RemapObjectHolderVisitor;
+import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
 import dev.architectury.loom.mappings.ForgeMappingsMerger;
 import dev.architectury.loom.mappings.MappingOption;
 import dev.architectury.loom.neoforge.StringConstantPatcher;
@@ -112,7 +113,12 @@ public class ForgeLibrariesProvider {
 							version = version.substring(0, atIndex);
 						}
 
-						dep = "dev.architectury:mixin-patched" + version + ".+";
+						// 只锁定已验证的 Mavenizer 配方，避免离线配置缓存因动态版本过期而失效。
+						if (":0.8.7".equals(version) && MinecraftPatchedProvider.usesMavenizer(extension, extension.getMinecraftProvider())) {
+							dep = "dev.architectury:mixin-patched:0.8.7.12";
+						} else {
+							dep = "dev.architectury:mixin-patched" + version + ".+";
+						}
 					}
 				}
 			}

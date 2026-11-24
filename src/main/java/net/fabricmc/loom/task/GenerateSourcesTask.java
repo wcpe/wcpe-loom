@@ -50,6 +50,7 @@ import java.util.stream.Stream;
 import javax.inject.Inject;
 
 import dev.architectury.loom.forge.ForgeSourcesService;
+import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
 import org.gradle.api.file.ConfigurableFileCollection;
 import org.gradle.api.file.FileCollection;
 import org.gradle.api.file.RegularFileProperty;
@@ -136,7 +137,12 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
 
 	// Contains the remapped linenumbers
 	@OutputFile
-	protected abstract RegularFileProperty getClassesOutputJar();
+	public abstract RegularFileProperty getClassesOutputJar();
+
+	/** 独立反编译任务的行号表，不写到共享 backup 旁. */
+	@Optional
+	@OutputFile
+	public abstract RegularFileProperty getLineMapOutput();
 
 	@Input
 	@Option(option = "use-cache", description = "Use the decompile cache")
@@ -296,14 +302,15 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
 
 		getDaemonUtilsContext().set(getProject().getObjects().newInstance(DaemonUtils.Context.class, getProject()));
 
-		getForgeSourcesOptions().set(ForgeSourcesService.createOptions(getProject()));
+		if (!MinecraftPatchedProvider.usesMavenizer(getExtension(), getExtension().getMinecraftProvider())) {
+			getForgeSourcesOptions().set(ForgeSourcesService.createOptions(getProject()));
 
-		// 提前展开 Forge 源码包（声明式、可缓存），避免每次执行都手工遍历归档。
-		// 用 provider 延迟探测任务是否存在，避免在尚未注册时抛错。
-		dependsOn(getProject().getProviders().provider(() ->
-				getProject().getTasks().findByName(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME) == null
-						? java.util.List.of()
-						: java.util.List.of(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME)));
+			// 提前展开 Forge 源码包；延迟探测任务以避免注册顺序约束。
+			dependsOn(getProject().getProviders().provider(() ->
+					getProject().getTasks().findByName(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME) == null
+							? java.util.List.of()
+							: java.util.List.of(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME)));
+		}
 
 		mustRunAfter(getProject().getTasks().withType(AbstractRemapJarTask.class));
 	}
@@ -311,6 +318,10 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
 	@TaskAction
 	public void run() throws IOException {
 		final Platform platform = Platform.CURRENT;
+
+		if (getLineMapOutput().isPresent()) {
+			Files.createDirectories(getSourcesOutputJar().get().getAsFile().toPath().getParent());
+		}
 
 		if (!platform.getArchitecture().is64Bit()) {
 			throw new UnsupportedOperationException("GenSources task requires a 64bit JVM to run due to the memory requirements.");
@@ -674,7 +685,8 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
 		final var remapper = new LineNumberRemapper(lineNumbers);
 		remapper.process(inputJar, outputJar);
 
-		final Path lineMap = inputJar.resolveSibling(inputJar.getFileName() + ".linemap.txt");
+		final Path lineMap = getLineMapOutput().isPresent() ? getLineMapOutput().get().getAsFile().toPath()
+				: inputJar.resolveSibling(inputJar.getFileName() + ".linemap.txt");
 
 		try (BufferedWriter writer = Files.newBufferedWriter(lineMap)) {
 			lineNumbers.write(writer);

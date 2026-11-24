@@ -5,6 +5,7 @@ import javax.inject.Inject;
 import org.gradle.api.Project;
 import org.gradle.api.plugins.JavaPluginExtension;
 import org.gradle.api.provider.Provider;
+import org.gradle.jvm.toolchain.JavaLanguageVersion;
 import org.gradle.jvm.toolchain.JavaLauncher;
 import org.gradle.jvm.toolchain.JavaToolchainService;
 import org.gradle.jvm.toolchain.JavaToolchainSpec;
@@ -12,6 +13,11 @@ import org.gradle.jvm.toolchain.JavaToolchainSpec;
 public abstract class JavaExecutableFetcher {
 	@Inject
 	protected abstract JavaToolchainService getToolchainService();
+
+	static Provider<JavaLauncher> launcherFor(Project project, int majorVersion) {
+		final JavaExecutableFetcher fetcher = project.getObjects().newInstance(JavaExecutableFetcher.class);
+		return fetcher.getToolchainService().launcherFor(spec -> spec.getLanguageVersion().set(JavaLanguageVersion.of(majorVersion)));
+	}
 
 	public static Provider<String> getJavaToolchainExecutable(Project project) {
 		return project.provider(() -> {

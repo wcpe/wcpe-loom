@@ -33,7 +33,6 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.function.Consumer;
 
-import dev.architectury.loom.forge.dependency.ForgeProvider;
 import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
 import dev.architectury.loom.mappings.MappingOption;
 import dev.architectury.loom.util.Stopwatch;
@@ -170,7 +169,7 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
 			return;
 		}
 
-		final Path forgeCache = ForgeProvider.getForgeCache(project);
+		final Path forgeCache = MinecraftPatchedProvider.get(project).productionCacheDirectory();
 		Files.createDirectories(forgeCache);
 
 		boolean hasSrg = extension.shouldGenerateSrgTiny();
@@ -223,8 +222,7 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
 		// 决定，同一输入下结果一致，故无锁写入最多互相覆盖成等价内容，不会让读方看到半截文件。
 		// 迁移器返回值参与 hash 计算，构成迁移产物的就绪标记。
 		final MappingsMigrator.Inputs inputs = new MappingsMigrator.Inputs(forgeCache, rawTinyMappingsWithNs,
-				patchedIntermediateJar, extension.getForgeUniversalProvider().getForge().toPath(),
-				extension.getForgeUserdevProvider().getUserdevJar().toPath(), hasSrg, hasMojang,
+				patchedIntermediateJar, inheritanceJars(extension, patchedIntermediateJar), hasSrg, hasMojang,
 				extension.refreshDeps(), project.getLogger()::info);
 
 		for (MappingsMigrator migrator : this.migrators) {
@@ -250,6 +248,11 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
 		});
 	}
 
+	private static List<Path> inheritanceJars(LoomGradleExtension extension, Path patched) {
+		return MinecraftPatchedProvider.usesMavenizer(extension, extension.getMinecraftProvider()) ? List.of(patched)
+				: List.of(patched, extension.getForgeUniversalProvider().getForge().toPath(), extension.getForgeUserdevProvider().getUserdevJar().toPath());
+	}
+
 	/**
 	 * 把 mappings 迁移投影成执行期任务.
 	 *
@@ -266,8 +269,7 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
 		final Path migratedMappingsWithNs = tinyMappingsWithNs.toAbsolutePath().normalize();
 		final Path readyMarker = this.hashPath.toAbsolutePath().normalize();
 		final Path patchedIntermediateJar = MinecraftPatchedProvider.get(project).getMinecraftPatchedIntermediateJar();
-		final Path forgeJar = extension.getForgeUniversalProvider().getForge().toPath();
-		final Path userdevJar = extension.getForgeUserdevProvider().getUserdevJar().toPath();
+		final List<Path> jars = inheritanceJars(extension, patchedIntermediateJar);
 
 		// 同一产物路径在本构建内只能有一个生产者：同一构建内两个配置相同的子项目会算出同一条路径。
 		// 指纹只放**决定内容**的量，refreshDeps 只影响「这轮要不要重建」故不参与。
@@ -288,8 +290,12 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
 			task.getReadyMarker().set(readyMarker.toFile());
 			task.getMigratorCacheDir().set(forgeCache.toAbsolutePath().toString());
 			task.getPatchedIntermediateJar().set(patchedIntermediateJar.toFile());
-			task.getForgeJar().set(forgeJar.toFile());
-			task.getForgeUserdevJar().set(userdevJar.toFile());
+
+			if (jars.size() > 1) {
+				task.getForgeJar().set(jars.get(1).toFile());
+				task.getForgeUserdevJar().set(jars.get(2).toFile());
+			}
+
 			task.getHasSrg().set(hasSrg);
 			task.getHasMojang().set(hasMojang);
 			task.getRefreshDeps().set(extension.refreshDeps());

@@ -43,6 +43,7 @@ import java.util.jar.JarInputStream;
 import java.util.jar.JarOutputStream;
 import java.util.zip.ZipEntry;
 
+import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
 import lzma.sdk.lzma.Decoder;
 import lzma.sdk.lzma.Encoder;
 import lzma.streams.LzmaInputStream;
@@ -71,12 +72,19 @@ public class PatchProvider extends DependencyProvider {
 	@Override
 	public void provide(DependencyInfo dependency) throws Exception {
 		init();
-		// legacy Forge（1.8-1.16）没有独立的 installer，补丁位于 universal jar 内
-		installerJar = getExtension().isModernForgeLike()
-				? dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve Forge installer")).toPath()
-				: getExtension().getForgeUniversalProvider().getForge().toPath();
+		var extension = getExtension();
 
-		if (getExtension().isLegacyForge()) {
+		// 这条合包路线从源码生成整份开发 JAR，不读 installer 的运行时补丁。
+		if (MinecraftPatchedProvider.usesMavenizer(extension, extension.getMinecraftProvider())) {
+			return;
+		}
+
+		// 旧 Forge 的单端补丁位于 universal JAR，而不是独立 installer。
+		installerJar = extension.isModernForgeLike()
+				? dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve Forge installer")).toPath()
+				: extension.getForgeUniversalProvider().getForge().toPath();
+
+		if (extension.isLegacyForge()) {
 			clientPatches = projectCacheFolder.resolve("patches-client.lzma");
 			serverPatches = projectCacheFolder.resolve("patches-server.lzma");
 			extractLegacyPatches(clientPatches, serverPatches);

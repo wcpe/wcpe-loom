@@ -24,9 +24,13 @@
 
 package net.fabricmc.loom.configuration.decompile;
 
+import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
+import dev.architectury.loom.forge.tool.ForgeMavenizerService;
+import dev.architectury.loom.mappings.MappingOption;
 import org.gradle.api.Project;
 
 import net.fabricmc.loom.LoomGradleExtension;
@@ -34,13 +38,58 @@ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJar;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
 import net.fabricmc.loom.configuration.providers.minecraft.mapped.MappedMinecraftProvider;
+import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
+import net.fabricmc.loom.task.GenerateForgeMavenizerSourcesTask;
 import net.fabricmc.loom.task.GenerateForgePatchedSourcesTask;
 import net.fabricmc.loom.task.GenerateSourcesTask;
+import net.fabricmc.loom.task.service.MappingsService;
+import net.fabricmc.loom.task.service.SourceRemapperService;
 import net.fabricmc.loom.util.Constants;
 
 public class SingleJarDecompileConfiguration extends DecompileConfiguration<MappedMinecraftProvider> {
 	public SingleJarDecompileConfiguration(Project project, MappedMinecraftProvider minecraftProvider) {
 		super(project, minecraftProvider);
+	}
+
+	private void registerOfficialSources(MinecraftJar minecraftJar) {
+		final var patched = MinecraftPatchedProvider.get(project);
+		final var bundle = patched.registerMavenizerSourcesBundle();
+		final Path runtime = patched.getMinecraftPatchedIntermediateJar();
+		final Path receipt = ForgeMavenizerService.receipt(runtime);
+		final var mappings = extension.getMappingConfiguration();
+		final Path mappingFile = mappings.getMappingsPath(MappingOption.WITH_SRG);
+		final Path output = GenerateSourcesTask.getJarFileWithSuffix("-sources.jar", minecraftJar.getPath()).toPath();
+		final var libraries = project.getConfigurations().getByName(Constants.Configurations.MINECRAFT_COMPILE_LIBRARIES);
+		final var remapper = SourceRemapperService.TYPE.create(project, options -> {
+			options.getMappings().set(MappingsService.createOptions(project, mappingFile, "mojang", "named", true));
+			options.getJavaCompileRelease().set(21);
+			// 只传游戏及 Forge 的库，游戏类由已校验的同批 Mojang JAR 单独提供。
+			options.getClasspath().from(libraries);
+		});
+		final var producer = RemapMinecraftTaskRegistry.claim(project, output, Map.of(
+				"stage", "mavenizer-named-sources-v1", "bundle", bundle.artifact().toString(), "mappings", mappingFile.toString(),
+				"named", minecraftJar.getPath().toString(), "java", "21",
+				"libraries", libraries.getAllDependencies().stream().map(Object::toString).sorted().collect(java.util.stream.Collectors.joining("\n"))
+		), () -> project.getTasks().register(GenerateForgeMavenizerSourcesTask.NAME, GenerateForgeMavenizerSourcesTask.class, task -> {
+			task.setGroup(Constants.TaskGroup.FABRIC);
+			task.setDescription("生成与 Forge 运行时同批的 named 官方源码。");
+			task.getBundle().set(bundle.artifact().toFile());
+			task.getRuntimeSrgJar().set(runtime.toFile());
+			task.getRuntimeReceipt().set(receipt.toFile());
+			task.getNamedJar().set(minecraftJar.toFile());
+			task.getSourceRemapper().set(remapper);
+			task.getOutputJar().set(output.toFile());
+			task.dependsOn(bundle.taskPath());
+			task.dependsOn(extension.getMinecraftJarsCollection(MappingsNamespace.NAMED));
+			mappings.addMappingsProducerDependency(task);
+		}));
+
+		if (project.getTasks().findByName(GenerateForgeMavenizerSourcesTask.NAME) == null) {
+			project.getTasks().register(GenerateForgeMavenizerSourcesTask.NAME, task -> {
+				task.setGroup(Constants.TaskGroup.FABRIC);
+				task.dependsOn(producer.taskPath());
+			});
+		}
 	}
 
 	@Override
@@ -54,6 +103,11 @@ public class SingleJarDecompileConfiguration extends DecompileConfiguration<Mapp
 		assert minecraftJars.size() == 1;
 		final MinecraftJar minecraftJar = minecraftJars.get(0);
 		final String taskBaseName = getTaskName(minecraftJar.getType());
+		final boolean officialSources = MinecraftPatchedProvider.usesMavenizer(extension, extension.getMinecraftProvider());
+
+		if (officialSources) {
+			registerOfficialSources(minecraftJar);
+		}
 
 		LoomGradleExtension.get(project).getDecompilerOptions().forEach(options -> {
 			final String decompilerName = options.getFormattedName();
@@ -61,7 +115,15 @@ public class SingleJarDecompileConfiguration extends DecompileConfiguration<Mapp
 			// Decompiler will be passed to the constructor of GenerateSourcesTask
 			project.getTasks().register(taskName, GenerateSourcesTask.class, options).configure(task -> {
 				task.getInputJarName().set(minecraftJar.getName());
-				task.getSourcesOutputJar().fileValue(GenerateSourcesTask.getJarFileWithSuffix("-sources.jar", minecraftJar.getPath()));
+
+				if (officialSources) {
+					var output = project.getLayout().getBuildDirectory().dir("loom/decompile/" + options.getName());
+					task.getSourcesOutputJar().set(output.map(directory -> directory.file("minecraft-sources.jar")));
+					task.getClassesOutputJar().set(output.map(directory -> directory.file("minecraft-linenumbers.jar")));
+					task.getLineMapOutput().set(output.map(directory -> directory.file("minecraft.linemap.txt")));
+				} else {
+					task.getSourcesOutputJar().fileValue(GenerateSourcesTask.getJarFileWithSuffix("-sources.jar", minecraftJar.getPath()));
+				}
 
 				task.dependsOn(project.getTasks().named("validateAccessWidener"));
 				task.setDescription("Decompile minecraft using %s.".formatted(decompilerName));
@@ -73,11 +135,12 @@ public class SingleJarDecompileConfiguration extends DecompileConfiguration<Mapp
 			task.setDescription("Decompile minecraft using the default decompiler.");
 			task.setGroup(Constants.TaskGroup.FABRIC);
 
-			task.dependsOn(project.getTasks().named("genSourcesWith" + DecompileConfiguration.DEFAULT_DECOMPILER));
+			task.dependsOn(project.getTasks().named(officialSources ? GenerateForgeMavenizerSourcesTask.NAME
+					: "genSourcesWith" + DecompileConfiguration.DEFAULT_DECOMPILER));
 		});
 
 		// TODO: Support for env-only jars?
-		if (extension.isForge() && !extension.isLegacyForge() && extension.getMinecraftJarConfiguration().get() == MinecraftJarConfiguration.MERGED) {
+		if (!officialSources && extension.isForge() && !extension.isLegacyForge() && extension.getMinecraftJarConfiguration().get() == MinecraftJarConfiguration.MERGED) {
 			project.getTasks().register("genForgePatchedSources", GenerateForgePatchedSourcesTask.class, task -> {
 				task.setDescription("Decompile Minecraft using Forge's toolchain.");
 				task.setGroup(Constants.TaskGroup.FABRIC);

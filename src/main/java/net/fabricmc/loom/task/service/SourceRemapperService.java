@@ -127,6 +127,25 @@ public final class SourceRemapperService extends Service<SourceRemapperService.O
 		}
 	}
 
+	/** 使用同批 Mojang 类解析官方源码，所有声明转换成功后才替换目标归档. */
+	public void remapSourcesJarStrict(Path source, Path destination, Path mojangClassesJar) throws IOException {
+		MappingsService mappings = getServiceFactory().get(getOptions().getMappings());
+		var tree = mappings.getMemoryMappingTree();
+
+		if (!"mojang".equals(mappings.getFrom()) || !"named".equals(mappings.getTo())
+				|| tree.getNamespaceId("mojang") < -1 || tree.getNamespaceId("named") < -1) {
+			throw new IOException("Expected mojang -> named mappings, got " + tree.getSrcNamespace() + " -> " + tree.getDstNamespaces());
+		}
+
+		if (Files.isSameFile(source, mojangClassesJar) || (Files.exists(destination) && (Files.isSameFile(source, destination) || Files.isSameFile(mojangClassesJar, destination)))) {
+			throw new IOException("Source archive, classes and output must be distinct");
+		}
+
+		var mercury = createMercury();
+		mercury.getClassPath().addFirst(mojangClassesJar.toRealPath());
+		StrictSourceArchive.remap(source, destination, mercury, tree);
+	}
+
 	private Mercury createMercury() throws IOException {
 		var mercury = new Mercury();
 		mercury.setGracefulClasspathChecks(true);
