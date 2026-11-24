@@ -83,6 +83,11 @@ public class PatchProvider extends DependencyProvider {
 		}
 	}
 
+	/** {@return 已解析的运行时补丁来源；尚未解析时为 null}. */
+	public @Nullable Path getRuntimeInstaller() {
+		return installerJar;
+	}
+
 	public Path extractClientPatches() {
 		if (clientPatches == null) {
 			clientPatches = projectCacheFolder.resolve("patches-client.lzma");
