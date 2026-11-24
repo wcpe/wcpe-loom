@@ -34,6 +34,7 @@ import java.util.function.Consumer;
 
 import dev.architectury.loom.forge.ForgeMemberNameFixer;
 import dev.architectury.loom.forge.InnerClassRemapper;
+import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
 import org.gradle.api.DefaultTask;
 import org.gradle.api.file.ConfigurableFileCollection;
 import org.gradle.api.file.RegularFileProperty;
@@ -133,6 +134,7 @@ public abstract class RemapMinecraftTask extends DefaultTask {
 		// 与 split 形态的 client-only jar（缺 @Environment(CLIENT)）都必须由接线侧显式设为 true，
 		// 理由见各输入的说明。
 		getCopyOnly().convention(false);
+		getBridgeForgeRenamedMethods().convention(false);
 		getInjectClientSidedVisitor().convention(false);
 		getInjectMixinExtension().convention(false);
 	}
@@ -410,6 +412,10 @@ public abstract class RemapMinecraftTask extends DefaultTask {
 	@OutputFile
 	public abstract RegularFileProperty getOutputBackupJar();
 
+	/** 是否在重映射后补回 Forge 1.16.5 特定私有方法的旧名. */
+	@Input
+	public abstract Property<Boolean> getBridgeForgeRenamedMethods();
+
 	@TaskAction
 	public void remap() throws IOException {
 		final Path inputJar = getInputJar().get().getAsFile().toPath();
@@ -432,6 +438,10 @@ public abstract class RemapMinecraftTask extends DefaultTask {
 			}
 
 			remapJar(inputJar, outputJar);
+
+			if (getForgeLike().get() && getBridgeForgeRenamedMethods().get()) {
+				MinecraftPatchedProvider.bridgeRenamedVanillaMethods(outputJar, LOGGER::info);
+			}
 		}
 
 		// 落位顺序与配置期一致：jar → pom → backup。直通模式同样要产出后两者——配置期在该分支下也是
