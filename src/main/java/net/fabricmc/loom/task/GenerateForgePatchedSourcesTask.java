@@ -385,8 +385,18 @@ public abstract class GenerateForgePatchedSourcesTask extends AbstractLoomTask {
 			sourcesService.addForgeSources(null, getOutputJar().get().getAsFile().toPath());
 		} finally {
 			// 中间目录不进构建产物：它们可能装着整份反编译结果（数百 MB），而本任务的产物只有两个 jar
-			deleteDirectory(mcpCache);
-			deleteDirectory(decompilation);
+			// 诊断开关：保留中间目录，便于定位 MCP 链在哪一步失败（默认关闭）。
+			// 除环境变量外也接受 -D 系统属性：Gradle daemon 会复用已有进程，命令行前置的环境变量
+			// 未必进入执行任务的 JVM，而 -D 由 Gradle 显式传递给 daemon，定位问题更可靠。
+			final boolean keepCache = Boolean.parseBoolean(System.getenv("ALLINCORE_DIAG_KEEP_MCP_CACHE"))
+					|| Boolean.parseBoolean(System.getProperty("allincore.diag.keepMcpCache"));
+
+			if (!keepCache) {
+				deleteDirectory(mcpCache);
+				deleteDirectory(decompilation);
+			} else {
+				getLogger().lifecycle(":诊断：保留 MCP 中间目录 {} 与 {}", mcpCache, decompilation);
+			}
 		}
 	}
 
