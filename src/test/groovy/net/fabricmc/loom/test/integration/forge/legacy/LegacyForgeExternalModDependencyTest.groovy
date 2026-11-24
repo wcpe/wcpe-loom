@@ -58,6 +58,23 @@ class LegacyForgeExternalModDependencyTest extends Specification implements Grad
 		version << STANDARD_TEST_VERSIONS
 	}
 
+	def "FG2 launcher keeps both Forge and custom Mixin mappings"() {
+		given:
+		def gradle = gradleProject(project: "forge/legacy/externalModDependency")
+
+		when:
+		def result = gradle.run(task: "generateDLIConfig")
+		def dliConfig = new File(gradle.projectDir.toString(), ".gradle/loom-cache/launch.cfg").text
+		def legacyMappingKey = "net.minecraftforge.gradle.GradleStart.srg.srg-mcp="
+		def legacyMapping = dliConfig.readLines().find { it.trim().startsWith(legacyMappingKey) }
+
+		then:
+		result.task(":generateDLIConfig").outcome == SUCCESS
+		dliConfig.contains("architectury.mixinRemapper.mappingsPath=")
+		legacyMapping != null
+		new File(legacyMapping.trim().substring(legacyMappingKey.length())).isFile()
+	}
+
 	/**
 	 * userdev3 的归一发生在配置期（依赖解析本身就在 afterEvaluate），
 	 * 因此配置缓存必须能完整复用，而不能在后续运行时重新解析或改写。
