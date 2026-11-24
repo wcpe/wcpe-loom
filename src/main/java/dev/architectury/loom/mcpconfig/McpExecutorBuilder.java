@@ -227,6 +227,10 @@ public final class McpExecutorBuilder {
 		return cache.resolve("downloads").resolve(Checksum.of(url).sha256().hex(24));
 	}
 
+	private Path userCache() {
+		return LoomGradleExtension.get(project).getFiles().getUserCache().toPath();
+	}
+
 	/**
 	 * Enqueues a step and its dependencies to be executed.
 	 *
@@ -310,12 +314,8 @@ public final class McpExecutorBuilder {
 		case "downloadServer" -> ConstantLogic.createOptions(setupContext, () -> minecraftProvider.getMinecraftServerJar().toPath());
 		case "strip" -> StripLogic.createOptions(setupContext);
 		case "listLibraries" -> ListLibrariesLogic.createOptions(setupContext);
-		case "downloadClientMappings" -> DownloadManifestFileLogic.createOptions(setupContext,
-				Objects.requireNonNull(minecraftProvider.getVersionInfo().download("client_mappings"),
-						"client_mappings download is not available for this Minecraft version"));
-		case "downloadServerMappings" -> DownloadManifestFileLogic.createOptions(setupContext,
-				Objects.requireNonNull(minecraftProvider.getVersionInfo().download("server_mappings"),
-						"server_mappings download is not available for this Minecraft version"));
+		case "downloadClientMappings" -> officialMappings("client");
+		case "downloadServerMappings" -> officialMappings("server");
 		case "inject" -> InjectLogic.createOptions(setupContext);
 		case "patch" -> PatchLogic.createOptions(setupContext);
 		default -> {
@@ -326,6 +326,14 @@ public final class McpExecutorBuilder {
 			throw new UnsupportedOperationException("MCP config step type: " + type);
 		}
 		};
+	}
+
+	private Provider<DownloadManifestFileLogic.Options> officialMappings(String side) {
+		final String key = side + "_mappings";
+		return DownloadManifestFileLogic.createOptions(setupContext,
+				Objects.requireNonNull(minecraftProvider.getVersionInfo().download(key),
+						key + " download is not available for this Minecraft version"),
+				userCache().resolve(minecraftProvider.minecraftVersion()), side);
 	}
 
 	private class SetupContextImpl implements StepLogic.SetupContext {
