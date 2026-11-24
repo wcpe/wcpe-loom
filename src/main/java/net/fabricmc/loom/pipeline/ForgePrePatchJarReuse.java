@@ -28,7 +28,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -52,7 +51,7 @@ import net.fabricmc.loom.util.cache.JarReusability;
  * {@code extractServer} 实测 3~4 分钟），于是「产物明明就在盘上、内容也对」时仍会重跑十几分钟。
  *
  * <p>本类就是那条 action 的前置判据：产物存在、可作为 jar 打开、且<b>产出它的输入与本次输入逐项相同</b>时
- * 直接返回。判据纯读（stat + 小文件的内容摘要），不打开、不解压、不改写产物。
+ * 直接返回。判据只读取文件字节并检查产物的 jar 结构，不解压条目、不改写任何文件。
  *
  * <h2>身份从哪来：旁车文件</h2>
  *
@@ -83,26 +82,22 @@ import net.fabricmc.loom.util.cache.JarReusability;
  * 判据落回「照常执行」。同理，换 MC 版本、改 side、切 NeoForge、换 MCPConfig（步进集合或工具版本变了）都会
  * 使键失效。
  *
- * <p>反方向（漏判导致不该跳过时跳过）只有一个入口：某件输入<b>内容变了但 stat 与摘要都没变</b>。大文件
- * （vanilla jar、srg 映射）取「大小 + 最后修改时间」，小文件（{@code config.json} 这类决定步进集合与工具版本的
- * 清单）取内容摘要。这条取舍的依据与 {@code SpecStore.inputIdentity} 同源：链上的输入一律由下载器或
- * 原子落位写入，不会出现「大小与时间不变而内容改变」；而每次构建真去哈希 25~50MB 的 vanilla jar，等于把
- * 「便宜」这个前提丢掉。
+ * <p>所有输入均按文件字节流计算完整 SHA-256，不使用大小或修改时间代替摘要。仅修改文件时间不会让键失效；
+ * 反过来，即使大小和修改时间未变，换入不同内容也不会命中。
  *
  * <h2>产物自身也被钉住</h2>
  *
- * <p>旁车同时记下写入那一刻产物的大小与修改时间。产物后来被别的进程（另一个 loom 版本、另一棵工作树）
- * 改写时两者不符，本判据判「不可复用」并照常执行——这是唯一会让复用失效的常见情形，代价是多跑一次链，
- * 换来的是一直站在「宁可重跑」这一侧。
+ * <p>旁车同时记下产物的完整 SHA-256。即使产物仍能作为 jar 打开，字节摘要不符也不会复用。
  */
 public final class ForgePrePatchJarReuse {
 	/**
 	 * 判据的格式版本.
 	 *
-	 * <p>键的组成、旁车语义或「产品是否同代」的口径一旦变化就递增它：旧旁车随即全部失效并自动重跑一次，
-	 * 无需人工清理共享缓存目录。
+	 * <p>v1 只记大文件的大小与修改时间，无法证明历史字节。旧版不迁写；仅当该产物被请求并成功重建后，才记录 v2。
+	 * 无需人工清理共享缓存目录，未参与本次构建的产物及旁车不受影响。
 	 */
-	public static final String FORMAT = "loom-forge-pre-patch-jar-v1";
+	public static final String FORMAT = "loom-forge-pre-patch-jar-v2";
+	private static final String KEY_PREFIX = FORMAT + '|';
 
 	/** 旁车所在目录名（产物同目录下的隐藏子目录，避免与产物文件名相撞）. */
 	private static final String SIDECAR_DIRECTORY = ".identity";
@@ -116,9 +111,6 @@ public final class ForgePrePatchJarReuse {
 	 * <p>这类键既不会被比较通过，也不会被写进旁车：输入读不到时「相同」无从谈起，此时唯一正确的动作是照常执行。
 	 */
 	private static final String INCOMPLETE_MARKER = "|incomplete";
-
-	/** 指纹取内容摘要的大小上限（超过则退化为大小 + 修改时间）.*/
-	private static final long HASH_MAX_BYTES = 1024L * 1024L;
 
 	/** 文件不可读时的指纹取值；它同时会让整条键带上 {@code incomplete} 标记. */
 	private static final String MISSING = "missing";
@@ -152,7 +144,7 @@ public final class ForgePrePatchJarReuse {
 
 		sorted.sort(Comparator.comparing(Path::toString));
 
-		final StringBuilder key = new StringBuilder(FORMAT).append('|').append(identity);
+		final StringBuilder key = new StringBuilder(KEY_PREFIX).append(identity);
 		boolean complete = true;
 
 		for (Path input : sorted) {
@@ -198,29 +190,29 @@ public final class ForgePrePatchJarReuse {
 		}
 
 		final Path sidecar = sidecar(output);
-		final String recorded = readSidecar(sidecar, output, logger);
+		final List<String> recorded = readSidecar(sidecar, logger);
 
 		if (recorded == null) {
 			logger.lifecycle("pre-patch jar 已存在但还没有身份旁车，本轮执行整条 MCP 链并记录身份：{}", output);
 			return false;
 		}
 
-		if (!recorded.startsWith(KEY_FIELD)) {
-			logger.lifecycle("pre-patch jar 的身份旁车格式不符（{}），本轮执行整条 MCP 链：{}", sidecar, output);
+		final String recordedKey = readField(recorded, KEY_FIELD);
+
+		if (recordedKey == null || !recordedKey.startsWith(KEY_PREFIX)) {
+			logger.lifecycle("pre-patch jar 的身份旁车不是当前格式 {}（{}），本轮执行整条 MCP 链：{}", FORMAT, sidecar, output);
 			return false;
 		}
-
-		final String recordedKey = recorded.substring(KEY_FIELD.length());
 
 		if (!recordedKey.equals(expectedKey)) {
 			logger.lifecycle("pre-patch jar 的产出输入与本次不同（身份不符），本轮重新执行整条 MCP 链：{}", output);
 			return false;
 		}
 
-		final String recordedProduct = readProductField(sidecar);
+		final String recordedProduct = readField(recorded, PRODUCT_FIELD);
 		final String product = fingerprintOf(output.toAbsolutePath().normalize());
 
-		if (recordedProduct == null || !recordedProduct.equals(product)) {
+		if (MISSING.equals(product) || recordedProduct == null || !recordedProduct.equals(product)) {
 			// 产物在旁车写入之后被别的进程改写：内容不可信，宁可重跑
 			logger.lifecycle("pre-patch jar 在身份记录之后被改写（{} vs {}），本轮重新执行整条 MCP 链：{}",
 					recordedProduct, product, output);
@@ -273,74 +265,52 @@ public final class ForgePrePatchJarReuse {
 	}
 
 	/**
-	 * 单件输入的指纹.
+	 * 按字节流计算输入或产物的完整 SHA-256.
 	 *
-	 * <p>小文件取内容摘要（{@code config.json} 只有几 KB，而它决定整条链跑哪些步、用哪个工具版本，精确性在这里
-	 * 最值钱）；大文件取「大小 + 最后修改时间」（vanilla jar 25~50MB，逐次哈希等于把便宜判据变成昂贵判据，
-	 * 而这些文件一律由下载器或原子落位写入，见类注释）。
-	 *
-	 * @param file 输入文件（调用方已归一化）
-	 * @return 指纹；读不到时为 {@link #MISSING}
+	 * @param file 输入或产物文件（调用方已归一化）
+	 * @return 指纹；不是常规文件或读不到时为 {@link #MISSING}
 	 */
 	private static String fingerprintOf(Path file) {
 		try {
-			final BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
-
-			if (!attrs.isRegularFile()) {
+			if (!Files.isRegularFile(file)) {
 				return MISSING;
 			}
 
-			if (attrs.size() <= HASH_MAX_BYTES) {
-				return attrs.size() + "-sha256:" + Checksum.of(file).sha256().hex(16);
-			}
-
-			return attrs.size() + "-mtime:" + attrs.lastModifiedTime().toMillis();
-		} catch (IOException | RuntimeException e) {
-			// 读不到元数据、或摘要计算失败：当作「不可判定」⇒ 键带 incomplete 标记 ⇒ 照常执行
+			return "sha256:" + Checksum.of(file).sha256().hex();
+		} catch (RuntimeException e) {
+			// 摘要计算失败（含读取时的 UncheckedIOException）：当作不可判定，不能复用
 			return MISSING;
 		}
 	}
 
 	/**
-	 * 读旁车里的键行.
+	 * 一次读完旁车，避免并发替换时从不同旁车各取一个字段.
 	 *
 	 * @param sidecar 旁车文件
-	 * @param output 产物（仅用于日志）
 	 * @param logger 日志出口
-	 * @return 键行原文（以 {@code key=} 开头）；旁车缺失或不可读时为 {@code null}
+	 * @return 旁车原文；缺失或不可读时为 {@code null}
 	 */
-	private static String readSidecar(Path sidecar, Path output, Logger logger) {
+	private static List<String> readSidecar(Path sidecar, Logger logger) {
 		if (!Files.isRegularFile(sidecar)) {
 			return null;
 		}
 
 		try {
-			for (String line : Files.readAllLines(sidecar, StandardCharsets.UTF_8)) {
-				if (line.startsWith(KEY_FIELD)) {
-					return line;
-				}
-			}
-
-			return "";
+			return Files.readAllLines(sidecar, StandardCharsets.UTF_8);
 		} catch (IOException e) {
-			// 读不动就按「没有旁车」处理：方向安全，且不值得打断构建
 			logger.info("读取 pre-patch jar 的身份旁车失败（按不可复用处理）：{}", sidecar, e);
 			return null;
 		}
 	}
 
-	/** {@return 旁车里记录的产物指纹；缺失时为 {@code null}} */
-	private static String readProductField(Path sidecar) {
-		try {
-			for (String line : Files.readAllLines(sidecar, StandardCharsets.UTF_8)) {
-				if (line.startsWith(PRODUCT_FIELD)) {
-					return line.substring(PRODUCT_FIELD.length());
-				}
+	/** {@return 旁车字段的值；缺失时为 {@code null}}. */
+	private static String readField(List<String> recorded, String field) {
+		for (String line : recorded) {
+			if (line.startsWith(field)) {
+				return line.substring(field.length());
 			}
-
-			return null;
-		} catch (IOException e) {
-			return null;
 		}
+
+		return null;
 	}
 }
