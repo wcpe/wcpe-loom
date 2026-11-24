@@ -65,6 +65,8 @@ public abstract class StepLogic<O extends Service.Options> extends Service<O> {
 		Path mappings();
 		String resolve(ConfigValue value);
 		DownloadBuilder downloadBuilder(String url);
+		boolean offline();
+		boolean refreshDownloads();
 		void javaexec(Action<? super ForgeToolExecutor.Settings> configurator);
 
 		/**

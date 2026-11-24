@@ -253,6 +253,16 @@ public final class McpExecutor extends Service<McpExecutor.Options> {
 		}
 
 		@Override
+		public boolean offline() {
+			return getOptions().getOffline().get();
+		}
+
+		@Override
+		public boolean refreshDownloads() {
+			return getOptions().getManualRefreshDeps().get();
+		}
+
+		@Override
 		public DownloadBuilder downloadBuilder(String url) {
 			DownloadBuilder builder;
 
