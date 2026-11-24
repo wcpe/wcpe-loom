@@ -41,15 +41,23 @@ public interface MappingsMigrator {
 	 * @param cache 迁移器缓存所在目录（与 {@code ForgeProvider.getForgeCache} 同一个）
 	 * @param rawMappings 迁移前、已按命名空间合并好的映射树
 	 * @param patchedIntermediateJar 打补丁后的中间 Minecraft jar（缓存未命中时才读）
-	 * @param forgeJar Forge 的 universal jar（继承关系来源之一）
-	 * @param userdevJar Forge 的 userdev jar（同上）
+	 * @param inheritanceJars 实际参与继承扫描的有序输入，完整重编译路线仅有 patchedIntermediateJar
 	 * @param hasSrg 本配置是否生成 srg 命名空间的映射
 	 * @param hasMojang 本配置是否生成 mojang 命名空间的映射
 	 * @param refreshDeps 是否显式要求刷新（刷新时一律走重建分支、忽略缓存）
 	 * @param info 日志出口：配置期路径传项目 logger，执行期任务传任务自己的 logger
 	 */
-	record Inputs(Path cache, Path rawMappings, Path patchedIntermediateJar, Path forgeJar, Path userdevJar,
+	record Inputs(Path cache, Path rawMappings, Path patchedIntermediateJar, List<Path> inheritanceJars,
 			boolean hasSrg, boolean hasMojang, boolean refreshDeps, Consumer<String> info) {
+		public Inputs {
+			inheritanceJars = List.copyOf(inheritanceJars);
+		}
+
+		public Inputs(Path cache, Path rawMappings, Path patchedIntermediateJar, Path forgeJar, Path userdevJar,
+				boolean hasSrg, boolean hasMojang, boolean refreshDeps, Consumer<String> info) {
+			this(cache, rawMappings, patchedIntermediateJar, List.of(patchedIntermediateJar, forgeJar, userdevJar),
+					hasSrg, hasMojang, refreshDeps, info);
+		}
 	}
 
 	/**

@@ -418,15 +418,15 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
 			return extension.getMinecraftProvider().minecraftVersion();
 		}
 
-final String version = "%s-%s".formatted(extension.getMinecraftProvider().minecraftVersion(), extension.getMappingConfiguration().mappingsIdentifier());
+		final String version = "%s-%s".formatted(extension.getMinecraftProvider().minecraftVersion(), extension.getMappingConfiguration().mappingsIdentifier());
 
-// 两项修复影响不同的输入产物，各自隔离旧缓存。
-return version + (extension.isLegacyForge() ? "-legacy-members-v2" : "")
-		+ (bridgeForgeRenamedMethods() ? "-forge-method-bridge-v1" : "");
-}
+		// 两项修复影响不同的输入产物，各自隔离旧缓存。
+		return version + (extension.isLegacyForge() ? "-legacy-members-v2" : "")
+				+ (bridgeForgeRenamedMethods() ? "-forge-method-bridge-v1" : "");
+	}
 
-private boolean bridgeForgeRenamedMethods() {
-return extension.isForge() && !extension.disableObfuscation() && "1.16.5".equals(minecraftProvider.minecraftVersion());
+	private boolean bridgeForgeRenamedMethods() {
+		return extension.isForge() && !extension.disableObfuscation() && "1.16.5".equals(minecraftProvider.minecraftVersion());
 	}
 
 	protected String getDependencyNotation(MinecraftJar.Type type) {
@@ -685,7 +685,7 @@ return extension.isForge() && !extension.disableObfuscation() && "1.16.5".equals
 	private List<Path> remapClasspath(RemappedJars remappedJars) {
 		final List<Path> classpath = new ArrayList<>(List.of(remappedJars.remapClasspath()));
 
-		if (extension.isForgeLike()) {
+		if (extension.isForgeLike() && !MinecraftPatchedProvider.usesMavenizer(extension, minecraftProvider)) {
 			final Path forgeJar = extension.getForgeUniversalProvider().getForge().toPath();
 
 			if (Files.isRegularFile(forgeJar) && !classpath.contains(forgeJar)) {
@@ -922,6 +922,12 @@ return extension.isForge() && !extension.disableObfuscation() && "1.16.5".equals
 		final boolean bridgeForgeRenamedMethods = bridgeForgeRenamedMethods();
 		identity.put("bridgeForgeRenamedMethods", Boolean.toString(bridgeForgeRenamedMethods));
 		identity.put("forgeLike", Boolean.toString(extension.isForgeLike()));
+		final boolean completeForgeInput = MinecraftPatchedProvider.usesMavenizer(extension, minecraftProvider);
+
+		if (completeForgeInput) {
+			identity.put("forgeProducer", MinecraftPatchedProvider.MAVENIZER_GENERATION);
+		}
+
 		identity.put("validateTargetNamespace", Boolean.toString(validateTargetNamespace));
 		// innerClassNames 没有指纹项：它不再是配置期读出来的值，而是 (inputJar, forgeLike) 的纯函数，
 		// 由 RemapMinecraftTask 在执行期现算（见 resolveInnerClassNames）。这两个判据都已经在上面
@@ -1000,6 +1006,7 @@ return extension.isForge() && !extension.disableObfuscation() && "1.16.5".equals
 					task.getFixRecords().set(fixRecords);
 					task.getBridgeForgeRenamedMethods().set(bridgeForgeRenamedMethods);
 					task.getForgeLike().set(extension.isForgeLike());
+					task.getCompleteForgeInput().set(completeForgeInput);
 
 					// named 参考 jar 可能尚未落盘；冷缓存也必须由任务图保证它先产出。
 					if (forgeReferenceJars != null) {

@@ -49,6 +49,7 @@ import java.util.zip.ZipFile;
 
 import dev.architectury.loom.forge.ForgeMigratedMappingConfiguration;
 import dev.architectury.loom.forge.dependency.SrgProvider;
+import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
 import dev.architectury.loom.mappings.ForgeMappingsMerger;
 import dev.architectury.loom.mappings.MCPReader;
 import dev.architectury.loom.mappings.MappingOption;
@@ -142,7 +143,7 @@ public class MappingConfiguration {
 				minecraftProvider.minecraftVersion(),
 				Boolean.toString(extension.getUseIntermediateMappings().get()),
 				Boolean.toString(extension.disableObfuscation()),
-				forgeVersion);
+				forgeVersion + MinecraftPatchedProvider.mappingGenerationSuffix(extension, minecraftProvider));
 		return Checksum.of(rawKey).sha256().hex();
 	}
 
@@ -238,7 +239,8 @@ public class MappingConfiguration {
 		String mappingsIdentifier;
 
 		if (extension.isForgeLike()) {
-			mappingsIdentifier = createForgeMappingsIdentifier(extension, mappingsName, version, getMappingsClassifier(dependency, jarInfo.v2()), minecraftProvider.minecraftVersion());
+			mappingsIdentifier = createForgeMappingsIdentifier(extension, mappingsName, version, getMappingsClassifier(dependency, jarInfo.v2()), minecraftProvider.minecraftVersion())
+					+ MinecraftPatchedProvider.mappingGenerationSuffix(extension, minecraftProvider);
 		} else {
 			mappingsIdentifier = createMappingsIdentifier(mappingsName, version, getMappingsClassifier(dependency, jarInfo.v2()), minecraftProvider.minecraftVersion());
 		}

@@ -70,6 +70,7 @@ import dev.architectury.loom.forge.dependency.ForgeProvider;
 import dev.architectury.loom.forge.dependency.ForgeUserdevProvider;
 import dev.architectury.loom.forge.dependency.PatchProvider;
 import dev.architectury.loom.forge.tool.ForgeExternalToolService;
+import dev.architectury.loom.forge.tool.ForgeMavenizerService;
 import dev.architectury.loom.mappings.MappingOption;
 import dev.architectury.loom.mcpconfig.McpConfigProvider;
 import dev.architectury.loom.mcpconfig.McpExecutor;
@@ -109,9 +110,11 @@ import net.fabricmc.loom.configuration.providers.mappings.TinyMappingsService;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
 import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
 import net.fabricmc.loom.pipeline.AccessTransformForgeJarTask;
+import net.fabricmc.loom.pipeline.GenerateForgeMavenizerJarTask;
 import net.fabricmc.loom.pipeline.GenerateForgePatchedIntermediateJarTask;
 import net.fabricmc.loom.pipeline.GenerateForgePatchedJarTask;
 import net.fabricmc.loom.pipeline.GenerateForgePrePatchJarTask;
+import net.fabricmc.loom.pipeline.PrepareForgeMavenizerSourcesTask;
 import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
 import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry.Producer;
 import net.fabricmc.loom.util.Check;
@@ -207,9 +210,76 @@ public class MinecraftPatchedProvider {
 		return LoomGradleExtension.get(project);
 	}
 
+	public static final String MAVENIZER_GENERATION = "mavenizer-v1";
+	private static final String MAVENIZER_MCP = "1.21.11-20251223.124241";
+
+	/** 下游按生产策略分流，不根据文件名猜测字节码来源. */
+	public boolean usesMavenizer() {
+		return usesMavenizer(getExtension(), type, minecraftProvider.minecraftVersion());
+	}
+
+	private static boolean usesMavenizer(LoomGradleExtension extension, Type type, String mcVersion) {
+		return type == Type.MERGED && "1.21.11".equals(mcVersion) && extension.isForge()
+				&& !extension.isLegacyForge() && !extension.disableObfuscation() && !extension.isUnobfuscatedForge()
+				&& "1.21.11-61.2.5".equals(extension.getForgeProvider().getVersion().getCombined());
+	}
+
+	public static boolean usesMavenizer(LoomGradleExtension extension, MinecraftProvider minecraft) {
+		return minecraft instanceof MergedForgeMinecraftProvider && usesMavenizer(extension, Type.MERGED, minecraft.minecraftVersion());
+	}
+
+	public static String mappingGenerationSuffix(LoomGradleExtension extension, MinecraftProvider minecraft) {
+		return usesMavenizer(extension, minecraft) ? "-" + MAVENIZER_GENERATION : "";
+	}
+
+	public Path productionCacheDirectory() {
+		Path base = ForgeProvider.getForgeCache(project);
+		return usesMavenizer() ? base.resolve(MAVENIZER_GENERATION) : base;
+	}
+
+	private String mavenizerMcpVersion() {
+		String mcp = getExtension().getForgeUserdevProvider().getConfig().mcp();
+
+		if (!("de.oceanlabs.mcp:mcp_config:" + MAVENIZER_MCP + "@zip").equals(mcp)) {
+			throw new IllegalStateException("Forge 官方源码重编译未验证此 MCP 坐标：" + mcp);
+		}
+
+		return MAVENIZER_MCP;
+	}
+
+	private Provider<ForgeMavenizerService.Options> mavenizerOptions() {
+		return ForgeMavenizerService.createOptions(project, getExtension().getForgeProvider().getVersion().getCombined(),
+				minecraftProvider.minecraftVersion(), mavenizerMcpVersion(), productionCacheDirectory().resolve("tool"));
+	}
+
+	/** 声明同一批次的源码原料；只由源码任务消费，不参与游戏构建或启动. */
+	public Producer registerMavenizerSourcesBundle() {
+		if (!usesMavenizer()) {
+			throw new IllegalStateException("当前 Forge 产物不是 Mavenizer 源码重编译产物");
+		}
+
+		final Path runtime = getMinecraftPatchedIntermediateJar();
+		final Path receipt = ForgeMavenizerService.receipt(runtime);
+		final Path bundle = productionCacheDirectory().resolve("mavenizer-sources-v1.zip");
+		final var identity = Map.of(
+				"stage", "mavenizer-sources-v1", "runtime", runtime.toString(), "mcp", mavenizerMcpVersion());
+
+		return RemapMinecraftTaskRegistry.claim(project, bundle, identity, () -> {
+			return project.getTasks().register(PrepareForgeMavenizerSourcesTask.NAME, PrepareForgeMavenizerSourcesTask.class, task -> {
+				task.setGroup(Constants.TaskGroup.FABRIC);
+				task.getMavenizer().set(mavenizerOptions());
+				task.getRuntimeSrgJar().set(runtime.toFile());
+				task.getRuntimeReceipt().set(receipt.toFile());
+				task.getOutputBundle().set(bundle.toFile());
+				// 收据与运行时同属一个生产任务；配置期回退时两件均已落盘。
+				minecraftProvider.addProducerDependency(task, runtime);
+			});
+		});
+	}
+
 	private void initPatchedFiles() {
 		String forgeVersion = getExtension().getForgeProvider().getVersion().getCombined();
-		Path forgeWorkingDir = ForgeProvider.getForgeCache(project);
+		Path forgeWorkingDir = productionCacheDirectory();
 		// Note: strings used instead of platform id since FML requires one of these exact strings
 		// depending on the loader to recognise Minecraft.
 		String patchId = (getExtension().isNeoForge() ? "neoforge" : "forge") + "-" + forgeVersion + "-";
@@ -222,7 +292,7 @@ public class MinecraftPatchedProvider {
 		intermediateNamespace = intermediateId;
 		minecraftIntermediateJar = forgeWorkingDir.resolve("minecraft-" + type.id + "-" + intermediateId + ".jar");
 		minecraftPatchedIntermediateJar = forgeWorkingDir.resolve("minecraft-" + type.id + "-" + intermediateId + "-patched.jar");
-		minecraftPatchedIntermediateAtJar = forgeWorkingDir.resolve("minecraft-" + type.id + "-" + intermediateId + "-at-patched.jar");
+		minecraftPatchedIntermediateAtJar = usesMavenizer() ? minecraftPatchedIntermediateJar : forgeWorkingDir.resolve("minecraft-" + type.id + "-" + intermediateId + "-at-patched.jar");
 		minecraftPatchedJar = forgeWorkingDir.resolve("minecraft-" + type.id + "-patched.jar");
 		minecraftClientExtra = forgeWorkingDir.resolve("client-extra.jar");
 	}
@@ -235,6 +305,10 @@ public class MinecraftPatchedProvider {
 	 * 把它计入判定会让 {@link #needsWork()} 恒为真、每次构建都白取一次跨进程锁。
 	 */
 	protected Path[] getGlobalCaches() {
+		if (usesMavenizer()) {
+			return new Path[] { minecraftPatchedIntermediateJar, minecraftPatchedJar, minecraftClientExtra };
+		}
+
 		List<Path> files = new ArrayList<>(Arrays.asList(
 				minecraftIntermediateJar,
 				minecraftPatchedIntermediateJar,
@@ -321,6 +395,10 @@ public class MinecraftPatchedProvider {
 
 		logger.lifecycle("Forge 的 patched 中间产物保持配置期生产：{}", blocker);
 
+		if (usesMavenizer()) {
+			prePatchJarProducer = registerPrePatchTask();
+		}
+
 		// 无锁快路径：产物齐备且补丁版本最新时，本次仅做内存配置，不触碰共享缓存，不取锁
 		if (!needsWork()) {
 			this.dirty = false;
@@ -377,11 +455,9 @@ public class MinecraftPatchedProvider {
 	 * <p>同一产物路径在本构建内只能有一个生产者，因此逐产物走
 	 * {@link RemapMinecraftTaskRegistry#claim}：同一构建内两个配置相同的子项目不会各自建一个任务写同一个文件。
 	 */
-	private void registerPatchedChainTasks() {
+	private Producer registerPrePatchTask() {
 		final var extension = getExtension();
 		final Path prePatchJar = minecraftIntermediateJar.toAbsolutePath().normalize();
-		final Path patchedIntermediate = minecraftPatchedIntermediateJar.toAbsolutePath().normalize();
-		final Path atPatched = minecraftPatchedIntermediateAtJar.toAbsolutePath().normalize();
 
 		// 分支判据与配置期 createPrePatchJar 逐字一致
 		final boolean installerTools = shouldUseNeoForgeInstallerToolsToCreatePrePatchJar();
@@ -394,7 +470,7 @@ public class MinecraftPatchedProvider {
 		final Path mcpWorkDir = project.getLayout().getBuildDirectory()
 				.dir("tmp/" + GenerateForgePrePatchJarTask.NAME + "/" + type.id).get().getAsFile().toPath();
 
-		final Producer prePatchProducer = RemapMinecraftTaskRegistry.claim(project, prePatchJar, Map.of(
+		return RemapMinecraftTaskRegistry.claim(project, prePatchJar, Map.of(
 				"stage", "forge-pre-patch-jar",
 				"mcVersion", extension.getMinecraftProvider().minecraftVersion(),
 				"forgeVersion", extension.getForgeProvider().getVersion().getCombined(),
@@ -438,6 +514,28 @@ public class MinecraftPatchedProvider {
 			// 本任务的输入是 vanilla jar（两条分支都读它，见 wireVanillaJarDependencies）
 			wireVanillaJarDependencies(task);
 		}));
+	}
+
+	private void registerPatchedChainTasks() {
+		final var extension = getExtension();
+		final Path prePatchJar = minecraftIntermediateJar.toAbsolutePath().normalize();
+		final Path patchedIntermediate = minecraftPatchedIntermediateJar.toAbsolutePath().normalize();
+		final Path atPatched = minecraftPatchedIntermediateAtJar.toAbsolutePath().normalize();
+		final Producer prePatchProducer = registerPrePatchTask();
+		this.prePatchJarProducer = prePatchProducer;
+
+		if (usesMavenizer()) {
+			final Producer producer = RemapMinecraftTaskRegistry.claim(project, patchedIntermediate, Map.of(
+					"stage", MAVENIZER_GENERATION, "mcp", MAVENIZER_MCP, "forge", extension.getForgeProvider().getVersion().getCombined()
+			), () -> project.getTasks().register(GenerateForgeMavenizerJarTask.NAME, GenerateForgeMavenizerJarTask.class, task -> {
+				task.setGroup(Constants.TaskGroup.FABRIC);
+				task.getMavenizer().set(mavenizerOptions());
+				task.getOutputJar().set(patchedIntermediate.toFile());
+			}));
+			minecraftProvider.registerTaskProducedArtifact(patchedIntermediate, producer);
+			logger.lifecycle("Forge 的完整 SRG 产物由官方源码重编译任务承担：{}", producer.taskPath());
+			return;
+		}
 
 		final Path runtimeInstaller = runtimeInstaller();
 		final Producer patchedProducer = RemapMinecraftTaskRegistry.claim(project, patchedIntermediate, Map.of(
@@ -524,7 +622,6 @@ public class MinecraftPatchedProvider {
 		// 中间产物的产出方同样要登记：mappings 迁移任务把它声明成 @InputFile（迁移器缓存未命中时读它），
 		// 只按路径声明输入不会带任务依赖，Gradle 的隐式依赖校验会直接拒绝构建
 		minecraftProvider.registerTaskProducedArtifact(patchedIntermediate, patchedProducer);
-		this.prePatchJarProducer = prePatchProducer;
 
 		logger.lifecycle("Forge 的 patched 三级产物由执行期任务承担：{}",
 				List.of(prePatchProducer.taskPath(), patchedProducer.taskPath(), atPatchedProducer.taskPath()));
@@ -658,7 +755,7 @@ public class MinecraftPatchedProvider {
 	 */
 	private boolean needsWork() {
 		// 无锁读路径：除存在性外还要拒绝空 zip／截断文件等半成品（其它进程可能正在就地重建共享缓存）
-		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(jar -> !isReusableJar(jar))) {
+		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(jar -> !isReusableProductionJar(jar))) {
 			return true;
 		}
 
@@ -669,11 +766,30 @@ public class MinecraftPatchedProvider {
 		}
 	}
 
+	private boolean isReusableProductionJar(Path jar) {
+		if (jar.equals(minecraftPatchedIntermediateJar) && usesMavenizer()) {
+			return ForgeMavenizerService.isReusable(jar, getExtension().getForgeProvider().getVersion().getCombined(),
+					minecraftProvider.minecraftVersion(), mavenizerMcpVersion());
+		}
+
+		return isReusableJar(jar);
+	}
+
 	private Void providePatched() throws Exception {
 		// 锁内二次确认：等锁期间其它进程可能已完成生产。本方法不删除任何共享产物，
 		// 「整链重建」由 checkCache 的返回值表达，缺失或损坏的产物则由下面的可复用性判定按件补齐
 		final boolean forceRebuild = checkCache();
 		this.dirty = forceRebuild;
+
+		if (usesMavenizer()) {
+			if (getExtension().refreshDeps() || !isReusableProductionJar(minecraftPatchedIntermediateJar)) {
+				produceMavenizerJar();
+				this.dirty = true;
+			}
+
+			this.dirty |= !isReusableJar(minecraftClientExtra);
+			return null;
+		}
 
 		if (forceRebuild || !isReusableJar(minecraftIntermediateJar)) {
 			this.dirty = true;
@@ -722,7 +838,7 @@ public class MinecraftPatchedProvider {
 	public Path getOrProduceMinecraftPatchedIntermediateJar() {
 		final Path jar = getMinecraftPatchedIntermediateJar();
 
-		if (isReusableJar(jar)) {
+		if (isReusableProductionJar(jar)) {
 			return jar;
 		}
 
@@ -739,7 +855,7 @@ public class MinecraftPatchedProvider {
 		// 补齐后必须再校验一次：仍然不可复用说明该产物这次没能被完整生产出来
 		// （例如锁内判定把它当作可复用而跳过重建，或被外部进程在补齐后再次写坏）。
 		// 这里抛异常而不是返回坏路径：坏路径会让下游把「读不出内容」当成「没有内容」，静默产出错误映射
-		if (!isReusableJar(jar)) {
+		if (!isReusableProductionJar(jar)) {
 			throw new UncheckedIOException(new IOException(
 					"补齐后共享缓存中的 patched 中间产物仍不可复用（无法作为 zip/jar 打开，或没有任何条目）: " + jar));
 		}
@@ -761,7 +877,18 @@ public class MinecraftPatchedProvider {
 	 * 而不是把不存在的路径交给迁移器去读。
 	 */
 	protected void produceIntermediateJarIfMissing() throws Exception {
-		provide();
+		if (usesMavenizer()) {
+			produceMavenizerJar();
+		} else {
+			provide();
+		}
+	}
+
+	private void produceMavenizerJar() throws IOException {
+		try (var factory = new ScopedServiceFactory()) {
+			final ForgeMavenizerService mavenizer = factory.get(mavenizerOptions());
+			mavenizer.produce(minecraftPatchedIntermediateJar);
+		}
 	}
 
 	/**
@@ -861,8 +988,12 @@ public class MinecraftPatchedProvider {
 			task.setDescription("Produces the patched Minecraft jar for %s".formatted(
 					extension.getMinecraftProvider().minecraftVersion()));
 			task.getAtPatchedJar().set(minecraftPatchedIntermediateAtJar.toFile());
-			task.getForgeJar().set(getForgeJar());
-			task.getForgeUserdevJar().set(getForgeUserdevJar());
+			task.getCompleteForgeInput().set(usesMavenizer());
+
+			if (!usesMavenizer()) {
+				task.getForgeJar().set(getForgeJar());
+				task.getForgeUserdevJar().set(getForgeUserdevJar());
+			}
 
 			if (mappingsOptions != null) {
 				task.getMappingsServiceOptions().set(mappingsOptions);
@@ -956,8 +1087,8 @@ public class MinecraftPatchedProvider {
 	 */
 	public record ProductionOptions(
 			Path atPatchedJar,
-			Path forgeJar,
-			Path forgeUserdevJar,
+			@Nullable Path forgeJar,
+			@Nullable Path forgeUserdevJar,
 			@Nullable Path clientJar,
 			@Nullable Path serverJar,
 			@Nullable MemoryMappingTree mappings,
@@ -970,6 +1101,15 @@ public class MinecraftPatchedProvider {
 			String remapNamespace,
 			String coreModNamespace,
 			String distAttribute) {
+		public ProductionOptions {
+			if ((forgeJar == null) != (forgeUserdevJar == null) || forgeJar == null && (!forge || unobfuscatedForge)) {
+				throw new IllegalArgumentException("最终重映射需要完整 Forge 输入，或成对提供 universal 和 userdev");
+			}
+		}
+
+		public boolean completeForgeInput() {
+			return forgeJar == null;
+		}
 	}
 
 	/**
@@ -987,8 +1127,8 @@ public class MinecraftPatchedProvider {
 
 		return new ProductionOptions(
 				minecraftPatchedIntermediateAtJar,
-				getForgeJar().toPath(),
-				getForgeUserdevJar().toPath(),
+				usesMavenizer() ? null : getForgeJar().toPath(),
+				usesMavenizer() ? null : getForgeUserdevJar().toPath(),
 				clientExtra ? minecraftProvider.getMinecraftClientJar().toPath() : null,
 				needsServerJarForDistManifest(extension) ? getServerJarForDistManifest().toPath() : null,
 				mappings,
@@ -1822,21 +1962,26 @@ public class MinecraftPatchedProvider {
 		TinyRemapper remapper = buildRemapper(options, mcInput);
 
 		try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(mcOutput).build()) {
-			outputConsumer.addNonClassFiles(forgeJar, NonClassCopyMode.FIX_META_INF, remapper);
-
-			InputTag mcTag = remapper.createInputTag();
-			InputTag forgeTag = remapper.createInputTag();
-			List<CompletableFuture<?>> futures = new ArrayList<>();
-			futures.add(remapper.readInputsAsync(mcTag, mcInput));
-			futures.add(remapper.readInputsAsync(forgeTag, forgeJar, forgeUserdevJar));
-			CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-			remapper.apply(outputConsumer, mcTag);
-			remapper.apply(outputConsumer, forgeTag);
+			if (options.completeForgeInput()) {
+				outputConsumer.addNonClassFiles(mcInput, NonClassCopyMode.FIX_META_INF, remapper);
+				remapper.readInputs(mcInput);
+				remapper.apply(outputConsumer);
+			} else {
+				outputConsumer.addNonClassFiles(forgeJar, NonClassCopyMode.FIX_META_INF, remapper);
+				InputTag mcTag = remapper.createInputTag();
+				InputTag forgeTag = remapper.createInputTag();
+				CompletableFuture.allOf(remapper.readInputsAsync(mcTag, mcInput), remapper.readInputsAsync(forgeTag, forgeJar, forgeUserdevJar)).join();
+				remapper.apply(outputConsumer, mcTag);
+				remapper.apply(outputConsumer, forgeTag);
+			}
 		} finally {
 			remapper.finish();
 		}
 
-		copyUserdevFiles(forgeUserdevJar, mcOutput);
+		if (!options.completeForgeInput()) {
+			copyUserdevFiles(Objects.requireNonNull(forgeUserdevJar), mcOutput);
+		}
+
 		remapCoreMods(mcOutput, Objects.requireNonNull(options.mappings(), "coremod 重映射需要映射树"),
 				options.coreModNamespace(), options.runtimeMojang());
 		applyLoomPatchVersion(mcOutput);

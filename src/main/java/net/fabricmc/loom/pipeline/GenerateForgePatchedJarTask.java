@@ -99,12 +99,18 @@ public abstract class GenerateForgePatchedJarTask extends DefaultTask {
 	@PathSensitive(PathSensitivity.NONE)
 	public abstract RegularFileProperty getAtPatchedJar();
 
-	/** Forge 的 universal jar. */
+	/** 是否从已经包含 Forge 类与资源的完整 SRG 产物重映射. */
+	@Input
+	public abstract Property<Boolean> getCompleteForgeInput();
+
+	/** Forge 的 universal jar；完整重编译产物不再合入它. */
+	@Optional
 	@InputFile
 	@PathSensitive(PathSensitivity.NONE)
 	public abstract RegularFileProperty getForgeJar();
 
-	/** Forge 的 userdev jar. */
+	/** Forge 的 userdev jar；完整重编译产物不再注入它. */
+	@Optional
 	@InputFile
 	@PathSensitive(PathSensitivity.NONE)
 	public abstract RegularFileProperty getForgeUserdevJar();
@@ -220,8 +226,8 @@ public abstract class GenerateForgePatchedJarTask extends DefaultTask {
 
 			final var options = new MinecraftPatchedProvider.ProductionOptions(
 					path(getAtPatchedJar()),
-					path(getForgeJar()),
-					path(getForgeUserdevJar()),
+					getCompleteForgeInput().get() ? null : path(getForgeJar()),
+					getCompleteForgeInput().get() ? null : path(getForgeUserdevJar()),
 					optionalPath(getClientJar()),
 					optionalPath(getServerJar()),
 					mappings,
@@ -242,7 +248,8 @@ public abstract class GenerateForgePatchedJarTask extends DefaultTask {
 					optionalPath(getClientExtraJar()),
 					Path.of(getLockRoot().get()),
 					getLockKey().get(),
-					getRefreshDeps().get(),
+					// 任务已因输入变化而执行，不能只因旧产物的 manifest 仍有效就跳过重映射。
+					getRefreshDeps().get() || options.completeForgeInput(),
 					getLogger()::lifecycle);
 		}
 	}

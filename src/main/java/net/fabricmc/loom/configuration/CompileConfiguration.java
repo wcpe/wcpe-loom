@@ -44,6 +44,7 @@ import dev.architectury.loom.forge.dependency.ForgeUserdevProvider;
 import dev.architectury.loom.forge.dependency.PatchProvider;
 import dev.architectury.loom.forge.dependency.SrgProvider;
 import dev.architectury.loom.forge.minecraft.ForgeMinecraftProvider;
+import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
 import dev.architectury.loom.mcpconfig.McpConfigProvider;
 import org.gradle.api.Action;
 import org.gradle.api.Project;
@@ -185,7 +186,7 @@ public abstract class CompileConfiguration implements Runnable {
 				// TODO: Find a better place for this?
 				//   This has to be after dependencyManager.handleDependencies() above
 				//   because of https://github.com/architectury/architectury-loom/issues/72.
-				if (!ModConfigurationRemapper.isCIBuild()) {
+				if (!ModConfigurationRemapper.isCIBuild() && !MinecraftPatchedProvider.usesMavenizer(extension, extension.getMinecraftProvider())) {
 					try {
 						ForgeSourcesService.addForgeSourcesDuringProjectConfiguration(getProject(), configContext.serviceFactory());
 					} catch (IOException e) {

@@ -74,7 +74,7 @@ public final class MethodInheritanceMappingsMigrator implements MappingsMigrator
 	@Override
 	public long setup(Inputs inputs) throws IOException {
 		Path cacheFile = inputs.cache().resolve("method-inheritance-migrator.json");
-		List<Path> jars = List.of(inputs.patchedIntermediateJar(), inputs.forgeJar(), inputs.userdevJar());
+		List<Path> jars = inputs.inheritanceJars();
 		// 本代输入的内容键：命名空间开关 + 原始 mappings + 冷分支会读的三个 jar。
 		// 只用路径存在性判断缓存是否可用会让「同一份声明输入对应两种产物」——见 MappingsMigratorCache。
 		final String key = MappingsMigratorCache.identity(inputs.hasSrg(), inputs.hasMojang(),
