@@ -599,7 +599,7 @@ public final class ForgeMemberNameFixer {
 
 							return null;
 						}
-}, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+					}, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
 					result.put(reader.getClassName(), new ClassMembers(fields, methods));
 				} catch (RuntimeException e) {
 					// 单个类解析失败只跳过该类

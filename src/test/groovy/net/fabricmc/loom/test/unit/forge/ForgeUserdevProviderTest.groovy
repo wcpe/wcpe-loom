@@ -78,7 +78,11 @@ class ForgeUserdevProviderTest extends Specification {
 		project.extensions.add('loom', Stub(LoomGradleExtension) {
 			getForgeProvider() >> forge
 		})
-		[Constants.Configurations.MCP_CONFIG, Constants.Configurations.SRG, Constants.Configurations.FORGE_UNIVERSAL].each {
+		[
+			Constants.Configurations.MCP_CONFIG,
+			Constants.Configurations.SRG,
+			Constants.Configurations.FORGE_UNIVERSAL
+		].each {
 			project.configurations.create(it)
 		}
 		def notation = "net.minecraftforge:forge:${version}".toString()
@@ -90,8 +94,12 @@ class ForgeUserdevProviderTest extends Specification {
 			resolveFile() >> { throw new AssertionError('已归一的 userdev 不应重新解析') }
 		}
 		def original = userdev3 ? [spec: 2, notchObf: true, libraries: [
-			'org.jline:jline:3.5.1', 'java3d:vecmath:1.5.2', 'net.minecraftforge:legacydev:0.2.3.+:fatjar'
-		]] : [inheritsFrom: '1.12.2', libraries: [[name: 'net.minecraft:launchwrapper:1.12']]]
+				'org.jline:jline:3.5.1',
+				'java3d:vecmath:1.5.2',
+				'net.minecraftforge:legacydev:0.2.3.+:fatjar'
+			]] : [inheritsFrom: '1.12.2', libraries: [
+				[name: 'net.minecraft:launchwrapper:1.12']
+			]]
 		def rawConfig = temp.resolve('forge-config.json')
 		Files.writeString(rawConfig, JsonOutput.toJson(original))
 		def sources = new ByteArrayOutputStream()
@@ -118,7 +126,10 @@ class ForgeUserdevProviderTest extends Specification {
 
 		where:
 		shape             | version            | userdev3 || extras
-		'1.12.2 userdev3'  | '1.12.2-14.23.5.2860' | true     || ['org.jline:jline:3.5.1', 'java3d:vecmath:1.5.2']
+		'1.12.2 userdev3'  | '1.12.2-14.23.5.2860' | true     || [
+			'org.jline:jline:3.5.1',
+			'java3d:vecmath:1.5.2'
+		]
 		'其它版本 userdev3' | '1.11.2-13.20.1.2588' | true     || []
 		'原生 FG2'         | '1.12.2-14.23.5.2847' | false    || []
 	}

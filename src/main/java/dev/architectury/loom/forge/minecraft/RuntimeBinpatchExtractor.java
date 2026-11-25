@@ -156,10 +156,10 @@ public final class RuntimeBinpatchExtractor {
 
 					final byte[] body = readClassBody(zip.getInputStream(entry).readAllBytes());
 
-				// 条目名不能证明类体已经位于目标命名空间。
-				if (body != null && className.equals(new ClassReader(body).getClassName())) {
-					bodies.put(className, body);
-				}
+					// 条目名不能证明类体已经位于目标命名空间。
+					if (body != null && className.equals(new ClassReader(body).getClassName())) {
+						bodies.put(className, body);
+					}
 				}
 			}
 		} finally {

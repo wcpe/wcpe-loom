@@ -558,6 +558,7 @@ public class MinecraftPatchedProvider {
 					if (runtimeInstaller != null) {
 						task.getRuntimeInstaller().set(runtimeInstaller.toFile());
 					}
+
 					task.getFixParameterAnnotations().set(extension.isForgeLikeAndNotOfficial() && !extension.isUnobfuscatedForge());
 					dependsOnProducer(task, prePatchProducer);
 				}));
@@ -2057,6 +2058,7 @@ public class MinecraftPatchedProvider {
 			final Path root = fs.get().getPath("/");
 			final Set<String> present = new TreeSet<>();
 			final List<Path> classes = new ArrayList<>();
+
 			try (var paths = Files.walk(root)) {
 				paths.filter(Files::isRegularFile).filter(path -> path.toString().endsWith(".class")).forEach(path -> {
 					present.add(entryName(path));
@@ -2248,6 +2250,7 @@ public class MinecraftPatchedProvider {
 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(patchedJar, false)) {
 			final Path root = fs.get().getPath("/");
 			final List<Path> classes = new ArrayList<>();
+
 			try (var paths = Files.walk(root)) {
 				paths.filter(Files::isRegularFile).filter(p -> p.toString().endsWith(".class")).forEach(classes::add);
 			}
