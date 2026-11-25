@@ -27,6 +27,7 @@ package net.fabricmc.loom.test.unit.cache
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.FileTime
 import java.util.concurrent.TimeUnit
 
@@ -120,17 +121,50 @@ class ArtifactReuseTest extends Specification {
 		!ArtifactReuse.isReusable(merged, RECIPE, [merged], [client])
 	}
 
-	def "输入内容被换了（大小相同、仅 mtime 不同）也能识别出来"() {
-		given: "两个不同内容但**恰好等长**的 client jar：只比大小会漏掉这种换代"
+	def "输入内容被等长替换且 mtime 变了时判为不可复用"() {
+		given:
 		def client = jar("client.jar", ["a.txt": "aaaa"])
 		def merged = jar("minecraft-merged.jar", ["a.txt": "a"])
+		def time = Files.getLastModifiedTime(client)
+		def size = Files.size(client)
 		ArtifactReuse.record(merged, RECIPE, [merged], [client])
 
 		when:
 		client = jar("client.jar", ["a.txt": "bbbb"])
+		Files.setLastModifiedTime(client, FileTime.fromMillis(time.toMillis() + TimeUnit.SECONDS.toMillis(2)))
 
 		then:
+		Files.size(client) == size
+		Files.getLastModifiedTime(client).toMillis() != time.toMillis()
 		!ArtifactReuse.isReusable(merged, RECIPE, [merged], [client])
+	}
+
+	def "文件三元组相同但 #fileKind 的内容已变时不复用"() {
+		given:
+		def client = jar("client.jar", ["a.txt": "aaaa"])
+		def merged = jar("minecraft-merged.jar", ["a.txt": "aaaa"])
+		def target = changeOutput ? merged : client
+		def replacement = jar("replacement.jar", ["a.txt": "bbbb"])
+		def originalBytes = Files.readAllBytes(target)
+		def original = Files.readAttributes(target, BasicFileAttributes.class)
+		ArtifactReuse.record(merged, RECIPE, [merged], [client])
+
+		when: "原位写入等长的有效 JAR 并恢复原时间戳，不依赖写入速度或 inode 循环"
+		Files.write(target, Files.readAllBytes(replacement))
+		Files.setLastModifiedTime(target, original.lastModifiedTime())
+		def current = Files.readAttributes(target, BasicFileAttributes.class)
+
+		then:
+		Files.readAllBytes(target) != originalBytes
+		current.size() == original.size()
+		current.lastModifiedTime() == original.lastModifiedTime()
+		current.fileKey() == original.fileKey()
+		!ArtifactReuse.isReusable(merged, RECIPE, [merged], [client])
+
+		where:
+		fileKind | changeOutput
+		"输入"     | false
+		"产物"     | true
 	}
 
 	def "输入只是 mtime 变了（内容相同）仍判为可复用"() {
