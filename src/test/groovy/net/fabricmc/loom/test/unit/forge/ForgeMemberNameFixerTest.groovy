@@ -91,31 +91,107 @@ class ForgeMemberNameFixerTest extends Specification {
 		def missingDescriptor = '(Ljava/lang/Object;)V'
 		def validDescriptor = '(Ljava/lang/Number;)V'
 		def universal = writeJar('forge-universal.jar', [(MODEL_LOADER): modelLoader([
-			['a', oldDescriptor], ['a', '(Lfm;)V'], ['a', '([Lfm;)V'], ['unchanged', '(Lfm;)V'],
-			['left', ambiguousDescriptor], ['right', ambiguousDescriptor], ['oldMissing', missingDescriptor], ['oldValid', validDescriptor]
-		])])
+				['a', oldDescriptor],
+				['a', '(Lfm;)V'],
+				['a', '([Lfm;)V'],
+				['unchanged', '(Lfm;)V'],
+				['left', ambiguousDescriptor],
+				['right', ambiguousDescriptor],
+				[
+					'oldMissing',
+					missingDescriptor
+				],
+				['oldValid', validDescriptor]
+			])])
 		def named = writeJar('forge-named.jar', [(MODEL_LOADER): modelLoader([
-			['renamedRight', ambiguousDescriptor], ['a', '([Lnet/minecraft/Registry;)V'], ['setupModelRegistry', namedDescriptor],
-			['renamedLeft', ambiguousDescriptor], ['loadModel', '(Lnet/minecraft/Registry;)V'], ['unchanged', '(Lnet/minecraft/Registry;)V'],
-			['newMissing', missingDescriptor], ['newValid', validDescriptor]
-		])])
+				[
+					'renamedRight',
+					ambiguousDescriptor
+				],
+				[
+					'a',
+					'([Lnet/minecraft/Registry;)V'
+				],
+				[
+					'setupModelRegistry',
+					namedDescriptor
+				],
+				[
+					'renamedLeft',
+					ambiguousDescriptor
+				],
+				[
+					'loadModel',
+					'(Lnet/minecraft/Registry;)V'
+				],
+				[
+					'unchanged',
+					'(Lnet/minecraft/Registry;)V'
+				],
+				[
+					'newMissing',
+					missingDescriptor
+				],
+				['newValid', validDescriptor]
+			])])
 		def target = writeJar('target.jar', [(MODEL_LOADER): modelLoader([
-			['setupModelRegistry', targetDescriptor], ['loadModel', scalarDescriptor], ['unchanged', scalarDescriptor], ['a', arrayDescriptor],
-			['renamedLeft', ambiguousDescriptor], ['renamedRight', ambiguousDescriptor], ['oldValid', validDescriptor], ['newValid', validDescriptor]
-		]), (CALLER): modelCaller([
-			['a', targetDescriptor], ['a', scalarDescriptor], ['a', arrayDescriptor], ['left', ambiguousDescriptor],
-			['setupModelRegistry', targetDescriptor], ['oldMissing', missingDescriptor], ['oldValid', validDescriptor]
-		])])
+				[
+					'setupModelRegistry',
+					targetDescriptor
+				],
+				['loadModel', scalarDescriptor],
+				['unchanged', scalarDescriptor],
+				['a', arrayDescriptor],
+				[
+					'renamedLeft',
+					ambiguousDescriptor
+				],
+				[
+					'renamedRight',
+					ambiguousDescriptor
+				],
+				['oldValid', validDescriptor],
+				['newValid', validDescriptor]
+			]), (CALLER): modelCaller([
+				['a', targetDescriptor],
+				['a', scalarDescriptor],
+				['a', arrayDescriptor],
+				['left', ambiguousDescriptor],
+				[
+					'setupModelRegistry',
+					targetDescriptor
+				],
+				[
+					'oldMissing',
+					missingDescriptor
+				],
+				['oldValid', validDescriptor]
+			])])
 
 		when:
 		ForgeMemberNameFixer.fix(target, universal, named, mappings, 'official', namespace)
 
 		then:
 		def calls = readCaller(target).methods.first().instructions.toArray().findAll { it instanceof MethodInsnNode }
-		calls*.name == ['setupModelRegistry', 'loadModel', 'a', 'left', 'setupModelRegistry', 'oldMissing', 'oldValid']
+		calls*.name == [
+			'setupModelRegistry',
+			'loadModel',
+			'a',
+			'left',
+			'setupModelRegistry',
+			'oldMissing',
+			'oldValid'
+		]
 		calls*.owner.every { it == MODEL_LOADER }
-		calls*.desc == [targetDescriptor, scalarDescriptor, arrayDescriptor, ambiguousDescriptor,
-			targetDescriptor, missingDescriptor, validDescriptor]
+		calls*.desc == [
+			targetDescriptor,
+			scalarDescriptor,
+			arrayDescriptor,
+			ambiguousDescriptor,
+			targetDescriptor,
+			missingDescriptor,
+			validDescriptor
+		]
 
 		where:
 		namespace | registry
@@ -206,4 +282,4 @@ class ForgeMemberNameFixerTest extends Specification {
 		}
 		return node
 	}
-	}
+}

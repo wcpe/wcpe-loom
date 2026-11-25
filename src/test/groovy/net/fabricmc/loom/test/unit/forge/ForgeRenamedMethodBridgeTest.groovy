@@ -168,7 +168,10 @@ class ForgeRenamedMethodBridgeTest extends Specification {
 		readTarget(jar, NAMED_TARGET).methods.find { it.name == "func_227987_b_" } == null
 
 		where:
-		access << [Opcodes.ACC_PUBLIC, Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC]
+		access << [
+			Opcodes.ACC_PUBLIC,
+			Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC
+		]
 	}
 
 	def "改名后的方法也不在时视为不是该缺陷形态"() {
