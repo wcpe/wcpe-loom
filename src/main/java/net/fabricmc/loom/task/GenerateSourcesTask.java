@@ -290,10 +290,8 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
 
 		getDaemonUtilsContext().set(getProject().getObjects().newInstance(DaemonUtils.Context.class, getProject()));
 
-		if (!MinecraftPatchedProvider.usesMavenizer(getExtension(), getExtension().getMinecraftProvider())) {
+		if (!getExtension().isForge() || !MinecraftPatchedProvider.usesMavenizer(getExtension(), getExtension().getMinecraftProvider())) {
 			getForgeSourcesOptions().set(ForgeSourcesService.createOptions(getProject()));
-
-			// 提前展开 Forge 源码包；延迟探测任务以避免注册顺序约束。
 			dependsOn(getProject().getProviders().provider(() ->
 					getProject().getTasks().findByName(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME) == null
 							? java.util.List.of()
