@@ -52,6 +52,7 @@ import static org.gradle.testkit.runner.TaskOutcome.UP_TO_DATE
  * </ul>
  * 参照产物写在 {@code build/probe/configtime-*.jar}，因此**被测产物的路径上只有被测任务一个写入者**——
  * 不会出现「配置期先写一份、任务再覆盖」这类别名，否则「两者一致」可以由「读到了同一份文件」伪造出来。
+ * 参考链的 intermediate 读取同次参考 pre-patch，AT 再读取同次参考 intermediate，避免配置期读到旧缓存。
  *
  * <p>该实现与任务共用，故「两者一致」在实现层面是构造性的；本测试真正要钉住的是**接线**：
  * 每一级任务读的是不是上一级的产物、写的是不是那条路径、最终 jar 的任务读的是不是 AT 任务的产物。
@@ -118,6 +119,13 @@ class ForgePatchedChainTaskEquivalenceTest extends Specification implements Grad
 		report.INTERMEDIATE_INPUT == report.PRE_PATCH_OUTPUT
 		report.AT_INPUT == report.INTERMEDIATE_OUTPUT
 
+		and: "参考链只读本轮上一步产物，不读被测任务的共享缓存"
+		report.REFERENCE_INTERMEDIATE_INPUT == report.REFERENCE_PRE_PATCH
+		report.REFERENCE_AT_INPUT == report.REFERENCE_INTERMEDIATE
+		report.REFERENCE_PRE_PATCH != report.SUBJECT_PRE_PATCH
+		report.REFERENCE_INTERMEDIATE != report.SUBJECT_INTERMEDIATE
+		report.REFERENCE_AT_PATCHED != report.SUBJECT_AT_PATCHED
+
 		and: "最终 jar 的任务读的就是 AT 任务的产物（末端接线）"
 		report.FINAL_JAR_TASK_AT_PATCHED_INPUT == report.AT_OUTPUT
 
@@ -138,6 +146,7 @@ class ForgePatchedChainTaskEquivalenceTest extends Specification implements Grad
 		diff(subjectAtPatched, referenceAtPatched).isEmpty()
 
 		and: "扰动对照：比对口径能识别「名字相同、字节不同」——拿另一级的产物当期望值必须报差异"
+		diff(subjectPrePatch.take(1), subjectPrePatch).size() == subjectPrePatch.size() - 1
 		diff(subjectPrePatch, subjectIntermediate).size() > 0
 		diff(subjectIntermediate, subjectAtPatched).size() > 0
 	}
@@ -276,8 +285,10 @@ class ForgePatchedChainTaskEquivalenceTest extends Specification implements Grad
 
 			// 对照②：intermediate jar（配置期实现：binpatcher + 补类 + 删参数名）
 			def referenceIntermediate = new File(probeDir, 'configtime-intermediate.jar')
+			def referenceIntermediateInput = referencePrePatch.toPath()
+			lines << 'REFERENCE_INTERMEDIATE_INPUT=' + referenceIntermediateInput.toAbsolutePath().toString()
 			dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider.producePatchedIntermediateForTask(
-					provider.minecraftIntermediateJar,
+					referenceIntermediateInput,
 					referenceIntermediate.toPath(),
 					extension.forgeUserdevProvider.joinedPatches,
 					provider.createBinpatcherTool(),
@@ -289,8 +300,10 @@ class ForgePatchedChainTaskEquivalenceTest extends Specification implements Grad
 			// 对照③：at-patched jar（配置期实现：AT 工具）
 			def referenceAtPatched = new File(probeDir, 'configtime-at-patched.jar')
 			def atTempFiles = new dev.architectury.loom.util.TempFiles()
+			def referenceAtInput = referenceIntermediate.toPath()
+			lines << 'REFERENCE_AT_INPUT=' + referenceAtInput.toAbsolutePath().toString()
 			provider.runAccessTransformer(provider.createAccessTransformerOptions(atTempFiles),
-					provider.minecraftPatchedIntermediateJar, referenceAtPatched.toPath(), serviceFactory)
+					referenceAtInput, referenceAtPatched.toPath(), serviceFactory)
 
 			atTempFiles.close()
 			tempFiles.close()
@@ -343,7 +356,7 @@ class ForgePatchedChainTaskEquivalenceTest extends Specification implements Grad
 	}
 
 	private static List<String> diff(Map<String, String> actual, Map<String, String> expected) {
-		return actual.findResults { name, hash -> hash == expected[name] ? null : name }
+		return (actual.keySet() + expected.keySet()).findAll { name -> actual[name] != expected[name] }.toList()
 	}
 
 	private static void printEvidence(Map<String, String> report, Map<String, String> prePatch,
