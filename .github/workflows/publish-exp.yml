@@ -1,4 +1,9 @@
 name: Publish
+
+env:
+  # 只选择依赖下载源：默认 Google，可切换为 aliyun 或 official。
+  WCPE_CI_MAVEN_CENTRAL: ${{ vars.WCPE_CI_MAVEN_CENTRAL || 'google' }}
+
 on: workflow_dispatch
 
 permissions:
