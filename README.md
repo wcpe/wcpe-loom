@@ -193,7 +193,7 @@ dependencies {
 | **`dev/1.17-wcpe`**（默认分支） | **开发主线**，基于 architectury 1.17 上游 | 活跃开发 |
 | `1.15-wcpe` | 1.15 代系（Essential Loom `dev/1.15` + WCPE 补丁），已归档 | 冻结保留 |
 
-- 1.17 线是一条**线性补丁队列**：`base/architectury-1.17-026ce830`（上游基底，不可变 tag）→ 补丁段（每个补丁一个提交，带 DEP-3 溯源块）→ `patch-queue/1.17`（队列末端 tag）→ 元数据段（CI / 文档 / 脚本 / 队列规范）→ 默认分支 `dev/1.17-wcpe`。1.15 线的 WCPE 补丁即按此**重放**到 architectury 1.17 基底之上（上游相隔约 5 个月，两线同一项目的不同历史点）；维护手册见 [`.upstream/README.md`](./.upstream/README.md)。
+- 1.17 线使用标准 Debian 3.0 (quilt) 补丁序列：未应用的真源为 `debian/1.17`，`dev/1.17-wcpe` 是可直接构建的派生视图。原 `patch-queue/1.17` tag 仅作历史锚点；见[补丁队列操作手册](./.upstream/README.md)。
 - 正式版以 tag 标记：`wcpe-v1.17.1`、`wcpe-v1.17.2`…（不用 `v1.17.*`，该前缀已被上游 release tag 占用）。
 
 ## 插件 id

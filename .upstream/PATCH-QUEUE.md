@@ -1,55 +1,54 @@
 # WCPE Loom 1.17 补丁队列规范
 
-本规范定义 `dev/1.17-wcpe` 相对上游基底的补丁如何组织、标注与校验。流程借鉴 1.15 线的
-`.upstream/PATCH-QUEUE.md`（Debian quilt / DEP-3 实践），但**队列模型不同**：
-
-| | 1.15 线 | 1.17 线（本线） |
-|---|---|---|
-| 维护方式 | 逐个补丁 cherry-pick 采集、可增删 | 把 1.15 线的改动**整体重放**后合并为固定序列 |
-| 同步上游 | 换基底 rebase 逐个补丁 | **整条序列** `rebase --onto` 到新基底 |
-| 队列标识 | `patch-queue/1.15` · `patch-queue/v1.15-wcpe.N` | `patch-queue/1.17` |
+本规范定义 1.17 线的 Debian quilt 真源、生成的应用视图、补丁溯源和发版边界。当前补丁真源是
+`debian/1.17` 的标准 3.0 (quilt) 未应用态；本项目仍是 Maven 发布的 Gradle 插件项目，Debian 目录不代表
+仓库在维护 Debian 正式发行包。
 
 ## 1. 队列结构
 
-历史自基底起分为三段，边界由 tag 标记：
-
 ```
-base/architectury-1.17-026ce830   ← 基底快照（不可变）
-  ↓  补丁队列：每个提交 = 一个补丁 = 一个逻辑变更单元
-patch-queue/1.17                  ← 队列末端标记
-  ↓  仓库元数据：非补丁内容，按普通提交维护
-HEAD
+debian/1.17                         唯一真源：标准 3.0 (quilt) 未应用态
+  ↓  完整 series 共 151 条：132 条历史 + 15 条本次新增 + 4 条旧源码/测试补录
+
+gbp pq import / export               临时补丁工作分支
+  ↓  由 series 逐条自动重放，并保留提交 trailer
+
+dev/1.17-wcpe                       生成的应用视图
 ```
 
-- **基底**：上游的一个不可变提交快照，用 `base/<来源>-<代系>-<sha 前 8 位>` 注释 tag 固定。
-  基线一旦固定不再移动；换基底等于换 tag。
-- **补丁队列**：基底之上的**线性提交，禁止 merge 提交**。整条序列可被线性重放到新基底。
-- **仓库元数据**：CI、文档、发布脚本、队列自身的清单（本目录与 `scripts/`）。这些属于本仓库
-  而非补丁，不参与队列。
+规范要点：
+
+- `debian/1.17` 是唯一补丁真源。补丁文件和 `debian/patches/series` 共同定义标准 quilt 未应用态。
+- 迁移时的 `series` 共 151 条：132 条历史、15 条本次新增、4 条旧源码/测试补录。旧主线已有 132+4 条；
+  这次只把 15 条按 `series` 顺序应用到旧主线。`dev/1.17-wcpe` 是生成的应用视图，不是第二个补丁真源。
+- 应用视图重放保留每条补丁提交的 `Origin`、`Forwarded`、`Patch-Name` 等 trailer。
+- `gbp pq import` 和 `gbp pq export` 只负责补丁工作分支与未应用态之间的转换。
+- `gbp pq export` 后审阅补丁与 `series` 再提交。上游 `.gitignore` 的 `/*` 会忽略新增的打包文件；
+  新补丁须逐一 `git add -f -- debian/patches/<文件>`，不要全量暂存。
+- 原 `patch-queue/1.17` tag 冻结为历史锚点，不再作为当前队列末端移动。
+- CI 与 TestKit 镜像属于仓库元数据，不改变补丁真源，不产生第二套队列。
+
+补丁与元数据的判定仍是：*换上游后这行还需要吗？* 需要 → 补丁；不需要 → CI、文档、脚本等仓库元数据。
 
 ## 2. 补丁的判定标准
 
-一个补丁是一个**逻辑变更单元**，须同时满足：
+一个补丁是一个逻辑变更单元，须同时满足：
 
 1. 能用一句话说明其目的；
-2. 能独立审查，不必先读队列中其他补丁；
-3. 撤销它不牵连其他补丁的功能。
+2. 能独立审查，不必先读其他补丁；
+3. 撤销它不牵连不相关补丁的功能。
 
 | 情形 | 处置 |
 |---|---|
 | 一个变更恰好是一个逻辑单元 | 1:1 保留 |
-| N 个提交共同构成一个逻辑变更（开发中的多次迭代） | **压缩为一个补丁** |
-| 一个提交混合多个不相关的变更 | **拆分为多个补丁** |
+| 多个提交共同构成一个逻辑变更 | 压缩为一个补丁 |
+| 一个提交混合多个不相关变更 | 拆分为多个补丁 |
 
-**压缩判据**：若补丁 B 修改的内容全部是补丁 A 新增或修改过的行，B 必须压缩进 A。队列描述的是
-**最终状态**，不是开发过程的年表；"先实现、再修正实现"的中间态不属于队列。
-
-> 本线首次重建时，25 个补丁提交即按此判据由 42 个开发提交合并而来（见 `migration-1.17.md`
-> 第四节）。此后陆续追加补丁，当前条数以 `scripts/sync-upstream.sh status` 为准。
+队列描述最终状态，不描述临时开发过程。补丁的顺序以 `series` 为准，不以应用视图上的手工提交顺序为准。
 
 ## 3. 溯源标注
 
-每个补丁的提交信息末尾附溯源块，字段取自 Debian DEP-3（另有本仓库扩展字段 `Patch-Name`，见本节末尾）：
+每个新补丁的提交信息末尾必须保留 DEP-3 溯源块，并带本仓库扩展字段 `Patch-Name`：
 
 ```
 <type>(<scope>): <中文描述>
@@ -58,116 +57,68 @@ HEAD
 
 Origin: <取值>
 Forwarded: <取值>
+Patch-Name: <slug>
 ```
+
+字段约定：
 
 | 字段 | 取值 | 含义 |
 |---|---|---|
-| `Origin` | `upstream, <提交URL>` | 取自上游，可原样保留 |
-| | `backport, <上游版本>` | 从其他代系向后移植 |
-| | `vendor, wcpe-loom` | 本项目自研，永不上游 |
-| `Forwarded` | `no` | 应当反馈上游，尚未反馈 |
-| | `not-needed` | 本项目专属，无需反馈 |
-| | `<URL>` | 已反馈，附链接 |
-| `Applied-Upstream` | `<版本或提交>` | 可选。上游已收录 → 换基底时**直接删除该补丁** |
+| `Origin` | `upstream, <提交 URL>` | 取自上游 |
+| `Origin` | `backport, <上游版本>` | 从其他代系移植 |
+| `Origin` | `vendor, wcpe-loom` | 本项目自研 |
+| `Forwarded` | `no` | 应当反馈上游但尚未反馈 |
+| `Forwarded` | `not-needed` | 本项目专属，无需反馈 |
+| `Forwarded` | `<URL>` | 已反馈，附链接 |
+| `Applied-Upstream` | `<版本或提交>` | 可选；上游已收录时记录 |
+| `Patch-Name` | `^[a-z0-9]+(-[a-z0-9]+)*$`，≤ 48 字符 | 补丁稳定标识，序列内唯一 |
 
-### `Patch-Name`：本仓库的扩展字段
+`Patch-Name` 只认 trailer，不认 SHA、标题或 patch-id。应用视图重建或源树重新导出时，稳定标识必须保持不变。
+历史补丁缺失该字段时不回填，元数据提交不带该字段。历史上已经补录的四条旧补丁只在描述中保留，不计入
+本版新增补丁。
 
-DEP-3 没有这个字段，加它只为一件事：**发布说明要按补丁面做集合差**。
+## 4. 校验与源锁定
 
-```
-patches(ref) = ref 可达、位于 base..ref 区间内的补丁提交的 Patch-Name 集合
-新增补丁     = patches(本版) - patches(上一版)
-```
+Maven 分支中的 `.upstream/quilt-1.17.lock` 固化正式发版所依据的源树。校验时先取得打包分支，并使用默认本地
+canonical ref `refs/remotes/origin/debian/1.17`：
 
-只认 trailer，不认 SHA、不认标题、不认 patch-id——插补丁重写队列后，同一逻辑补丁换了 SHA 仍被认作
-同一个，不会在下一版里作为「新增」重复出现（旧机制按 `PREV..CURR` 区间生成，实测 1.17.16~1.17.19
-每版 78%~93% 的条目是这种「同标题、不同 SHA」的重写副本）。
-
-| 字段 | 取值 | 含义 |
-|---|---|---|
-| `Patch-Name` | `^[a-z0-9]+(-[a-z0-9]+)*$`，≤ 48 字符 | 补丁的稳定标识；补丁段内**全局唯一**，打上去之后不要再改 |
-
-完整示例（与 DEP-3 溯源块同处提交信息末尾的 trailer 块）：
-
-```
-fix(forge): 修掉 xxx
-
-正文说明为什么改、改动要点。
-
-Origin: vendor, wcpe-loom
-Forwarded: no
-Patch-Name: legacy-forge-at-translate
+```bash
+git fetch origin refs/heads/debian/1.17:refs/remotes/origin/debian/1.17
+bash scripts/sync-upstream.sh verify
 ```
 
-- `add-patch finish` 要求本次新提交的 `Patch-Name` 等于分支名去掉 `add-patch/` 前缀。
-- 元数据段提交（CI / 文档 / 脚本）**不带** `Patch-Name`。
-- 1.17.19 及更早的历史补丁没有该字段，**不回填**（回填 = 重写已发布历史）；它们因此不出现在任何
-  「新增补丁」里，其说明留在历史 Release 中。
+`verify` 必须是只读操作，至少用于确认锁定源、`series` 和 `dev/1.17-wcpe` 应用视图能够对应；不得通过校验
+生成第二个补丁来源，不得改写工作区、分支或 tag。需要摘要时使用：
 
-### 本线补丁的溯源归类
+```bash
+bash scripts/sync-upstream.sh status
+```
 
-| 补丁 | Origin | Forwarded |
-|---|---|---|
-| 1–11（P1、P3–P12 重放） | `vendor, wcpe-loom` | `not-needed` |
-| 12（移除 RunConfig） | `vendor, wcpe-loom` | `not-needed` |
-| 13（补回重放丢失内容） | `vendor, wcpe-loom` | `no`（其中缓存锁相关值得反馈上游） |
-| 14–15（legacy Forge 支持） | `backport, essential dev/1.15` | `no`（上游 1.17 已移除该链路，宜反馈） |
-| 16（P2 内容） | `vendor, wcpe-loom` | `no` |
-| 17（DownloadSourcesHook） | `backport, essential dev/1.15` | `no` |
-| 18（分隔符归一化） | `vendor, wcpe-loom` | `no`（基底自身在 Windows 上的缺陷） |
-| 19·20（测试与 checkstyle） | `backport, essential dev/1.15` | `not-needed` |
-| 21（server-only 守卫） | `vendor, wcpe-loom` | `no`（**上游缺陷，应反馈**） |
-| 22–25（插件 id / 发布 / 文档） | `vendor, wcpe-loom` | `not-needed` |
+命令入口接受只读校验参数：
 
-## 4. 校验
+```bash
+bash scripts/sync-upstream.sh {verify|status} [--view 提交] [--package-ref 打包引用]
+```
 
-`bash scripts/sync-upstream.sh verify` 检查：基底与队列末端 tag 是否存在、队列是否线性无 merge、
-提交数、溯源块是否齐备、工作树是否与队列一致、**本地队列末端是否与远端一致**。默认只读，
-不修改任何分支或 tag。
+`verify` 和 `status` 都不得修改工作区或引用。
 
-队列末端的真源是**远端**，本地 tag 只是缓存（见第 5 节第 2 条）。这一项不一致记 error，
-并给出一条对齐命令；取不到远端（离线 / 无 `origin`）时降级为 warn，不阻塞离线操作。
+## 5. 维护和发版纪律
 
-补丁面（发布说明的依据）另有三项检查：
+1. 补丁顺序以 `debian/patches/series` 为唯一顺序来源；应用视图只读生成，不在其上建立并行队列。
+2. 补丁工作使用 `gbp pq import` / `gbp pq export` 临时分支流程，不恢复旧队尾标签操作。
+3. 发版前先独立验证真源、锁定文件和应用视图；验证通过后，主线只快进到同一 SHA，由 CI 在该 SHA 上运行。
+4. 正式版本只发布 `wcpe-v*` tag；上一标签和既有上传策略保持不变。
+5. 队列和主线流程禁止 merge、强推以及临时修改分支保护；验证失败不能靠改写引用绕过。
+6. CI、TestKit、发布清单等仓库元数据可以按普通元数据维护，但不得冒充补丁真源。
+7. 历史 `patch-queue/1.17` tag、历史提交前缀和历史发布说明保持不变；旧流程只作为历史记录。
 
-| 检查 | 级别 | 为什么 |
-|---|---|---|
-| slug 唯一性：补丁段内不得有两个补丁用同一个 slug | **error** | 同名会被集合差当成同一个补丁，新增的那条被静默吞掉 |
-| slug 格式：`^[a-z0-9]+(-[a-z0-9]+)*$`，长度 ≤ 48 | **error** | 格式不合法多半是手写错；脚本与 CI 必须同一口径解析 |
-| 缺 `Patch-Name` | warn | 1.17.19 及更早的历史补丁豁免（不回填），只报条数并提示；新补丁由 `add-patch finish` 拦住 |
+发布清单在 tag 前生成并提交，提交清单并创建 tag 后由 CI 严格校验：
 
-`add-patch finish` 另有强制项：本次新提交（`queue..HEAD`）每个都必须带 `Patch-Name`，值**等于**分支名
-去掉 `add-patch/` 前缀；缺失、不一致，或与补丁段既有 slug 重名（本次新增的那条除外）→ 打印补齐方法并
-`return 1`，不生成候选分支。
+```bash
+bash scripts/gen-release-notes.sh --tag wcpe-v1.17.N
+# 提交发布清单并创建 tag 后，由 CI 执行严格校验
+bash scripts/gen-release-notes.sh --check wcpe-v1.17.N
+```
 
-## 5. 维护纪律
-
-1. 队列内部**禁止 merge 提交**；需要合并上游时用 `rebase --onto`，不是 merge。
-2. **队列末端的真源是远端，本地 tag 只是缓存。** `patch-queue/1.17` 是可移动 tag，每次
-   插补丁 / 换基底 / 压缩元数据都会 `git tag -f` 前移它，而前移是**非快进更新**——`git fetch`
-   遇到与远端分叉的本地 tag 默认不覆盖，于是各人的本地 tag 停在自己上次同步的位置。
-   动手前先对齐，否则补丁会挂到旧末端：
-
-   ```bash
-   bash scripts/sync-upstream.sh status        # 本地/远端末端并列，过期会直接标出来
-   bash scripts/sync-upstream.sh pull-queue    # 以远端为准对齐（旧值自动备份到 backup/pq-local-*）
-   ```
-
-   `add-patch` 与 `rebase` 的起点都是本地 tag，因此两者都会先做这项比对，本地落后时直接拒绝执行。
-   想把「最近一次同步的远端值」也留在本地（离线可读），跑 `bash scripts/sync-upstream.sh setup-mirror`
-   配一条镜像 refspec：远端 tag 会被镜像到 `refs/remotes/origin/tags/patch-queue/1.17`，
-   由每次 `git fetch` 自动维护，不受上面那条「分叉不覆盖」规则限制。
-3. **不自动打发布 tag**、不自动推送改写后的队列；改写后必须人工确认内容等价再切换分支。
-4. 内容等价判据：`git diff <改写后> <改写前>` 为空（或差异仅限明确预期的那几个文件）。
-5. 每次换基底或改写队列后，同步更新 `migration-1.17.md` 与本节第 3 节的溯源归类。
-6. **新补丁必须带 `Patch-Name`**；历史补丁**不回填**——回填等于重写已发布历史，违反发版纪律。
-   发布说明只认这个 trailer，不带它的补丁永远不出现在「新增补丁」里（其说明已在历史 Release 中）。
-
-### 追加补丁的溯源归类（WCPE 后续开发）
-
-| 主题 | Origin | Forwarded |
-|---|---|---|
-| 本线自行开发的补丁，以及 CI/文档/脚本等仓库元数据 | `vendor, wcpe-loom` | `not-needed` |
-| 其中修复既有缺陷、值得反馈上游者（AW/AT 条目纯值化进配置缓存、SourceRemapper 静默丢 MC classpath、ForgeSources 空 jar 与反编译缓存键、Forge 处理器执行期重建两处缺陷、AT 规则按目标 jar 命名空间翻译、jar processor 哈希随配置顺序漂移、forge 日志透传开关被当缓存输入） | `vendor, wcpe-loom` | `no` |
-| legacy Forge 专属（universal jar 重映射到 named、继承方法映射补全）——上游 1.17 已移除该链路 | `vendor, wcpe-loom` | `no` |
-| spotless 的 Eclipse P2 镜像与 `splitModDependency` 夹具堆设置——本仓库环境专属 | `vendor, wcpe-loom` | `not-needed` |
+旧的 `add-patch`、`finish`、`rebase`、`pull-queue`、`setup-mirror` 命令属于迁移前模型。新模式下脚本会提示
+它们不再适用；当前规范不为这些命令补充替代参数，也不假设尚未实现的 Debian 操作。

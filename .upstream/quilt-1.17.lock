@@ -1,0 +1,232 @@
+{
+  "format": 1,
+  "upstream": "026ce8305cb7eabc85d918d9be99d6ba95a0900b",
+  "packaging": "c135fd153be49a53c89e94d56e3427d11781975f",
+  "quilt_tree": "2efcec543ca7144bb30c3f1e444eaa50315cf9c6",
+  "view_parent": "ae14aa1cc912156956227a88736be85148ed4b4e",
+  "view_end": "21cf87f07e81841df781350a226bf2335bf5881b",
+  "metadata_end": "03d982740f621e1ab5a0b2926588340689a393cb",
+  "view_items": [
+    "0133-fix-forge.patch",
+    "0134-fix-forge.patch",
+    "0135-fix-forge.patch",
+    "0136-fix-forge.patch",
+    "0137-fix-forge.patch",
+    "0138-fix-mcp.patch",
+    "0139-fix-forge.patch",
+    "0140-fix-forge.patch",
+    "0141-fix-forge.patch",
+    "0142-fix-forge.patch",
+    "0143-feat-forge.patch",
+    "0144-fix-cache.patch",
+    "0145-test-forge.patch",
+    "0146-chore-forge.patch",
+    "0147-fix-forge.patch"
+  ],
+  "overlays": {
+    ".github/release.yml": [
+      [
+        "100644",
+        "63d05582d0146a76d60c346fa48581960aa148e8"
+      ],
+      [
+        "100644",
+        "cc513ae527fe6492d9a74209526cdd9adb2a8a7b"
+      ]
+    ],
+    ".github/workflows/publish-exp.yml": [
+      [
+        "100644",
+        "d21d02c60f713b17a420e332f9d122804692a285"
+      ],
+      [
+        "100644",
+        "86214b4c96db24c24000cbb39eac8d0239b90b0b"
+      ]
+    ],
+    ".github/workflows/publish.yml": [
+      [
+        "100644",
+        "63a7a325a3f7d438ae1fd32acaa39471dbf7b7f1"
+      ],
+      null
+    ],
+    ".github/workflows/test-push.yml": [
+      [
+        "100644",
+        "8f372483921b0420038d4ee317aa0350094729e8"
+      ],
+      [
+        "100644",
+        "a29c50016a814329c4734be918b98c8da6034c73"
+      ]
+    ],
+    ".gitignore": [
+      [
+        "100644",
+        "1b6c3f0f7f4bd14533d2de0831e317318e3c48a4"
+      ],
+      [
+        "100644",
+        "8e9d3cd1e09b6e8d7dd97c9c66ef14f180d56342"
+      ]
+    ],
+    ".upstream/PATCH-QUEUE.md": [
+      [
+        "100644",
+        "7daf6e034c53a3a8e1b15d3b5c6f7d017eee3299"
+      ],
+      [
+        "100644",
+        "467eee05d003a6f5141920279f0729a66d3d0de3"
+      ]
+    ],
+    ".upstream/README.md": [
+      [
+        "100644",
+        "7853ceebe9550e55ff75fb96f8a30167f6b3b181"
+      ],
+      [
+        "100644",
+        "729a6655646c7c57daa3bca0164a862de2089e0d"
+      ]
+    ],
+    ".upstream/migration-1.17.md": [
+      [
+        "100644",
+        "ede60b27a118b3ef155d06e47a165b63936dba7b"
+      ],
+      [
+        "100644",
+        "1c88ec2a183dc875770ea3d161bc302b50793378"
+      ]
+    ],
+    ".upstream/patch-faces-legacy.md": [
+      null,
+      [
+        "100644",
+        "e2d1bb6acc176c5471e2356cb1581e84932cb473"
+      ]
+    ],
+    ".upstream/release-anchors.txt": [
+      null,
+      [
+        "100644",
+        "2986da1aa2a1ad22505f8f6726f8631623750bb8"
+      ]
+    ],
+    ".upstream/releases/README.md": [
+      null,
+      [
+        "100644",
+        "dfdbe20f28dd46d3d2b3e53cede488706874bf0e"
+      ]
+    ],
+    ".upstream/releases/wcpe-v1.17.20.md": [
+      null,
+      [
+        "100644",
+        "5a91d91d96e22ab6d5c2b74f8dc460ee2bacb5d3"
+      ]
+    ],
+    ".upstream/releases/wcpe-v1.17.21.md": [
+      null,
+      [
+        "100644",
+        "4c68a82e0b5dce39ad047d97b26d7c902f5b4c41"
+      ]
+    ],
+    ".upstream/releases/wcpe-v1.17.22.md": [
+      null,
+      [
+        "100644",
+        "45f44e901f443f9c0082bf4b9ca7237be0c5afa7"
+      ]
+    ],
+    ".upstream/releases/wcpe-v1.17.23.md": [
+      null,
+      [
+        "100644",
+        "9c115560df5a9dfea69bd7c6a180cda7dd7c7ff8"
+      ]
+    ],
+    "AGENTS.md": [
+      [
+        "100644",
+        "b0149d29e3c7a4f6d828dcb514a0c712a2f0cb36"
+      ],
+      [
+        "100644",
+        "826171c5cc4a83f0895d9b79119774a3441e623a"
+      ]
+    ],
+    "CLAUDE.md": [
+      null,
+      [
+        "100644",
+        "ef49d824c652b5746ae647ffc28d700e57a3d3a7"
+      ]
+    ],
+    "README.md": [
+      [
+        "100644",
+        "d23129e54c5106fe42d193a10a0a1976fe1aa337"
+      ],
+      [
+        "100644",
+        "1e13b63681d8c3c0da2c19d0f8b4c5d1c55a217a"
+      ]
+    ],
+    "build.gradle": [
+      [
+        "100644",
+        "87afcbbfde125112c5691d2a87db4255ffc9d411"
+      ],
+      [
+        "100644",
+        "0fd0469b06cde5a990f15c9b1a408a2f9009eb4b"
+      ]
+    ],
+    "gradle/ci-testkit-maven-central.init.gradle": [
+      null,
+      [
+        "100644",
+        "1953646f1f38dbf748030a8a0c690977bcf722fa"
+      ]
+    ],
+    "scripts/gen-release-notes.sh": [
+      null,
+      [
+        "100755",
+        "8c68537e509637e4a287c20a11223c88d88c8e3e"
+      ]
+    ],
+    "scripts/sync-upstream.sh": [
+      [
+        "100644",
+        "c2101f12eaffbc03295ea31a9d417953437cf408"
+      ],
+      [
+        "100644",
+        "dbe18b8f9d370aff9f657fe3cbb7bbf369204bbe"
+      ]
+    ],
+    "scripts/tests/gen-release-notes-test.sh": [
+      null,
+      [
+        "100755",
+        "b0747baf99fcd7c535a6ee3b285169989379a4dd"
+      ]
+    ],
+    "src/test/groovy/net/fabricmc/loom/test/util/GradleProjectTestTrait.groovy": [
+      [
+        "100644",
+        "3cf1af8cf601e9ea1c08142a2cfc542625a2a808"
+      ],
+      [
+        "100644",
+        "78bcfcb2b8ae9383b9693c29fff9eb5d1d66252e"
+      ]
+    ]
+  }
+}

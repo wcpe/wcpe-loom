@@ -55,30 +55,36 @@ scripts/                        队列维护与发布脚本（见第 3 节）
 `pipeline/` 是执行期（任务化，可缓存）。近年大量工作是把产物生产从配置期迁到执行期任务，
 以支持 configuration cache 与 build cache。改动这两处的边界时要留意缓存键。
 
-## 3. 补丁队列（本仓库最重要、也最反直觉的约定）
+## 3. 补丁队列与应用视图（当前约定）
 
-本仓库**不是**普通 Git 流程。默认分支 `dev/1.17-wcpe` 的历史分三段：
+本线的补丁真源已经迁移到 Debian 标准 3.0 (quilt) 的未应用态。这里的 Debian 结构只负责保存和编排源补丁，
+本项目仍是 Maven 发布线上的 Gradle 插件项目，不表示仓库在维护 Debian 正式发行包。
 
 ```
-base/architectury-1.17-026ce830   基底（不可变 tag，上游快照）
-  ↓  补丁段：线性提交，每个 = 一个逻辑变更，带 DEP-3 溯源块
-patch-queue/1.17                  队列末端（可移动 tag，重写后需前移）
-  ↓  元数据段：CI / 文档 / 脚本 / 队列规范
-dev/1.17-wcpe                     默认分支 = HEAD
+debian/1.17                         真源分支：标准 3.0 (quilt) 未应用态
+  ↓  完整 series 共 151 条：132 条历史 + 15 条本次新增 + 4 条旧源码/测试补录
+
+gbp pq import / export               临时补丁工作分支的导入与导出
+  ↓  按 series 逐条自动重放，并保留每条提交的 trailer
+
+dev/1.17-wcpe                       生成的应用视图，不是第二个权威队列
 ```
 
-**判据**：*换上游这行还需要吗？* 需要 → 补丁段；不需要 → 元数据段。
+- `debian/1.17` 是唯一补丁真源；完整标准 `series` 共 151 条：132 条历史、15 条本次同步新增、4 条旧源码/测试补录。
+  旧主线已有 132+4 条；本次只把 15 条按 `series` 顺序应用到旧主线。
+- `gbp pq import` 与 `gbp pq export` 只用于临时补丁工作分支；完成修改后把结果导回真源，不要把应用视图当成独立队列维护。
+- `dev/1.17-wcpe` 是供构建、测试和 Maven 发布使用的生成视图。它与真源对应同一批补丁，但不是第二个权威来源。
+- 原 `patch-queue/1.17` tag 冻结为历史锚点，仅用于阅读历史；不再作为当前队列末端移动。
+- CI 与 TestKit 镜像属于仓库元数据，不改变 Debian 补丁真源，也不产生另一套队列。
 
-### 改代码（补丁段）
+**判据**：*换上游后这行还需要吗？* 需要 → 补丁；不需要 → CI、文档、脚本等仓库元数据。
 
-```bash
-bash scripts/sync-upstream.sh add-patch <名字>   # 起点是 patch-queue/1.17，不是默认分支 HEAD
-# …改代码、提交（末尾带溯源块 + Patch-Name）…
-git checkout dev/1.17-wcpe
-bash scripts/sync-upstream.sh add-patch finish <名字>
-```
+### 补丁工作与溯源
 
-提交信息末尾必须有溯源块：
+在 `debian/1.17` 上用 `gbp pq import` 进入临时工作分支，按逻辑单元修改并提交；完成后用
+`gbp pq export` 导回未应用态，审阅补丁和 `series` 后再提交。上游 `.gitignore` 的 `/*`
+第 2 行 `/*` 会忽略 `debian/`，打包分支不修改该忽略规则；导出新增补丁后逐个使用
+`git add -f -- debian/patches/<文件>`，不要全量 add。新补丁继续保留提交信息末尾的 DEP-3 溯源块和 `Patch-Name`：
 
 ```
 fix(forge): 修掉 xxx
@@ -90,59 +96,40 @@ Forwarded: no
 Patch-Name: <slug>
 ```
 
-- `Origin`：`vendor, wcpe-loom` / `backport, <上游版本>` / `upstream, <URL>`
-- `Forwarded`：`no`（该反馈上游）/ `not-needed`（本仓库专属）/ `<URL>`（已反馈）
-- `Patch-Name`：`<slug>`（`^[a-z0-9]+(-[a-z0-9]+)*$`，≤ 48 字符，补丁段内唯一）。发布说明按它做集合差，
-  重写队列换了 SHA 也能认出「本版新增」——所以打上去就别再改；历史补丁不回填，元数据提交不带它。
+- `Origin`：`vendor, wcpe-loom` / `backport, <上游版本>` / `upstream, <URL>`。
+- `Forwarded`：`no`（该反馈上游）/ `not-needed`（本仓库专属）/ `<URL>`（已反馈）。
+- `Patch-Name`：`<slug>`（`^[a-z0-9]+(-[a-z0-9]+)*$`，≤ 48 字符，补丁序列内唯一）。发布说明按它做集合差，
+  重建应用视图时也能认出同一逻辑补丁；历史补丁不回填，元数据提交不带它。
 
-### 改 CI / 文档 / 脚本（元数据段）
+### 校验、锁定与发版
 
-直接在 `dev/1.17-wcpe` 提交并 `git push`，无需强推、无需动分支保护。
-
-### 发版纪律（最容易踩）
-
-**一旦打了 `wcpe-v*` tag，那个提交之前的历史就不能再改写。**
-
-插补丁必然要重写队列并强推，但如果重写在已发布 tag 之前，那个 tag 会永久脱离主线历史，
-导致 compare 失真、发版区间跳版、同版本号对应两份历史。
-
-- 插补丁、压缩元数据都放在**发版之前**
-- 打完 tag 之后只用普通提交，直到下次发版前再整理
-- 万一已发生：发布说明不受影响（它按 `Patch-Name` 补丁面算，与 SHA/拓扑无关）；
-  锚点表 `.upstream/release-anchors.txt` 已废弃，不必再补
-
-**发布清单随 tag 一起提交**：打 tag 前先 `bash scripts/gen-release-notes.sh --tag wcpe-v1.17.N` 生成
-`.upstream/releases/wcpe-v1.17.N.md`，人工审阅后用普通提交（元数据段）提交，再打 tag。CI 用
-`--check <tag>` 严格校验，清单缺失或不一致会让 Release 作业失败——它不现生成，也不回退旧区间引擎。
-锚点表只对 `--legacy` 重算 1.17.19 及更早版本有用，已冻结。
-
-### 校验与同步上游
+Maven 分支中的 `.upstream/quilt-1.17.lock` 固化本次源树。校验前先取得打包分支的本地 canonical ref；缺省值是
+`refs/remotes/origin/debian/1.17`：
 
 ```bash
-bash scripts/sync-upstream.sh verify     # 只读自检：线性、无 merge、溯源与 Patch-Name 齐备、与远端队列末端一致
-bash scripts/sync-upstream.sh status     # 只读：基底/队列/元数据/远端一览（本地与远端末端并列）
-bash scripts/sync-upstream.sh pull-queue # 以远端为准对齐本地队列末端（旧值备份到 backup/pq-local-*）
-bash scripts/sync-upstream.sh setup-mirror  # 一次性：把远端队列 tag 镜像到 refs/remotes/，供离线回退
-bash scripts/sync-upstream.sh rebase <新基底sha> [tag]   # 整条队列重放到新基底
+git fetch origin refs/heads/debian/1.17:refs/remotes/origin/debian/1.17
+bash scripts/sync-upstream.sh verify
 ```
 
-**队列末端的真源是远端，本地 tag 只是缓存。** `patch-queue/1.17` 是可移动 tag（远端没有同名分支），
-每次改写都前移，而前移是非快进更新——`git fetch` 遇到与远端分叉的本地 tag 不会覆盖，于是各人的
-本地 tag 停在自己上次同步的位置。**动手前先 `status`，本地落后就 `pull-queue`**：`verify` 把不一致
-当 error，`add-patch` / `rebase` 会直接拒绝执行（否则补丁会挂到旧末端，把远端已有补丁挤掉）。
-反过来，**绝不要在落后的克隆上 `git push --tags --force`**——那会把远端队列 tag 回退。
+`verify` 是只读校验，不生成第二个队列，也不改写工作区或引用。`verify` 和 `status` 都接受只读参数
+`[--view 提交] [--package-ref 打包引用]`。正式流程保持以下顺序：
 
-**首次同步上游前必须先配置远端**——仓库只带 `origin`，脚本默认的上游名 `architectury`
-需要自己添加，否则 `fetch` 会失败、`status` 会显示「上游远端: architectury -> (未 fetch)」：
+1. 在补丁真源和锁定源上独立验证，确认应用视图可由 `series` 重现。
+2. 让主线只对已验证的同一 SHA 快进，交给 CI 在该 SHA 上验证；不制造 merge 提交。
+3. 只发布 `wcpe-v*` tag；上一标签的使用方式和上传策略保持不变。
+
+不得通过强推、merge 或临时修改分支保护来绕过上述流程。旧的 `add-patch`、`add-patch finish`、`rebase`、`pull-queue`、
+`setup-mirror` 只属于迁移前的队尾标签流程；新模式下脚本会提示这些命令不再适用。历史提交前缀和历史说明不改写。
+
+发布清单仍在打 tag 前生成并提交：
 
 ```bash
-git remote add architectury https://github.com/architectury/architectury-loom.git
-git fetch architectury dev/1.17          # 本线跟随的分支是 dev/1.17，不是 architectury
+bash scripts/gen-release-notes.sh --tag wcpe-v1.17.N
+# 提交发布清单并创建 tag 后，由 CI 执行严格校验
+bash scripts/gen-release-notes.sh --check wcpe-v1.17.N
 ```
 
-> 基底 tag 的注释里记着当时的来源与日期，例如
-> `base/architectury-1.17-026ce830` 对应上游 `dev/1.17` 的 `026ce830`。
-> 换基底时用 `git tag -l --format='%(contents)' <基底tag>` 回溯来源。
+四条历史旧补录只在历史描述中保留，不计入本版新增补丁；不要把它们重新列为本版新增。
 
 详细规范见 `.upstream/README.md`（操作手册）、`.upstream/PATCH-QUEUE.md`（规范）、
 `.upstream/migration-1.17.md`（谱系清单）。

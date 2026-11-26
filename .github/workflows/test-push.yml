@@ -55,23 +55,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # 发布说明引擎的回归测试：纯 bash + git，秒级，不需要 JDK。
-  #
-  # 单独开一个作业而**不**塞进 release：release 只在正式版 tag 上跑，而引擎的
-  # 正确性（“发布说明 = 补丁面集合差”）恰恰只会在插补丁/重写队列之后才退化，
-  # 那些改动都是普通分支推送——放进 release 等于把回归推到发版当天才发现。
-  # 所以它每次 push / PR 都跑，不设 needs，也不做 tag 判定。
-  # 成本可忽：引擎本身在真仓库上已从旧实现的约 40 秒（全历史 patch-id 计算）
-  # 降到约 0.8 秒（两次 git log 扫描），测试在一次性临时仓库里把
-  # 「插补丁 → 重写队列 → 打 tag」全过程走一遍，实测约 1 秒。
+  # 本作业只读取打包分支中的补丁数据，不运行打包分支代码。
   scripts:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      # 测试自己造一次性 git 仓库，不依赖本仓库历史，默认浅克隆即可。
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - name: 发布说明引擎回归测试
         run: bash scripts/tests/gen-release-notes-test.sh
+      - name: quilt 队列校验回归测试
+        run: python3 -I -B scripts/tests/verify-quilt-view-test.py
+      # PR 的临时合并提交不是发布视图；真正的推送、验证或标签查实际 SHA。
+      - name: 核对构建视图来自标准补丁队列
+        if: github.event_name != 'pull_request'
+        run: |
+          git fetch --no-tags origin refs/heads/debian/1.17:refs/remotes/origin/debian/1.17
+          bash scripts/sync-upstream.sh verify
 
   # 判断本次推送是否「只动了 scripts/ 下的运维脚本」。
   #
@@ -500,10 +502,8 @@ jobs:
   # 正式版发布后创建 GitHub Release（仅 tag 触发）
   #
   # 发布说明唯一的来源是仓库里的 `.upstream/releases/<tag>.md`，它与发版提交一同进 tag。
-  # 这里**不**再从 git 历史现场生成——本仓库每插一个补丁都要重写补丁队列，
-  # 上一版 tag 因此脱离主线祖先链，按提交区间算出的说明会反复包含已发布条目。
-  # 把清单固化进 tag 有三个好处：正文确定（重跑不变）、能在提交里审阅、
-  # CI 只读文件不必理解历史拓扑；锚点表与「上一版换算到主线」也随之失去意义。
+  # 清单由已提交的补丁标识按集合差生成，也兼容早期标签不在主线祖先链上的历史。
+  # 当前默认分支只快进，清单仍在打 tag 前审阅并提交，让重跑使用同一份正文。
   release:
     needs: publish
     # 作业级 if 只判「publish 成功且未被取消」，**不在 github 表达式里判 tag**。
