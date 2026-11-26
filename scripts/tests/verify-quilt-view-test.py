@@ -365,13 +365,18 @@ class VerifyQuiltViewTest(unittest.TestCase):
 			fixture.git("checkout", "-q", "debian/1.17")
 			git_dir = fixture.repo / ".git"
 			index_before = (git_dir / "index").read_bytes()
-			objects_before = set((git_dir / "objects").rglob("*"))
+			objects = git_dir / "objects"
+			for path in objects.rglob("*"):
+				if path.is_file():
+					# 旧对象可暴露写入重复对象时的时间戳刷新。
+					os.utime(path, ns=(1_000_000_000_000_000_000,) * 2)
+			objects_before = {p: p.stat().st_mtime_ns for p in objects.rglob("*")}
 			refs_before = fixture.git("show-ref")
 			result = self.run_verify(fixture, "--view", fixture.view)
 			self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 			self.assertFalse(marker.exists(), "校验不能执行 debian/rules")
 			self.assertEqual((git_dir / "index").read_bytes(), index_before)
-			self.assertEqual(set((git_dir / "objects").rglob("*")), objects_before)
+			self.assertEqual({p: p.stat().st_mtime_ns for p in objects.rglob("*")}, objects_before)
 			self.assertEqual(fixture.git("show-ref"), refs_before)
 			self.assertEqual(fixture.rev("HEAD"), fixture.packaging)
 			self.assertEqual(fixture.git("status", "--porcelain"), b"")

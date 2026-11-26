@@ -103,9 +103,6 @@ class GitReader:
 			raise GitError(f"git {args[0]} 失败" + (f"：{detail!r}" if detail else ""))
 		return proc.stdout
 
-	def objects_path(self) -> bytes:
-		return self.run("rev-parse", "--path-format=absolute", "--git-path", "objects").removesuffix(b"\n")
-
 	def resolve_commit(self, revision: str, label: str) -> str:
 		if re.fullmatch(r"[0-9a-fA-F]{1,39}", revision):
 			raise VerificationError(f"{label} 不接受短 SHA；请传完整引用或 40 位提交号。")
@@ -186,15 +183,15 @@ def relative_path(path: Any, label: str) -> str:
 
 
 class IsolatedReplay:
-	"""所有索引和新对象写入临时裸仓库；alternates 只读取原对象。"""
+	"""用独立对象库重放补丁，不通过 alternates 刷新源对象的时间戳。"""
 
-	def __init__(self, root: Path, objects: bytes):
-		if not os.path.isabs(objects) or b"\n" in objects or b"\r" in objects:
-			raise VerificationError("源仓库对象目录必须是可用的绝对路径，且不能包含换行。")
+	def __init__(self, root: Path, source: GitReader, trees: tuple[str, str]):
 		self.git = GitReader(root)
 		self.git.run("init", "--bare", "--quiet", "--template=", "--object-format=sha1")
-		# alternates 按行读路径，不按空格或冒号拆分。
-		(root / "objects/info/alternates").write_bytes(objects + b"\n")
+		# 只复制重放起点需要的树和 blob，不复制历史、引用，也不做硬链接。
+		roots = ("\n".join(trees) + "\n").encode("ascii")
+		pack = source.run("pack-objects", "--quiet", "--revs", "--stdout", data=roots)
+		self.git.run("index-pack", "--stdin", data=pack)
 		self.tree = ""
 
 	def reset(self, tree: str) -> None:
@@ -464,16 +461,18 @@ class Verifier:
 		self._check_metadata(lock["metadata_end"], view_commit, final=True)
 
 		with tempfile.TemporaryDirectory(prefix="verify-quilt-view-") as directory:
-			replay = IsolatedReplay(Path(directory), self.git.objects_path())
+			upstream_tree = self.git.tree_id(lock["upstream"])
+			parent_tree = self.git.tree_id(lock["view_parent"])
+			replay = IsolatedReplay(Path(directory), self.git, (upstream_tree, parent_tree))
 			# 独立展开全队列：它不依赖 Maven 历史，也不依赖预先存在的 quilt_tree 对象。
-			replay.reset(self.git.tree_id(lock["upstream"]))
+			replay.reset(upstream_tree)
 			for path, oid in patches.items():
 				replay.apply(self.git.blob(oid), path)
 			if replay.tree != lock["quilt_tree"]:
 				raise VerificationError(f"完整 series 重放后的 tree {replay.tree} 不等于 lock.quilt_tree {lock['quilt_tree']}；请核对补丁或重新生成 lock。")
 
 			# Maven 可能继承已经发布的 Patched 历史和运维覆盖；以实际父树逐条核对选中的重放提交。
-			replay.reset(self.git.tree_id(lock["view_parent"]))
+			replay.reset(parent_tree)
 			slugs: set[str] = set()
 			for path, commit in zip(lock["view_items"], commits):
 				patch = self.git.blob(patches[path])
