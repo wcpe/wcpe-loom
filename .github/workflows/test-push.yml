@@ -1,5 +1,9 @@
 name: CI
 
+env:
+  # 只选择依赖下载源：默认 Google，可切换为 aliyun 或 official。
+  WCPE_CI_MAVEN_CENTRAL: ${{ vars.WCPE_CI_MAVEN_CENTRAL || 'google' }}
+
 # 唯一的构建工作流：测试矩阵 + 发布。
 #
 # 历史上这里是两个文件（test-push.yml 跑测试、publish.yml 跑发布），两者都对

@@ -59,14 +59,52 @@ if (libs.versions.kotlin.get() != kotlinVersion) {
 	throw new IllegalStateException("Requires Kotlin version: ${kotlinVersion}")
 }
 
+def ciMavenCentralSource = providers.environmentVariable('WCPE_CI_MAVEN_CENTRAL').orNull
+def ciMavenCentralMirrors = [
+	google: 'https://maven-central.storage-download.googleapis.com/maven2/',
+	aliyun: 'https://maven.aliyun.com/repository/central/',
+]
+
+if (ciMavenCentralSource != null) {
+	if (ciMavenCentralSource != 'official' && !ciMavenCentralMirrors.containsKey(ciMavenCentralSource)) {
+		throw new GradleException('WCPE_CI_MAVEN_CENTRAL 只接受 google、aliyun 或 official')
+	}
+
+	logger.lifecycle("CI 的 Maven Central 来源：${ciMavenCentralSource}")
+}
+
 repositories {
-	mavenCentral()
+	if (ciMavenCentralSource == null || ciMavenCentralSource == 'official') {
+		mavenCentral()
+	} else {
+		maven {
+			name = 'CiMavenCentralMirror'
+			url = uri(ciMavenCentralMirrors[ciMavenCentralSource])
+		}
+	}
+
 	maven { url = "https://maven.fabricmc.net/" }
 	maven { url = "https://maven.architectury.dev/" }
 	maven {
 		url = "https://maven.minecraftforge.net/"
 		content {
 			excludeGroupByRegex "org\\.eclipse\\.?.*"
+		}
+	}
+
+	if (ciMavenCentralSource != null) {
+		// 插件标记及其实现由 Architectury 提供，不向 Central 探测这两个模块。
+		exclusiveContent {
+			forRepository {
+				maven {
+					name = 'ArchitecturyPack200'
+					url = 'https://maven.architectury.dev/'
+				}
+			}
+			filter {
+				includeModule 'dev.architectury.architectury-pack200', 'dev.architectury.architectury-pack200.gradle.plugin'
+				includeModule 'dev.architectury', 'architectury-pack200'
+			}
 		}
 	}
 }
