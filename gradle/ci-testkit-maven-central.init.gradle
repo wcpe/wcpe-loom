@@ -1,0 +1,35 @@
+import org.gradle.api.artifacts.repositories.MavenArtifactRepository
+
+// 只在显式使用此脚本的测试构建中替换中央仓库，保留其他仓库及其过滤规则。
+def source = System.getenv('WCPE_CI_MAVEN_CENTRAL')
+if (source == null || source == 'official') {
+	return
+}
+
+def mirrors = [
+	google: 'https://maven-central.storage-download.googleapis.com/maven2/',
+	aliyun: 'https://maven.aliyun.com/repository/central/',
+]
+def mirror = mirrors[source]
+if (mirror == null) {
+	throw new GradleException('WCPE_CI_MAVEN_CENTRAL 只接受 google、aliyun 或 official')
+}
+
+def centralUrls = ['https://repo.maven.apache.org/maven2', 'https://repo1.maven.org/maven2']
+def redirectCentral = { repositories ->
+	repositories.withType(MavenArtifactRepository).all { repository ->
+		def url = repository.url?.toString()?.replaceFirst('/+$', '')
+		if (url in centralUrls) {
+			repository.url = mirror
+		}
+	}
+}
+
+gradle.beforeSettings { settings ->
+	redirectCentral(settings.pluginManagement.repositories)
+	redirectCentral(settings.dependencyResolutionManagement.repositories)
+}
+gradle.beforeProject { project ->
+	redirectCentral(project.buildscript.repositories)
+	redirectCentral(project.repositories)
+}
