@@ -188,6 +188,11 @@ trait GradleProjectTestTrait {
 			args << "--parallel"
 			args << "--warning-mode" << warningMode
 			args << "--gradle-user-home" << gradleHomeDir
+
+			// 测试使用独立的 Gradle 目录，需显式传入持续集成的选源配置。
+			if (System.getenv('WCPE_CI_MAVEN_CENTRAL') != null) {
+				args << '--init-script' << new File('gradle/ci-testkit-maven-central.init.gradle').absolutePath
+			}
 			args.addAll(options.args ?: [])
 
 			runner.withArguments(args as String[])
