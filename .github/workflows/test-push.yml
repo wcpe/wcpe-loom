@@ -70,7 +70,7 @@ jobs:
         run: python3 -I -B scripts/tests/verify-quilt-view-test.py
       # PR 的临时合并提交不是发布视图；真正的推送、验证或标签查实际 SHA。
       - name: 核对构建视图来自标准补丁队列
-        if: github.event_name != 'pull_request'
+        if: github.repository == 'wcpe/wcpe-loom' && github.event_name != 'pull_request'
         run: |
           git fetch --no-tags origin refs/heads/debian/1.17:refs/remotes/origin/debian/1.17
           bash scripts/sync-upstream.sh verify

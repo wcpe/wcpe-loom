@@ -326,6 +326,15 @@ class VerifyQuiltViewTest(unittest.TestCase):
 			fixture = Fixture(Path(directory), package_transform=duplicate_name)
 			self.assert_failed(fixture, "唯一非空的合法 Patch-Name")
 
+	def test_missing_origin_in_patch(self) -> None:
+		def omit_origin(fixture: Fixture) -> None:
+			patch = fixture.repo / "debian/patches/patch-one.patch"
+			patch.write_bytes(patch.read_bytes().replace(b"Origin: vendor, test\n", b"", 1))
+
+		with tempfile.TemporaryDirectory() as directory:
+			fixture = Fixture(Path(directory), package_transform=omit_origin)
+			self.assert_failed(fixture, "一致且非空的 Origin")
+
 	def test_short_sha(self) -> None:
 		def shorten(lock: dict[str, Any]) -> None:
 			lock["upstream"] = lock["upstream"][:8]

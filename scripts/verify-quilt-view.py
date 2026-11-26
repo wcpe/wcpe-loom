@@ -402,10 +402,9 @@ class Verifier:
 		if actual.get("patch-name") != patch_names:
 			raise VerificationError(f"视图提交 {commit} 的唯一 Patch-Name trailer 必须匹配 {path!r} 的 {patch_names[0]!r}；请核对顺序与溯源块。")
 		for key in ("Origin", "Forwarded"):
-			headers = [str(value).strip() for value in mail.get_all(key, [])]
-			for expected in (headers, provenance.get(key.lower())):
-				if expected and actual.get(key.lower()) != expected:
-					raise VerificationError(f"视图提交 {commit} 的 {key} trailer 与补丁 {path!r} 不一致；请保留打包溯源。")
+			expected = [str(value).strip() for value in mail.get_all(key, [])] + provenance.get(key.lower(), [])
+			if len(expected) != 1 or not expected[0] or actual.get(key.lower()) != expected:
+				raise VerificationError(f"补丁 {path!r} 与视图提交 {commit} 必须各有一个一致且非空的 {key}；请保留打包溯源。")
 		return patch_names[0]
 
 	@staticmethod
