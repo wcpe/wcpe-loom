@@ -1,0 +1,1145 @@
+From 82793d0bba925f3ef79a7758f6e3c7a26f1c8801 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Sun, 4 Oct 2026 15:41:27 +0800
+Subject: [PATCH 082/147] =?UTF-8?q?fix(forge):=20=E4=BF=AE=E4=B8=A4?=
+ =?UTF-8?q?=E5=A4=84=E6=9C=AC=E8=BD=AE=E5=BC=95=E5=85=A5=E7=9A=84=E5=9B=9E?=
+ =?UTF-8?q?=E5=BD=92=E2=80=94=E2=80=94=E9=85=8D=E7=BD=AE=E7=BC=93=E5=AD=98?=
+ =?UTF-8?q?=E6=B0=B8=E4=B9=85=E5=A4=B1=E6=95=88=E4=B8=8E=E7=BC=93=E5=AD=98?=
+ =?UTF-8?q?=E6=A0=BC=E5=BC=8F=E4=B8=8D=E5=90=91=E5=90=8E=E5=85=BC=E5=AE=B9?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A/B 测量（1.17.11 vs 1.17.12-dev）暴露的两个真实代价。
+
+## 回归 1：forge 临时目录让配置缓存永久失效（热构建变慢）
+
+现象：两次运行都报 Calculating task graph ... because the file system entry
+'.../generateForgePrePatchJar/merged/downloads/87cb...' has been created / removed，配置缓存
+永远无法复用（1.17.11 是 Reusing configuration cache.）。forge 热构建 1s→3s。
+
+根因（从 Gradle 9.5 源码确认，非猜测）：不是"目录位置"，而是**配置期对该目录做了一次文件系统观察**。
+ConfigurationCacheFingerprintWriter.fileSystemEntryObserved() 的唯一门控是 isExecutingWork()
+（任务动作内不记）与两个全局开关；DefaultIgnoredConfigurationInputs 只认用户设的
+ignored-file-system-check-inputs，**对 build/tmp、Task.getTemporaryDir() 没有任何位置豁免**——所以
+"换个目录"这条路不成立。失效点是 McpExecutorBuilder$SetupContextImpl.downloadFile() 里的
+Files.exists(<workDir>/downloads/<sha256(url)[:24]>)（CC 报告 trace 直接点名该内部类）：它在配置期
+被触发（FunctionLogic.Options 的 @InputFile getToolJar() 要被 CC 序列化），而**观察本身会创建该文件**，
+文件又位于任务自有工作目录、执行结束即删 → 记录值恒与下次检查值相反。1.17.11 能复用是因为它用
+TempFiles 随机目录且配置期跑完即删，探测结果恒为"不存在"而稳定。
+
+修法：配置期只算路径（纯计算、零 I/O），下载挪到执行期（任务动作内的观察不记录）；工具 jar 由
+@InputFile 改 @InputFiles（@InputFile 对"已设值但文件不存在"直接判失败，@Optional 不豁免，实测验证）。
+改动 StepLogic / McpConfigFunction / McpExecutorBuilder / McpExecutor / FunctionLogic。
+
+实测（AllinGame/platform-forge-1.20.1，同一命令连续三次）：
+  RUN1 Calculating task graph ... because '../gradle.properties' has changed. | stored
+  RUN2 Reusing configuration cache. | BUILD SUCCESSFUL in 1m 15s | reused
+  RUN3 Reusing configuration cache. | BUILD SUCCESSFUL in 1s    | reused
+机制级佐证：CC 报告里 downloads 条目 4~5 条 → 0 条（报告仍有 101 条 file-system-entry，非空报告）。
+
+## 回归 2：迁移器缓存新格式让 1.17.11 配置期硬失败
+
+6ae718aa 把缓存写成信封 {"key":…,"entries":{…}}，而 1.17.11 把整份文件当 Map<String,String> 解析
+→ JsonSyntaxException: Expected a string but was BEGIN_OBJECT at line 1 column 253（col 253 正是
+entries 起点）。即「把 loom_version 改回 1.17.11」不足以让仓库恢复可用。
+
+修法：主文件永远保持旧版认识的扁平形状；键挪到旁车文件 <名>.key，内含 {"key":…,"entriesSha256":…}
+（摘要挡住"新键+旧内容"的跨代组合）。旧版读旧文件照旧；旧版写下的无键缓存被新版当未命中重算。
+
+双向兼容实测：
+- 单元测试 MappingsMigratorCacheCompatTest 6/6 PASSED，含负对照：同一内容包成上一版信封 → 旧版解析
+  必红，报错与线上逐字一致
+- 端到端：把上一版信封放回共享路径 → 1.17.11 FAILED（JsonSyntaxException at line 1 column 253）；
+  换成新格式 → 1.17.11 BUILD SUCCESSFUL in 50s
+- 集成用例 ForgeMigratorCacheIdentityTest ④ 用真 Gson 读真实缓存（旧版解析：字段表 10 条 / 方法表 0 条），
+  并验证"删掉旁车键 → 重算且产物回到冷参照"
+
+零回归：4 件 jar、**31546 条 entry 逐条 SHA-256**，diff 为空（--rerun 强制重产对比）。
+负对照（回归 1）：最小复现（配置期"探测+落位"到任务工作目录）→ 第 2 次 Calculating task graph ...；
+同一脚本的修法形态 → 三次全部 Reusing configuration cache.
+
+验证：compileJava / checkstyleMain / checkstyleTest / codenarcTest 通过；ZipFsPoisoningTest + 新增
+单元用例 17 PASSED；pipeline.* 35 用例 34 PASSED（唯一红 SplitModDependencyProducerTest 系 TestKit
+daemon 被 GC 杀，定向重跑 PASSED）；ForgePatchedChain / ForgePatchedJar / ForgeMigratorCacheIdentity
+全绿。
+
+语义变化（如实记录）：工具 jar 不再按内容参与 up-to-date（稳态下 @InputFiles 为空），身份由
+McpConfigFunction 的 repo/version 覆盖；若必须保留内容指纹，下一手改成"独立下载任务 + 输出接线"。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/dev/architectury/loom/forge/MappingsMigratorCache.java b/src/main/java/dev/architectury/loom/forge/MappingsMigratorCache.java
+index be2583fa4cf0ab3943a6ec82ca1550831f05f1a4..9861abf7ad6f3408a1fdba540246ef3672a81395 100644
+--- a/src/main/java/dev/architectury/loom/forge/MappingsMigratorCache.java
++++ b/src/main/java/dev/architectury/loom/forge/MappingsMigratorCache.java
+@@ -24,7 +24,6 @@
+ 
+ package dev.architectury.loom.forge;
+ 
+-import java.io.BufferedReader;
+ import java.io.IOException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+@@ -41,7 +40,7 @@ import net.fabricmc.loom.util.Checksum;
+ import net.fabricmc.loom.util.cache.AtomicFiles;
+ 
+ /**
+- * 迁移器缓存的**内容键**与「键 + 内容」信封的读写.
++ * 迁移器缓存的**内容键**与「内容 + 旁车键」的读写.
+  *
+  * <h2>为什么需要内容键</h2>
+  *
+@@ -56,22 +55,41 @@ import net.fabricmc.loom.util.cache.AtomicFiles;
+  *
+  * <h2>怎么解决</h2>
+  *
+- * <p>缓存写成 {@code {"key": <内容键>, "entries": <迁移结果>}}，读方只在键**逐字相等**时才采信 {@code entries}，
+- * 否则一律当作未命中、走冷分支重算。键由「决定迁移结果的量」构成（见 {@link #identity}）：
+- * ns 开关 + 原始 mappings 的摘要 + 各 jar 的摘要。缺失键、旧格式、键不符三种情况都落到「重算」这一侧，
+- * 方向是安全的——键不符最多多算一次，绝不会把别代的迁移结果当成本代结果。
++ * <p>读方只在内容键**逐字相等**时才采信内容文件，否则一律当作未命中、走冷分支重算。键由「决定迁移结果的量」
++ * 构成（见 {@link #identity}）：ns 开关 + 原始 mappings 的摘要 + 各 jar 的摘要。缺失键、键不符两种情况都落到
++ * 「重算」这一侧，方向是安全的——键不符最多多算一次，绝不会把别代的迁移结果当成本代结果。
+  *
+  * <p>代价是暖分支也要把输入读一遍算摘要（15-16MB 的 jar 在几十 ms 级），而冷分支要做的是「解开 jar、
+  * 扫全部 class、解析整棵映射树」，高出一个数量级，因此这份开销换来「产物只由声明输入决定」是划算的。
++ *
++ * <h2>键为什么放在旁车文件，而不是内容文件里</h2>
++ *
++ * <p>内容文件（{@code migrated-fields.json} / {@code method-inheritance-migrator.json}）位于**跨版本共享**的
++ * 缓存目录，旧版 loom（1.17.11 及以前）会把它整份当作扁平数据解析：前者是 {@code Map<String,String>}，
++ * 后者是 {@code Pair} 数组。把键与内容包成 {@code {"key":…,"entries":…}} 信封会让旧版在**配置期硬失败**
++ * （{@code JsonSyntaxException: Expected a string but was BEGIN_OBJECT}），也就是「把 loom 版本回退一档」这种
++ * 正常运维动作会把仓库直接打瘫——新旧版对缓存格式的容忍度是**不对称**的：新版能读旧格式（键缺失即重算），
++ * 旧版读不了新格式。因此键改放独立的旁车文件 {@code <内容文件名>.key}：内容文件**永远保持旧版认识的扁平形状**，
++ * 旧版读它一切照旧（语义仍是旧的、有缺陷，但那是旧版自己的事）；新版靠旁车键决定命中与否，未命中即重算并
++ * 同时刷新两者。旧版写下的缓存没有旁车键 → 新版视为未命中 → 重算，方向同样安全。
++ *
++ * <p>旁车键里还记着内容文件的摘要：键与内容是两次独立的原子落位，跨 daemon 并发下可能读到「新键 + 旧内容」
++ * 的组合，摘要不符即判未命中，把这次竞态也挡在「重算」这一侧。
+  */
+ final class MappingsMigratorCache {
+ 	/**
+ 	 * 键的格式标记.
+ 	 *
+-	 * <p>键的组成或信封语义一旦变化就递增它：旧缓存随即全部失效并自动重算，无需人工清理共享目录。
++	 * <p>键的组成或旁车语义一旦变化就递增它：旧缓存随即全部失效并自动重算，无需人工清理共享目录。
+ 	 */
+ 	private static final String FORMAT = "loom-forge-migrator-cache-v1";
+ 
++	/** 旁车键文件名后缀，追加在内容文件名之后（{@code migrated-fields.json} → {@code migrated-fields.json.key}）. */
++	private static final String KEY_SUFFIX = ".key";
++
++	private static final String KEY_FIELD = "key";
++	private static final String ENTRIES_SHA256_FIELD = "entriesSha256";
++
+ 	private MappingsMigratorCache() {
+ 	}
+ 
+@@ -98,43 +116,56 @@ final class MappingsMigratorCache {
+ 		return builder.toString();
+ 	}
+ 
++	/** {@return 内容文件对应的旁车键文件路径}. */
++	static Path keyFile(Path cacheFile) {
++		return cacheFile.resolveSibling(cacheFile.getFileName() + KEY_SUFFIX);
++	}
++
+ 	/**
+-	 * 读信封：只有键逐字相等时才返回 {@code entries}，其余情形一律返回 {@code null}（视为未命中，由调用方重算）.
++	 * 读缓存：旁车键与本代输入逐字相等、且内容摘要自洽时返回内容文件的根节点，其余情形一律返回 {@code null}
++	 * （视为未命中，由调用方重算）.
+ 	 *
+-	 * <p>三种「不可信」都归到这里，且都留日志，避免「缓存被静默忽略」难以排查：
+-	 * 文件无法解析或压根不是对象（半截内容、被别的写方换成了数组）、没有 {@code key} 字段（改造前写下的旧格式）、
+-	 * 键与当前输入不符（别代内容）。
++	 * <p>每一种「不可信」都归到这里，且都留日志，避免「缓存被静默忽略」难以排查：内容文件或旁车键缺失、
++	 * 旁车键无法解析、键与当前输入不符、内容摘要与旁车键记录的不符（并发换代）、内容文件无法解析。
+ 	 *
+-	 * @param cacheFile 缓存文件
++	 * @param cacheFile 内容文件（保持旧版认识的扁平形状）
+ 	 * @param expectedKey 当前输入算出的内容键
+ 	 * @param logger 日志出口（调用方自己的 logger，配置期与执行期各写各的）
+-	 * @return 缓存里的迁移结果；{@code null} 表示未命中
++	 * @return 内容文件解析出的根节点；{@code null} 表示未命中
+ 	 */
+ 	static @Nullable JsonElement read(Path cacheFile, String expectedKey, Logger logger) throws IOException {
+ 		if (Files.notExists(cacheFile)) {
+ 			return null;
+ 		}
+ 
+-		final JsonElement root;
++		final Path keyFile = keyFile(cacheFile);
+ 
+-		try (BufferedReader reader = Files.newBufferedReader(cacheFile)) {
+-			root = JsonParser.parseReader(reader);
+-		} catch (JsonParseException | IllegalStateException e) {
+-			logger.info("迁移器缓存无法解析（{}），按未命中处理", cacheFile);
++		if (Files.notExists(keyFile)) {
++			// 旧版 loom 写下的缓存没有旁车键：宁可重算，也不能把来源不明的内容当成本代结果
++			logger.info("迁移器缓存没有内容键旁车文件（{}），按未命中处理", keyFile);
+ 			return null;
+ 		}
+ 
+-		if (root == null || !root.isJsonObject()) {
+-			logger.info("迁移器缓存不是「键 + 内容」信封（{}），按未命中处理", cacheFile);
++		final JsonObject keyRoot;
++
++		try {
++			final JsonElement parsed = JsonParser.parseString(Files.readString(keyFile));
++
++			if (parsed == null || !parsed.isJsonObject()) {
++				logger.info("迁移器缓存的内容键不是对象（{}），按未命中处理", keyFile);
++				return null;
++			}
++
++			keyRoot = parsed.getAsJsonObject();
++		} catch (JsonParseException | IllegalStateException e) {
++			logger.info("迁移器缓存的内容键无法解析（{}），按未命中处理", keyFile);
+ 			return null;
+ 		}
+ 
+-		final JsonObject envelope = root.getAsJsonObject();
+-		final JsonElement key = envelope.get("key");
+-		final JsonElement entries = envelope.get("entries");
++		final JsonElement key = keyRoot.get(KEY_FIELD);
+ 
+-		if (key == null || !key.isJsonPrimitive() || entries == null) {
+-			logger.info("迁移器缓存没有内容键（{}），按未命中处理", cacheFile);
++		if (key == null || !key.isJsonPrimitive() || !key.getAsJsonPrimitive().isString()) {
++			logger.info("迁移器缓存的内容键字段缺失或形状不符（{}），按未命中处理", keyFile);
+ 			return null;
+ 		}
+ 
+@@ -143,22 +174,49 @@ final class MappingsMigratorCache {
+ 			return null;
+ 		}
+ 
+-		return entries;
++		final JsonElement entriesSha256 = keyRoot.get(ENTRIES_SHA256_FIELD);
++
++		if (entriesSha256 == null || !entriesSha256.isJsonPrimitive() || !entriesSha256.getAsJsonPrimitive().isString()) {
++			logger.info("迁移器缓存的内容摘要字段缺失或形状不符（{}），按未命中处理", keyFile);
++			return null;
++		}
++
++		final String payload = Files.readString(cacheFile);
++
++		if (!Checksum.of(payload).sha256().matchesStr(entriesSha256.getAsString())) {
++			// 键与内容是两次独立的原子落位：跨 daemon 并发下可能读到「新键 + 旧内容」的组合
++			logger.info("迁移器缓存的内容与内容键不同代（{}），按未命中处理", cacheFile);
++			return null;
++		}
++
++		try {
++			return JsonParser.parseString(payload);
++		} catch (JsonParseException | IllegalStateException e) {
++			logger.info("迁移器缓存无法解析（{}），按未命中处理", cacheFile);
++			return null;
++		}
+ 	}
+ 
+ 	/**
+-	 * 原子发布「内容键 + 迁移结果」.
++	 * 原子发布「内容 + 旁车键」.
++	 *
++	 * <p>缓存位于跨 daemon 共享目录，就地覆盖会让读方看到半截文件，故两份文件都沿用既有的
++	 * 「一次性临时文件 + 原子 move」。先落内容、后落键：键一旦就位就说明它描述的那份内容已经在盘上，
++	 * 剩下的并发窗口由旁车键里的内容摘要兜住。
+ 	 *
+-	 * <p>缓存位于跨 daemon 共享目录，就地覆盖会让读方看到半截文件，故沿用既有的一次性临时文件 + 原子 move。
++	 * <p><b>内容文件写的是 {@code entries} 本身，不带任何信封</b>——旧版 loom 要能整份读它，见类注释。
+ 	 *
+-	 * @param cacheFile 缓存文件
++	 * @param cacheFile 内容文件
+ 	 * @param key 写内容时用的内容键（下一次读它的人会重新算一遍并比对）
+ 	 * @param entries 迁移结果（字段迁移器是对象，方法迁移器是数组）
+ 	 */
+ 	static void publish(Path cacheFile, String key, JsonElement entries) throws IOException {
+-		final JsonObject envelope = new JsonObject();
+-		envelope.addProperty("key", key);
+-		envelope.add("entries", entries);
+-		AtomicFiles.publish(cacheFile, tmp -> Files.writeString(tmp, envelope.toString()));
++		final String payload = entries.toString();
++		AtomicFiles.publish(cacheFile, tmp -> Files.writeString(tmp, payload));
++
++		final JsonObject keyRoot = new JsonObject();
++		keyRoot.addProperty(KEY_FIELD, key);
++		keyRoot.addProperty(ENTRIES_SHA256_FIELD, Checksum.of(payload).sha256().hex());
++		AtomicFiles.publish(keyFile(cacheFile), tmp -> Files.writeString(tmp, keyRoot.toString()));
+ 	}
+ }
+diff --git a/src/main/java/dev/architectury/loom/mcpconfig/McpConfigFunction.java b/src/main/java/dev/architectury/loom/mcpconfig/McpConfigFunction.java
+index aba9a72ab0cae9e6b8aaf4fe63fce485259999c6..ec828eb1f5e00e8ff5d01f38a1f7c4f05b41bc44 100644
+--- a/src/main/java/dev/architectury/loom/mcpconfig/McpConfigFunction.java
++++ b/src/main/java/dev/architectury/loom/mcpconfig/McpConfigFunction.java
+@@ -52,15 +52,23 @@ public record McpConfigFunction(String version, List<ConfigValue> args, List<Con
+ 	private static final String JVM_ARGS_KEY = "jvmargs";
+ 	private static final String REPO_KEY = "repo";
+ 
+-	public Path download(StepLogic.SetupContext executionContext) throws IOException {
++	/**
++	 * {@return 本函数的工具 jar 落位路径}.
++	 *
++	 * <p>两条来源都不下载：{@code repo} 非空时按 URL 在下载缓存里算路径（纯计算，见
++	 * {@link StepLogic.SetupContext#downloadCachePath}）；否则交给 Gradle 依赖解析（其缓存位置本就稳定）。
++	 * 下载由执行期的 {@link StepLogic.ExecutionContext#ensureToolJar} 完成。
++	 */
++	public Path resolvePath(StepLogic.SetupContext context) throws IOException {
+ 		if (repo != null) {
+-			return executionContext.downloadFile(getDownloadUrl());
++			return context.downloadCachePath(getDownloadUrl());
+ 		} else {
+-			return executionContext.downloadDependency(version);
++			return context.downloadDependency(version);
+ 		}
+ 	}
+ 
+-	private String getDownloadUrl() {
++	/** {@return 工具 jar 的下载地址}；{@code repo} 为空时无意义. */
++	public String getDownloadUrl() {
+ 		String[] parts = version.split(":");
+ 		StringBuilder builder = new StringBuilder();
+ 		builder.append(repo);
+diff --git a/src/main/java/dev/architectury/loom/mcpconfig/McpExecutor.java b/src/main/java/dev/architectury/loom/mcpconfig/McpExecutor.java
+index b354ae9992bc9ed1c502148a87ad6e55548a944e..8d66709c38ff0d56df41335415af2f933a24a9a7 100644
+--- a/src/main/java/dev/architectury/loom/mcpconfig/McpExecutor.java
++++ b/src/main/java/dev/architectury/loom/mcpconfig/McpExecutor.java
+@@ -25,7 +25,10 @@
+ package dev.architectury.loom.mcpconfig;
+ 
+ import java.io.IOException;
++import java.io.InputStream;
++import java.net.HttpURLConnection;
+ import java.net.URISyntaxException;
++import java.net.URL;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.util.HashMap;
+@@ -56,6 +59,7 @@ import org.gradle.api.tasks.PathSensitive;
+ import org.gradle.api.tasks.PathSensitivity;
+ import org.jspecify.annotations.Nullable;
+ 
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.loom.util.download.Download;
+ import net.fabricmc.loom.util.download.DownloadBuilder;
+ import net.fabricmc.loom.util.service.Service;
+@@ -235,6 +239,19 @@ public final class McpExecutor extends Service<McpExecutor.Options> {
+ 			return McpExecutor.this.resolve(step, value);
+ 		}
+ 
++		@Override
++		public Path ensureToolJar(Path target, String url) throws IOException {
++			// 刷新依赖时明确绕过 MCP 下载缓存；否则只复用完整的缓存文件。
++			// 这处存在性判断刻意留在执行期：任务动作内的文件系统观察不会被配置缓存记成输入指纹。
++			if (!getOptions().getManualRefreshDeps().get() && Files.exists(target)) {
++				return target;
++			}
++
++			Files.createDirectories(target.getParent());
++			redirectAwareDownload(url, target);
++			return target;
++		}
++
+ 		@Override
+ 		public DownloadBuilder downloadBuilder(String url) {
+ 			DownloadBuilder builder;
+@@ -263,4 +280,33 @@ public final class McpExecutor extends Service<McpExecutor.Options> {
+ 			toolService.exec(configurator);
+ 		}
+ 	}
++
++	/**
++	 * 原子地把 {@code url} 下载到 {@code path}.
++	 *
++	 * <p>这些文件可能仍链接到旧 Forge 仓库，需要跟随重定向到新地址。下载在临时文件里完成后原子落位，
++	 * 避免并发构建的读方看到半截 jar。
++	 */
++	private static void redirectAwareDownload(String urlString, Path path) throws IOException {
++		AtomicFiles.publish(path, temporary -> downloadRedirectAware(urlString, temporary));
++	}
++
++	private static void downloadRedirectAware(String urlString, Path path) throws IOException {
++		URL url = new URL(urlString);
++
++		if (url.getProtocol().equals("http")) {
++			url = new URL("https", url.getHost(), url.getPort(), url.getFile());
++		}
++
++		HttpURLConnection connection = (HttpURLConnection) url.openConnection();
++		connection.connect();
++
++		if (connection.getResponseCode() == HttpURLConnection.HTTP_MOVED_PERM || connection.getResponseCode() == HttpURLConnection.HTTP_MOVED_TEMP) {
++			downloadRedirectAware(connection.getHeaderField("Location"), path);
++		} else {
++			try (InputStream in = connection.getInputStream()) {
++				Files.copy(in, path);
++			}
++		}
++	}
+ }
+diff --git a/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java b/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java
+index 1d51c52627e1fcd68c13b0033eb842d721078fde..9016d6b6307482e7b077bfd7076d96a78016c56c 100644
+--- a/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java
++++ b/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java
+@@ -26,10 +26,7 @@ package dev.architectury.loom.mcpconfig;
+ 
+ import java.io.File;
+ import java.io.IOException;
+-import java.io.InputStream;
+ import java.io.UncheckedIOException;
+-import java.net.HttpURLConnection;
+-import java.net.URL;
+ import java.nio.file.Files;
+ import java.nio.file.NoSuchFileException;
+ import java.nio.file.Path;
+@@ -68,7 +65,6 @@ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+ import net.fabricmc.loom.util.Checksum;
+ import net.fabricmc.loom.util.Constants;
+-import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.loom.util.Lazy;
+ import net.fabricmc.loom.util.gradle.GradleUtils;
+ import net.fabricmc.loom.util.service.Service;
+@@ -92,7 +88,6 @@ public final class McpExecutorBuilder {
+ 	private final List<McpConfigStep> steps;
+ 	private final DependencySet dependencySet;
+ 	private final Map<String, McpConfigFunction> functions;
+-	private final boolean manualRefreshDeps;
+ 	private final Map<String, String> config = new HashMap<>();
+ 	private final StepLogic.SetupContext setupContext = new SetupContextImpl();
+ 	private StepLogic.@Nullable StepLogicProvider stepLogicProvider = null;
+@@ -103,7 +98,6 @@ public final class McpExecutorBuilder {
+ 		this.cache = cache;
+ 		this.steps = provider.getData().steps().get(environment);
+ 		this.functions = provider.getData().functions();
+-		this.manualRefreshDeps = LoomGradleExtension.get(project).manualRefreshDeps();
+ 		this.dependencySet = new DependencySet(this.steps);
+ 		this.dependencySet.skip(step -> isNoOp(step.type()));
+ 
+@@ -222,10 +216,15 @@ public final class McpExecutorBuilder {
+ 		config.put(key, value);
+ 	}
+ 
+-	private Path getDownloadCache() throws IOException {
+-		Path downloadCache = cache.resolve("downloads");
+-		Files.createDirectories(downloadCache);
+-		return downloadCache;
++	/**
++	 * {@return 该 URL 在下载缓存中的落位路径}.
++	 *
++	 * <p><b>刻意只算路径、不碰文件系统</b>：本方法在配置期（步进逻辑选项被配置缓存序列化时）被调用，
++	 * 任何存在性判断都会被配置缓存记成文件系统输入指纹，而下载缓存位于任务自有工作目录内、
++	 * 每次执行结束即删，其存在性逐次翻转，配置缓存将永久无法复用。目录与文件的落地都在执行期完成。
++	 */
++	private Path downloadCachePath(String url) {
++		return cache.resolve("downloads").resolve(Checksum.of(url).sha256().hex(24));
+ 	}
+ 
+ 	/**
+@@ -336,38 +335,8 @@ public final class McpExecutorBuilder {
+ 		}
+ 
+ 		@Override
+-		public Path downloadFile(String url) throws IOException {
+-			Path path = getDownloadCache().resolve(Checksum.of(url).sha256().hex(24));
+-
+-			// 刷新依赖时明确绕过 MCP 下载缓存；否则只复用完整的缓存文件。
+-			if (!manualRefreshDeps && Files.exists(path)) return path;
+-
+-			redirectAwareDownload(url, path);
+-			return path;
+-		}
+-
+-		// 这些文件可能仍链接到旧 Forge 仓库，需要跟随重定向到新地址。
+-		private static void redirectAwareDownload(String urlString, Path path) throws IOException {
+-			AtomicFiles.publish(path, temporary -> downloadRedirectAware(urlString, temporary));
+-		}
+-
+-		private static void downloadRedirectAware(String urlString, Path path) throws IOException {
+-			URL url = new URL(urlString);
+-
+-			if (url.getProtocol().equals("http")) {
+-				url = new URL("https", url.getHost(), url.getPort(), url.getFile());
+-			}
+-
+-			HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+-			connection.connect();
+-
+-			if (connection.getResponseCode() == HttpURLConnection.HTTP_MOVED_PERM || connection.getResponseCode() == HttpURLConnection.HTTP_MOVED_TEMP) {
+-				downloadRedirectAware(connection.getHeaderField("Location"), path);
+-			} else {
+-				try (InputStream in = connection.getInputStream()) {
+-					Files.copy(in, path);
+-				}
+-			}
++		public Path downloadCachePath(String url) {
++			return McpExecutorBuilder.this.downloadCachePath(url);
+ 		}
+ 
+ 		@Override
+diff --git a/src/main/java/dev/architectury/loom/mcpconfig/steplogic/FunctionLogic.java b/src/main/java/dev/architectury/loom/mcpconfig/steplogic/FunctionLogic.java
+index 0a27e90899f3765977376c62fadcf8f8ead17b00..69a545d21ed24e8eb2fb749dc40636e62975d70c 100644
+--- a/src/main/java/dev/architectury/loom/mcpconfig/steplogic/FunctionLogic.java
++++ b/src/main/java/dev/architectury/loom/mcpconfig/steplogic/FunctionLogic.java
+@@ -27,19 +27,21 @@ package dev.architectury.loom.mcpconfig.steplogic;
+ import java.io.File;
+ import java.io.IOException;
+ import java.io.UncheckedIOException;
++import java.nio.file.Path;
+ import java.util.jar.Attributes;
+ import java.util.jar.JarFile;
+ 
+ import dev.architectury.loom.mcpconfig.McpConfigFunction;
++import org.gradle.api.file.ConfigurableFileCollection;
+ import org.gradle.api.file.RegularFileProperty;
+ import org.gradle.api.provider.Property;
+ import org.gradle.api.provider.Provider;
+ import org.gradle.api.tasks.Input;
+-import org.gradle.api.tasks.InputFile;
++import org.gradle.api.tasks.InputFiles;
++import org.gradle.api.tasks.Internal;
+ import org.gradle.api.tasks.PathSensitive;
+ import org.gradle.api.tasks.PathSensitivity;
+ 
+-import net.fabricmc.loom.util.Lazy;
+ import net.fabricmc.loom.util.service.Service;
+ import net.fabricmc.loom.util.service.ServiceFactory;
+ import net.fabricmc.loom.util.service.ServiceType;
+@@ -54,24 +56,48 @@ public final class FunctionLogic extends StepLogic<FunctionLogic.Options> {
+ 		@Input
+ 		Property<McpConfigFunction> getFunction();
+ 
+-		// 归一化策略必须声明：这些选项现在会作为任务的 @Nested 输入参与 up-to-date 判定，
+-		// 而 Gradle 对「缺归一化策略的 @InputFile」会直接让任务失败。工具 jar 只按内容参与判定，故用 NONE。
+-		@InputFile
++		/**
++		 * 工具 jar 的落位路径.
++		 *
++		 * <p>{@code @Internal}：它只是「下载缓存里按 URL 算出来的地址」，配置期纯计算即可得，
++		 * 本身不是可判定的输入；参与 up-to-date 判定的是 {@link #getToolJar()}。
++		 */
++		@Internal
++		RegularFileProperty getToolJarPath();
++
++		/**
++		 * 工具 jar 本身，作为输入参与 up-to-date 判定.
++		 *
++		 * <p>用 {@code @InputFiles}（而不是 {@code @InputFile}）：该文件在配置期<b>刻意</b>不下载
++		 * （见 {@link #createOptions}），因此配置期它可能并不存在，而 {@code @InputFile} 对
++		 * 「已设值但文件不存在」会直接判任务失败（{@code @Optional} 也不能豁免）。{@code @InputFiles}
++		 * 允许缺失，存在时按内容参与判定。工具的「身份」另由 {@link #getFunction()} 里的
++		 * {@code repo}/{@code version} 覆盖——版本或仓库一变即失效。
++		 */
++		@InputFiles
+ 		@PathSensitive(PathSensitivity.NONE)
+-		RegularFileProperty getToolJar();
++		ConfigurableFileCollection getToolJar();
+ 	}
+ 
++	/**
++	 * 配置期只接线，不碰文件系统.
++	 *
++	 * <p>工具 jar 的路径按 URL 纯计算得出，<b>不做存在性判断、也不下载</b>：一旦在配置期观察
++	 * 「下载缓存里的文件是否存在」，配置缓存就会把它记成文件系统输入指纹；而下载缓存位于任务自有的
++	 * {@code build/tmp/…} 工作目录内、每次执行结束即删，其存在性逐次翻转，配置缓存将永久无法复用。
++	 * 下载改由执行期的 {@link ExecutionContext#ensureToolJar} 完成（任务动作内的观察不被记录）。
++	 */
+ 	public static Provider<Options> createOptions(SetupContext context, McpConfigFunction function) {
+ 		return TYPE.create(context.project(), options -> {
+ 			options.getFunction().set(function);
+-			final Provider<File> jar = context.project().provider(Lazy.of(() -> {
+-				try {
+-					return function.download(context).toFile();
+-				} catch (IOException e) {
+-					throw new UncheckedIOException(e);
+-				}
+-			})::get);
+-			options.getToolJar().set(context.project().getLayout().file(jar));
++
++			try {
++				final Path path = function.resolvePath(context);
++				options.getToolJarPath().set(path.toFile());
++				options.getToolJar().setFrom(path.toFile());
++			} catch (IOException e) {
++				throw new UncheckedIOException("无法解析 MCP 工具 jar 的落位路径", e);
++			}
+ 		});
+ 	}
+ 
+@@ -87,7 +113,7 @@ public final class FunctionLogic extends StepLogic<FunctionLogic.Options> {
+ 		context.setOutput("output.jar");
+ 
+ 		McpConfigFunction function = getOptions().getFunction().get();
+-		File jar = getOptions().getToolJar().get().getAsFile();
++		File jar = resolveToolJar(context, function);
+ 		String mainClass;
+ 
+ 		try (JarFile jarFile = new JarFile(jar)) {
+@@ -104,6 +130,22 @@ public final class FunctionLogic extends StepLogic<FunctionLogic.Options> {
+ 		});
+ 	}
+ 
++	/**
++	 * {@return 就位后的工具 jar}.
++	 *
++	 * <p>配置期只算出了落位路径；这里在执行期把它补齐：{@code repo} 非空（裸 URL 下载）时按需下载，
++	 * 否则该文件已由 Gradle 依赖解析在配置期就位。
++	 */
++	private File resolveToolJar(ExecutionContext context, McpConfigFunction function) throws IOException {
++		final Path target = getOptions().getToolJarPath().get().getAsFile().toPath();
++
++		if (function.repo() == null) {
++			return target.toFile();
++		}
++
++		return context.ensureToolJar(target, function.getDownloadUrl()).toFile();
++	}
++
+ 	@Override
+ 	public String getDisplayName(String stepName) {
+ 		return stepName + " with " + getOptions().getFunction().get().version();
+diff --git a/src/main/java/dev/architectury/loom/mcpconfig/steplogic/StepLogic.java b/src/main/java/dev/architectury/loom/mcpconfig/steplogic/StepLogic.java
+index b0483f901cbb661e1d8f8a64debd0eea20360fe6..35287b1c2bac533b62d6ad38455eb537c6a1a2bc 100644
+--- a/src/main/java/dev/architectury/loom/mcpconfig/steplogic/StepLogic.java
++++ b/src/main/java/dev/architectury/loom/mcpconfig/steplogic/StepLogic.java
+@@ -67,6 +67,18 @@ public abstract class StepLogic<O extends Service.Options> extends Service<O> {
+ 		DownloadBuilder downloadBuilder(String url);
+ 		void javaexec(Action<? super ForgeToolExecutor.Settings> configurator);
+ 
++		/**
++		 * 把工具 jar 就位（缺失才下载）并返回其路径.
++		 *
++		 * <p>下载被刻意推迟到执行期：配置期对「下载缓存中的文件」做存在性判断会被配置缓存记成
++		 * 文件系统输入指纹，而该文件在任务结束时被清掉，下一次构建的存在性就与记录值相反——
++		 * 于是配置缓存永远无法复用。执行期（任务动作内）的文件系统观察不会被记录，因此不会污染指纹。
++		 *
++		 * @param target 配置期纯计算出的落位路径
++		 * @param url    下载地址
++		 */
++		Path ensureToolJar(Path target, String url) throws IOException;
++
+ 		default List<String> resolve(List<ConfigValue> configValues) {
+ 			return CollectionUtil.map(configValues, this::resolve);
+ 		}
+@@ -74,7 +86,17 @@ public abstract class StepLogic<O extends Service.Options> extends Service<O> {
+ 
+ 	public interface SetupContext {
+ 		Project project();
+-		Path downloadFile(String url) throws IOException;
++
++		/**
++		 * {@return 该 URL 在下载缓存中的落位路径}.
++		 *
++		 * <p><b>纯路径计算，不做任何文件系统访问</b>：本方法在配置期被调用，一旦在这里判断文件是否存在
++		 * （或顺手把文件下下来），配置缓存就会把该路径记成文件系统输入；而下载缓存位于任务自有工作目录内、
++		 * 每次执行结束即删，存在性逐次翻转，配置缓存将永久失效。真正的下载见
++		 * {@link ExecutionContext#ensureToolJar}。
++		 */
++		Path downloadCachePath(String url) throws IOException;
++
+ 		Path downloadDependency(String notation);
+ 		Provider<FileCollection> getMinecraftLibraries();
+ 	}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeMigratorCacheIdentityTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeMigratorCacheIdentityTest.groovy
+index cfa656754ac2b3f0e7e0781e75b6c352df029a3b..918c8e54520e1dbd0a5b9f721a99d513a8d4b4e7 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeMigratorCacheIdentityTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeMigratorCacheIdentityTest.groovy
+@@ -26,6 +26,9 @@ package net.fabricmc.loom.test.integration.pipeline
+ 
+ import java.security.MessageDigest
+ 
++import com.google.gson.Gson
++import com.google.gson.reflect.TypeToken
++import com.mojang.datafixers.util.Pair
+ import groovy.json.JsonOutput
+ import groovy.json.JsonSlurper
+ import spock.lang.Shared
+@@ -230,6 +233,102 @@ class ForgeMigratorCacheIdentityTest extends Specification implements GradleProj
+ 		diff(restoredMigrated, perturbedMigrated).size() > 0
+ 	}
+ 
++	/**
++	 * 跨版本格式兼容：**新版写下的缓存必须仍能被旧版 loom 整份读下去**.
++	 *
++	 * <h2>被测缺陷</h2>
++	 *
++	 * <p>缓存文件位于跨版本共享的 forge 缓存目录，旧版 loom（1.17.11 及以前）把整份文件当扁平数据解析：
++	 * {@code migrated-fields.json} 是 {@code Map<String,String>}，{@code method-inheritance-migrator.json} 是
++	 * {@code List<Pair<String,String>>}。把键与内容包成 {@code {"key":…,"entries":…}} 信封后，旧版在
++	 * **配置期硬失败**（{@code JsonSyntaxException: Expected a string but was BEGIN_OBJECT}，报错列号正落在
++	 * {@code entries} 起点）——「把 loom 版本回退一档」这种正常运维动作会把仓库打瘫。容忍度是**不对称**的：
++	 * 新版能读旧格式（键缺失即重算），旧版读不了新格式，所以键必须挪到旧版不会去读的旁车文件里。
++	 *
++	 * <h2>三条断言</h2>
++	 *
++	 * <ul>
++	 *   <li><b>①旧版解析必须不报错</b>：直接用 1.17.11 那两个目标类型做 Gson 反序列化（判据是**真** Gson，
++	 *       不是形状的近似），且内容非空——否则断言会退化成「空文件当然能解析」。</li>
++	 *   <li><b>②内容键不在旧版读的那条路径上</b>：内容文件里没有 {@code entries} 信封的痕迹，
++	 *       键另存于 {@code <内容文件名>.key}。</li>
++	 *   <li><b>③旧版写下的缓存不被新版采信</b>：把旁车键删掉（内容仍是合法扁平形状，等价于旧版写方留下的
++	 *       那一份）后重跑任务，产物必须回到冷参照、且旁车键被重新写下——说明这一轮真的重算了，
++	 *       而不是「恰好读到了同一份内容」。</li>
++	 * </ul>
++	 */
++	def "④跨版本格式兼容：新版写出的缓存必须仍能被旧版 loom 整份读下去"() {
++		setup: "冷算一次，拿到新版写下的共享缓存（内容文件 + 旁车键）"
++		def reference = runTask("cold")
++		def referenceMigrated = lines(new File(reference.TASK_MIGRATED))
++		def referenceWithNs = lines(new File(reference.TASK_MIGRATED_WITH_NS))
++		def referenceHash = readHash(reference)
++		def fieldCache = new File(reference.FIELD_CACHE)
++		def methodCache = new File(reference.METHOD_CACHE)
++
++		expect: "①旧版 loom 的解析逻辑必须成功；字段表非空（本夹具的字段迁移确实有内容）"
++		def oldFields = oldVersionFieldParse(fieldCache)
++		def oldMethods = oldVersionMethodParse(methodCache)
++		println("旧版解析：字段表 ${oldFields.size()} 条 / 方法表 ${oldMethods.size()} 条")
++		oldFields.size() > 0
++
++		and: "①b 方法表：本夹具的继承迁移结果本就是空集，但形状仍必须是旧版认识的数组——"
++		// 信封形态（{"key":…,"entries":[]}）在这里会直接以 Expected BEGIN_ARRAY but was BEGIN_OBJECT 失败，
++		// 所以「空集」不影响本条断言的判别力；非空方法表的覆盖在单元用例
++		// MappingsMigratorCacheCompatTest「①方法表」里（那里带负对照）。
++		methodCache.text.trim().startsWith('[')
++		!methodCache.text.trim().startsWith('{')
++
++		and: "②内容键只在旁车文件里，内容文件里没有信封的任何痕迹"
++		sidecarOf(fieldCache).exists()
++		sidecarOf(methodCache).exists()
++		sidecarOf(fieldCache).name == "migrated-fields.json.key"
++		!fieldCache.text.contains('"entries"')
++		!methodCache.text.contains('"entries"')
++
++		when: "③模拟旧版写方：内容保持合法扁平形状，但旁车键不存在"
++		deleteSidecar(fieldCache)
++		deleteSidecar(methodCache)
++		def afterOldWrite = runTask("report")
++		def afterMigrated = lines(new File(afterOldWrite.TASK_MIGRATED))
++		def afterWithNs = lines(new File(afterOldWrite.TASK_MIGRATED_WITH_NS))
++
++		then: "任务不得失败，产物与就绪标记必须回到冷参照（没有键的扁平内容一律不被采信）"
++		def migratedDiff = diff(afterMigrated, referenceMigrated)
++		def withNsDiff = diff(afterWithNs, referenceWithNs)
++		explain(migratedDiff, new File(afterOldWrite.TASK_MIGRATED), new File(reference.TASK_MIGRATED))
++		explain(withNsDiff, new File(afterOldWrite.TASK_MIGRATED_WITH_NS), new File(reference.TASK_MIGRATED_WITH_NS))
++		migratedDiff.isEmpty()
++		withNsDiff.isEmpty()
++		readHash(afterOldWrite) == referenceHash
++
++		and: "旁车键被重新写下：这一轮真的重算了，而不是「恰好读到了同一份内容」"
++		sidecarOf(fieldCache).exists()
++		sidecarOf(methodCache).exists()
++	}
++
++	/**
++	 * 旧版 loom 的字段表读法，判据是**真** Gson：
++	 * {@code new Gson().fromJson(reader, new TypeToken<Map<String,String>>(){})}.
++	 *
++	 * <p>Groovy 捕获不了匿名 {@code TypeToken} 的泛型实参，故改用 {@code TypeToken.getParameterized}
++	 * 构造同一个目标类型——反序列化仍是 Gson 本人在做，不是形状的近似。
++	 */
++	private static Map<String, String> oldVersionFieldParse(File cache) {
++		def type = TypeToken.getParameterized(Map, String, String).getType()
++		return (Map<String, String>) new Gson().fromJson(cache.getText("UTF-8"), type)
++	}
++
++	/**
++	 * 旧版 loom 的方法表读法，判据同上：
++	 * {@code new Gson().fromJson(reader, new TypeToken<List<Pair<String,String>>>(){})}.
++	 */
++	private static List<Pair<String, String>> oldVersionMethodParse(File cache) {
++		def pairType = TypeToken.getParameterized(Pair, String, String).getType()
++		def type = TypeToken.getParameterized(List, pairType).getType()
++		return (List<Pair<String, String>>) new Gson().fromJson(cache.getText("UTF-8"), type)
++	}
++
+ 	/**
+ 	 * 一次「按模式准备共享缓存 → 重跑迁移任务」.
+ 	 *
+@@ -259,11 +358,12 @@ class ForgeMigratorCacheIdentityTest extends Specification implements GradleProj
+ 	}
+ 
+ 	/**
+-	 * 把两个缓存换成「改造前格式的垃圾内容」：外层没有内容键，内容也与本代输入无关.
++	 * 把两个缓存换成「旧版 loom 格式的垃圾内容」：内容文件是裸内容、且**没有旁车键**.
+ 	 *
+-	 * <p>形态刻意沿用改造前那种「裸内容」写法（字段表是对象、方法表是 {@code [{left,right}]} 列表），
+-	 * 因此对改造前的代码是**可解析且会被采信**的——它不会报错，只会静默换一套迁移结果。
+-	 * 这正是「另一棵树/更旧版本在这个共享目录里留下的东西」会造成的后果，也是本条对照要钉住的点。
++	 * <p>形态刻意沿用旧版那种「裸内容」写法（字段表是对象、方法表是 {@code [{left,right}]} 列表），
++	 * 因此对旧版代码是**可解析且会被采信**的——它不会报错，只会静默换一套迁移结果。
++	 * 这正是「另一棵树/更旧版本在这个共享目录里留下的东西」会造成的后果，也是本条对照要钉住的点：
++	 * 新版读方只能靠旁车键判断内容出自哪一组输入，没有键就必须重算。
+ 	 *
+ 	 * <p>同时留一份到 {@code build/probe}：用例需要断言「被投毒的内容确实与本代真实内容不同」，
+ 	 * 否则整条对照可能是空转的。
+@@ -271,6 +371,8 @@ class ForgeMigratorCacheIdentityTest extends Specification implements GradleProj
+ 	private void poisonCaches(Map<String, String> report) {
+ 		new File(report.FIELD_CACHE).text = '{}'
+ 		new File(report.METHOD_CACHE).text = '[{"left":"#poison","right":"()V"}]'
++		deleteSidecar(new File(report.FIELD_CACHE))
++		deleteSidecar(new File(report.METHOD_CACHE))
+ 		new File(probeDir(), "poison-field-cache.json").text = new File(report.FIELD_CACHE).text
+ 		new File(probeDir(), "poison-method-cache.json").text = new File(report.METHOD_CACHE).text
+ 	}
+@@ -279,41 +381,49 @@ class ForgeMigratorCacheIdentityTest extends Specification implements GradleProj
+ 	 * 把缓存里的迁移结果清空，**保持内容键不变**：这是「键一致但内容被扰动」的形态，
+ 	 * 用来证明缓存内容真的被消费（产物与就绪标记必须随之变化）。
+ 	 *
+-	 * <p>兼容两种信封：带 {@code key}/{@code entries} 的新格式，以及改造前的裸内容（那时没有键，
+-	 * 读到什么用什么）。两种形态下都把「条目」清空。
++	 * <p>新版的内容键在旁车文件里，并且记着内容文件的摘要，因此「扰动」必须自洽地同时改两处：
++	 * 内容清空 + 旁车键里的摘要跟着更新。只改内容不改摘要会被判成「键与内容不同代」而按未命中重算，
++	 * 那样这条对照就退化成「什么都没验证」——它要钉的是「缓存内容流进了产物」，不是「读方拒绝坏数据」。
+ 	 */
+ 	private static void emptyCacheEntries(File cacheFile) {
+-		def json = new JsonSlurper().parseText(cacheFile.text)
+-
+-		if (json instanceof Map && json.containsKey('key') && json.containsKey('entries')) {
+-			def entries = json.entries
++		def keyFile = sidecarOf(cacheFile)
++		def keyJson = new JsonSlurper().parseText(keyFile.text)
++		def emptied = new JsonSlurper().parseText(cacheFile.text) instanceof Map ? [:] : []
++		def payload = JsonOutput.toJson(emptied)
++		cacheFile.text = payload
++		keyFile.text = JsonOutput.toJson([key: keyJson.key, entriesSha256: sha256Hex(payload)])
++	}
+ 
+-			if (entries instanceof Map) {
+-				cacheFile.text = JsonOutput.toJson([key: json.key, entries: [:]])
+-			} else {
+-				cacheFile.text = JsonOutput.toJson([key: json.key, entries: []])
+-			}
++	/** 取内容文件对应的旁车键文件（{@code <内容文件名>.key}，与 {@code MappingsMigratorCache.keyFile} 同一规则）. */
++	private static File sidecarOf(File cacheFile) {
++		return new File(cacheFile.parentFile, cacheFile.name + '.key')
++	}
+ 
+-			return
+-		}
++	/** 删掉旁车键：模拟旧版 loom 的写方——它只知道内容文件，不会写也不会删键. */
++	private static void deleteSidecar(File cacheFile) {
++		sidecarOf(cacheFile).delete()
++	}
+ 
+-		cacheFile.text = json instanceof Map ? '{}' : '[]'
++	/** 与 {@code Checksum.of(String).sha256().hex()} 同口径（UTF-8 + SHA-256 十六进制小写）. */
++	private static String sha256Hex(String text) {
++		def digest = MessageDigest.getInstance("SHA-256")
++		digest.update(text.getBytes("UTF-8"))
++		return digest.digest().encodeHex().toString()
+ 	}
+ 
+-	/** 取缓存里的「迁移条目」：带键信封取 entries，改造前的裸内容取它自己. */
++	/** 取缓存里的「迁移条目」：内容文件本身就是迁移结果（旧版认识的扁平形状），键在旁车文件里. */
+ 	private static Map<Object, Object> entriesOf(File cacheFile) {
+ 		if (!cacheFile.exists()) {
+ 			return [:]
+ 		}
+ 
+ 		def json = new JsonSlurper().parseText(cacheFile.text)
+-		def entries = json instanceof Map && json.containsKey('entries') ? json.entries : json
+ 		def result = [:]
+ 
+-		if (entries instanceof Map) {
+-			result.putAll(entries)
+-		} else if (entries instanceof List) {
+-			entries.eachWithIndex { entry, index -> result[index] = entry.toString() }
++		if (json instanceof Map) {
++			result.putAll(json)
++		} else if (json instanceof List) {
++			json.eachWithIndex { entry, index -> result[index] = entry.toString() }
+ 		}
+ 
+ 		return result
+@@ -413,6 +523,10 @@ class ForgeMigratorCacheIdentityTest extends Specification implements GradleProj
+ 			} else if (mode == 'cold') {
+ 				java.nio.file.Files.deleteIfExists(fieldCache)
+ 				java.nio.file.Files.deleteIfExists(methodCache)
++				// 旁车键必须与内容同生共死：只删内容会留下「键在、内容不在」的形态，
++				// 那与本用例想构造的「缓存不存在」不是一回事
++				java.nio.file.Files.deleteIfExists(fieldCache.resolveSibling(fieldCache.fileName.toString() + '.key'))
++				java.nio.file.Files.deleteIfExists(methodCache.resolveSibling(methodCache.fileName.toString() + '.key'))
+ 			}
+ 
+ 			new File(probeDir, 'run-' + mode + '.properties').text = text
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/forge/MappingsMigratorCacheCompatTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/forge/MappingsMigratorCacheCompatTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..4411825095a17389ad33ac24e5142c286621c814
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/forge/MappingsMigratorCacheCompatTest.groovy
+@@ -0,0 +1,270 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.forge
++
++import java.lang.reflect.Method
++import java.nio.charset.StandardCharsets
++import java.nio.file.Files
++import java.nio.file.Path
++
++import com.google.gson.JsonArray
++import com.google.gson.JsonElement
++import com.google.gson.JsonObject
++import com.google.gson.JsonParser
++import com.google.gson.JsonPrimitive
++import com.google.gson.JsonSyntaxException
++import org.slf4j.Logger
++import org.slf4j.LoggerFactory
++import spock.lang.Specification
++import spock.lang.TempDir
++
++/**
++ * 迁移器缓存的**跨版本格式兼容**：新版写出的缓存必须仍能被旧版 loom 整份读下去.
++ *
++ * <h2>被测缺陷</h2>
++ *
++ * <p>迁移器缓存（{@code migrated-fields.json} / {@code method-inheritance-migrator.json}）位于**跨版本共享**
++ * 的 forge 缓存目录。旧版 loom（1.17.11 及以前）把整份文件当扁平数据解析：字段表是
++ * {@code Map<String,String>}，方法表是 {@code List<Pair<String,String>>}。把键与内容包成
++ * {@code {"key":…,"entries":…}} 信封之后，旧版会在**配置期硬失败**：
++ * {@code JsonSyntaxException: Expected a string but was BEGIN_OBJECT}（报错列号正落在 {@code entries} 的起点）。
++ * 也就是说「把 loom 版本回退一档」这种正常运维动作会把仓库直接打瘫——新旧版对缓存格式的容忍度是
++ * **不对称**的：新版能读旧格式（键缺失即重算），旧版读不了新格式。
++ *
++ * <h2>本用例钉住什么</h2>
++ *
++ * <ul>
++ *   <li><b>①新版写出的内容文件形状</b>：顶层必须是旧版认识的扁平形状，且逐字段可被旧版解析
++ *       （字段表：对象 + 全部 value 为 JSON 字符串；方法表：数组 + 每项为两个字符串的数组）。
++ *       这两条判据与「Gson 能否反序列化成 {@code Map<String,String>} / {@code List<Pair<String,String>>}」
++ *       等价——Gson 对这两种目标类型只接受上述形状，其它一律抛 {@code JsonSyntaxException}。</li>
++ *   <li><b>②负对照</b>：把同一份内容包成上一版那个信封，旧版解析**必须变红**。没有这一条，
++ *       ①里的解析判据可能只是「什么都没检查」的空转断言。</li>
++ *   <li><b>③双向兼容</b>：旧版写下扁平内容（没有旁车键）→ 新版不采信（按未命中重算），而旧版自己读它照旧；
++ *       新版写下内容 + 旁车键 → 新版键一致时命中、键不符时未命中。</li>
++ * </ul>
++ *
++ * <h2>为什么用反射</h2>
++ *
++ * <p>{@code MappingsMigratorCache} 是包私有实现类，而本用例的断言对象是「缓存文件的形状」而不是类可见性，
++ * 故与 {@code ZipFsPoisoningTest} 同样用反射取用，避免为了测试把内部实现提升为公开 API。
++ */
++class MappingsMigratorCacheCompatTest extends Specification {
++	/** 被测的包私有实现（{@code dev.architectury.loom.forge.MappingsMigratorCache}）. */
++	private static final Class<?> CACHE = Class.forName('dev.architectury.loom.forge.MappingsMigratorCache')
++
++	private static final Method PUBLISH = CACHE.getDeclaredMethod('publish', Path, String, JsonElement)
++	private static final Method READ = CACHE.getDeclaredMethod('read', Path, String, Logger)
++	private static final Method KEY_FILE = CACHE.getDeclaredMethod('keyFile', Path)
++
++	private static final Logger LOGGER = LoggerFactory.getLogger(MappingsMigratorCacheCompatTest)
++
++	private static final String KEY = 'loom-forge-migrator-cache-v1|srg=true|mojang=false|mappings-srg.tiny=abc'
++
++	static {
++		[PUBLISH, READ, KEY_FILE].each { it.setAccessible(true) }
++	}
++
++	@TempDir
++	Path tempDir
++
++	def "①字段表：新版写出的内容文件保持旧版能整份解析的扁平形状"() {
++		given: "一份非空的字段迁移表（形状与冷分支产出的完全一致：owner#field → 描述符）"
++		def cache = tempDir.resolve("migrated-fields.json")
++		def entries = new JsonObject()
++		entries.addProperty("net/minecraft/class_304#field_1658", "Lnet/minecraftforge/client/settings/KeyMappingLookup;")
++		entries.addProperty("net/minecraft/class_52#field_943", "Ljava/util/List;")
++
++		when: "用新版实现发布"
++		publish(cache, KEY, entries)
++
++		then: "旧版 1.17.11 的解析逻辑（Gson → Map<String,String>）必须不报错，且读到的内容与写入一致"
++		def old = oldFieldParse(cache)
++		old.size() == 2
++		old["net/minecraft/class_304#field_1658"] == "Lnet/minecraftforge/client/settings/KeyMappingLookup;"
++		old["net/minecraft/class_52#field_943"] == "Ljava/util/List;"
++
++		and: "内容键另放旁车文件，内容文件里没有 key/entries 信封的任何痕迹"
++		Files.exists(keyFile(cache))
++		!cache.text.contains('"entries"')
++	}
++
++	def "①方法表：新版写出的内容文件保持旧版能整份解析的扁平形状"() {
++		given: "一份非空的方法表（形状与冷分支产出的完全一致：[[intermediary 名, 描述符], …]）"
++		def cache = tempDir.resolve("method-inheritance-migrator.json")
++		def entries = new JsonArray()
++		entries.add(new JsonArray().tap { add("method_1234"); add("()V") })
++		entries.add(new JsonArray().tap { add("method_5678"); add("(I)V") })
++
++		when: "用新版实现发布"
++		publish(cache, KEY, entries)
++
++		then: "旧版 1.17.11 的解析逻辑（Gson → List<Pair<String,String>>）必须不报错"
++		def old = oldMethodParse(cache)
++		old.size() == 2
++		old[0] == ["method_1234", "()V"]
++		old[1] == ["method_5678", "(I)V"]
++
++		and: "内容键同样只在旁车文件里"
++		Files.exists(keyFile(cache))
++		!cache.text.contains('"entries"')
++	}
++
++	def "②负对照：上一版的 key/entries 信封必须让旧版解析变红（证明①的判据不是空转）"() {
++		given: "把同一份字段表包成上一版那个信封，并写进同一个路径"
++		def cache = tempDir.resolve("migrated-fields.json")
++		def entries = new JsonObject()
++		entries.addProperty("net/minecraft/class_52#field_943", "Ljava/util/List;")
++		def envelope = new JsonObject()
++		envelope.addProperty("key", KEY)
++		envelope.add("entries", entries)
++		Files.writeString(cache, envelope.toString(), StandardCharsets.UTF_8)
++
++		when: "旧版解析它"
++		oldFieldParse(cache)
++
++		then: "必须抛异常——正是 1.17.11 实测到的 JsonSyntaxException（Expected a string but was BEGIN_OBJECT）"
++		def e = thrown(JsonSyntaxException)
++		e.message.contains("BEGIN_OBJECT")
++	}
++
++	def "③新版读新版：键一致命中、键不符未命中"() {
++		given: "新版写下一份缓存"
++		def cache = tempDir.resolve("migrated-fields.json")
++		def entries = new JsonObject()
++		entries.addProperty("net/minecraft/class_52#field_943", "Ljava/util/List;")
++		publish(cache, KEY, entries)
++
++		expect: "键逐字相等时命中，取回的正是那份内容"
++		read(cache, KEY).getAsJsonObject().get("net/minecraft/class_52#field_943").getAsString() == "Ljava/util/List;"
++
++		and: "键不符（另一代输入）时按未命中处理"
++		read(cache, KEY + '|different') == null
++	}
++
++	def "③旧版写下 → 新版不采信：没有旁车键的扁平内容一律按未命中重算"() {
++		given: "模拟旧版 loom 的写方：只有扁平内容，没有旁车键"
++		def cache = tempDir.resolve("migrated-fields.json")
++		Files.writeString(cache, '{"net/minecraft/class_52#field_943":"Ljava/util/List;"}', StandardCharsets.UTF_8)
++
++		expect: "旧版自己读它照旧（不报错）"
++		oldFieldParse(cache).size() == 1
++
++		and: "新版把它当未命中——来源不明的扁平内容不得被采信"
++		read(cache, KEY) == null
++	}
++
++	def "③内容被扰动 → 新版不采信：旁车键里的内容摘要挡住跨代组合"() {
++		given: "新版写下一份缓存，然后把内容换成别代的结果（旁车键保持不动）"
++		def cache = tempDir.resolve("migrated-fields.json")
++		def entries = new JsonObject()
++		entries.addProperty("net/minecraft/class_52#field_943", "Ljava/util/List;")
++		publish(cache, KEY, entries)
++		Files.writeString(cache, '{}', StandardCharsets.UTF_8)
++
++		expect: "键虽然相等，但内容与旁车键记录的不同代，仍按未命中处理"
++		read(cache, KEY) == null
++	}
++
++	// --- 旧版 loom 解析逻辑的等价实现 ---
++
++	/**
++	 * 旧版字段表读法：{@code new Gson().fromJson(reader, new TypeToken<Map<String,String>>(){})}.
++	 *
++	 * <p>Gson 对 {@code Map<String,String>} 只接受「顶层对象 + 每个 value 都是 JSON 字符串」，
++	 * 其余形状（信封里的嵌套对象、数组、数字……）一律抛 {@code JsonSyntaxException}，
++	 * 故这里逐条断言这两件事，判据与旧版完全等价。
++	 */
++	private static Map<String, String> oldFieldParse(Path cache) {
++		final JsonElement root = JsonParser.parseString(Files.readString(cache, StandardCharsets.UTF_8))
++
++		if (root == null || !root.isJsonObject()) {
++			throw new JsonSyntaxException("Expected BEGIN_OBJECT but was " + describe(root))
++		}
++
++		final Map<String, String> result = [:]
++
++		root.getAsJsonObject().asMap().each { key, value ->
++			if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()) {
++				throw new JsonSyntaxException("Expected a string but was " + describe(value))
++			}
++
++			result.put(key, value.getAsString())
++		}
++
++		return result
++	}
++
++	/** 旧版方法表读法：{@code new Gson().fromJson(reader, new TypeToken<List<Pair<String,String>>>(){})}. */
++	private static List<List<String>> oldMethodParse(Path cache) {
++		final JsonElement root = JsonParser.parseString(Files.readString(cache, StandardCharsets.UTF_8))
++
++		if (root == null || !root.isJsonArray()) {
++			throw new JsonSyntaxException("Expected BEGIN_ARRAY but was " + describe(root))
++		}
++
++		final List<List<String>> result = []
++
++		root.getAsJsonArray().each { entry ->
++			if (!entry.isJsonArray() || entry.getAsJsonArray().size() != 2) {
++				throw new JsonSyntaxException("Expected a two-element array but was " + describe(entry))
++			}
++
++			result.add(entry.getAsJsonArray().collect { it.getAsString() })
++		}
++
++		return result
++	}
++
++	private static String describe(JsonElement element) {
++		if (element == null) {
++			return "null"
++		}
++
++		if (element instanceof JsonObject) {
++			return "BEGIN_OBJECT"
++		}
++
++		if (element instanceof JsonArray) {
++			return "BEGIN_ARRAY"
++		}
++
++		return ((JsonPrimitive) element).isString() ? "STRING" : "PRIMITIVE"
++	}
++
++	// --- 反射入口 ---
++
++	private static void publish(Path cacheFile, String key, JsonElement entries) {
++		PUBLISH.invoke(null, cacheFile, key, entries)
++	}
++
++	private static JsonElement read(Path cacheFile, String key) {
++		return READ.invoke(null, cacheFile, key, LOGGER) as JsonElement
++	}
++
++	private static Path keyFile(Path cacheFile) {
++		return KEY_FILE.invoke(null, cacheFile) as Path
++	}
++}

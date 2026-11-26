@@ -1,0 +1,178 @@
+From 6ffb5a210bfe2b9ccd7096bde886b83777192ba2 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:50 +0800
+Subject: [PATCH 049/147] =?UTF-8?q?perf(forge):=20=E9=92=89=E6=AD=BB=20For?=
+ =?UTF-8?q?ge=20=E5=BA=93=E7=9A=84=E6=97=A0=E6=95=88=E5=8A=A8=E6=80=81?=
+ =?UTF-8?q?=E7=89=88=E6=9C=AC=EF=BC=8C=E6=B6=88=E9=99=A4=E5=85=A8=E4=BB=93?=
+ =?UTF-8?q?=E5=BA=93=E7=89=88=E6=9C=AC=E5=88=97=E4=B8=BE=20(#7)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* perf(forge): 钉死 Forge 库的无效动态版本，消除全仓库版本列举
+
+Forge 自家 POM 用动态版本声明部分传递依赖（eventbus:6.0.5 声明
+cpw.mods:modlauncher:10.0.+，coremods:5.0.1 声明 modlauncher:9.0.+，
+forgespi 亦声明 net.jodah:typetools:0.6.+）。Gradle 解析动态版本必须对
+每个仓库列举版本列表，而消费方构建的仓库清单有 20 余个、多数不含这些
+构件，于是每次都串行走一遍慢 404。
+
+实测（264 模块消费方，离线对照）：ForgeLibrariesProvider 的解析步骤
+在线 1.5~5.4 秒、离线 0 毫秒，差值全为网络往返；其中 maven.wcpe.top
+单次 404 即耗时 1.8~2.6 秒。整个配置阶段因此被拉长四成。
+
+改动：在解析 Forge 库的 detached configuration 上挂 eachDependency，
+把「必然落选的动态声明」替换为等值固定版本，从而跳过版本列举。
+
+只收录动态声明必然落选的坐标——即 userdev 已用固定版本声明同一构件、
+且固定值不低于该动态声明能解析到的任何候选：
+
+- cpw.mods:modlauncher 钉 10.0.9：9.0.+ 更低、10.0.+ 的候选上限即 10.0.x
+- net.jodah:typetools 钉 0.6.3：0.6.+ 的候选上限即 0.6.3
+
+刻意不收录 dev.architectury:mixin-patched:0.8.5.+：该坐标没有固定声明与
+之竞争，动态版本真实生效（仓库同时存在 0.8.5.10 与 0.8.5.12，将来还会
+发布 0.8.5.13），钉死它会让构建永远停在当前版本，属功能退化。
+
+替换前后 Gradle 的版本冲突解决输入与输出均不变，仅省掉版本列举这一步
+网络往返，故对解析结果零影响。
+
+验证：
+- forgeDependencies 解析结果逐项比对：官方版与改动版各 64 条，diff 完全一致
+- 消费方 :forge-1.20.1:compileJava 端到端通过（206 个任务）
+- 配置阶段动态版本解析由 7 个降至 4 个，保留的 4 个均为真实生效者
+- 消费方 CC 未命中构建 12.7s → 7.2s（-43%）
+- checkstyleMain 通过
+
+* fix(forge): 动态版本改钉到 userdev 声明的固定版本，避免跨代系串版本
+
+上一版把 cpw.mods:modlauncher 无条件钉到 10.0.9，而各代系 userdev 自带的
+modlauncher 并不相同（由各版本 userdev 的 config.json 读出：1.16.5 线 8.1.3、
+1.18.1 线 9.1.0、1.19.4 线 10.0.8、1.20.1 线 10.0.9）。而
+ForgeLibrariesProvider 对所有 isForgeLike() 车道生效、没有版本门槛，这些
+车道会被强行抬到 10.0.9（1.16.5 线一次跨两个大版本），属真实回归。
+
+改为不写死版本表：从传入该 configuration 的依赖里收集「已用固定版本声明」的
+坐标（即 userdev 的声明），把与之竞争的动态声明钉到该版本。该版本就是
+「Forge 该版本发布时自带的版本」，既保留跳过版本列举的收益，也不跨代系串版本；
+没有固定声明与之竞争的动态版本（如 dev.architectury:mixin-patched:0.8.5.+）
+保持动态不变。
+
+顺带把 isDynamicVersion 补全为同时识别 [、(、] 开头与 latest.* 声明。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java
+index 50d7d0240ec69bce5907af2d71f871711683452c..82f044e8874f022fd809daf17aed02d27f1a12d4 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java
+@@ -28,6 +28,7 @@ import java.io.IOException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.util.ArrayList;
++import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+@@ -41,9 +42,11 @@ import dev.architectury.loom.util.ClassVisitorUtil;
+ import dev.architectury.loom.util.PropertyUtil;
+ import dev.architectury.loom.util.Version;
+ import org.gradle.api.Project;
++import org.gradle.api.artifacts.Configuration;
+ import org.gradle.api.artifacts.Dependency;
+ import org.gradle.api.artifacts.ModuleDependency;
+ import org.gradle.api.artifacts.ModuleVersionIdentifier;
++import org.gradle.api.artifacts.ModuleVersionSelector;
+ import org.gradle.api.artifacts.ResolvedArtifact;
+ import org.gradle.api.artifacts.ResolvedConfiguration;
+ import org.jspecify.annotations.Nullable;
+@@ -128,9 +131,10 @@ public class ForgeLibrariesProvider {
+ 		// Resolve all files. We just add the dependencies manually unless it's FML.
+ 		// We're transforming the files manually instead of using Gradle's mechanism because
+ 		// we can target the individual files to be transformed instead of creating new copies of all the libraries.
+-		final ResolvedConfiguration config = project.getConfigurations()
+-				.detachedConfiguration(dependencies.toArray(new Dependency[0]))
+-				.getResolvedConfiguration();
++		final Configuration detached = project.getConfigurations()
++				.detachedConfiguration(dependencies.toArray(new Dependency[0]));
++		pinDynamicVersionsToDeclaredVersions(detached, dependencies);
++		final ResolvedConfiguration config = detached.getResolvedConfiguration();
+ 
+ 		boolean isFancyModLoader10OrNewer = false;
+ 
+@@ -332,6 +336,74 @@ public class ForgeLibrariesProvider {
+ 		}
+ 	}
+ 
++	/**
++	 * 把 Forge 库传递依赖里的动态版本，钉到同一 configuration 中已声明的固定版本.
++	 *
++	 * <p>背景：Forge 自家 POM 用动态版本声明部分传递依赖（如 eventbus:6.0.5 声明
++	 * {@code cpw.mods:modlauncher:10.0.+}、coremods:5.0.1 声明 {@code modlauncher:9.0.+}）。
++	 * Gradle 解析动态版本必须对每个仓库列举版本列表，而本构建的仓库清单常有二十余个，
++	 * 多数不含这些构件，每次都要串行走一遍慢 404；实测单次配置阶段因此多耗 1.5~5.4 秒。
++	 *
++	 * <p>取值的依据是 userdev 自己声明的固定版本，而不是写死版本表：同一条 Forge 依赖清单里
++	 * 已用精确版本声明了这些构件（1.16.5 线 modlauncher 8.1.3、1.18.1 线 9.1.0、
++	 * 1.19.4 线 10.0.8、1.20.1 线 10.0.9），把与之竞争的动态声明钉到该版本，即得
++	 * 「该 Forge 版本发布时自带的版本」——既跳过版本列举，也不会跨代系串版本。
++	 *
++	 * <p>只处理「同一 configuration 里存在同坐标固定声明」的动态版本；没有固定声明与之竞争的
++	 * （如 {@code dev.architectury:mixin-patched:0.8.5.+}）保持动态，因为那类动态版本真实生效。
++	 *
++	 * @param configuration 正在解析的 Forge 库 configuration
++	 * @param dependencies 传入该 configuration 的依赖（含 userdev 声明的固定版本）
++	 */
++	private static void pinDynamicVersionsToDeclaredVersions(Configuration configuration, List<Dependency> dependencies) {
++		final Map<String, String> declaredVersions = new HashMap<>();
++
++		for (Dependency dependency : dependencies) {
++			final String version = dependency.getVersion();
++
++			if (version == null || isDynamicVersion(version)) {
++				continue;
++			}
++
++			declaredVersions.putIfAbsent(dependency.getGroup() + ":" + dependency.getName(), version);
++		}
++
++		if (declaredVersions.isEmpty()) {
++			return;
++		}
++
++		configuration.getResolutionStrategy().eachDependency(details -> {
++			final ModuleVersionSelector requested = details.getRequested();
++			final String version = requested.getVersion();
++
++			// 只处理动态版本；已是固定版本（含 userdev 的精确声明）保持原样，避免多余干预
++			if (version == null || !isDynamicVersion(version)) {
++				return;
++			}
++
++			final String declared = declaredVersions.get(requested.getGroup() + ":" + requested.getName());
++
++			// 没有同坐标的固定声明与之竞争时保持动态：那类动态版本真实生效，钉死会造成功能退化
++			if (declared != null) {
++				details.useVersion(declared);
++			}
++		});
++	}
++
++	/**
++	 * 判断版本声明是否为动态版本（{@code 1.+}、{@code [1.0,2.0)}、{@code ]1.0,2.0]}、{@code latest.release}）.
++	 *
++	 * @param version 版本声明
++	 * @return 动态版本返回 true
++	 */
++	private static boolean isDynamicVersion(String version) {
++		return version.indexOf('+') >= 0
++				|| version.startsWith("[")
++				|| version.startsWith("(")
++				|| version.startsWith("]")
++				|| version.startsWith("latest.");
++	}
++
+ 	/**
+ 	 * Reconstructs the dependency notation of a resolved artifact.
+ 	 * @param artifact the artifact

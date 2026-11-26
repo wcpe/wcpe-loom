@@ -1,0 +1,270 @@
+From 0ccfb7af724789b03badc4b992b6dc3fd03a54bf Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Wed, 25 Nov 2026 18:35:23 +0800
+Subject: [PATCH 146/147] =?UTF-8?q?chore(forge):=20=E4=BF=AE=E6=AD=A3?=
+ =?UTF-8?q?=E8=A1=A5=E4=B8=81=E6=A0=88=E7=9A=84=E9=9D=99=E6=80=81=E6=A3=80?=
+ =?UTF-8?q?=E6=9F=A5=E6=A0=BC=E5=BC=8F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+按仓库规范修正成员补译、二进制补类及相关回归用例的缩进和换行，不改变实现或断言。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+Patch-Name: forge-patch-format-validation
+
+diff --git a/src/main/java/dev/architectury/loom/forge/ForgeMemberNameFixer.java b/src/main/java/dev/architectury/loom/forge/ForgeMemberNameFixer.java
+index 1701bfd65b2ffdaefab5223256f03833714376a3..1c3ec3ecf67c2e94501932c681857543610db37d 100644
+--- a/src/main/java/dev/architectury/loom/forge/ForgeMemberNameFixer.java
++++ b/src/main/java/dev/architectury/loom/forge/ForgeMemberNameFixer.java
+@@ -599,7 +599,7 @@ public final class ForgeMemberNameFixer {
+ 
+ 							return null;
+ 						}
+-}, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
++					}, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+ 					result.put(reader.getClassName(), new ClassMembers(fields, methods));
+ 				} catch (RuntimeException e) {
+ 					// 单个类解析失败只跳过该类
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+index 880bbe5e66de2988dfb7ea84e1a7fcdc9a73f061..e9f40fd12380cf73a6ecefee30cc98a165548d38 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+@@ -558,6 +558,7 @@ public class MinecraftPatchedProvider {
+ 					if (runtimeInstaller != null) {
+ 						task.getRuntimeInstaller().set(runtimeInstaller.toFile());
+ 					}
++
+ 					task.getFixParameterAnnotations().set(extension.isForgeLikeAndNotOfficial() && !extension.isUnobfuscatedForge());
+ 					dependsOnProducer(task, prePatchProducer);
+ 				}));
+@@ -2057,6 +2058,7 @@ public class MinecraftPatchedProvider {
+ 			final Path root = fs.get().getPath("/");
+ 			final Set<String> present = new TreeSet<>();
+ 			final List<Path> classes = new ArrayList<>();
++
+ 			try (var paths = Files.walk(root)) {
+ 				paths.filter(Files::isRegularFile).filter(path -> path.toString().endsWith(".class")).forEach(path -> {
+ 					present.add(entryName(path));
+@@ -2248,6 +2250,7 @@ public class MinecraftPatchedProvider {
+ 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(patchedJar, false)) {
+ 			final Path root = fs.get().getPath("/");
+ 			final List<Path> classes = new ArrayList<>();
++
+ 			try (var paths = Files.walk(root)) {
+ 				paths.filter(Files::isRegularFile).filter(p -> p.toString().endsWith(".class")).forEach(classes::add);
+ 			}
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/RuntimeBinpatchExtractor.java b/src/main/java/dev/architectury/loom/forge/minecraft/RuntimeBinpatchExtractor.java
+index f71e40af7ae009d1e5121a390d5a5cf607afa0dd..30e1628f532243abbedfa9b92f580d2807b92099 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/RuntimeBinpatchExtractor.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/RuntimeBinpatchExtractor.java
+@@ -156,10 +156,10 @@ public final class RuntimeBinpatchExtractor {
+ 
+ 					final byte[] body = readClassBody(zip.getInputStream(entry).readAllBytes());
+ 
+-				// 条目名不能证明类体已经位于目标命名空间。
+-				if (body != null && className.equals(new ClassReader(body).getClassName())) {
+-					bodies.put(className, body);
+-				}
++					// 条目名不能证明类体已经位于目标命名空间。
++					if (body != null && className.equals(new ClassReader(body).getClassName())) {
++						bodies.put(className, body);
++					}
+ 				}
+ 			}
+ 		} finally {
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMemberNameFixerTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMemberNameFixerTest.groovy
+index a9dfa854dc54f0fadf7fb1460cee254f4d6f0547..ab21289194fa4b2d271d8f84ed80e889a9be5766 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMemberNameFixerTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMemberNameFixerTest.groovy
+@@ -91,31 +91,107 @@ class ForgeMemberNameFixerTest extends Specification {
+ 		def missingDescriptor = '(Ljava/lang/Object;)V'
+ 		def validDescriptor = '(Ljava/lang/Number;)V'
+ 		def universal = writeJar('forge-universal.jar', [(MODEL_LOADER): modelLoader([
+-			['a', oldDescriptor], ['a', '(Lfm;)V'], ['a', '([Lfm;)V'], ['unchanged', '(Lfm;)V'],
+-			['left', ambiguousDescriptor], ['right', ambiguousDescriptor], ['oldMissing', missingDescriptor], ['oldValid', validDescriptor]
+-		])])
++				['a', oldDescriptor],
++				['a', '(Lfm;)V'],
++				['a', '([Lfm;)V'],
++				['unchanged', '(Lfm;)V'],
++				['left', ambiguousDescriptor],
++				['right', ambiguousDescriptor],
++				[
++					'oldMissing',
++					missingDescriptor
++				],
++				['oldValid', validDescriptor]
++			])])
+ 		def named = writeJar('forge-named.jar', [(MODEL_LOADER): modelLoader([
+-			['renamedRight', ambiguousDescriptor], ['a', '([Lnet/minecraft/Registry;)V'], ['setupModelRegistry', namedDescriptor],
+-			['renamedLeft', ambiguousDescriptor], ['loadModel', '(Lnet/minecraft/Registry;)V'], ['unchanged', '(Lnet/minecraft/Registry;)V'],
+-			['newMissing', missingDescriptor], ['newValid', validDescriptor]
+-		])])
++				[
++					'renamedRight',
++					ambiguousDescriptor
++				],
++				[
++					'a',
++					'([Lnet/minecraft/Registry;)V'
++				],
++				[
++					'setupModelRegistry',
++					namedDescriptor
++				],
++				[
++					'renamedLeft',
++					ambiguousDescriptor
++				],
++				[
++					'loadModel',
++					'(Lnet/minecraft/Registry;)V'
++				],
++				[
++					'unchanged',
++					'(Lnet/minecraft/Registry;)V'
++				],
++				[
++					'newMissing',
++					missingDescriptor
++				],
++				['newValid', validDescriptor]
++			])])
+ 		def target = writeJar('target.jar', [(MODEL_LOADER): modelLoader([
+-			['setupModelRegistry', targetDescriptor], ['loadModel', scalarDescriptor], ['unchanged', scalarDescriptor], ['a', arrayDescriptor],
+-			['renamedLeft', ambiguousDescriptor], ['renamedRight', ambiguousDescriptor], ['oldValid', validDescriptor], ['newValid', validDescriptor]
+-		]), (CALLER): modelCaller([
+-			['a', targetDescriptor], ['a', scalarDescriptor], ['a', arrayDescriptor], ['left', ambiguousDescriptor],
+-			['setupModelRegistry', targetDescriptor], ['oldMissing', missingDescriptor], ['oldValid', validDescriptor]
+-		])])
++				[
++					'setupModelRegistry',
++					targetDescriptor
++				],
++				['loadModel', scalarDescriptor],
++				['unchanged', scalarDescriptor],
++				['a', arrayDescriptor],
++				[
++					'renamedLeft',
++					ambiguousDescriptor
++				],
++				[
++					'renamedRight',
++					ambiguousDescriptor
++				],
++				['oldValid', validDescriptor],
++				['newValid', validDescriptor]
++			]), (CALLER): modelCaller([
++				['a', targetDescriptor],
++				['a', scalarDescriptor],
++				['a', arrayDescriptor],
++				['left', ambiguousDescriptor],
++				[
++					'setupModelRegistry',
++					targetDescriptor
++				],
++				[
++					'oldMissing',
++					missingDescriptor
++				],
++				['oldValid', validDescriptor]
++			])])
+ 
+ 		when:
+ 		ForgeMemberNameFixer.fix(target, universal, named, mappings, 'official', namespace)
+ 
+ 		then:
+ 		def calls = readCaller(target).methods.first().instructions.toArray().findAll { it instanceof MethodInsnNode }
+-		calls*.name == ['setupModelRegistry', 'loadModel', 'a', 'left', 'setupModelRegistry', 'oldMissing', 'oldValid']
++		calls*.name == [
++			'setupModelRegistry',
++			'loadModel',
++			'a',
++			'left',
++			'setupModelRegistry',
++			'oldMissing',
++			'oldValid'
++		]
+ 		calls*.owner.every { it == MODEL_LOADER }
+-		calls*.desc == [targetDescriptor, scalarDescriptor, arrayDescriptor, ambiguousDescriptor,
+-			targetDescriptor, missingDescriptor, validDescriptor]
++		calls*.desc == [
++			targetDescriptor,
++			scalarDescriptor,
++			arrayDescriptor,
++			ambiguousDescriptor,
++			targetDescriptor,
++			missingDescriptor,
++			validDescriptor
++		]
+ 
+ 		where:
+ 		namespace | registry
+@@ -206,4 +282,4 @@ class ForgeMemberNameFixerTest extends Specification {
+ 		}
+ 		return node
+ 	}
+-	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeRenamedMethodBridgeTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeRenamedMethodBridgeTest.groovy
+index d4babbafd7b3d7c8bc6b835b0c90928cfec4253f..517fa90c915b7eb5f6e55fcafb82227e1b4959ea 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeRenamedMethodBridgeTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeRenamedMethodBridgeTest.groovy
+@@ -168,7 +168,10 @@ class ForgeRenamedMethodBridgeTest extends Specification {
+ 		readTarget(jar, NAMED_TARGET).methods.find { it.name == "func_227987_b_" } == null
+ 
+ 		where:
+-		access << [Opcodes.ACC_PUBLIC, Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC]
++		access << [
++			Opcodes.ACC_PUBLIC,
++			Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC
++		]
+ 	}
+ 
+ 	def "改名后的方法也不在时视为不是该缺陷形态"() {
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeUserdevProviderTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeUserdevProviderTest.groovy
+index 7e050d72e3caed84fee19f8a4b2da3240d8ee45f..918751046e3b38c4dd575afd2cd855cff7e43028 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeUserdevProviderTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeUserdevProviderTest.groovy
+@@ -78,7 +78,11 @@ class ForgeUserdevProviderTest extends Specification {
+ 		project.extensions.add('loom', Stub(LoomGradleExtension) {
+ 			getForgeProvider() >> forge
+ 		})
+-		[Constants.Configurations.MCP_CONFIG, Constants.Configurations.SRG, Constants.Configurations.FORGE_UNIVERSAL].each {
++		[
++			Constants.Configurations.MCP_CONFIG,
++			Constants.Configurations.SRG,
++			Constants.Configurations.FORGE_UNIVERSAL
++		].each {
+ 			project.configurations.create(it)
+ 		}
+ 		def notation = "net.minecraftforge:forge:${version}".toString()
+@@ -90,8 +94,12 @@ class ForgeUserdevProviderTest extends Specification {
+ 			resolveFile() >> { throw new AssertionError('已归一的 userdev 不应重新解析') }
+ 		}
+ 		def original = userdev3 ? [spec: 2, notchObf: true, libraries: [
+-			'org.jline:jline:3.5.1', 'java3d:vecmath:1.5.2', 'net.minecraftforge:legacydev:0.2.3.+:fatjar'
+-		]] : [inheritsFrom: '1.12.2', libraries: [[name: 'net.minecraft:launchwrapper:1.12']]]
++				'org.jline:jline:3.5.1',
++				'java3d:vecmath:1.5.2',
++				'net.minecraftforge:legacydev:0.2.3.+:fatjar'
++			]] : [inheritsFrom: '1.12.2', libraries: [
++				[name: 'net.minecraft:launchwrapper:1.12']
++			]]
+ 		def rawConfig = temp.resolve('forge-config.json')
+ 		Files.writeString(rawConfig, JsonOutput.toJson(original))
+ 		def sources = new ByteArrayOutputStream()
+@@ -118,7 +126,10 @@ class ForgeUserdevProviderTest extends Specification {
+ 
+ 		where:
+ 		shape             | version            | userdev3 || extras
+-		'1.12.2 userdev3'  | '1.12.2-14.23.5.2860' | true     || ['org.jline:jline:3.5.1', 'java3d:vecmath:1.5.2']
++		'1.12.2 userdev3'  | '1.12.2-14.23.5.2860' | true     || [
++			'org.jline:jline:3.5.1',
++			'java3d:vecmath:1.5.2'
++		]
+ 		'其它版本 userdev3' | '1.11.2-13.20.1.2588' | true     || []
+ 		'原生 FG2'         | '1.12.2-14.23.5.2847' | false    || []
+ 	}

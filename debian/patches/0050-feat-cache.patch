@@ -1,0 +1,3043 @@
+From 507aef8306b399ecbc83a8d43f0ca797420d9824 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:51 +0800
+Subject: [PATCH 050/147] =?UTF-8?q?feat(cache):=20=E5=85=B1=E4=BA=AB?=
+ =?UTF-8?q?=E7=BC=93=E5=AD=98=E9=BB=98=E8=AE=A4=E5=B9=B6=E5=8F=91=E5=AE=89?=
+ =?UTF-8?q?=E5=85=A8=EF=BC=8C=E6=B6=88=E9=99=A4=E5=A4=9A=E5=B7=A5=E4=BD=9C?=
+ =?UTF-8?q?=E6=A0=91=E4=BA=92=E7=9B=B8=E5=88=A0=E9=99=A4=E4=BA=A7=E7=89=A9?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+共享缓存默认并发安全，消除多工作树互相删除产物；并含审查后追加的 6 个修复。
+
+- 残留锁只作诊断，不再升级为全量重建；共享产物一律「临时文件 + 原子落位」，是否重建改由各 provider 的产物级校验决定
+- Windows 上原子替换被读方持有时退避重试并给出可诊断错误（读句柄含 zipfs 场景）
+- 按需补齐改用可复用性判定；client-extra 纳入按件重建
+- mapped / MCP / SRG 三类链与 MCP 读方的就绪判据统一为「可打开且非空」
+- mappings 迁移标记先失效、成对产物加提交标记、刷新不再重复生成
+- UnpickService 的 unpick 产物改为原子发布
+- 基线上两处守卫旧残留锁语义的回归测试同步更新
+
+验证：CI 69 项通过、0 失败；本地 build -x test 与相关集成用例通过。详见 PR 描述。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/README.md b/README.md
+index d160662431f128eac912884143c2ed4b41199c00..0ecd6b3855aaba0a7aa16893e74e90af51443b15 100644
+--- a/README.md
++++ b/README.md
+@@ -235,8 +235,49 @@ git push origin dev/1.17-wcpe
+ 
+ 支持的 Minecraft 版本：Fabric 全线；Forge/NeoForge 含 1.8–1.16 的 legacy 链路（1.12.2 端到端测试覆盖）。
+ 
++## 共享缓存与并发
++
++Loom 的产物默认放在**跨项目、跨工作树共享**的 `~/.gradle/caches/fabric-loom/` 下。多个工作树（或同一工作树的多个 Gradle daemon）同时构建同一个 Minecraft + 加载器版本时，会读写同一批产物；自 `1.17.9` 起把「共享缓存默认并发安全」作为设计约束，规则如下：
++
++| 场景 | 行为 |
++|---|---|
++| 产物齐备且补丁版本匹配 | **读路径完全无锁**：只做存在性判定与 manifest 校验，不取锁、不写入 |
++| 缺少某一件产物 | 只重建这一件及其下游（按件重建），不整组删除 |
++| 需要整链重建（补丁版本升级 / 显式刷新） | 在跨进程锁内重新生成，并**以「临时文件 + 原子落位」替换**：读方见到的要么是旧文件、要么是完整的新文件 |
++| 上一次构建被杀留下残留锁 | 只输出诊断信息，**不再触发全量重建** |
++| 用户显式刷新 | `--refresh-dependencies`（或 `-Dloom.refresh`）强制重建并原子替换，不再靠删除实现 |
++
++因此默认（无需任何隔离配置）就可以并行跑多个工作树，不会互相删除正在使用的产物。设计要点：
++
++- **绝不删除别人可能要读的有效产物**：删除会让锁外只做存在性判定的读方拿到缺失文件，也会让其它工作树误判「需要重建」，进而互相触发重建雪崩。
++- **半成品不会被当成就绪产物**：共享 jar 按「能作为 zip/jar 打开且至少含一个条目」校验。仍在跑旧版本 loom 的进程就地重建产物时，目标路径会短暂出现 22 字节的空 zip（本仓库实测形态），这种文件会被判定为「需要重建」而不是直接复用——避免把半成品一路带进最终产物，形成「补丁标记是新的、内容是坏的」的静默损坏。
++- **就绪标记最后落位**：补丁版本标记写在产物 manifest 内并与产物一起原子发布，因此「文件存在」蕴含「内容完整、版本正确」。
++- 跨进程互斥锁按「共享身份」派生 key（如 `forge-patched:<mc>:<forge>`、`mappings:<mappingsId>`），不同工作树算出同一把锁；等待超时可用 `-Dfabric.loom.lock.timeout.minutes=<分钟>` 调整（默认本地 30 分钟、CI 1 分钟）。
++- 需要缓存目录级隔离（而非仅锁隔离）时，可用系统属性 `fabric.loom.cache.dir=<路径>` 让该工作树使用私有 loom 缓存（代价是首次需重新下载/生成 MC 产物）：
++
++  ```properties
++  # gradle.properties
++  systemProp.fabric.loom.cache.dir=/path/to/private-loom-cache
++  ```
++
++<details>
++<summary><b>已知限制</b></summary>
++
++- MCP / NeoForm 的解包目录（`unpacked/`）是整棵树产物：替换时先把旧目录整体改名、再把新目录改名就位，两步之间存在极短的「目录不在原位」窗口（只在显式刷新或目录残缺时发生）；旧目录的清理是 best-effort。
++- 反编译共享缓存（`<userCache>/decompile/`）在显式刷新时仍会被删除，只是读写都在同一把锁内，不会打掉其它进程正在读的文件。
++- Forge legacy（1.8–1.16）链路没有单一版本标记产物，任一件缺失即按整链重建处理（各件仍为原子落位）。
++
++</details>
++
+ ## 常见问题
+ 
++<details>
++<summary><b>多个工作树并行构建时，缓存产物被别的构建删掉 / 报 <code>NoSuchFileException</code></b></summary>
++
++`1.17.9` 起已修复：早期版本在「任一件产物缺失」时会删除整组共享产物（`cleanAllCache`），并且残留锁会升级为全量重建，多个工作树因此轮流删除彼此正在读的文件。现在改为按件重建 + 原子落位 + 残留锁仅诊断（见上方「共享缓存与并发」）。升级到 `1.17.9` 及以上即可；若仍遇到，请附上出现 `NoSuchFileException` 的完整路径与同期的构建日志。
++
++</details>
++
+ <details>
+ <summary><b>配置缓存偶发失效 / 日志出现 <code>.lock' has been removed</code></b></summary>
+ 
+@@ -244,6 +285,7 @@ git push origin dev/1.17-wcpe
+ 
+ </details>
+ 
++
+ <details>
+ <summary><b>Forge 系依赖反复被探测，或报 <code>status code 500</code></b></summary>
+ 
+diff --git a/src/main/java/dev/architectury/loom/forge/FieldMappingsMigrator.java b/src/main/java/dev/architectury/loom/forge/FieldMappingsMigrator.java
+index baa57d0bf9eaf7648ebcf92d6557352480a72a1a..e3b3d7581851fdce103b38a15486864e09858548 100644
+--- a/src/main/java/dev/architectury/loom/forge/FieldMappingsMigrator.java
++++ b/src/main/java/dev/architectury/loom/forge/FieldMappingsMigrator.java
+@@ -56,6 +56,7 @@ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.FileSystemUtil;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.mappingio.MappingReader;
+ import net.fabricmc.mappingio.format.tiny.Tiny2FileWriter;
+ import net.fabricmc.mappingio.tree.MappingTree;
+@@ -84,20 +85,23 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
+ 				});
+ 			}
+ 		} else {
+-			Files.deleteIfExists(migratedFieldsCache);
+ 			migratedFields.clear();
+ 
+ 			if (hasSrg) {
+-				migratedFields.addAll(generateNewFieldMigration(MinecraftPatchedProvider.get(project).getMinecraftPatchedIntermediateJar(), MappingsNamespace.SRG.toString(), rawMappings).entrySet());
++				// 共享缓存可能正被其它进程重建（或其它工作树仍在用会删除整组产物的旧版本 loom）：
++				// 用 getOrProduce... 在产物缺失时先按件补齐，避免直接读取抛 NoSuchFileException
++				migratedFields.addAll(generateNewFieldMigration(MinecraftPatchedProvider.get(project).getOrProduceMinecraftPatchedIntermediateJar(), MappingsNamespace.SRG.toString(), rawMappings).entrySet());
+ 			} else if (hasMojang) {
+-				migratedFields.addAll(generateNewFieldMigration(MinecraftPatchedProvider.get(project).getMinecraftPatchedIntermediateJar(), MappingsNamespace.MOJANG.toString(), rawMappings).entrySet());
++				migratedFields.addAll(generateNewFieldMigration(MinecraftPatchedProvider.get(project).getOrProduceMinecraftPatchedIntermediateJar(), MappingsNamespace.MOJANG.toString(), rawMappings).entrySet());
+ 			}
+ 
+ 			Map<String, String> map = new HashMap<>();
+ 			migratedFields.forEach(entry -> {
+ 				map.put(entry.getKey().owner + "#" + entry.getKey().field, entry.getValue());
+ 			});
+-			Files.writeString(migratedFieldsCache, new Gson().toJson(map));
++			// 原子发布：缓存位于跨 daemon 共享的 forge 缓存目录（不按项目隔离），旧写法先删除再就地写入，
++			// 读方会看到内容缺失或半截
++			AtomicFiles.publish(migratedFieldsCache, tmp -> Files.writeString(tmp, new Gson().toJson(map)));
+ 		}
+ 
+ 		this.migratedFields.sort(Comparator.comparing(entry -> entry.getKey().owner + "#" + entry.getKey().field));
+diff --git a/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java b/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
+index c520356bc234b005396260915097d2187b6e36b9..50cdb41a697a9bbc7ac04715d2249fb4571a076c 100644
+--- a/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
++++ b/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
+@@ -28,8 +28,8 @@ import java.io.IOException;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+-import java.nio.file.StandardCopyOption;
+ import java.util.List;
++import java.util.concurrent.Callable;
+ 
+ import dev.architectury.loom.forge.dependency.ForgeProvider;
+ import dev.architectury.loom.util.Stopwatch;
+@@ -37,8 +37,19 @@ import org.gradle.api.Project;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ 
+ public final class ForgeMigratedMappingConfiguration extends MappingConfiguration {
++	/**
++	 * 就绪标记的「失效」哨兵值.
++	 *
++	 * <p>重建期间标记必须处于不可用状态，而删除标记文件会让并发读方在「存在性检查 → 读取」之间
++	 * 撞上 {@code NoSuchFileException}（{@link #isOutdated} 正是这样分两步读的），故改为原子写入
++	 * 一个不可能是合法 hash 的值：合法标记只可能是 {@code Long.toString(hash)} 的十进制表示，
++	 * 而 {@link #isOutdated} 用的是字符串比较，因此哨兵必然被判为「需重建」，判定自洽。
++	 */
++	private static final String INVALIDATED_HASH = "invalidated";
+ 	private final List<MappingsMigrator> migrators = List.of(new FieldMappingsMigrator(), new MethodInheritanceMappingsMigrator());
+ 	private Path hashPath;
+ 	private Path rawTinyMappings;
+@@ -79,39 +90,114 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
+ 		this.tinyMappingsWithMojang = mappingsWorkingDir().resolve("mappings-mojang-migrated.tiny");
+ 		Path tinyMappingsWithNs = hasSrg ? this.tinyMappingsWithSrg : hasMojang ? this.tinyMappingsWithMojang : this.tinyMappings;
+ 
++		// 迁移器的中间缓存位于共享的 forge 缓存目录，各自原子发布；其内容只由「原始 mappings + 补丁 jar」
++		// 决定，同一输入下结果一致，故无锁写入最多互相覆盖成等价内容，不会让读方看到半截文件。
++		// 迁移器返回值参与 hash 计算，构成迁移产物的就绪标记。
+ 		for (MappingsMigrator migrator : this.migrators) {
+ 			hash = hash * 31 + migrator.setup(project, extension.getMinecraftProvider(), forgeCache, rawTinyMappingsWithNs, hasSrg, hasMojang);
+ 		}
+ 
++		// 无锁快路径：就绪标记与各迁移产物齐备且 hash 一致时，本次不含任何共享缓存写入，不取锁。
++		// 重建方在整个重建期间把标记置为失效值（见 produceMigratedMappings），故此处不会读到
++		// 「标记有效、产物却只迁移了一半」的错位状态。
+ 		if (!isOutdated(extension, hasSrg, hasMojang)) {
+ 			project.getLogger().info(":manipulated {} mappings are up to date", extension.getPlatform().get().id());
+ 			return;
+ 		}
+ 
+-		Stopwatch stopwatch = Stopwatch.createStarted();
+-		Files.copy(this.rawTinyMappings, this.tinyMappings, StandardCopyOption.REPLACE_EXISTING);
+-		Files.copy(rawTinyMappingsWithNs, tinyMappingsWithNs, StandardCopyOption.REPLACE_EXISTING);
++		withMappingsLock(project, extension, () -> {
++			// 锁内二次确认：等锁期间其它进程可能已产出同一 hash 的迁移结果，此时直接复用
++			if (isOutdated(extension, hasSrg, hasMojang)) {
++				produceMigratedMappings(project, extension, rawTinyMappingsWithNs, tinyMappingsWithNs);
++			}
+ 
+-		Files.writeString(this.hashPath, Long.toString(this.hash), StandardCharsets.UTF_8);
++			return null;
++		});
++	}
++
++	/**
++	 * 生产迁移后的 mappings：复制与迁移结果一律原子发布，就绪标记先失效、最后才落位.
++	 *
++	 * <p>旧写法直接以共享产物为输出（先原地覆盖、迁移器再读回并就地重写），读方会看到半截 mappings；
++	 * 而 hash 就绪标记先于内容落位时，读方还会读到「标记在、内容半截」的错位状态。
++	 *
++	 * <p>「单文件原子」不等于「集合原子」：多件产物逐个落位，过程中盘上必然存在「部分新、部分旧」
++	 * 的混合集合，此时旧标记（内容与重建前的 hash 相同）看起来依然合法。带 refresh 的重建尤其危险——
++	 * 它是唯一「hash 未变却重写全部产物」的路径，其它 {@code refresh=false} 的进程会在整个重建时长内
++	 * 通过 {@link #isOutdated} 的 hash 比较直接判定「已就绪」，并据此读入只迁移了一半的 mappings。
++	 * 因此重建的第一步就是让标记失效，全部产物落位后才发布真实 hash，维持
++	 * 「标记有效 ⟹ 所有产物已就绪」这一不变式；若中途失败，标记留在失效态，下次构建会重建（安全方向）。
++	 */
++	private void produceMigratedMappings(Project project, LoomGradleExtension extension, Path rawTinyMappingsWithNs, Path tinyMappingsWithNs) throws IOException {
++		Stopwatch stopwatch = Stopwatch.createStarted();
++		// 先失效标记再碰任何产物：保证重建期间没有读方能凭旧标记把半迁移产物当成就绪产物
++		invalidateMigratedMappingsMarker();
++		AtomicFiles.copy(this.rawTinyMappings, this.tinyMappings);
++		AtomicFiles.copy(rawTinyMappingsWithNs, tinyMappingsWithNs);
+ 
+ 		for (MappingsMigrator migrator : this.migrators) {
+-			Path path = Files.createTempFile("mappings-working", ".tiny");
+-			Path pathWithNs = Files.createTempFile("mappings-working-ns", ".tiny");
+-			Files.copy(this.tinyMappings, path, StandardCopyOption.REPLACE_EXISTING);
+-			Files.copy(tinyMappingsWithNs, pathWithNs, StandardCopyOption.REPLACE_EXISTING);
+-
+-			List<MappingsMigrator.MappingsEntry> entries = List.of(new MappingsMigrator.MappingsEntry(path), new MappingsMigrator.MappingsEntry(pathWithNs));
+-			migrator.migrate(project, entries);
+-
+-			Files.copy(path, this.tinyMappings, StandardCopyOption.REPLACE_EXISTING);
+-			Files.copy(pathWithNs, tinyMappingsWithNs, StandardCopyOption.REPLACE_EXISTING);
+-			Files.deleteIfExists(path);
+-			Files.deleteIfExists(pathWithNs);
++			// 临时文件与产物同目录：跨文件系统的 move 会退化成「复制 + 删除」而不再原子
++			final Path path = AtomicFiles.tempSibling(this.tinyMappings);
++			final Path pathWithNs = AtomicFiles.tempSibling(tinyMappingsWithNs);
++
++			try {
++				Files.copy(this.tinyMappings, path);
++				Files.copy(tinyMappingsWithNs, pathWithNs);
++
++				List<MappingsMigrator.MappingsEntry> entries = List.of(new MappingsMigrator.MappingsEntry(path), new MappingsMigrator.MappingsEntry(pathWithNs));
++				migrator.migrate(project, entries);
++
++				AtomicFiles.move(path, this.tinyMappings);
++				AtomicFiles.move(pathWithNs, tinyMappingsWithNs);
++			} finally {
++				Files.deleteIfExists(path);
++				Files.deleteIfExists(pathWithNs);
++			}
+ 		}
+ 
++		// 就绪标记最后落位：标记先于内容落位会让读方读到「标记在、内容半截」
++		AtomicFiles.publish(this.hashPath, tmp -> Files.writeString(tmp, Long.toString(this.hash), StandardCharsets.UTF_8));
++
+ 		project.getLogger().info(":manipulated {} mappings in " + stopwatch.stop(), extension.getPlatform().get().id());
+ 	}
+ 
++	/**
++	 * 让迁移产物的就绪标记失效，直到本轮产物全部落位.
++	 *
++	 * <p>用原子发布写哨兵值而不是删除标记文件：删除会在「存在性检查 → 读取」之间给并发读方
++	 * 留下 {@code NoSuchFileException} 窗口，原子写入则保证标记始终存在，内容要么是哨兵、要么是完整 hash。
++	 */
++	private void invalidateMigratedMappingsMarker() throws IOException {
++		AtomicFiles.publish(this.hashPath, tmp -> Files.writeString(tmp, INVALIDATED_HASH, StandardCharsets.UTF_8));
++	}
++
++	/**
++	 * 在跨进程锁保护下生产迁移后的 mappings.
++	 *
++	 * <p>产物位于跨 daemon 共享的缓存目录（不按项目隔离），key 与 lockRoot 和
++	 * {@link MappingConfiguration} 生产原始 mappings 时使用的完全一致
++	 * （{@code "mappings:" + mappingsIdentifier} + {@code userCache/.locks}），
++	 * 因此「重写原始 mappings」与「迁移 mappings」不会交错——否则迁移方可能把刚被覆盖的原始文件复制成迁移产物。
++	 */
++	private void withMappingsLock(Project project, LoomGradleExtension extension, Callable<Void> action) throws IOException {
++		final Path lockRoot = extension.getFiles().getCacheLocks().toPath();
++		final String key = "mappings:" + mappingsIdentifier;
++
++		try {
++			LoomCacheService.get(project).get().runExclusive(lockRoot, key, LoomCacheService.defaultTimeout(), action);
++		} catch (IOException e) {
++			throw e;
++		} catch (Exception e) {
++			throw new RuntimeException("Could not manipulate mappings for " + mappingsIdentifier, e);
++		}
++	}
++
++	/**
++	 * 迁移产物是否需要重建.
++	 *
++	 * <p>判据与「标记有效 ⟹ 所有产物已就绪」的不变式自洽：标记缺失、内容为失效哨兵
++	 * （见 {@link #INVALIDATED_HASH}，说明有进程正在重建）或与本次算出的 hash 不一致，都判为需重建。
++	 */
+ 	private boolean isOutdated(LoomGradleExtension extension, boolean hasSrg, boolean hasMojang) throws IOException {
+ 		if (extension.refreshDeps()) return true;
+ 		if (Files.notExists(this.tinyMappings)) return true;
+diff --git a/src/main/java/dev/architectury/loom/forge/MethodInheritanceMappingsMigrator.java b/src/main/java/dev/architectury/loom/forge/MethodInheritanceMappingsMigrator.java
+index 2b08774c71d5489228f9cb6d500850972e6327cc..0934eb21ece5a7bc7cd94b269c1492a19dd9d30c 100644
+--- a/src/main/java/dev/architectury/loom/forge/MethodInheritanceMappingsMigrator.java
++++ b/src/main/java/dev/architectury/loom/forge/MethodInheritanceMappingsMigrator.java
+@@ -55,6 +55,7 @@ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.FileSystemUtil;
+ import net.fabricmc.loom.util.Pair;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.mappingio.MappingReader;
+ import net.fabricmc.mappingio.adapter.MappingSourceNsSwitch;
+ import net.fabricmc.mappingio.format.tiny.Tiny2FileWriter;
+@@ -80,12 +81,15 @@ public final class MethodInheritanceMappingsMigrator implements MappingsMigrator
+ 				methodsToRemove = new HashSet<>(list);
+ 			}
+ 		} else {
+-			Files.deleteIfExists(cacheFile);
+ 			LoomGradleExtension extension = LoomGradleExtension.get(project);
+-			Path patchedIntermediateJar = MinecraftPatchedProvider.get(project).getMinecraftPatchedIntermediateJar();
++			// 共享缓存可能正被其它进程重建（或其它工作树仍在用会删除整组产物的旧版本 loom）：
++			// 用 getOrProduce... 在产物缺失时先按件补齐，避免直接读取抛 NoSuchFileException
++			Path patchedIntermediateJar = MinecraftPatchedProvider.get(project).getOrProduceMinecraftPatchedIntermediateJar();
+ 			List<Path> jars = List.of(patchedIntermediateJar, extension.getForgeUniversalProvider().getForge().toPath(), extension.getForgeUserdevProvider().getUserdevJar().toPath());
+ 			methodsToRemove = prepareCache(project.getLogger(), rawMappings, jars, hasSrg, hasMojang);
+-			Files.writeString(cacheFile, new Gson().toJson(methodsToRemove.stream().sorted(Comparator.comparing(p -> p.left() + "|" + p.right())).toList()), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
++			// 原子发布：缓存位于跨 daemon 共享的 forge 缓存目录（不按项目隔离），旧写法先删除再就地写入，
++			// 读方会看到内容缺失或半截
++			AtomicFiles.publish(cacheFile, tmp -> Files.writeString(tmp, new Gson().toJson(methodsToRemove.stream().sorted(Comparator.comparing(p -> p.left() + "|" + p.right())).toList())));
+ 		}
+ 
+ 		return methodsToRemove.hashCode();
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java
+index 82f044e8874f022fd809daf17aed02d27f1a12d4..7d44c0a36ed12a6c4f8f95695e85ba57d25ec4ed 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java
+@@ -32,6 +32,7 @@ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.Callable;
+ 
+ import dev.architectury.loom.forge.ModDirTransformerDiscovererPatch;
+ import dev.architectury.loom.forge.RemapObjectHolderVisitor;
+@@ -64,6 +65,8 @@ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.ExceptionUtil;
+ import net.fabricmc.loom.util.FileSystemUtil;
+ import net.fabricmc.loom.util.LoomVersions;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.loom.util.service.ScopedServiceFactory;
+ import net.fabricmc.loom.util.service.ServiceFactory;
+ import net.fabricmc.mappingio.tree.MappingTree;
+@@ -213,45 +216,55 @@ public class ForgeLibrariesProvider {
+ 		final Path inputJar = artifact.getFile().toPath();
+ 		final Path outputJar = mavenHelper.getOutputFile(null);
+ 
+-		final TinyMappingsService mappingsService = mappingConfiguration.getMappingsService(project, serviceFactory, MappingOption.DEFAULT);
+-		final MappingTree mappings = mappingsService.getMappingTree();
+-
+ 		// Modify jar.
+-		if (!Files.exists(outputJar) || extension.refreshDeps()) {
+-			mavenHelper.copyToMaven(inputJar, null);
++		if (!mavenHelper.exists(null) || extension.refreshDeps()) {
++			withForgeDependencyLock(project, mavenHelper, () -> {
++				// 锁内二次确认：等锁期间其它进程可能已完成生产（jar 与 pom 一并就绪才算完成）
++				if (mavenHelper.exists(null) && !extension.refreshDeps()) {
++					return null;
++				}
+ 
+-			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(outputJar, false)) {
+-				Path path = fs.get().getPath("META-INF/services/cpw.mods.modlauncher.api.INameMappingService");
+-				Files.deleteIfExists(path);
++				final TinyMappingsService mappingsService = mappingConfiguration.getMappingsService(project, serviceFactory, MappingOption.DEFAULT);
++				final MappingTree mappings = mappingsService.getMappingTree();
+ 
+-				if (Files.exists(fs.get().getPath(FORGE_OBJECT_HOLDER_FILE))) {
+-					remapObjectHolder(project, outputJar, mappingConfiguration);
+-				}
++				// 「复制输入 + 全部就地加工」都在同目录临时文件上完成，最后一次性原子发布：
++				// 旧写法先 copyToMaven 发布输入 jar、再以 outputJar 为输出就地改写，其它 daemon 会读到半加工的 jar
++				publishTransformedJar(mavenHelper, inputJar, outputJar, jar -> {
++					try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar, false)) {
++						Path path = fs.get().getPath("META-INF/services/cpw.mods.modlauncher.api.INameMappingService");
++						Files.deleteIfExists(path);
+ 
+-				if (Files.exists(fs.getPath(FORGE_MOD_DIR_TRANSFORMER_DISCOVERER_FILE))) {
+-					ClassVisitorUtil.rewriteClassFile(fs.getPath(FORGE_MOD_DIR_TRANSFORMER_DISCOVERER_FILE), true, ModDirTransformerDiscovererPatch::new);
+-				}
++						if (Files.exists(fs.get().getPath(FORGE_OBJECT_HOLDER_FILE))) {
++							remapObjectHolder(project, jar, mappingConfiguration);
++						}
+ 
+-				if (Files.exists(fs.getPath(NEOFORGE_OBJECT_HOLDER_FILE))) {
+-					remapNeoForgeObjectHolder(project, outputJar, mappingConfiguration);
+-				}
++						if (Files.exists(fs.getPath(FORGE_MOD_DIR_TRANSFORMER_DISCOVERER_FILE))) {
++							ClassVisitorUtil.rewriteClassFile(fs.getPath(FORGE_MOD_DIR_TRANSFORMER_DISCOVERER_FILE), true, ModDirTransformerDiscovererPatch::new);
++						}
+ 
+-				if (Files.exists(fs.getPath(NEOFORGE_LAUNCH_HANDLER_FILE))) {
+-					ClassVisitorUtil.rewriteClassFile(fs.getPath(NEOFORGE_LAUNCH_HANDLER_FILE), StringConstantPatcher::forUserdevLaunchHandler);
+-				}
++						if (Files.exists(fs.getPath(NEOFORGE_OBJECT_HOLDER_FILE))) {
++							remapNeoForgeObjectHolder(project, jar, mappingConfiguration);
++						}
+ 
+-				if (Files.exists(fs.getPath(NEOFORGE_LOADER_FILE))) {
+-					ClassVisitorUtil.rewriteClassFile(fs.getPath(NEOFORGE_LOADER_FILE), next -> StringConstantPatcher.forFmlLoader(next, mappings));
+-				}
++						if (Files.exists(fs.getPath(NEOFORGE_LAUNCH_HANDLER_FILE))) {
++							ClassVisitorUtil.rewriteClassFile(fs.getPath(NEOFORGE_LAUNCH_HANDLER_FILE), StringConstantPatcher::forUserdevLaunchHandler);
++						}
+ 
+-				if (Files.exists(fs.getPath(NEOFORGE_GAME_LOCATOR_FILE))) {
+-					ClassVisitorUtil.rewriteClassFile(fs.getPath(NEOFORGE_GAME_LOCATOR_FILE), next -> StringConstantPatcher.forGameLocator(next, mappings));
+-				}
++						if (Files.exists(fs.getPath(NEOFORGE_LOADER_FILE))) {
++							ClassVisitorUtil.rewriteClassFile(fs.getPath(NEOFORGE_LOADER_FILE), next -> StringConstantPatcher.forFmlLoader(next, mappings));
++						}
+ 
+-				if (Files.exists(fs.getPath(NEOFORGE_REQUIRED_SYSTEM_FILES_FILE))) {
+-					ClassVisitorUtil.rewriteClassFile(fs.getPath(NEOFORGE_REQUIRED_SYSTEM_FILES_FILE), next -> StringConstantPatcher.forRequiredSystemFiles(next, mappings));
+-				}
+-			}
++						if (Files.exists(fs.getPath(NEOFORGE_GAME_LOCATOR_FILE))) {
++							ClassVisitorUtil.rewriteClassFile(fs.getPath(NEOFORGE_GAME_LOCATOR_FILE), next -> StringConstantPatcher.forGameLocator(next, mappings));
++						}
++
++						if (Files.exists(fs.getPath(NEOFORGE_REQUIRED_SYSTEM_FILES_FILE))) {
++							ClassVisitorUtil.rewriteClassFile(fs.getPath(NEOFORGE_REQUIRED_SYSTEM_FILES_FILE), next -> StringConstantPatcher.forRequiredSystemFiles(next, mappings));
++						}
++					}
++				});
++				return null;
++			});
+ 
+ 			// Copy sources when not running under CI.
+ 			if (!ModConfigurationRemapper.isCIBuild()) {
+@@ -287,19 +300,71 @@ public class ForgeLibrariesProvider {
+ 		final Path outputJar = mavenHelper.getOutputFile(null);
+ 
+ 		// Modify jar.
+-		if (!Files.exists(outputJar) || extension.refreshDeps()) {
+-			mavenHelper.copyToMaven(inputJar, null);
+-
+-			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(outputJar, false)) {
+-				if (Files.exists(fs.getPath(FORGE_MOD_DIR_TRANSFORMER_DISCOVERER_FILE))) {
+-					ClassVisitorUtil.rewriteClassFile(fs.getPath(FORGE_MOD_DIR_TRANSFORMER_DISCOVERER_FILE), true, ModDirTransformerDiscovererPatch::new);
++		if (!mavenHelper.exists(null) || extension.refreshDeps()) {
++			withForgeDependencyLock(project, mavenHelper, () -> {
++				// 锁内二次确认：等锁期间其它进程可能已完成生产
++				if (mavenHelper.exists(null) && !extension.refreshDeps()) {
++					return null;
+ 				}
+-			}
++
++				publishTransformedJar(mavenHelper, inputJar, outputJar, jar -> {
++					try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar, false)) {
++						if (Files.exists(fs.getPath(FORGE_MOD_DIR_TRANSFORMER_DISCOVERER_FILE))) {
++							ClassVisitorUtil.rewriteClassFile(fs.getPath(FORGE_MOD_DIR_TRANSFORMER_DISCOVERER_FILE), true, ModDirTransformerDiscovererPatch::new);
++						}
++					}
++				});
++				return null;
++			});
+ 		}
+ 
+ 		return mavenHelper.getNotation();
+ 	}
+ 
++	/**
++	 * 在共享的 Forge 依赖仓库中发布「已复制输入 + 已完成加工」的 jar，并配套写入 pom.
++	 *
++	 * <p>全部加工都在「与仓库产物同目录的唯一临时文件」上完成，最后一步才原子落位，因此读方
++	 * 要么看到完整的旧产物、要么看到完整的新产物，不会看到只加工了一半的 jar（例如已删掉
++	 * {@code INameMappingService} 服务文件、但还没改写 FML 类）。
++	 *
++	 * <p>jar 先落位、pom 后落位（pom 只有一份模板内容，且新产物出现后才会被解析），
++	 * 这样「pom 可见」蕴含「jar 可见」，暖缓存判定 {@code mavenHelper.exists(null)} 不会误判。
++	 */
++	private static void publishTransformedJar(LocalMavenHelper mavenHelper, Path inputJar, Path outputJar, AtomicFiles.IOConsumer<Path> transform) throws IOException {
++		Files.createDirectories(outputJar.getParent());
++		final Path temp = AtomicFiles.tempSibling(outputJar);
++
++		try {
++			Files.copy(inputJar, temp);
++			transform.accept(temp);
++			AtomicFiles.move(temp, outputJar);
++			mavenHelper.savePom();
++		} finally {
++			Files.deleteIfExists(temp);
++		}
++	}
++
++	/**
++	 * 在跨进程锁保护下生产一个 Forge 依赖仓库产物.
++	 *
++	 * <p>仓库位于跨 daemon 共享的 userCache（不按项目隔离），同一坐标 + 同一映射集的多个并发构建会写
++	 * 同一路径；key 由仓库坐标派生——group 已编码映射集哈希（或后续处理标记），因此不同工作树算出同一把锁，
++	 * 不同产物仍可并行。锁内判定为幂等的二次确认。
++	 */
++	private static void withForgeDependencyLock(Project project, LocalMavenHelper mavenHelper, Callable<Void> action) throws IOException {
++		final Path lockRoot = LoomGradleExtension.get(project).getFiles().getForgeDependencyRepo().toPath().resolve(Constants.Cache.LOCKS_DIR);
++		final String lockKey = "forge-dependency:" + mavenHelper.group() + ":" + mavenHelper.name() + ":" + mavenHelper.version();
++
++		try {
++			LoomCacheService.get(project).get().runExclusive(lockRoot, lockKey, LoomCacheService.defaultTimeout(), action);
++		} catch (IOException e) {
++			throw e;
++		} catch (Exception e) {
++			throw new RuntimeException("Could not transform Forge dependency " + mavenHelper.getNotation(), e);
++		}
++	}
++
+ 	private static void remapObjectHolder(Project project, Path outputJar, MappingConfiguration mappingConfiguration) throws IOException {
+ 		try {
+ 			// Merge SRG mappings. The real SRG mapping file hasn't been created yet since the usual SRG merging
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/SrgProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/SrgProvider.java
+index 02dffc2c02cc6eea3bc6c06ebe57d64091b21079..419a9fd8629be33283cf6d06cea770d375f2f7d7 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/SrgProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/SrgProvider.java
+@@ -28,6 +28,7 @@ import java.io.BufferedReader;
+ import java.io.ByteArrayInputStream;
+ import java.io.File;
+ import java.io.IOException;
++import java.io.InputStream;
+ import java.io.InputStreamReader;
+ import java.io.Reader;
+ import java.io.UncheckedIOException;
+@@ -101,21 +102,72 @@ public class SrgProvider extends DependencyProvider {
+ 	/**
+ 	 * {@return 是否需要生产 srg 相关产物}.
+ 	 *
+-	 * <p>无锁快路径：srg.tsrg 缺失或要求刷新时直接判定需要；否则读 srg.tsrg 首行判断形态，
++	 * <p>无锁快路径：srg.tsrg 缺失或不可复用、要求刷新时直接判定需要；否则读 srg.tsrg 首行判断形态，
+ 	 * 仅 tsrgV2（现代 MC）才存在 merged mojmap 产物，legacy 形态下其缺失属正常，无需生产。
++	 *
++	 * <p>所有判定都用「可复用」而非「存在」：这些文件位于跨 daemon 共享的 userCache，另一进程可能正在
++	 * 就地重建（旧版本 loom）或被中断留下残骸，存在性判定会把残骸当成就绪产物继续用下去。
+ 	 */
+ 	private boolean needsSrgProduction() throws IOException {
+-		if (Files.notExists(srg) || refreshDeps()) {
++		if (refreshDeps() || !isReusableTsrg(srg)) {
+ 			return true;
+ 		}
+ 
+ 		try (BufferedReader reader = Files.newBufferedReader(srg)) {
+-			if (!reader.readLine().startsWith("tsrg2")) {
++			final String firstLine = reader.readLine();
++
++			if (firstLine == null || !firstLine.startsWith("tsrg2")) {
+ 				return false;
+ 			}
+ 		}
+ 
+-		return Files.notExists(mergedMojangRaw) || Files.notExists(mergedMojangTrimmed);
++		return !isReusableTsrg(mergedMojangRaw) || !isReusableTsrg(mergedMojangTrimmed);
++	}
++
++	/**
++	 * {@return 该 tsrg 产物是否可作为输入复用}.
++	 *
++	 * <p>存在性判定不足以证明内容完整：这些文件位于跨 daemon 共享的 userCache，旧版本 loom 以最终路径为输出
++	 * 就地写，进程被中断会留下 0 字节或写到一半的文本；而截断的 tsrg 未必让 {@code MappingReader} 报错，
++	 * 结果是静默的错误映射。因此要求「非空、首行有内容、以行终止符结尾」：
++	 *
++	 * <ul>
++	 *     <li>非空且首行有内容：排除「先删后写」中途被杀留下的空文件、只剩换行的残骸；</li>
++	 *     <li>以行终止符结尾：tsrg 是逐行文本，写入方写完一行才会收尾该行，被截断的写入停在行中间的概率
++	 *     远高于正好停在行尾，这条能拦下绝大部分截断产物。</li>
++	 * </ul>
++	 *
++	 * <p>这三条对正常产物恒真（MCPConfig 的 {@code joined.tsrg}、lorenz 的 {@code TSrgWriter}、
++	 * mapping-io 的 TSRG2 writer、InstallerTools 的 {@code MERGE_MAPPING} 产物均满足），
++	 * 因此不会把正常产物永久判为不可用、把构建拖进「每次构建都重建」。
++	 *
++	 * <p>局限：截断恰好停在行边界、或只丢掉尾部若干完整记录时，这三条判据发现不了。要发现它只能做内容哈希
++	 * 或全量解析，而 raw+trimmed 合计接近 10MB，每次暖构建都解析会带来秒级开销，故不在此处做。
++	 */
++	private static boolean isReusableTsrg(Path path) {
++		try {
++			if (Files.notExists(path) || Files.size(path) == 0) {
++				return false;
++			}
++
++			try (BufferedReader reader = Files.newBufferedReader(path)) {
++				final String firstLine = reader.readLine();
++
++				if (firstLine == null || firstLine.isBlank()) {
++					return false;
++				}
++			}
++
++			final byte[] tail = new byte[1];
++
++			try (InputStream input = Files.newInputStream(path)) {
++				input.skipNBytes(Files.size(path) - 1);
++				return input.read(tail) == 1 && tail[0] == '\n';
++			}
++		} catch (IOException e) {
++			// 读取失败（例如文件正被其它进程删除/替换）同样按不可复用处理，让调用方重建
++			return false;
++		}
+ 	}
+ 
+ 	/**
+@@ -144,7 +196,8 @@ public class SrgProvider extends DependencyProvider {
+ 	}
+ 
+ 	private void produceSrg(DependencyInfo dependency) throws IOException {
+-		if (Files.exists(srg) && !refreshDeps()) {
++		// 锁内二次确认：等锁期间其它进程可能已产出可用产物（按「可复用」判定，避免把残骸当成果）
++		if (!refreshDeps() && isReusableTsrg(srg)) {
+ 			return;
+ 		}
+ 
+@@ -181,40 +234,79 @@ public class SrgProvider extends DependencyProvider {
+ 			return;
+ 		}
+ 
+-		if (Files.exists(mergedMojangRaw) && Files.exists(mergedMojangTrimmed) && !refreshDeps()) {
++		// 按件判定：只重建缺失或不可复用的那一件，不因一件有问题就删掉另一件已发布的产物。
++		// trimmed 由 raw 派生，因此 raw 不可复用时 trimmed 也要连带重建：否则会出现「只补下游件、
++		// 读了截断的上游件」的静默错误映射（trimmed 自身看起来完全正常）。
++		final boolean refresh = refreshDeps();
++		final boolean needsRaw = refresh || !isReusableTsrg(mergedMojangRaw);
++		final boolean needsTrimmed = needsRaw || !isReusableTsrg(mergedMojangTrimmed);
++
++		if (!needsRaw && !needsTrimmed) {
+ 			return;
+ 		}
+ 
+ 		Stopwatch stopwatch = Stopwatch.createStarted();
+ 		getProject().getLogger().lifecycle(":merging mappings (InstallerTools, srg + mojmap)");
+ 
+-		Files.deleteIfExists(mergedMojangRaw);
++		if (needsRaw) {
++			produceMergedMojangRaw();
++		}
++
++		if (needsTrimmed) {
++			// 从已完整落位的 raw 产物派生：失败最多让 trimmed 缺失，下次只需重建这一件；
++			// 已发布的 raw 不受影响（旧写法在开始前就把它删了，失败会连累读方）
++			produceMergedMojangTrimmed();
++		}
++
++		getProject().getLogger().lifecycle(":merged mappings (InstallerTools, srg + mojmap) in " + stopwatch.stop());
++	}
++
++	/**
++	 * 生产 raw 形态的 merged mojmap tsrg.
++	 *
++	 * <p>InstallerTools 自行创建 {@code --output} 指定的文件，因此先让它写「同目录唯一临时文件」，
++	 * 成功后再原子落位，读方不会看到半截产物，也不再需要先删除既有产物。
++	 */
++	private void produceMergedMojangRaw() throws IOException {
+ 		Path mojmapTsrg2 = getMojmapTsrg2(getProject(), getExtension());
+-		ForgeToolValueSource.exec(getProject(), settings -> {
+-			settings.classpath(DependencyDownloader.download(getProject(), LoomVersions.FORGE_INSTALLER_TOOLS.mavenNotation()));
+-			settings.getMainClass().set(INSTALLER_TOOLS_MAIN_CLASS);
+-			settings.args(
+-					"--task",
+-					"MERGE_MAPPING",
+-					"--left",
+-					getSrg().toAbsolutePath().toString(),
+-					"--right",
+-					mojmapTsrg2.toAbsolutePath().toString(),
+-					"--classes",
+-					"--output",
+-					mergedMojangRaw.toAbsolutePath().toString()
+-			);
+-		});
++		final Path temp = AtomicFiles.tempSibling(mergedMojangRaw);
++
++		try {
++			ForgeToolValueSource.exec(getProject(), settings -> {
++				settings.classpath(DependencyDownloader.download(getProject(), LoomVersions.FORGE_INSTALLER_TOOLS.mavenNotation()));
++				settings.getMainClass().set(INSTALLER_TOOLS_MAIN_CLASS);
++				settings.args(
++						"--task",
++						"MERGE_MAPPING",
++						"--left",
++						getSrg().toAbsolutePath().toString(),
++						"--right",
++						mojmapTsrg2.toAbsolutePath().toString(),
++						"--classes",
++						"--output",
++						temp.toAbsolutePath().toString()
++				);
++			});
++
++			AtomicFiles.move(temp, mergedMojangRaw);
++		} finally {
++			Files.deleteIfExists(temp);
++		}
++	}
+ 
++	/**
++	 * 从已发布的 raw 产物派生 trimmed 形态并原子发布.
++	 */
++	private void produceMergedMojangTrimmed() throws IOException {
+ 		MemoryMappingTree tree = new MemoryMappingTree();
+ 		MappingVisitor visitor = new ArgDroppingVisitor(new FieldDescWrappingVisitor(tree));
+ 		MappingReader.read(mergedMojangRaw, visitor);
+ 
+-		try (MappingWriter writer = MappingWriter.create(mergedMojangTrimmed, MappingFormat.TSRG_2_FILE)) {
+-			tree.accept(writer);
+-		}
+-
+-		getProject().getLogger().lifecycle(":merged mappings (InstallerTools, srg + mojmap) in " + stopwatch.stop());
++		AtomicFiles.publish(mergedMojangTrimmed, temp -> {
++			try (MappingWriter writer = MappingWriter.create(temp, MappingFormat.TSRG_2_FILE)) {
++				tree.accept(writer);
++			}
++		});
+ 	}
+ 
+ 	// A visitor that drop all method args from srg
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
+index 364e839b9cc48ec99252d2513e6fa1f0b07c215c..2b4ffec245b4fb4380316b59d1ecfce6c0723670 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
+@@ -32,7 +32,6 @@ import java.nio.file.FileVisitResult;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.SimpleFileVisitor;
+-import java.nio.file.StandardCopyOption;
+ import java.nio.file.StandardOpenOption;
+ import java.nio.file.attribute.BasicFileAttributes;
+ import java.util.Arrays;
+@@ -63,6 +62,7 @@ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.FileSystemUtil;
+ import net.fabricmc.loom.util.Pair;
+ import net.fabricmc.loom.util.ZipUtils;
++import net.fabricmc.loom.util.service.ScopedServiceFactory;
+ import net.fabricmc.loom.util.service.ServiceFactory;
+ import net.fabricmc.stitch.merge.JarMerger;
+ 
+@@ -77,8 +77,6 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 
+ 	private Path forgeJar;
+ 
+-	private boolean dirty;
+-
+ 	public MinecraftLegacyPatchedProvider(Project project, MinecraftProvider minecraftProvider, Type type) {
+ 		super(project, minecraftProvider, type);
+ 	}
+@@ -108,10 +106,9 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 		}
+ 
+ 		withPatchedLock(() -> {
+-			// 锁内判定：等锁期间其它进程可能已完成生产，checkCache 的 notExists 判定即为二次确认
+-			checkCache();
+-
+-			dirty = false;
++			// 锁内二次确认：等锁期间其它进程可能已完成生产。本方法不删除任何共享产物，
++			// 需要重建时由 checkCache 的返回值表达，缺失或损坏的产物由 remapJar 的可复用性判定按件补齐
++			dirty = checkCache();
+ 			return null;
+ 		});
+ 	}
+@@ -123,7 +120,7 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 	 * 半截产物）时按需要工作处理，进入锁内走完整判定。
+ 	 */
+ 	private boolean needsWork() {
+-		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(Files::notExists)) {
++		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(jar -> !isReusableJar(jar))) {
+ 			return true;
+ 		}
+ 
+@@ -134,9 +131,31 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 		}
+ 	}
+ 
+-	protected void cleanAllCache() throws IOException {
+-		for (Path path : getGlobalCaches()) {
+-			Files.deleteIfExists(path);
++	/**
++	 * 锁内二次确认：判定现有产物能否复用，并返回本次是否需要整链重建.
++	 *
++	 * <p>与父类一致，本方法不再删除共享产物：删除会让锁外只做存在性判定的读方拿到缺失文件，
++	 * 也会让其它工作树互相触发重建。legacy 链没有单一版本标记产物，任一件缺失即无法确认
++	 * 其余产物与当前算法同代，因此按整链重建处理（各件仍以「临时文件 + 原子落位」重新生成）。
++	 *
++	 * @return 是否需要整链重建
++	 */
++	@Override
++	protected boolean checkCache() throws IOException {
++		if (getExtension().refreshDeps()) {
++			// 显式刷新（--refresh-dependencies / -Dloom.refresh）：强制整链重建
++			return true;
++		}
++
++		if (Stream.of(getGlobalCaches()).anyMatch(jar -> !isReusableJar(jar))) {
++			return true;
++		}
++
++		try {
++			return !isPatchedJarUpToDate(minecraftPatchedAtJar) || !isPatchedJarUpToDate(forgeJar);
++		} catch (IOException e) {
++			// manifest 读不出来：共享产物被外部破坏，同样按整链重建处理
++			return true;
+ 		}
+ 	}
+ 
+@@ -150,65 +169,74 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 		};
+ 	}
+ 
+-	protected void checkCache() throws IOException {
+-		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(Files::notExists)
+-				|| !isPatchedJarUpToDate(minecraftPatchedAtJar) || !isPatchedJarUpToDate(forgeJar)) {
+-			cleanAllCache();
++	@Override
++	protected void produceIntermediateJarIfMissing() throws Exception {
++		// legacy 链的产物（forge.jar / client-patched.jar / server-patched.jar 等）在 remapJar 阶段生成，
++		// provide() 只做路径初始化与「是否需要重建」的判定，因此这里两步都要走一遍（均为幂等快路径）
++		provide();
++
++		try (var serviceFactory = new ScopedServiceFactory()) {
++			remapJar(serviceFactory);
+ 		}
+ 	}
+ 
+ 	@Override
+ 	public void remapJar(ServiceFactory serviceFactory) throws Exception {
+ 		// 无锁快路径：provide 已判定产物齐备（needsWork=false → dirty=false）时，本方法的全链
+-		// notExists 判定都会短路，无需取锁；仅当 provide 判定需要工作（dirty 或产物缺失）才进锁
+-		if (Stream.of(forgeJar, minecraftClientPatchedJar, minecraftServerPatchedJar).allMatch(Files::exists)
+-				&& (type != Type.MERGED || Files.exists(minecraftMergedPatchedJar))
+-				&& Files.exists(minecraftPatchedAtJar)) {
+-			dirty = false;
++		// 可复用性判定（存在 + 不是空 zip／截断文件）都会短路，无需取锁；仅当 provide 判定需要工作才进锁。
++		// 注意必须带上 !dirty：显式刷新与「补丁版本过期」不再通过删除产物表达，
++		// 若这里只判存在性，就会把 provide 设好的强制重建信号清掉。
++		if (!dirty
++				&& Stream.of(forgeJar, minecraftClientPatchedJar, minecraftServerPatchedJar).allMatch(MinecraftLegacyPatchedProvider::isReusableJar)
++				&& (type != Type.MERGED || isReusableJar(minecraftMergedPatchedJar))
++				&& isReusableJar(minecraftPatchedAtJar)) {
+ 			return;
+ 		}
+ 
+ 		withPatchedLock(() -> {
+-			// 锁内判定：等锁期间其它进程可能已完成生产，notExists 判定即为二次确认
+-			if (Files.notExists(forgeJar)) {
++			// 锁内二次确认：等锁期间其它进程可能已完成生产；所有产物均以「临时文件 + 原子落位」生成
++			if (dirty || !isReusableJar(forgeJar)) {
+ 				dirty = true;
+-				patchForge();
+-				applyLoomPatchVersion(forgeJar);
++				publishAtomically(forgeJar, this::patchForge);
+ 			}
+ 
+-			if (Files.notExists(minecraftClientPatchedJar) || Files.notExists(minecraftServerPatchedJar)) {
++			if (dirty || !isReusableJar(minecraftClientPatchedJar) || !isReusableJar(minecraftServerPatchedJar)) {
+ 				dirty = true;
+ 				patchJars();
+ 			}
+ 
+-			if (type == Type.MERGED && (dirty || Files.notExists(minecraftMergedPatchedJar))) {
++			if (type == Type.MERGED && (dirty || !isReusableJar(minecraftMergedPatchedJar))) {
+ 				dirty = true;
+-				mergeJars();
++				publishAtomically(minecraftMergedPatchedJar, this::mergeJars);
+ 			}
+ 
+-			if (dirty || Files.notExists(minecraftPatchedAtJar)) {
++			if (dirty || !isReusableJar(minecraftPatchedAtJar)) {
+ 				dirty = true;
+ 				Path minecraftPatchedJar = switch (type) {
+ 				case CLIENT_ONLY -> minecraftClientPatchedJar;
+ 				case SERVER_ONLY -> minecraftServerPatchedJar;
+ 				case MERGED -> minecraftMergedPatchedJar;
+ 				};
+-				accessTransform(minecraftPatchedJar, minecraftPatchedAtJar);
+-				walkFileSystems(forgeJar, minecraftPatchedAtJar, (path) -> true, this::copyReplacing);
+-				applyLoomPatchVersion(minecraftPatchedAtJar);
++				// AT、Forge 文件复制与补丁版本标记全部在临时文件上完成，最后原子落位
++				publishAtomically(minecraftPatchedAtJar, output -> {
++					accessTransform(minecraftPatchedJar, output);
++					walkFileSystems(forgeJar, output, (path) -> true, this::copyReplacing);
++					applyLoomPatchVersion(output);
++				});
+ 			}
+ 
+ 			return null;
+ 		});
+ 	}
+ 
+-	private void patchForge() throws Exception {
++	private void patchForge(Path output) throws Exception {
+ 		Stopwatch stopwatch = Stopwatch.createStarted();
+ 		logger.lifecycle(":patching forge");
+ 
+-		Files.copy(getExtension().getForgeUniversalProvider().getForge().toPath(), forgeJar, StandardCopyOption.REPLACE_EXISTING);
++		// output 是本次独占的临时文件：复制与全部加工都在它上面完成，最后原子落位
++		Files.copy(getExtension().getForgeUniversalProvider().getForge().toPath(), output);
+ 
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(forgeJar, false)) {
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(output, false)) {
+ 			// For the development environment, we need to remove the binpatches, otherwise forge will try to re-apply them
+ 			Files.delete(fs.get().getPath("binpatches.pack.lzma"));
+ 
+@@ -266,7 +294,7 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 				.orElse(null);
+ 		if (log4jBeta9 != null) {
+ 			Predicate<Path> isHelper = path -> path.startsWith("/org/apache/logging/log4j/core/helpers");
+-			walkFileSystems(log4jBeta9, forgeJar, isHelper, this::copyReplacing);
++			walkFileSystems(log4jBeta9, output, isHelper, this::copyReplacing);
+ 		}
+ 
+ 		// While Forge will discover mods on the classpath, it won't do the same for ATs, coremods or tweakers.
+@@ -275,13 +303,16 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 		// No clue why FG went the hack route when it's the same project and they could have just added first-party
+ 		// support for loading both from the classpath right into Forge (it's even really simply to do).
+ 		// We'll have none of those hacks and instead patch first-party support into Forge.
+-		ZipUtils.transform(forgeJar, Stream.of(new Pair<>(CoreModManagerTransformer.FILE, original -> {
++		ZipUtils.transform(output, Stream.of(new Pair<>(CoreModManagerTransformer.FILE, original -> {
+ 			ClassReader reader = new ClassReader(original);
+ 			ClassWriter writer = new ClassWriter(reader, 0);
+ 			reader.accept(new CoreModManagerTransformer(writer), 0);
+ 			return writer.toByteArray();
+ 		})));
+ 
++		// 补丁版本标记是就绪标记：必须在原子落位之前写入临时文件，读方才能「见到即完整」
++		applyLoomPatchVersion(output);
++
+ 		logger.lifecycle(":patched forge in " + stopwatch.stop());
+ 	}
+ 
+@@ -291,8 +322,10 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 
+ 		MinecraftProvider minecraftProvider = getExtension().getMinecraftProvider();
+ 		PatchProvider patchProvider = getExtension().getPatchProvider();
+-		patchJars(minecraftProvider.getMinecraftServerJar().toPath(), minecraftServerPatchedJar, patchProvider.extractServerPatches());
+-		patchJars(minecraftProvider.getMinecraftClientJar().toPath(), minecraftClientPatchedJar, patchProvider.extractClientPatches());
++		// 两件产物各自「临时文件 + 原子落位」：任一件失败都不会在共享缓存里留下半截 jar，
++		// 也不会破坏另一件已发布的有效产物
++		publishAtomically(minecraftServerPatchedJar, output -> patchJars(minecraftProvider.getMinecraftServerJar().toPath(), output, patchProvider.extractServerPatches()));
++		publishAtomically(minecraftClientPatchedJar, output -> patchJars(minecraftProvider.getMinecraftClientJar().toPath(), output, patchProvider.extractClientPatches()));
+ 
+ 		logger.lifecycle(":patched jars in " + stopwatch.stop());
+ 	}
+@@ -309,18 +342,19 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 		modifyClasses(output, ParameterAnnotationsFixer::new);
+ 	}
+ 
+-	private void mergeJars() throws Exception {
++	private void mergeJars(Path output) throws Exception {
+ 		logger.info(":merging jars");
+ 		Stopwatch stopwatch = Stopwatch.createStarted();
+ 
+-		try (JarMerger jarMerger = new JarMerger(minecraftClientPatchedJar.toFile(), minecraftServerPatchedJar.toFile(), minecraftMergedPatchedJar.toFile())) {
++		// output 是本次独占的临时文件，合并与后续类改写都在它上面完成，最后原子落位
++		try (JarMerger jarMerger = new JarMerger(minecraftClientPatchedJar.toFile(), minecraftServerPatchedJar.toFile(), output.toFile())) {
+ 			jarMerger.enableSyntheticParamsOffset();
+ 			jarMerger.merge();
+ 		}
+ 
+ 		// The JarMerger adds Sided annotations but so do the Forge patches. The latter doesn't require extra
+ 		// dependencies beyond Forge, so we'll keep those and convert any non-redundant Fabric ones.
+-		modifyClasses(minecraftMergedPatchedJar, SideAnnotationMerger::new);
++		modifyClasses(output, SideAnnotationMerger::new);
+ 
+ 		logger.info(":merged jars in " + stopwatch);
+ 	}
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+index 286f8c7e19382b984d94468159dac1763472434a..a83d56924155f034aeb4dd5b9b8026452e2ebd2b 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+@@ -92,7 +92,9 @@ import net.fabricmc.loom.util.FileSystemUtil;
+ import net.fabricmc.loom.util.LoomVersions;
+ import net.fabricmc.loom.util.TinyRemapperHelper;
+ import net.fabricmc.loom.util.ZipUtils;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.loom.util.cache.CacheEntryLock;
++import net.fabricmc.loom.util.cache.JarReusability;
+ import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.loom.util.service.ScopedServiceFactory;
+ import net.fabricmc.loom.util.service.ServiceFactory;
+@@ -130,7 +132,8 @@ public class MinecraftPatchedProvider {
+ 	private Path minecraftPatchedJar;
+ 	private Path minecraftClientExtra;
+ 
+-	private boolean dirty = false;
++	// 对子类开放：legacy Forge 子类需要读写该标志，且 isDirty() 必须能反映子类的重建状态
++	protected boolean dirty = false;
+ 
+ 	public static MinecraftPatchedProvider get(Project project) {
+ 		MinecraftProvider provider = LoomGradleExtension.get(project).getMinecraftProvider();
+@@ -172,28 +175,66 @@ public class MinecraftPatchedProvider {
+ 		minecraftClientExtra = forgeWorkingDir.resolve("client-extra.jar");
+ 	}
+ 
+-	protected void cleanAllCache() throws IOException {
+-		for (Path path : getGlobalCaches()) {
+-			Files.deleteIfExists(path);
+-		}
+-	}
+-
++	/**
++	 * {@return 本配置下必须可复用的共享产物列表，供 {@link #needsWork()} 判定}.
++	 *
++	 * <p>列表只包含当前 jar 配置确实会生成的产物：server-only 不提供 client jar，
++	 * {@code client-extra.jar} 既不生成也不进 classpath、不注册进 FORGE_EXTRA（见 {@link #providesClientJar()}），
++	 * 把它计入判定会让 {@link #needsWork()} 恒为真、每次构建都白取一次跨进程锁。
++	 */
+ 	protected Path[] getGlobalCaches() {
+-		Path[] files = {
++		List<Path> files = new ArrayList<>(Arrays.asList(
+ 				minecraftIntermediateJar,
+ 				minecraftPatchedIntermediateJar,
+ 				minecraftPatchedIntermediateAtJar,
+ 				minecraftPatchedJar,
+-				minecraftClientExtra,
+-		};
++				minecraftClientExtra
++		));
++
++		if (!providesClientJar()) {
++			files.remove(minecraftClientExtra);
++		}
+ 
+-		return files;
++		return files.toArray(Path[]::new);
+ 	}
+ 
+-	protected void checkCache() throws IOException {
+-		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(Files::notExists)
+-				|| !isPatchedJarUpToDate(minecraftPatchedJar)) {
+-			cleanAllCache();
++	/**
++	 * {@return 该共享产物是否可作为输入复用}.
++	 *
++	 * <p>口径与理由见 {@link JarReusability#isReusable(Path)}：能作为 zip 打开且至少含一个条目。
++	 * 实现只有那一份，其它共享缓存链（mapped minecraft jar、mcp.zip、SrgProvider 产物等）用的是同一判定；
++	 * 本方法保留，是因为 legacy 子类仍以 {@code isReusableJar} 的名字调用它。
++	 */
++	protected static boolean isReusableJar(Path jar) {
++		return JarReusability.isReusable(jar);
++	}
++
++	/**
++	 * 锁内二次确认：判定现有产物能否复用，并返回本次是否需要整链重建.
++	 *
++	 * <p>本方法刻意不再删除共享产物。这些 jar 位于跨 daemon 共享的 forge 缓存目录：
++	 * 删除会让锁外只做存在性判定的读方拿到缺失文件，也会让其它工作树误判「需要重建」而互相触发重建。
++	 * 取而代之的策略是：
++	 * <ul>
++	 *     <li>可复用的产物原样保留，缺失或损坏的产物由后续步骤按件补齐（{@link #needsWork()} 同样基于可复用性判定）；</li>
++	 *     <li>需要整链重建时由返回值表达，各步骤以「临时文件 + 原子落位」重新生成，
++	 *     读方见到的要么是旧文件、要么是完整的新文件。</li>
++	 * </ul>
++	 *
++	 * @return 是否需要整链重建
++	 */
++	protected boolean checkCache() throws IOException {
++		if (getExtension().refreshDeps()) {
++			// 显式刷新（--refresh-dependencies / -Dloom.refresh）：强制整链重建
++			return true;
++		}
++
++		// 最终产物的 manifest 承载补丁版本标记；缺失或版本过期时，中间产物无法证明与当前算法同代，整链重建
++		try {
++			return !isPatchedJarUpToDate(minecraftPatchedJar);
++		} catch (IOException e) {
++			// manifest 读不出来：共享产物被外部破坏，同样按整链重建处理
++			return true;
+ 		}
+ 	}
+ 
+@@ -231,9 +272,13 @@ public class MinecraftPatchedProvider {
+ 	 *
+ 	 * <p>产物缺失或 Loom 补丁版本过期即需要工作。manifest 读取遇到损坏文件（多进程并发下
+ 	 * 的半截产物）时按需要工作处理，进入锁内走完整判定。
++	 *
++	 * <p>参与判定的产物集合由 {@link #getGlobalCaches()} 给出，它只含本配置下确实会生成的产物：
++	 * server-only 不含 client-extra，否则判定恒为「需要工作」，无锁快路径永远走不到。
+ 	 */
+ 	private boolean needsWork() {
+-		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(Files::notExists)) {
++		// 无锁读路径：除存在性外还要拒绝空 zip／截断文件等半成品（其它进程可能正在就地重建共享缓存）
++		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(jar -> !isReusableJar(jar))) {
+ 			return true;
+ 		}
+ 
+@@ -245,29 +290,93 @@ public class MinecraftPatchedProvider {
+ 	}
+ 
+ 	private Void providePatched() throws Exception {
+-		// 锁内判定：等锁期间其它进程可能已完成生产，checkCache 与 notExists 均为幂等二次确认
+-		checkCache();
+-
+-		this.dirty = false;
++		// 锁内二次确认：等锁期间其它进程可能已完成生产。本方法不删除任何共享产物，
++		// 「整链重建」由 checkCache 的返回值表达，缺失或损坏的产物则由下面的可复用性判定按件补齐
++		final boolean forceRebuild = checkCache();
++		this.dirty = forceRebuild;
+ 
+-		if (Files.notExists(minecraftIntermediateJar)) {
++		if (forceRebuild || !isReusableJar(minecraftIntermediateJar)) {
+ 			this.dirty = true;
+-			createPrePatchJar();
++			// 原子落位：临时文件写完才替换最终产物，锁外读方不会看到半截 jar
++			publishAtomically(minecraftIntermediateJar, this::createPrePatchJar);
+ 		}
+ 
+-		if (dirty || Files.notExists(minecraftPatchedIntermediateJar)) {
++		if (dirty || !isReusableJar(minecraftPatchedIntermediateJar)) {
+ 			this.dirty = true;
+-			patchJars();
++			publishAtomically(minecraftPatchedIntermediateJar, this::producePatchedIntermediate);
+ 		}
+ 
+-		if (dirty || Files.notExists(minecraftPatchedIntermediateAtJar)) {
++		if (dirty || !isReusableJar(minecraftPatchedIntermediateAtJar)) {
+ 			this.dirty = true;
+ 			accessTransformForge();
+ 		}
+ 
++		// client-extra 在 remapJar 阶段生成，本阶段不重建它，但必须在这里置位重建信号：
++		// 否则会出现「needsWork 判定需要工作、providePatched 却查不出任何需要重建的件」的死角，
++		// remapJar 因 dirty=false 直接返回，损坏的 client-extra 既不被修复、又被注册进 FORGE_EXTRA
++		// （见 registerExtraDependencies），此后每次构建都重复这个空转。
++		// server-only 不生成 client-extra，不能参与判定，否则 dirty 恒为真、每轮都整链重建
++		if (providesClientJar() && !isReusableJar(minecraftClientExtra)) {
++			this.dirty = true;
++		}
++
+ 		return null;
+ 	}
+ 
++	/**
++	 * {@return 打补丁后的中间 Minecraft jar；产物不可复用时先按件补齐}.
++	 *
++	 * <p>该 jar 位于跨 daemon 共享的 forge 缓存目录：其它工作树的构建（尤其是仍在删除整组产物的
++	 * 旧版本 loom）可能让它在被读取前一刻消失，直接读取会以
++	 * {@link java.nio.file.NoSuchFileException} 打断整个构建。
++	 *
++	 * <p>判定与补齐都基于「可复用」（存在、能作为 zip/jar 打开且至少含一个条目，见
++	 * {@link #isReusableJar(Path)}）而非「存在」：共享缓存里可能出现 22 字节空 zip 或截断文件，
++	 * 只判存在性会把这类半成品原样交给调用方——它能以只读 jar 文件系统打开但读不出任何 class，
++	 * 下游（FieldMappingsMigrator / MethodInheritanceMappingsMigrator）会把「读不出内容」当成
++	 * 「没有内容」，从而把空结果写进映射缓存，形成静默错误映射。
++	 *
++	 * <p>补齐走 {@link #produceIntermediateJarIfMissing()}：产物齐备时它是无锁快路径，不可复用时在
++	 * {@code forge-patched} 跨进程锁内只重建缺失件，并以原子方式落位。
++	 */
++	public Path getOrProduceMinecraftPatchedIntermediateJar() {
++		final Path jar = getMinecraftPatchedIntermediateJar();
++
++		if (isReusableJar(jar)) {
++			return jar;
++		}
++
++		logger.lifecycle(":共享缓存中的中间产物 {} 不可复用（缺失或损坏），先按件补齐（其它进程可能正在重建该缓存）", jar);
++
++		try {
++			produceIntermediateJarIfMissing();
++		} catch (IOException e) {
++			throw new UncheckedIOException(e);
++		} catch (Exception e) {
++			throw new RuntimeException("补齐共享缓存中的 patched 中间产物失败: " + jar, e);
++		}
++
++		// 补齐后必须再校验一次：仍然不可复用说明该产物这次没能被完整生产出来
++		// （例如锁内判定把它当作可复用而跳过重建，或被外部进程在补齐后再次写坏）。
++		// 这里抛异常而不是返回坏路径：坏路径会让下游把「读不出内容」当成「没有内容」，静默产出错误映射
++		if (!isReusableJar(jar)) {
++			throw new UncheckedIOException(new IOException(
++					"补齐后共享缓存中的 patched 中间产物仍不可复用（无法作为 zip/jar 打开，或没有任何条目）: " + jar));
++		}
++
++		return jar;
++	}
++
++	/**
++	 * 确保 {@link #getMinecraftPatchedIntermediateJar()} 指向的产物已存在.
++	 *
++	 * <p>默认实现调用 {@link #provide()}；legacy 链的产物在 {@link #remapJar(ServiceFactory)}
++	 * 阶段生成（{@code provide()} 只做判定），由子类覆盖补齐。
++	 */
++	protected void produceIntermediateJarIfMissing() throws Exception {
++		provide();
++	}
++
+ 	public void remapJar(ServiceFactory serviceFactory) throws Exception {
+ 		// 无锁快路径：provide 已判定无需重建（dirty=false）时，此处仅注册依赖（纯内存操作），不取锁
+ 		if (!dirty) {
+@@ -279,16 +388,18 @@ public class MinecraftPatchedProvider {
+ 	}
+ 
+ 	private Void remapPatchedJarWithDirty(ServiceFactory serviceFactory) throws Exception {
+-		// 锁内判定：等锁期间其它进程可能已完成生产，dirty/notExists 判定即为二次确认
++		// 锁内二次确认：等锁期间其它进程可能已完成生产（dirty 为幂等判定）；本方法不删除共享产物
++		// dirty 也可能只表示「client-extra 需要重建」（见 providePatched）：此时最终 jar 会被幂等地重发一次，
++		// 而 client-extra 的修复不会被跳过
+ 		if (dirty) {
+ 			if (getExtension().isUnobfuscatedForge()) {
+-				mergeUnobfuscatedPatchedJar();
++				publishAtomically(minecraftPatchedJar, this::mergeUnobfuscatedPatchedJar);
+ 			} else {
+-				remapPatchedJar(serviceFactory);
++				publishAtomically(minecraftPatchedJar, output -> remapPatchedJar(output, serviceFactory));
+ 			}
+ 
+ 			if (providesClientJar()) {
+-				fillClientExtraJar(serviceFactory);
++				publishAtomically(minecraftClientExtra, output -> fillClientExtraJar(serviceFactory, output));
+ 			}
+ 		}
+ 
+@@ -327,6 +438,36 @@ public class MinecraftPatchedProvider {
+ 		}
+ 	}
+ 
++	/**
++	 * 原子发布：在「临时文件 + 原子落位」保护下执行可能抛出任意受检异常的生产动作.
++	 *
++	 * <p>补丁步骤会调用外部工具（binpatcher / installer tools 等），其受检异常不限于 {@link IOException}，
++	 * 无法直接作为 {@link AtomicFiles.IOConsumer}；这里统一折叠为 {@link UncheckedIOException} 后向上抛，
++	 * 以保证共享缓存里永远不会出现半截产物。
++	 *
++	 * @param target   最终落位路径（位于跨 daemon 共享的缓存目录）
++	 * @param producer 内容生产者，接收本次独占的临时文件路径
++	 */
++	protected static void publishAtomically(Path target, ThrowingProducer producer) throws IOException {
++		AtomicFiles.publish(target, tmp -> {
++			try {
++				producer.accept(tmp);
++			} catch (IOException e) {
++				throw e;
++			} catch (Exception e) {
++				throw new UncheckedIOException(new IOException("原子发布 " + target + " 失败", e));
++			}
++		});
++	}
++
++	/**
++	 * 允许抛出任意受检异常的生产回调（{@link AtomicFiles.IOConsumer} 只允许 {@link IOException}）.
++	 */
++	@FunctionalInterface
++	protected interface ThrowingProducer {
++		void accept(Path output) throws Exception;
++	}
++
+ 	/**
+ 	 * server-only 的 jar 配置不提供 client jar，client-extra 既不生成也不加入 classpath.
+ 	 *
+@@ -336,31 +477,30 @@ public class MinecraftPatchedProvider {
+ 		return getExtension().getMinecraftJarConfiguration().get() != MinecraftJarConfiguration.SERVER_ONLY;
+ 	}
+ 
+-	private void mergeUnobfuscatedPatchedJar() throws IOException {
++	private void mergeUnobfuscatedPatchedJar(Path output) throws IOException {
+ 		logger.lifecycle(":merging userdev into minecraft");
+-		Path mcOutput = minecraftPatchedJar;
+ 		Path forgeUserdevJar = getForgeUserdevJar().toPath();
+ 
+-		Files.deleteIfExists(mcOutput);
+-		Files.copy(minecraftPatchedIntermediateAtJar, mcOutput);
++		// output 是本次独占的临时文件：整份写入后在它上面完成全部加工，再由调用方原子落位
++		Files.copy(minecraftPatchedIntermediateAtJar, output);
+ 
+ 		// No manifest available to reuse here (mergetool's output has none, Forge's own jar is signed).
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(mcOutput, false)) {
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(output, false)) {
+ 			createEmptyJarManifest(fs.getPath("META-INF", "MANIFEST.MF"));
+ 		}
+ 
+-		copyUserdevFiles(forgeUserdevJar, mcOutput);
+-		applyLoomPatchVersion(mcOutput);
++		copyUserdevFiles(forgeUserdevJar, output);
++		applyLoomPatchVersion(output);
+ 	}
+ 
+-	private void createPrePatchJar() throws IOException {
++	private void createPrePatchJar(Path output) throws IOException {
+ 		if (getExtension().isUnobfuscatedForge()) {
+-			createUnobfuscatedPrePatchJar();
++			createUnobfuscatedPrePatchJar(output);
+ 			return;
+ 		}
+ 
+ 		if (shouldUseNeoForgeInstallerToolsToCreatePrePatchJar()) {
+-			createNeoForgeInstallerToolsPrePatchJar();
++			createNeoForgeInstallerToolsPrePatchJar(output);
+ 			return;
+ 		}
+ 
+@@ -368,22 +508,23 @@ public class MinecraftPatchedProvider {
+ 			McpExecutorBuilder builder = createMcpExecutor(tempFiles.directory("loom-mcp"));
+ 			builder.enqueue("rename");
+ 			McpExecutor executor = serviceFactory.get(builder.build());
+-			Path output = executor.execute();
+-			Files.copy(output, minecraftIntermediateJar);
++			Path result = executor.execute();
++			// output 是本次独占的临时文件，写完后由调用方原子落位到共享缓存
++			Files.copy(result, output);
+ 		}
+ 	}
+ 
+-	private void createUnobfuscatedPrePatchJar() throws IOException {
++	private void createUnobfuscatedPrePatchJar(Path output) throws IOException {
+ 		try (var tempFiles = new TempFiles(); var serviceFactory = new ScopedServiceFactory()) {
+ 			McpExecutorBuilder builder = createMcpExecutor(tempFiles.directory("loom-mcp"));
+ 			builder.enqueue(getExtension().isNeoForge() ? "preProcessJar" : "merge");
+ 			McpExecutor executor = serviceFactory.get(builder.build());
+-			Path output = executor.execute();
+-			Files.copy(output, minecraftIntermediateJar, StandardCopyOption.REPLACE_EXISTING);
++			Path result = executor.execute();
++			Files.copy(result, output, StandardCopyOption.REPLACE_EXISTING);
+ 		}
+ 	}
+ 
+-	private void createNeoForgeInstallerToolsPrePatchJar() throws IOException {
++	private void createNeoForgeInstallerToolsPrePatchJar(Path output) throws IOException {
+ 		try (var tempFiles = new TempFiles()) {
+ 			final Path mappings = tempFiles.file("mappings", ".txt");
+ 
+@@ -407,16 +548,16 @@ public class MinecraftPatchedProvider {
+ 				}
+ 
+ 				settings.args("--input-mappings", mappings.toAbsolutePath().toString());
+-				settings.args("--output", minecraftIntermediateJar.toAbsolutePath().toString());
++				// 外部工具自行创建该文件：指向本次独占的临时文件，避免锁外读方看到半截产物
++				settings.args("--output", output.toAbsolutePath().toString());
+ 				settings.args("--neoform-data", getExtension().getMcpConfigProvider().getMcp().toAbsolutePath().toString());
+ 			});
+ 		}
+ 	}
+ 
+-	private void fillClientExtraJar(ServiceFactory serviceFactory) throws IOException {
+-		Files.deleteIfExists(minecraftClientExtra);
+-
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(minecraftClientExtra, true)) {
++	private void fillClientExtraJar(ServiceFactory serviceFactory, Path output) throws IOException {
++		// output 是本次独占的临时文件：原子发布要求生产者自行创建目标，故无需（也不应）先删除任何共享产物
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(output, true)) {
+ 			Path manifestPath = fs.getPath("META-INF", "MANIFEST.MF");
+ 
+ 			if (getExtension().isNeoForge()) {
+@@ -432,7 +573,7 @@ public class MinecraftPatchedProvider {
+ 			}
+ 		}
+ 
+-		copyNonClassFiles(minecraftProvider.getMinecraftClientJar().toPath(), minecraftClientExtra);
++		copyNonClassFiles(minecraftProvider.getMinecraftClientJar().toPath(), output);
+ 	}
+ 
+ 	// Generates the jar manifest for NeoForge client-extra jars.
+@@ -611,7 +752,8 @@ public class MinecraftPatchedProvider {
+ 	}
+ 
+ 	protected void accessTransformForge() throws IOException {
+-		accessTransform(minecraftPatchedIntermediateJar, minecraftPatchedIntermediateAtJar);
++		// 原子落位：AT 后的 jar 属于共享缓存，必须先完整生成再替换，避免锁外读方拿到半截 jar
++		AtomicFiles.publish(minecraftPatchedIntermediateAtJar, tmp -> accessTransform(minecraftPatchedIntermediateJar, tmp));
+ 	}
+ 
+ 	/**
+@@ -634,13 +776,12 @@ public class MinecraftPatchedProvider {
+ 		logger.lifecycle(":access transformed minecraft in " + stopwatch.stop());
+ 	}
+ 
+-	private void remapPatchedJar(ServiceFactory serviceFactory) throws Exception {
++	private void remapPatchedJar(Path mcOutput, ServiceFactory serviceFactory) throws Exception {
+ 		logger.lifecycle(":remapping minecraft (TinyRemapper, {} -> official)", IntermediaryNamespaces.intermediary(project));
+ 		Path mcInput = minecraftPatchedIntermediateAtJar;
+-		Path mcOutput = minecraftPatchedJar;
+ 		Path forgeJar = getForgeJar().toPath();
+ 		Path forgeUserdevJar = getForgeUserdevJar().toPath();
+-		Files.deleteIfExists(mcOutput);
++		// mcOutput 是本次独占的临时文件（尚不存在），tiny-remapper 自行创建；无需先删任何共享产物
+ 
+ 		TinyRemapper remapper = buildRemapper(serviceFactory, mcInput);
+ 
+@@ -673,16 +814,22 @@ public class MinecraftPatchedProvider {
+ 		CoreModClassRemapper.remapJar(project, isRuntimeMojang, patchedJar, mappings);
+ 	}
+ 
+-	private void patchJars() throws Exception {
++	/**
++	 * 生产打补丁后的中间产物.
++	 *
++	 * <p>{@code output} 是本次独占的临时文件：binpatcher 与后续的类改写全部作用在它上面，
++	 * 完整生成后才由调用方原子落位到共享缓存路径。
++	 */
++	private void producePatchedIntermediate(Path output) throws Exception {
+ 		Stopwatch stopwatch = Stopwatch.createStarted();
+ 		logger.lifecycle(":patching jars");
+-		patchJars(minecraftIntermediateJar, minecraftPatchedIntermediateJar, type.patches.apply(getExtension().getPatchProvider(), getExtension().getForgeUserdevProvider()));
++		patchJars(minecraftIntermediateJar, output, type.patches.apply(getExtension().getPatchProvider(), getExtension().getForgeUserdevProvider()));
+ 
+-		copyMissingClasses(minecraftIntermediateJar, minecraftPatchedIntermediateJar);
+-		deleteParameterNames(minecraftPatchedIntermediateJar);
++		copyMissingClasses(minecraftIntermediateJar, output);
++		deleteParameterNames(output);
+ 
+ 		if (getExtension().isForgeLikeAndNotOfficial() && !getExtension().isUnobfuscatedForge()) {
+-			fixParameterAnnotation(minecraftPatchedIntermediateJar);
++			fixParameterAnnotation(output);
+ 		}
+ 
+ 		logger.lifecycle(":patched jars in " + stopwatch.stop());
+diff --git a/src/main/java/dev/architectury/loom/mcpconfig/McpConfigProvider.java b/src/main/java/dev/architectury/loom/mcpconfig/McpConfigProvider.java
+index ffc5df2aac9879c4602ff7953363596c3886488f..8441997988d28bbc53abae923588e7267eec2895 100644
+--- a/src/main/java/dev/architectury/loom/mcpconfig/McpConfigProvider.java
++++ b/src/main/java/dev/architectury/loom/mcpconfig/McpConfigProvider.java
+@@ -24,11 +24,13 @@
+ 
+ package dev.architectury.loom.mcpconfig;
+ 
++import java.io.IOException;
+ import java.io.Reader;
++import java.io.UncheckedIOException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+-import java.nio.file.StandardCopyOption;
+ import java.util.Objects;
++import java.util.UUID;
+ 
+ import com.google.gson.Gson;
+ import com.google.gson.JsonObject;
+@@ -39,11 +41,15 @@ import net.fabricmc.loom.configuration.DependencyInfo;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.DeletingFileVisitor;
+ import net.fabricmc.loom.util.ZipUtils;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.cache.JarReusability;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ 
+ public class McpConfigProvider extends DependencyProvider {
+ 	private Path mcp;
+ 	private Path configJson;
+ 	private Path unpacked;
++	private String version;
+ 	private McpConfigData data;
+ 
+ 	public McpConfigProvider(Project project) {
+@@ -87,16 +93,9 @@ public class McpConfigProvider extends DependencyProvider {
+ 
+ 		Path mcpZip = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve MCPConfig")).toPath();
+ 
+-		if (!Files.exists(mcp) || !Files.exists(unpacked) || refreshDeps()) {
+-			Files.copy(mcpZip, mcp, StandardCopyOption.REPLACE_EXISTING);
+-
+-			// Delete existing files
+-			if (Files.exists(unpacked)) {
+-				Files.walkFileTree(unpacked, new DeletingFileVisitor());
+-			}
+-
+-			Files.createDirectory(unpacked);
+-			ZipUtils.unpackAll(mcp, unpacked);
++		// 无锁快路径：zip 与解包目录都已就绪且未要求刷新时不触碰共享缓存，也就无需取锁
++		if (needsZip() || needsUnpacked()) {
++			produceWithLock(mcpZip);
+ 		}
+ 
+ 		JsonObject json;
+@@ -108,7 +107,139 @@ public class McpConfigProvider extends DependencyProvider {
+ 		data = McpConfigData.fromJson(json);
+ 	}
+ 
++	/**
++	 * {@return zip 是否需要（重新）发布}.
++	 *
++	 * <p>无锁快路径的一部分：产物已就绪且未要求刷新时无需重建，也就不取锁。该判定只读，可在锁外安全调用。
++	 *
++	 * <p>就绪口径含内容校验（{@link JarReusability#isReusable(Path)}：能作为 zip 打开且至少含一个条目）：
++	 * 共享缓存里的 {@code mcp.zip} 可能被旧版本 loom 的就地覆盖中断，留下空 zip 或截断文件；只判存在
++	 * 会把这类残骸当成就绪产物，后面整条 MCP 执行链都会读这个坏 zip。该口径不会拒绝正常产物。
++	 *
++	 * <p>仍然不把 zip 与输入构件比对尺寸/校验和：同一构件在不同镜像下尺寸可能不同，比对会让两个使用
++	 * 不同镜像的进程互相覆盖，造成每次构建都重建。
++	 */
++	private boolean needsZip() {
++		return refreshDeps() || !JarReusability.isReusable(mcp);
++	}
++
++	/**
++	 * {@return 解包目录是否需要（重新）构建}.
++	 *
++	 * <p>以 {@code config.json} 而非解包目录本身作为就绪标记：写入方先解包到同目录的临时目录再整体落位，
++	 * 故 {@code config.json} 存在 ⟹ 整棵树完整；反过来，残缺目录（旧写法中途失败留下的）会被识别出来并重建。
++	 */
++	private boolean needsUnpacked() {
++		return refreshDeps() || Files.notExists(configJson);
++	}
++
++	/**
++	 * 在跨进程锁保护下生产 MCPConfig 的 zip 与解包目录，两者按件重建.
++	 *
++	 * <p>路径位于跨 daemon 共享的 {@code userCache}（不按项目隔离），同一 MC 版本 + MCPConfig 版本的多个
++	 * 并发构建会写同一路径；由首个取得锁的进程写入，其余进程等待后直接复用（锁内二次确认）。
++	 * 旧写法全程无锁：先就地覆盖 zip，再递归删除整个解包目录后重新解包，读方会看到「目录存在但内容不全」
++	 * 的半成品，是 Forge 全链输入被破坏的主要来源。
++	 */
++	private void produceWithLock(Path mcpZip) {
++		final String lockKey = "mcp-config:" + getMinecraftProvider().minecraftVersion() + ":" + version;
++		final Path lockRoot = mcp.getParent().resolve(Constants.Cache.LOCKS_DIR);
++
++		try {
++			LoomCacheService.get(getProject()).get().runExclusive(lockRoot, lockKey, LoomCacheService.defaultTimeout(), () -> {
++				// 锁内二次确认：等锁期间其它进程可能已发布就绪的产物，按件判定避免重复生产
++				final boolean publishZip = needsZip();
++
++				if (publishZip) {
++					// 原子发布：读方要么看到完整 zip，要么看不到（旧写法就地覆盖会留下半截 zip）
++					AtomicFiles.copy(mcpZip, mcp);
++				}
++
++				if (publishZip || needsUnpacked()) {
++					publishUnpacked(publishZip);
++				}
++
++				return null;
++			});
++		} catch (IOException e) {
++			throw new UncheckedIOException(e);
++		} catch (Exception e) {
++			throw new RuntimeException("Could not unpack MCPConfig " + version, e);
++		}
++	}
++
++	/**
++	 * 解包 {@code mcp.zip} 到共享目录，整棵树按「先建临时目录、再整体落位」发布.
++	 *
++	 * <p>目录无法像文件那样原子覆盖（rename 到非空目录在多数平台直接失败），因此按两种情形分别处理：
++	 * <ul>
++	 *     <li>非强制重建且目标目录已完整：丢弃本次解包的临时目录，保持既有目录原样。读方全程可见完整目录，
++	 *         且解包结果由 zip 唯一决定，保留旧目录与换成新目录等价，不换取那份「短暂缺失」的风险；</li>
++	 *     <li>强制重建或目标目录缺失/残缺：把旧目录先用原子 rename 挪到唯一名字（不做原地递归删除：
++	 *         读方可能正打开其中的文件，删掉正在读的文件比让它读到旧内容更糟），再把临时目录 rename 就位。
++	 *         两步之间存在目标目录短暂缺失的窗口（先把 {@code unpacked} 挪走、再把新目录挪回原位）。
++	 *         这个窗口无法靠目录 rename 消除，而且它并非只出现在「本来就没有有效目录可保留」的场合：
++	 *         {@code force} 也由 {@code mcp.zip} 缺失/损坏（{@link #needsZip()}）或显式刷新触发，
++	 *         此时被挪走的旧目录本来完整有效。锁外的读方——任务期的 MCP 执行链（见
++	 *         {@code McpExecutorBuilder}）——会短暂看不到目录，因此读方不再静默跳过：它在窗口内短暂重试，
++	 *         超时后抛出带路径的错误，而不是少传 {@code --data/--mappings} 等输入继续构建（那会产出被
++	 *         manifest 标记为最新、却缺少输入的 patched jar）。若第二步失败，旧目录以 {@code *.old}
++	 *         留在原地，下次构建按「目录残缺」重建，可自愈。</li>
++	 * </ul>
++	 *
++	 * <p>更彻底的方案是给解包目录加一层稳定指针（内容按唯一名存放，读方先读一个原子替换的指针文件），
++	 * 让 rename 窗口对读方完全不可见。这里没有采用：那会改变与其它 Loom 版本共享的缓存布局
++	 * （其它版本直接读写 {@code unpacked}），而 Windows 上目录符号链接需要特权，收益不抵成本。
++	 *
++	 * @param force 本次是否因输入变化而强制重建，为 true 时即使目标目录完整也替换
++	 */
++	private void publishUnpacked(boolean force) throws IOException {
++		Files.createDirectories(unpacked.getParent());
++		final Path temp = AtomicFiles.tempSibling(unpacked);
++
++		try {
++			Files.createDirectory(temp);
++			ZipUtils.unpackAll(mcp, temp);
++
++			if (!force && Files.exists(configJson)) {
++				return;
++			}
++
++			// 唯一旧名：避免与其它进程残留的旧目录互相覆盖
++			final Path stale = unpacked.resolveSibling(unpacked.getFileName() + "." + UUID.randomUUID() + ".old");
++
++			if (Files.exists(unpacked)) {
++				AtomicFiles.move(unpacked, stale);
++			}
++
++			AtomicFiles.move(temp, unpacked);
++			// 清理失败只影响磁盘占用（新目录已就位），不应让构建失败
++			deleteDirectoryQuietly(stale);
++		} finally {
++			deleteDirectoryQuietly(temp);
++		}
++	}
++
++	/**
++	 * 删除目录，失败仅告警.
++	 *
++	 * <p>仅用于清理「已 rename 走的旧目录」与「被丢弃的临时目录」：这些目录不再被任何读方使用，
++	 * 删除失败最多留下垃圾文件，不影响产物正确性，故不向上抛出。
++	 */
++	private void deleteDirectoryQuietly(Path directory) {
++		if (Files.notExists(directory)) {
++			return;
++		}
++
++		try {
++			DeletingFileVisitor.deleteDirectory(directory);
++		} catch (IOException e) {
++			getProject().getLogger().warn("删除 MCPConfig 缓存目录失败（仅影响磁盘占用）：{}", directory, e);
++		}
++	}
++
+ 	private void init(String version) {
++		this.version = version;
+ 		String mcpName = getExtension().isNeoForge() ? "neoform" : "mcp";
+ 		Path dir = getMinecraftProvider().dir(mcpName + "/" + version).toPath();
+ 		mcp = dir.resolve("mcp.zip");
+diff --git a/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java b/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java
+index 9f64c701fb7abad2f10e37f211380b7e9976eec9..840aa6a2e8caa683882260d0545d7335b27c8aac 100644
+--- a/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java
++++ b/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java
+@@ -27,9 +27,11 @@ package dev.architectury.loom.mcpconfig;
+ import java.io.File;
+ import java.io.IOException;
+ import java.io.InputStream;
++import java.io.UncheckedIOException;
+ import java.net.HttpURLConnection;
+ import java.net.URL;
+ import java.nio.file.Files;
++import java.nio.file.NoSuchFileException;
+ import java.nio.file.Path;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+@@ -39,6 +41,7 @@ import java.util.NoSuchElementException;
+ import java.util.Objects;
+ import java.util.Set;
+ import java.util.SortedSet;
++import java.util.concurrent.TimeUnit;
+ 
+ import com.google.gson.JsonElement;
+ import com.google.gson.JsonObject;
+@@ -74,6 +77,14 @@ import net.fabricmc.loom.util.service.Service;
+  * and enqueued steps.
+  */
+ public final class McpExecutorBuilder {
++	/**
++	 * 解包目录被写入方替换时，读方等待其「回到原位」的预算.
++	 *
++	 * <p>窗口本身只有两次 rename 的时长（毫秒级），这里给足余量，以覆盖写方在替换前后做清理的时间。
++	 */
++	private static final long UNPACKED_SWAP_WAIT_MILLIS = 5_000;
++	private static final long UNPACKED_SWAP_POLL_MILLIS = 25;
++
+ 	private final Project project;
+ 	private final MinecraftProvider minecraftProvider;
+ 	private final Path cache;
+@@ -136,20 +147,74 @@ public final class McpExecutorBuilder {
+ 		}
+ 	}
+ 
++	/**
++	 * 把 MCP 配置声明的输入文件加入执行参数.
++	 *
++	 * <p>解包目录位于跨 daemon 共享的 userCache，写入方替换整棵目录时（旧目录 rename 走、新目录 rename 就位）
++	 * 存在一个「目录不在原位」的窗口。此处先短暂重试等待写方完成，超时仍不可见即抛出带路径与原因的错误。
++	 *
++	 * <p>不能像以前那样在文件缺失时静默跳过：撞上窗口会少传 {@code --data/--mappings} 等输入而构建照常成功，
++	 * 产出的 patched jar 还会被 manifest 标记为最新并长期复用，正是要消灭的那种静默损坏。
++	 */
+ 	private void addDefaultFile(McpConfigProvider provider, String key, String value) {
+-		Path path = provider.getUnpackedZip().resolve(value).toAbsolutePath();
++		final Path unpacked = provider.getUnpackedZip().toAbsolutePath();
++		Path path = unpacked.resolve(value).toAbsolutePath();
+ 
+-		if (!path.startsWith(provider.getUnpackedZip().toAbsolutePath())) {
++		if (!path.startsWith(unpacked)) {
+ 			// This is probably not what we're looking for since it falls outside the directory.
+ 			return;
+-		} else if (Files.notExists(path)) {
+-			// Not a real file, let's continue.
+-			return;
+ 		}
+ 
++		awaitUnpackedInput(unpacked, path, key);
+ 		addConfig(key, path.toString());
+ 	}
+ 
++	/**
++	 * 等待解包目录与其声明的输入文件就位.
++	 *
++	 * @param unpacked 解包目录
++	 * @param path     配置声明的输入文件
++	 * @param key      配置键，仅用于日志与错误信息
++	 */
++	private void awaitUnpackedInput(Path unpacked, Path path, String key) {
++		final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(UNPACKED_SWAP_WAIT_MILLIS);
++		boolean loggedWait = false;
++
++		while (Files.notExists(path)) {
++			if (System.nanoTime() >= deadline) {
++				throw missingUnpackedInput(unpacked, path, key);
++			}
++
++			if (!loggedWait) {
++				loggedWait = true;
++				project.getLogger().info("MCPConfig 输入 {}（配置项 {}）暂不可见，等待解包目录 {} 替换完成", path, key, unpacked);
++			}
++
++			try {
++				Thread.sleep(UNPACKED_SWAP_POLL_MILLIS);
++			} catch (InterruptedException e) {
++				// 保留中断状态：这里已经不可能继续等下去，直接把缺失输入报出去
++				Thread.currentThread().interrupt();
++				throw missingUnpackedInput(unpacked, path, key);
++			}
++		}
++	}
++
++	/**
++	 * {@return 「解包目录未就位」的错误，带路径与原因}.
++	 *
++	 * <p>区分两种成因，便于定位是并发替换（稍后重试即可）还是缓存本身不完整（需要重建缓存）。
++	 */
++	private static UncheckedIOException missingUnpackedInput(Path unpacked, Path path, String key) {
++		final String reason = Files.notExists(unpacked)
++				? "解包目录不在原位（很可能正被其它进程替换）"
++				: "解包目录存在，但其中没有该输入（缓存不完整）";
++
++		return new UncheckedIOException(new NoSuchFileException(path.toString(), unpacked.toString(),
++				"MCPConfig 配置项 %s 指向的输入在等待 %d 毫秒后仍不可用：%s；缺少该输入会让 MCP 执行链静默少传 --data/--mappings"
++						.formatted(key, UNPACKED_SWAP_WAIT_MILLIS, reason)));
++	}
++
+ 	public void addConfig(String key, String value) {
+ 		config.put(key, value);
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+index 2c65c946ad27c4840a54f4e6831c4b9a885d1ef2..3a0fa81a9812d2e994d039f37c85b3ac74aede33 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+@@ -145,8 +145,13 @@ public abstract class CompileConfiguration implements Runnable {
+ 			final LockResult lockResult = acquireProcessLockWaiting(getLockFile());
+ 
+ 			if (lockResult != LockResult.ACQUIRED_CLEAN) {
+-				getProject().getLogger().lifecycle("Found existing cache lock file ({}), rebuilding loom cache. This may have been caused by a failed or canceled build.", lockResult);
+-				extension.setRefreshDeps(true);
++				// 残留锁只作为「上次构建未干净收尾」的诊断信息，不再升级为全量重建：
++				// 1) 共享产物一律「临时文件 + 原子落位」，被中断的构建不会留下半截产物，无需用重建兜底；
++				// 2) 一旦升级为 refreshDeps，多个工作树会轮流删除共享缓存，正是并发冲突的根源；
++				// 3) 是否重建改由各 provider 的产物校验决定（缺失 / 补丁版本过期 / 显式 --refresh-dependencies）。
++				getProject().getLogger().lifecycle(
++						"Found existing cache lock file ({}), assuming the previous build was canceled; reusing the existing loom cache.",
++						lockResult);
+ 			}
+ 
+ 			try {
+@@ -574,7 +579,8 @@ public abstract class CompileConfiguration implements Runnable {
+ 	// 锁文件只承载两件事：是否存在（上次构建是否干净收尾）、以及 OS 文件锁（是否有进程正在配置构建）。
+ 	// 这里刻意不读取文件内容：读内容会被配置缓存记为文件输入，
+ 	// 而锁文件在构建末尾会因干净收尾被删除，下一次构建便会以 file '...lock' has been removed 为由丢弃配置缓存。
+-	// 返回 ACQUIRED_CLEAN 表示上次构建干净收尾，其余结果表示需要重建 loom 缓存。
++	// 返回 ACQUIRED_CLEAN 表示上次构建干净收尾，其余结果表示上次构建未干净收尾——仅用于输出诊断信息，
++	// 不再据此触发全量重建（见 run() 中的说明）。
+ 	@SuppressWarnings("BusyWait")
+ 	private LockResult acquireProcessLockWaiting_(LockFile lockFile, Duration timeout) throws IOException {
+ 		final long timeoutMs = timeout.toMillis();
+@@ -664,7 +670,8 @@ public abstract class CompileConfiguration implements Runnable {
+ 	}
+ 
+ 	// 配置失败时保留锁文件、只释放 OS 锁，
+-	// 使下一次构建能判定上次未干净收尾并重建缓存，而无需等待本进程退出
++	// 使下一次构建能判定上次未干净收尾（并据此输出诊断信息），而无需等待本进程退出。
++	// 注意：残留锁不再触发全量重建——共享产物一律原子发布，被中断的构建不会留下半截产物。
+ 	private void disownLock() {
+ 		releaseProcessLock();
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/LocalMavenHelper.java b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/LocalMavenHelper.java
+index e9438e9ec3493a49c5fa0d112207d3c9f3216d39..5e8a383c931923e411a2f42ca02e247d66b9f557 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/LocalMavenHelper.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/LocalMavenHelper.java
+@@ -35,6 +35,8 @@ import java.nio.file.StandardCopyOption;
+ 
+ import org.jspecify.annotations.Nullable;
+ 
++import net.fabricmc.loom.util.cache.JarReusability;
++
+ public record LocalMavenHelper(String group, String name, String version, @Nullable String baseClassifier, Path root, @Nullable String snapshotVersion) {
+ 	public LocalMavenHelper(String group, String name, String version, @Nullable String baseClassifier, Path root) {
+ 		this(group, name, version, baseClassifier, root, null);
+@@ -73,10 +75,30 @@ public record LocalMavenHelper(String group, String name, String version, @Nulla
+ 		}
+ 	}
+ 
++	/**
++	 * {@return 该 maven 构件的 jar 与 pom 是否都存在}.
++	 *
++	 * <p>只做存在性判定，不校验内容，语义保持不变。若调用点需要的是「内容可用」——典型场景是把产物
++	 * 当作跨 daemon／跨 loom 版本共享缓存里的就绪判据——请改用 {@link #isReusable(String)}。
++	 */
+ 	public boolean exists(String classifier) {
+ 		return Files.exists(getOutputFile(classifier)) && Files.exists(getPomPath());
+ 	}
+ 
++	/**
++	 * {@return 该 maven 构件是否既存在、内容又可复用}.
++	 *
++	 * <p>在 {@link #exists(String)} 之上追加 jar 的内容校验（见 {@link JarReusability#isReusable(Path)}）：
++	 * 这些仓库目录跨 daemon、跨 loom 版本共享，旧版本 loom 以最终路径为输出就地写，
++	 * 被中断会留下 0 字节或截断的 jar；只判存在会让这类残骸被当成暖缓存，作为 Gradle 依赖进入编译链。
++	 *
++	 * <p>该口径不会把正常产物判为不可用——按「临时文件 + 原子落位」发布的 jar 必然可打开且非空——
++	 * 因此不会引起「每次构建都重建」。
++	 */
++	public boolean isReusable(@Nullable String classifier) {
++		return exists(classifier) && JarReusability.isReusable(getOutputFile(classifier));
++	}
++
+ 	public String getNotation() {
+ 		if (baseClassifier != null) {
+ 			return String.format("%s:%s:%s:%s", group, name, version, baseClassifier);
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/GeneratedIntermediateMappingsProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/GeneratedIntermediateMappingsProvider.java
+index 88290916122f4bb8cc20f76975806801940d524a..0aecb2e5107e2a86bcce6778dd4ff02c48209501 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/GeneratedIntermediateMappingsProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/GeneratedIntermediateMappingsProvider.java
+@@ -27,7 +27,9 @@ package net.fabricmc.loom.configuration.providers.mappings;
+ import java.io.File;
+ import java.io.IOException;
+ import java.nio.file.Files;
++import java.nio.file.NoSuchFileException;
+ import java.nio.file.Path;
++import java.nio.file.attribute.BasicFileAttributes;
+ 
+ import dev.architectury.loom.util.LoggerFilter;
+ import dev.architectury.loom.util.Stopwatch;
+@@ -38,6 +40,10 @@ import org.slf4j.LoggerFactory;
+ import net.fabricmc.loom.api.mappings.intermediate.IntermediateMappingsProvider;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarMerger;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
++import net.fabricmc.loom.util.Constants;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.cache.CacheEntryLock;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.mappingio.MappingReader;
+ import net.fabricmc.mappingio.MappingWriter;
+ import net.fabricmc.mappingio.format.MappingFormat;
+@@ -50,10 +56,50 @@ public abstract class GeneratedIntermediateMappingsProvider extends Intermediate
+ 
+ 	@Override
+ 	public void provide(Path tinyMappings) throws IOException {
+-		if (Files.exists(tinyMappings)) {
++		final boolean refresh = minecraftProvider.refreshDeps();
++
++		// 无锁快路径：产物位于共享缓存目录（<userCache>/<mcVersion>/<name>.tiny），已在位且未要求刷新时直接返回
++		if (Files.exists(tinyMappings) && !refresh) {
+ 			return;
+ 		}
+ 
++		// 进锁前先记下产物指纹：锁内二次确认靠它判断「等锁期间是否已有人发布了新一轮产物」
++		final ArtifactStamp stampBeforeLock = ArtifactStamp.of(tinyMappings);
++
++		// 产物的共享身份 = MC 版本 + provider 名（路径即 <userCache>/<mcVersion>/<name>.tiny），
++		// 故锁 key 由这两者派生，保证不同工作树/daemon 算出同一 key；锁文件放在产物所属目录下的 .locks。
++		final Path lockRoot = tinyMappings.getParent().resolve(Constants.Cache.LOCKS_DIR);
++		final String key = "mc-intermediary:" + getMinecraftVersion().get() + ":" + getName();
++
++		try {
++			CacheEntryLock.withLock(lockRoot, key, LoomCacheService.defaultTimeout(), () -> {
++				// 锁内二次确认：
++				// - 未要求刷新：等锁期间若产物已被其它进程生成并发布，直接复用；
++				// - 要求刷新：refresh 只需保证「真正重建一次」，而该产物内容只是「合并后的 MC jar + stitch」
++				//   的函数、路径按 mcVersion 定址（同一版本的产物内容恒定），等锁期间若已有人发布过新一轮产物，
++				//   我们要的那次重建就已经发生，再生成一遍只是白等一次分钟级的合并 + stitch。
++				// 注意不能用 refresh 直接短路本判据：否则等锁期间别人刚生成好的同一份产物会被再生成一遍。
++				if (!refresh) {
++					if (Files.exists(tinyMappings)) {
++						return null;
++					}
++				} else if (wasRepublishedWhileWaiting(stampBeforeLock, tinyMappings)) {
++					return null;
++				}
++
++				generate(tinyMappings);
++				return null;
++			});
++		} catch (IOException | RuntimeException e) {
++			// 生成过程自身的失败（含 stitch 失败）与锁超时保持原有语义向上抛出
++			throw e;
++		} catch (Exception e) {
++			// 兜底：仅剩锁工具可能抛出的受检异常
++			throw new IOException("Failed to generate intermediate mappings: " + key, e);
++		}
++	}
++
++	private void generate(Path tinyMappings) throws IOException {
+ 		Stopwatch stopwatch = Stopwatch.createStarted();
+ 		LOGGER.info(":generating dummy intermediary");
+ 
+@@ -83,9 +129,13 @@ public abstract class GeneratedIntermediateMappingsProvider extends Intermediate
+ 				}
+ 			});
+ 
+-			try (MappingWriter writer = MappingWriter.create(tinyMappings, MappingFormat.TINY_2_FILE)) {
+-				MappingReader.read(tinyV1, writer);
+-			}
++			// 原子发布共享产物：先在临时文件上写完，再原子 move 到最终路径。
++			// 不再「先删后写」——删除会制造「产物不存在」窗口，锁外的存在性快路径会误判并触发重复生成。
++			AtomicFiles.publish(tinyMappings, tmp -> {
++				try (MappingWriter writer = MappingWriter.create(tmp, MappingFormat.TINY_2_FILE)) {
++					MappingReader.read(tinyV1, writer);
++				}
++			});
+ 		} finally {
+ 			Files.deleteIfExists(mergedJar);
+ 			Files.deleteIfExists(tinyV1);
+@@ -95,6 +145,36 @@ public abstract class GeneratedIntermediateMappingsProvider extends Intermediate
+ 		LOGGER.info(":generated dummy intermediary in " + stopwatch.stop());
+ 	}
+ 
++	/**
++	 * 等锁期间该产物是否已被新一轮发布.
++	 *
++	 * <p>判据为「进锁后的指纹 ≠ 进锁前的指纹」且产物在位：产物缺失（例如被外部清理）不算已发布，
++	 * 此时仍须自己生成，否则会把「无产物」当成「已重建」。
++	 */
++	private static boolean wasRepublishedWhileWaiting(ArtifactStamp stampBeforeLock, Path tinyMappings) throws IOException {
++		final ArtifactStamp stampInLock = ArtifactStamp.of(tinyMappings);
++		return stampInLock.exists() && !stampInLock.equals(stampBeforeLock);
++	}
++
++	/**
++	 * 产物指纹：存在性 + 大小 + 修改时间.
++	 *
++	 * <p>该产物的写入方式是「临时文件 + 原子 move」，任何指纹变化都来自一次完整发布，故可用于判断
++	 * 「等锁期间是否已有人发布了新一轮产物」。退一步说，即便时间戳粒度过粗导致漏判，后果也只是
++	 * 多做一次生成，不会破坏显式刷新的语义（漏判方向是安全的）。
++	 */
++	private record ArtifactStamp(boolean exists, long size, long lastModifiedMillis) {
++		static ArtifactStamp of(Path path) throws IOException {
++			try {
++				final BasicFileAttributes attributes = Files.readAttributes(path, BasicFileAttributes.class);
++				return new ArtifactStamp(true, attributes.size(), attributes.lastModifiedTime().toMillis());
++			} catch (NoSuchFileException e) {
++				// 取指纹期间文件被外部删除：按「不存在」处理，由调用方决定是否重新生成
++				return new ArtifactStamp(false, -1L, -1L);
++			}
++		}
++	}
++
+ 	@Override
+ 	public @NonNull String getName() {
+ 		return "generated-intermediate";
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/IntermediateMappingsService.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/IntermediateMappingsService.java
+index cc215b58c934cd9443fd302f66dbed6834b1fcd9..2b02b4bde01116b8efddb310561e650a721cb580 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/IntermediateMappingsService.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/IntermediateMappingsService.java
+@@ -82,7 +82,10 @@ public final class IntermediateMappingsService extends Service<IntermediateMappi
+ 		}
+ 
+ 		final IntermediateMappingsProvider intermediateProvider = extension.getIntermediateMappingsProvider();
+-		final Path intermediaryTiny = minecraftProvider.file(intermediateProvider.getName() + ".tiny").toPath();
++		// 先取好名字：失败分支要拿它写日志，而从 provider 取名字是（可能由用户实现的）代码，
++		// 不应在异常处理路径上再执行一次
++		final String providerName = intermediateProvider.getName();
++		final Path intermediaryTiny = minecraftProvider.file(providerName + ".tiny").toPath();
+ 
+ 		try {
+ 			if (intermediateProvider instanceof IntermediateMappingsProviderInternal internal) {
+@@ -91,18 +94,52 @@ public final class IntermediateMappingsService extends Service<IntermediateMappi
+ 				intermediateProvider.provide(intermediaryTiny);
+ 			}
+ 		} catch (IOException e) {
+-			try {
+-				Files.deleteIfExists(intermediaryTiny);
+-			} catch (IOException ex) {
+-				LOGGER.warn("Failed to delete intermediary mappings file", ex);
+-			}
+-
++			handleProvideFailure(providerName, intermediateProvider, intermediaryTiny, e);
+ 			throw new UncheckedIOException("Failed to provide intermediate mappings", e);
+ 		}
+ 
+ 		return createOptions(project, minecraftProvider, intermediaryTiny);
+ 	}
+ 
++	/**
++	 * 提供中间映射失败后的兜底处理.
++	 *
++	 * <p>内置 provider（{@link IntermediateMappingsProviderInternal} 与 {@link GeneratedIntermediateMappingsProvider}）
++	 * 都改为「临时文件 + 原子 move」发布：失败时盘上要么是旧发布的完整产物、要么是本次发布的完整产物，
++	 * 不会留下半截文件，因此不能再删除——产物位于跨工作树/daemon 共享的缓存目录
++	 * （{@code <userCache>/<mcVersion>/}），无条件删除会删掉其它进程刚成功发布的完整产物，
++	 * 使正在读它的进程遭遇 {@code NoSuchFileException}。这些 provider 会读取刷新标记，
++	 * 产物真的损坏时可用 {@code --refresh-dependencies} 强制重建（刷新不再靠删除实现）。
++	 *
++	 * <p>用户自定义的 {@link IntermediateMappingsProvider} 相反：公开 API
++	 * （{@code LoomGradleExtensionApiImpl#setIntermediateMappingsProvider}）只向它暴露 MC 版本、下载器与
++	 * 命名空间，没有任何刷新信号，实现通常「存在即返回」并就地写目标路径。这种 provider 一旦写坏，
++	 * 损坏文件会被永久复用，而 {@code --refresh-dependencies} 对它无效——故只对它保留原有的
++	 * 「失败即删除」兜底，让下次构建重新生成。
++	 */
++	private static void handleProvideFailure(String providerName, IntermediateMappingsProvider provider, Path intermediaryTiny, IOException failure) {
++		if (isAtomicProvider(provider)) {
++			LOGGER.warn("[{}] 提供中间映射失败，保留已有产物（该 provider 采用原子发布）；若产物本身已损坏，可加 --refresh-dependencies 强制重建", providerName, failure);
++			return;
++		}
++
++		try {
++			Files.deleteIfExists(intermediaryTiny);
++			LOGGER.warn("[{}] 提供中间映射失败，已删除可能损坏的产物 {}，下次构建会重新生成；自定义 provider 不受 --refresh-dependencies 影响", providerName, intermediaryTiny, failure);
++		} catch (IOException deleteFailure) {
++			// 删除失败不掩盖原始失败：原始异常仍会由调用方抛出并附带在异常链中
++			LOGGER.warn("[{}] 提供中间映射失败，且删除产物 {} 也失败；请手动删除该文件后重试", providerName, intermediaryTiny, deleteFailure);
++		}
++	}
++
++	/**
++	 * 该 provider 是否属于「已知原子发布产物」的实现（失败时无需删除兜底）.
++	 */
++	private static boolean isAtomicProvider(IntermediateMappingsProvider provider) {
++		return provider instanceof IntermediateMappingsProviderInternal
++				|| provider instanceof GeneratedIntermediateMappingsProvider;
++	}
++
+ 	private static Provider<Options> createOptions(Project project, MinecraftProvider minecraftProvider, Path intermediaryTiny) {
+ 		final LoomGradleExtension extension = LoomGradleExtension.get(project);
+ 		final IntermediateMappingsProvider intermediateProvider = extension.getIntermediateMappingsProvider();
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/LayeredMappingsFactory.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/LayeredMappingsFactory.java
+index 15f198bc19323abe861ee25f8ded76809aba0e90..c965be05ff1d2183af9d55cdd7739753ba57605b 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/LayeredMappingsFactory.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/LayeredMappingsFactory.java
+@@ -53,6 +53,7 @@ import net.fabricmc.loom.configuration.providers.mappings.unpick.UnpickMetadata;
+ import net.fabricmc.loom.configuration.providers.mappings.utils.AddConstructorMappingVisitor;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.ZipUtils;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.mappingio.adapter.MappingDstNsReorder;
+ import net.fabricmc.mappingio.adapter.MappingSourceNsSwitch;
+@@ -127,12 +128,23 @@ public record LayeredMappingsFactory(LayeredMappingSpec spec) {
+ 		var processor = new LayeredMappingsProcessor(spec, !useIntermediateMappings);
+ 		List<MappingLayer> layers = processor.resolveLayers(mappingContext);
+ 
+-		Files.deleteIfExists(mappingsZip);
+-
+-		writeMapping(processor, layers, mappingsZip, useIntermediateMappings);
+-		writeAnnotationData(processor, layers, mappingsZip);
+-		writeSignatureFixes(processor, layers, mappingsZip);
+-		writeUnpickData(processor, layers, mappingsZip);
++		// 该产物是一个 jar，需要连续拼装多个条目（mappings/mappings.tiny、注解、签名修复、unpick 数据）：
++		// 整份在「同目录唯一临时文件」上拼装完再原子落位，避免任一环节失败留下半截 jar
++		//（存在性快路径会把半截 jar 当成已完成产物）。
++		// 不再先删除最终产物：删除会制造「产物不存在」窗口，并可能删掉其它进程正在读的全局仓库副本。
++		final Path tmp = AtomicFiles.tempSibling(mappingsZip);
++
++		try {
++			writeMapping(processor, layers, tmp, useIntermediateMappings);
++			writeAnnotationData(processor, layers, tmp);
++			writeSignatureFixes(processor, layers, tmp);
++			writeUnpickData(processor, layers, tmp);
++
++			AtomicFiles.move(tmp, mappingsZip);
++		} finally {
++			// 原子 move 成功后 tmp 已不存在；失败时清理残留，避免遗留垃圾临时文件
++			Files.deleteIfExists(tmp);
++		}
+ 
+ 		return mappingsZip;
+ 	}
+@@ -186,7 +198,7 @@ public record LayeredMappingsFactory(LayeredMappingSpec spec) {
+ 			AddConstructorMappingVisitor addConstructor = new AddConstructorMappingVisitor(nsSwitch);
+ 			mappings.accept(addConstructor);
+ 
+-			Files.deleteIfExists(mappingsFile);
++			// 传入的是本次专用的临时文件（尚不存在），由 ZipUtils 自行创建，故无需先删除已有产物
+ 			ZipUtils.add(mappingsFile, "mappings/mappings.tiny", writer.toString().getBytes(StandardCharsets.UTF_8));
+ 		}
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+index cdf23ef41b7237c2643054d3a1866dd5c03d7a5f..1399e37030bd8edb4975e4964f4ffae38662ffd6 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+@@ -43,6 +43,7 @@ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
++import java.util.concurrent.Callable;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.function.Supplier;
+ import java.util.zip.ZipFile;
+@@ -72,9 +73,10 @@ import net.fabricmc.loom.configuration.providers.mappings.tiny.TinyJarInfo;
+ import net.fabricmc.loom.configuration.providers.mappings.unpick.UnpickMetadata;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+ import net.fabricmc.loom.util.Constants;
+-import net.fabricmc.loom.util.DeletingFileVisitor;
+ import net.fabricmc.loom.util.FileSystemUtil;
+ import net.fabricmc.loom.util.ZipUtils;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.cache.CacheEntryLock;
+ import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.loom.util.service.ScopedServiceFactory;
+ import net.fabricmc.loom.util.service.ServiceFactory;
+@@ -93,6 +95,11 @@ public class MappingConfiguration {
+ 	private static final Logger LOGGER = LoggerFactory.getLogger(MappingConfiguration.class);
+ 	private static final String RECORD_SIGNATURES_PATH = "extras/record_signatures.json";
+ 
++	/** 成对就绪标记的内容：两件产物出自同一次生成. */
++	private static final String PAIR_MARKER_READY = "ready";
++	/** 成对就绪标记的失效内容：本轮正在（重新）生成这对产物. */
++	private static final String PAIR_MARKER_INVALID = "invalidated";
++
+ 	/**
+ 	 * 跨项目复用缓存：同构项目（同一套 mappings + 同一 MC 版本 + 同一平台）产出的
+ 	 * MappingConfiguration 语义等价，且暖路径下只读，无需每个项目都重开一次 mappings jar。
+@@ -124,6 +131,8 @@ public class MappingConfiguration {
+ 	public final Path srgToNamedSrg; // FORGE: srg to named in srg file format
+ 	private final Map<MappingOption, Supplier<Path>> mappingOptions;
+ 	private final Path unpickDefinitions;
++	// mappings.tiny 与 mappings.jar 的成对就绪标记：与两件产物同处共享工作目录，跨工作树/daemon 共享
++	private final Path mappingsPairMarker;
+ 
+ 	private List<AnnotationsData> annotationsData = List.of();
+ 
+@@ -138,6 +147,7 @@ public class MappingConfiguration {
+ 		this.baseTinyMappings = mappingsWorkingDir.resolve("mappings-base.tiny");
+ 		this.tinyMappings = mappingsWorkingDir.resolve("mappings.tiny");
+ 		this.tinyMappingsJar = mappingsWorkingDir.resolve("mappings.jar");
++		this.mappingsPairMarker = mappingsWorkingDir.resolve("mappings-pair.ready");
+ 		this.unpickDefinitions = mappingsWorkingDir.resolve("mappings.unpick");
+ 		this.tinyMappingsWithSrg = mappingsWorkingDir.resolve("mappings-srg.tiny");
+ 		this.tinyMappingsWithMojang = mappingsWorkingDir.resolve("mappings-mojang.tiny");
+@@ -158,7 +168,7 @@ public class MappingConfiguration {
+ 		if (!refresh && declaredVersion != null) {
+ 			final MappingConfiguration earlyHit = SHARED_EARLY.get(earlyKey(extension, dependency, minecraftProvider, declaredVersion));
+ 
+-			if (earlyHit != null && Files.exists(earlyHit.tinyMappings) && Files.exists(earlyHit.tinyMappingsJar)) {
++			if (earlyHit != null && earlyHit.hasUsableMappingsPair()) {
+ 				return earlyHit;
+ 			}
+ 		}
+@@ -189,11 +199,12 @@ public class MappingConfiguration {
+ 		final Path workingDir = minecraftProvider.dir(mappingsIdentifier).toPath();
+ 
+ 		// 跨项目复用：同构项目命中同一实例即可跳过第二次起的 setup——其成本主要是
+-		// 重复打开 mappings jar（zipfs 建索引）。命中后仍校验产物在位，避免缓存到已删文件。
++		// 重复打开 mappings jar（zipfs 建索引）。命中后仍校验两件产物成对就绪，
++		// 避免缓存到已删文件，或只落位了一半的一代产物。
+ 		if (!refresh) {
+ 			final MappingConfiguration shared = SHARED_INSTANCES.get(mappingsIdentifier);
+ 
+-			if (shared != null && Files.exists(shared.tinyMappings) && Files.exists(shared.tinyMappingsJar)) {
++			if (shared != null && shared.hasUsableMappingsPair()) {
+ 				return shared;
+ 			}
+ 		}
+@@ -209,7 +220,9 @@ public class MappingConfiguration {
+ 		try {
+ 			mappingProvider.setup(project, serviceFactory, minecraftProvider, inputJar);
+ 		} catch (Exception e) {
+-			cleanWorkingDirectory(workingDir);
++			// 不再清理共享工作目录（<userCache>/<mappingsIdentifier>，跨工作树/daemon 共享）：
++			// 递归删除会连带删掉其它进程刚发布的有效产物，并制造「产物不存在」窗口引发锁外读方重建雪崩。
++			// setup 内的所有写入均为「临时文件 + 原子落位」，失败路径不会留下半截产物，故无需清理。
+ 			throw new RuntimeException("Failed to setup mappings: " + dependency.getDepString(), e);
+ 		}
+ 
+@@ -255,8 +268,9 @@ public class MappingConfiguration {
+ 	private void setup(Project project, ServiceFactory serviceFactory, MinecraftProvider minecraftProvider, Path inputJar) throws Exception {
+ 		final boolean refresh = minecraftProvider.refreshDeps();
+ 
+-		// 无锁快路径：mappings 产物均已就绪且未要求刷新时，不获取文件锁，仅在内存中重新提取额外信息（每次必须执行）
+-		if (!refresh && Files.exists(tinyMappings) && Files.exists(tinyMappingsJar)) {
++		// 无锁快路径：两件 mappings 产物成对就绪（含成对标记，见 hasUsableMappingsPair）且未要求刷新时，
++		// 不获取文件锁，仅在内存中重新提取额外信息（每次必须执行）
++		if (!refresh && hasUsableMappingsPair()) {
+ 			// 轻量预检：先读 zip 中央目录的条目名判断有无 extras，再决定是否打开 zipfs。
+ 			// 打开 zipfs 会建索引，成本远高于读条目名；而 layered mappings jar 往往只有
+ 			// 「目录 + mappings/mappings.tiny」两个条目，此时可整段跳过。
+@@ -271,22 +285,60 @@ public class MappingConfiguration {
+ 
+ 		final LoomCacheService cacheService = LoomCacheService.get(project).get();
+ 		final Path lockRoot = LoomGradleExtension.get(project).getFiles().getCacheLocks().toPath();
+-		final String key = "mappings:" + mappingsIdentifier;
+ 
+-		cacheService.runExclusive(lockRoot, key, LoomCacheService.defaultTimeout(), () -> {
++		cacheService.runExclusive(lockRoot, mappingsLockKey(), LoomCacheService.defaultTimeout(), () -> {
+ 			produceMappings(project, serviceFactory, minecraftProvider, inputJar, refresh);
+ 			return null;
+ 		});
+ 	}
+ 
++	/**
++	 * mappings 共享产物的跨进程互斥 key.
++	 *
++	 * <p>由共享身份（{@link #mappingsIdentifier} 已编码 mappings 坐标、classifier、MC 版本与平台差异）派生，
++	 * 保证不同工作树/daemon 对同一批产物算出同一把锁；lockRoot 为 {@code <userCache>/.locks}，同样跨工作树一致。
++	 */
++	private String mappingsLockKey() {
++		return "mappings:" + mappingsIdentifier;
++	}
++
++	/**
++	 * 在 mappings 锁内执行一段共享产物生产动作.
++	 *
++	 * <p>{@link LoomCacheService#runExclusive} 声明抛出 {@link Exception}，而本类各生产入口只声明
++	 * {@link IOException}；这里把非 IO 异常折叠为 {@link RuntimeException} 后上抛，避免为加锁改动对外签名。
++	 */
++	private void runWithMappingsLock(Project project, String failureMessage, Callable<Void> action) throws IOException {
++		final LoomGradleExtension extension = LoomGradleExtension.get(project);
++		final Path lockRoot = extension.getFiles().getCacheLocks().toPath();
++
++		try {
++			LoomCacheService.get(project).get().runExclusive(lockRoot, mappingsLockKey(), LoomCacheService.defaultTimeout(), action);
++		} catch (IOException e) {
++			throw e;
++		} catch (Exception e) {
++			throw new RuntimeException(failureMessage, e);
++		}
++	}
++
+ 	// 产 mappings 文件：受 per-key 锁保护。注意 extractExtras 会在内存中填充字段，
+ 	// 但本方法仅在「冷/刷新」路径执行；暖路径的内存填充已在 setup 的无锁快路径中完成。
+ 	private void produceMappings(Project project, ServiceFactory serviceFactory, MinecraftProvider minecraftProvider, Path inputJar, boolean refresh) throws IOException {
+-		if (refresh) {
+-			cleanWorkingDirectory(mappingsWorkingDir);
++		// 刷新（--refresh-dependencies）不再靠删除共享产物实现：删除会制造「产物不存在」窗口，
++		// 锁外的存在性快路径会误判、并连带删掉其它进程正在读的文件。
++		// 改为「强制重建 + 原子替换」，读方始终看到旧的完整文件或新的完整文件。
++		final boolean writeTiny = Files.notExists(tinyMappings) || refresh;
++		// mappings.jar 的内容派生自 mappings.tiny（把同一份 tiny 原样打进 zip），故本轮重写了 tiny 就必须
++		// 同轮重写 jar：否则「新的 mappings.tiny + 旧的 mappings.jar」同样会被后面的标记认证为成对就绪。
++		final boolean writeJar = writeTiny || Files.notExists(tinyMappingsJar);
++
++		// 只要本轮会写其中任一件，就先让成对标记失效：两件产物是两次独立发布，
++		// 若两次发布之间标记仍为就绪，读方会命中「新的 mappings.tiny + 旧的 mappings.jar」。
++		if (writeTiny || writeJar) {
++			invalidateMappingsPairMarker();
+ 		}
+ 
+-		if (Files.notExists(tinyMappings) || refresh) {
++		if (writeTiny) {
+ 			storeMappings(project, serviceFactory, minecraftProvider, inputJar);
+ 		} else {
+ 			try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getReadOnlyJarFileSystem(inputJar)) {
+@@ -294,23 +346,63 @@ public class MappingConfiguration {
+ 			}
+ 		}
+ 
+-		if (Files.notExists(tinyMappingsJar) || refresh) {
+-			Files.deleteIfExists(tinyMappingsJar);
+-			ZipUtils.add(tinyMappingsJar, "mappings/mappings.tiny", Files.readAllBytes(tinyMappings));
++		if (writeJar) {
++			// 原子发布 mappings.jar：先在临时文件上完成全部加工再原子落位，不再「先删后就地写」
++			AtomicFiles.publish(tinyMappingsJar, tmp -> ZipUtils.add(tmp, "mappings/mappings.tiny", Files.readAllBytes(tinyMappings)));
+ 		}
++
++		// 两件产物都已落位，最后提交成对标记：标记就绪 ⟹ 这对产物出自同一次生成
++		AtomicFiles.publish(mappingsPairMarker, tmp -> Files.writeString(tmp, PAIR_MARKER_READY, StandardCharsets.UTF_8));
++	}
++
++	/**
++	 * 暖路径判据：mappings.tiny 与 mappings.jar 成对就绪.
++	 *
++	 * <p>这两件产物由 {@link #produceMappings} 分两次独立发布，「单件原子」并不等于「成对原子」：
++	 * 两次 move 之间读方会拿到「新的 mappings.tiny + 旧的 mappings.jar」，而 remap 用前者、
++	 * MAPPINGS_FINAL 暴露后者，于是同一次构建里这两处可能来自两代不同的映射产物。
++	 * 注意「只认最后发布的那一件」并不能解决：
++	 * 旧一代的 mappings.jar 一直留在盘上，两次发布之间它依然是「存在」的，存在性无法区分代次。
++	 * 因此这里额外要求成对标记处于就绪态：生产方在写这对产物之前先把标记置为失效值，
++	 * 两件都落位后才写回就绪值，于是「标记就绪 ⟹ 两件产物已被提交为一对」。
++	 *
++	 * <p>残余窗口：本方法检查标记与调用方随后读取两件文件之间仍有毫秒级间隙，理论上仍可能在
++	 * 生产方「发布完 mappings.tiny、尚未发布 mappings.jar」这一小段（写 zip 的时间）撞上混合产物。
++	 * 彻底消除需要版本化路径（读方先读指针、再读不可变的代次文件），改动面远超本次范围；
++	 * 相比修复前「整个重建时长（分钟级）内都可能读到混合产物」，窗口已被压到最小。
++	 *
++	 * <p>代价：标记是本次新增的，升级后第一次构建（或标记被外部清理时）暖路径会判为未就绪而进锁一次；
++	 * 锁内确认两件产物均已存在且未要求刷新后只会补写标记，不会重新提取 mappings。
++	 */
++	private boolean hasUsableMappingsPair() {
++		try {
++			return Files.exists(tinyMappings) && Files.exists(tinyMappingsJar)
++					&& PAIR_MARKER_READY.equals(Files.readString(mappingsPairMarker, StandardCharsets.UTF_8));
++		} catch (IOException e) {
++			// 读标记失败（例如正被并发原子替换的瞬间）按「未就绪」处理：进锁重新确认，不影响正确性
++			return false;
++		}
++	}
++
++	/**
++	 * 让成对就绪标记失效，直到本轮两件产物全部落位.
++	 *
++	 * <p>用原子发布写哨兵值而不是删除标记文件：删除会在「存在性检查 → 读取」之间给并发读方留下
++	 * {@code NoSuchFileException} 窗口（本类此前多处按「先查存在再读内容」两步读取共享文件）；
++	 * 原子写入则保证标记始终存在，内容只可能是哨兵或 {@link #PAIR_MARKER_READY}。
++	 *
++	 * <p>若生产中途失败，标记留在失效态，下轮构建会重新生成这对产物（安全方向）。
++	 */
++	private void invalidateMappingsPairMarker() throws IOException {
++		AtomicFiles.publish(mappingsPairMarker, tmp -> Files.writeString(tmp, PAIR_MARKER_INVALID, StandardCharsets.UTF_8));
+ 	}
+ 
+ 	public void setupPost(Project project) throws IOException {
+ 		LoomGradleExtension extension = LoomGradleExtension.get(project);
++		final boolean refresh = extension.refreshDeps();
+ 
+ 		if (extension.isNeoForge()) {
+ 			this.mappingOptions.put(MappingOption.WITH_MOJANG, () -> this.tinyMappingsWithMojang);
+-
+-			// Generate the Mojmap-merged mappings if needed.
+-			// Note that this needs to happen before manipulateMappings for FieldMigratedMappingConfiguration.
+-			if (Files.notExists(tinyMappingsWithMojang) || extension.refreshDeps()) {
+-				mergeMojang(project, tinyMappings, tinyMappingsWithMojang);
+-			}
+ 		}
+ 
+ 		if (extension.shouldGenerateSrgTiny()) {
+@@ -319,22 +411,57 @@ public class MappingConfiguration {
+ 			if (extension.isForge() && extension.getForgeProvider().usesMojangAtRuntime()) {
+ 				this.mappingOptions.put(MappingOption.WITH_MOJANG, () -> this.tinyMappingsWithSrg);
+ 			}
++		}
+ 
+-			if (Files.notExists(tinyMappingsWithSrg) || extension.refreshDeps()) {
+-				if (extension.isForge() && extension.getForgeProvider().usesMojangAtRuntime()) {
+-					Path tmp = Files.createTempFile("mappings", ".tiny");
+-					mergeMojang(project, tinyMappings, tmp);
+-					mergeSrg(project, tmp, tinyMappingsWithSrg);
+-					Files.deleteIfExists(tmp);
+-				} else {
+-					mergeSrg(project, tinyMappings, tinyMappingsWithSrg);
++		// 无锁快路径：两件共享产物（mappings-mojang.tiny / mappings-srg.tiny）均已就绪且未要求刷新时，
++		// 本方法不含任何共享写入，故不取锁。
++		final boolean needsMojangMerge = extension.isNeoForge() && (refresh || Files.notExists(tinyMappingsWithMojang));
++		final boolean needsSrgMerge = extension.shouldGenerateSrgTiny() && (refresh || Files.notExists(tinyMappingsWithSrg));
++
++		if (needsMojangMerge || needsSrgMerge) {
++			// 一次写一组互相依赖的共享产物（mojang 合并结果 + srg 合并结果）时，整段包进同一把 mappings 锁：
++			// 与 produceMappings 共用 key，避免同一 mappings 的产物被不同工作树/daemon 交叉生产。
++			runWithMappingsLock(project, "生成共享 mappings（mojang/srg 合并结果）失败", () -> {
++				// Generate the Mojmap-merged mappings if needed.
++				// Note that this needs to happen before manipulateMappings for FieldMigratedMappingConfiguration.
++				if (needsMojangMerge && (refresh || Files.notExists(tinyMappingsWithMojang))) {
++					mergeMojangAtomic(project, tinyMappingsWithMojang);
+ 				}
+-			}
++
++				// 锁内二次确认：等锁期间可能已被其它进程产出（refresh 时仍需强制重建）
++				if (needsSrgMerge && (refresh || Files.notExists(tinyMappingsWithSrg))) {
++					mergeSrgAtomic(project, extension, tinyMappingsWithSrg);
++				}
++
++				return null;
++			});
+ 		}
+ 
+ 		manipulateMappings(project, tinyMappingsJar);
+ 	}
+ 
++	// mojang 合并产物的原子发布：在临时文件上合并完成后原子落位，避免留下半截 tiny
++	private void mergeMojangAtomic(Project project, Path target) throws IOException {
++		AtomicFiles.publish(target, tmp -> mergeMojang(project, tinyMappings, tmp));
++	}
++
++	// srg 合并产物的原子发布；Forge 在运行时使用 mojang 映射时需先产出 mojang 合并结果作为中间文件
++	private void mergeSrgAtomic(Project project, LoomGradleExtension extension, Path target) throws IOException {
++		if (extension.isForge() && extension.getForgeProvider().usesMojangAtRuntime()) {
++			// 中间产物用进程独享的系统临时文件，最终产物仍走原子发布
++			final Path intermediate = Files.createTempFile("mappings", ".tiny");
++
++			try {
++				mergeMojang(project, tinyMappings, intermediate);
++				AtomicFiles.publish(target, tmp -> mergeSrg(project, intermediate, tmp));
++			} finally {
++				Files.deleteIfExists(intermediate);
++			}
++		} else {
++			AtomicFiles.publish(target, tmp -> mergeSrg(project, tinyMappings, tmp));
++		}
++	}
++
+ 	public void applyToProject(Project project, DependencyInfo dependency) throws IOException {
+ 		if (unpickMetadata != null) {
+ 			if (unpickMetadata.hasConstants()) {
+@@ -359,14 +486,29 @@ public class MappingConfiguration {
+ 			}
+ 
+ 			if (Files.notExists(srgToNamedSrg) || extension.refreshDeps()) {
+-				try (var serviceFactory = new ScopedServiceFactory()) {
+-					TinyMappingsService mappingsService = getMappingsService(project, serviceFactory, MappingOption.WITH_SRG);
++				final boolean refresh = extension.refreshDeps();
++				// 该产物与 mappings-srg.tiny 同处共享工作目录且由它派生，故与 produceMappings / setupPost
++				// 共用同一把 mappings 锁，避免不同工作树/daemon 交叉生产这一组互相依赖的产物。
++				runWithMappingsLock(project, "生成 srg->named mappings 失败", () -> {
++					// 锁内二次确认：等锁期间可能已被其它进程产出（refresh 时仍需强制重建）
++					if (!refresh && Files.exists(srgToNamedSrg)) {
++						return null;
++					}
+ 
+-					try (MappingWriter writer = MappingWriter.create(srgToNamedSrg, MappingFormat.SRG_FILE)) {
+-						MappingVisitor visitor = new MappingSourceNsSwitch(new MappingDstNsReorder(writer, "named"), "srg");
+-						mappingsService.getMappingTree().accept(visitor);
++					try (var serviceFactory = new ScopedServiceFactory()) {
++						TinyMappingsService mappingsService = getMappingsService(project, serviceFactory, MappingOption.WITH_SRG);
++
++						// 原子发布：先在临时文件上写完整份 srg 文本，再原子 move 落位
++						AtomicFiles.publish(srgToNamedSrg, tmp -> {
++							try (MappingWriter writer = MappingWriter.create(tmp, MappingFormat.SRG_FILE)) {
++								MappingVisitor visitor = new MappingSourceNsSwitch(new MappingDstNsReorder(writer, "named"), "srg");
++								mappingsService.getMappingTree().accept(visitor);
++							}
++						});
+ 					}
+-				}
++
++					return null;
++				});
+ 			}
+ 		}
+ 
+@@ -446,7 +588,8 @@ public class MappingConfiguration {
+ 		}
+ 
+ 		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getReadOnlyJarFileSystem(inputJar)) {
+-			extractMappings(delegate.fs(), baseTinyMappings);
++			// 原子发布 baseTinyMappings：它同样位于共享工作目录，跨进程写入时不能让读方看到半截文件
++			AtomicFiles.publish(baseTinyMappings, tmp -> extractMappings(delegate.fs(), tmp));
+ 			extractExtras(delegate.fs());
+ 		}
+ 
+@@ -457,9 +600,9 @@ public class MappingConfiguration {
+ 				// These are unmerged v2 mappings
+ 				IntermediateMappingsService intermediateMappingsService = serviceFactory.get(IntermediateMappingsService.createOptions(project, minecraftProvider));
+ 
+-				MappingsMerger.mergeAndSaveMappings(baseTinyMappings, tinyMappings, minecraftProvider, intermediateMappingsService);
++				AtomicFiles.publish(tinyMappings, tmp -> MappingsMerger.mergeAndSaveMappings(baseTinyMappings, tmp, minecraftProvider, intermediateMappingsService));
+ 			} else {
+-				Files.copy(baseTinyMappings, tinyMappings, StandardCopyOption.REPLACE_EXISTING);
++				AtomicFiles.copy(baseTinyMappings, tinyMappings);
+ 			}
+ 		} else {
+ 			if (LoomGradleExtension.get(project).isForgeLike()) {
+@@ -479,9 +622,9 @@ public class MappingConfiguration {
+ 			}
+ 
+ 			// These are merged v1 mappings
+-			Files.deleteIfExists(tinyMappings);
+ 			LOGGER.info(":populating field names");
+-			suggestFieldNames(minecraftJars.get(0), baseTinyMappings, tinyMappings);
++			// 原子发布：stitch 的字段名补全要求输出文件不存在（临时文件即满足），故无需再先删旧产物
++			AtomicFiles.publish(tinyMappings, tmp -> suggestFieldNames(minecraftJars.get(0), baseTinyMappings, tmp));
+ 		}
+ 	}
+ 
+@@ -506,9 +649,12 @@ public class MappingConfiguration {
+ 		Path srgPath = getRawSrgFile(project);
+ 		MappingTree tree = new MCPReader(intermediaryTinyPath, srgPath).read(mcpJar);
+ 
+-		try (MappingWriter writer = MappingWriter.create(tinyMappings, MappingFormat.TINY_2_FILE)) {
+-			tree.accept(writer);
+-		}
++		// 原子发布 MCP 合并出的 tiny mappings：先在临时文件上写完再原子落位
++		AtomicFiles.publish(tinyMappings, tmp -> {
++			try (MappingWriter writer = MappingWriter.create(tmp, MappingFormat.TINY_2_FILE)) {
++				tree.accept(writer);
++			}
++		});
+ 	}
+ 
+ 	private boolean isMCP(Path path) throws IOException {
+@@ -581,7 +727,9 @@ public class MappingConfiguration {
+ 			return;
+ 		}
+ 
+-		Files.copy(unpickPath, unpickDefinitions, StandardCopyOption.REPLACE_EXISTING);
++		// 原子发布共享的 mappings.unpick：它位于共享工作目录，锁外（暖路径）也会被重写，
++		// 就地写会让并发读方看到半截文件，故走「临时文件 + 原子 move」
++		AtomicFiles.copy(unpickPath, unpickDefinitions);
+ 
+ 		unpickMetadata = UnpickMetadata.parse(unpickMetadataPath);
+ 	}
+@@ -614,18 +762,6 @@ public class MappingConfiguration {
+ 		}
+ 	}
+ 
+-	private static void cleanWorkingDirectory(Path mappingsWorkingDir) {
+-		try {
+-			if (Files.exists(mappingsWorkingDir)) {
+-				Files.walkFileTree(mappingsWorkingDir, new DeletingFileVisitor());
+-			}
+-
+-			Files.createDirectories(mappingsWorkingDir);
+-		} catch (IOException e) {
+-			e.printStackTrace();
+-		}
+-	}
+-
+ 	public Path mappingsWorkingDir() {
+ 		return mappingsWorkingDir;
+ 	}
+@@ -675,11 +811,9 @@ public class MappingConfiguration {
+ 			Path path = mappingsWorkingDir.resolve("mappings-mixin-" + namespace + ".tiny");
+ 
+ 			try {
++				// 无锁快路径：产物已在位且未要求刷新时直接返回，不取锁也不写文件
+ 				if (Files.notExists(path) || loom.refreshDeps()) {
+-					List<String> lines = new ArrayList<>(Files.readAllLines(getPlatformMappingFile(loom)));
+-					lines.set(0, lines.get(0).replace("intermediary", "yraidemretni").replace(namespace, "intermediary"));
+-					Files.deleteIfExists(path);
+-					Files.write(path, lines);
++					writeReplacedTarget(loom, namespace, path);
+ 				}
+ 
+ 				return path;
+@@ -689,6 +823,33 @@ public class MappingConfiguration {
+ 		});
+ 	}
+ 
++	/**
++	 * 生产一份共享的 {@code mappings-mixin-<ns>.tiny}.
++	 *
++	 * <p>该文件位于共享的 mappings 工作目录（{@code <userCache>/<mappingsIdentifier>/}），
++	 * 多个工作树/daemon 会同时读写它，故写入整段包进与 {@link #produceMappings} 同一把 mappings 锁，
++	 * 并采用「临时文件 + 原子 move」发布：读方要么看到旧的完整文件、要么看到新的完整文件，
++	 * 不会读到半截内容，也不再「先删后写」制造产物不存在的窗口。
++	 */
++	private void writeReplacedTarget(LoomGradleExtension loom, String namespace, Path path) throws Exception {
++		// 此处拿不到 Project（无法用 LoomCacheService 的 JVM 内监视器），直接用同一 key 的跨进程锁；
++		// 同一 JVM 内的并发由 FileLock 的重叠检测 + 轮询等待串行化。
++		final Path lockRoot = loom.getFiles().getCacheLocks().toPath();
++
++		CacheEntryLock.withLock(lockRoot, mappingsLockKey(), LoomCacheService.defaultTimeout(), () -> {
++			// 锁内二次确认：等锁期间可能已被其它进程产出（refresh 时仍需强制重建）
++			if (!loom.refreshDeps() && Files.exists(path)) {
++				return null;
++			}
++
++			List<String> lines = new ArrayList<>(Files.readAllLines(getPlatformMappingFile(loom)));
++			lines.set(0, lines.get(0).replace("intermediary", "yraidemretni").replace(namespace, "intermediary"));
++
++			AtomicFiles.publish(path, tmp -> Files.write(tmp, lines));
++			return null;
++		});
++	}
++
+ 	/**
+ 	 * The mapping file that is specific to the platform settings.
+ 	 * It contains SRG (Forge/common) or Mojang mappings (NeoForge) as needed.
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MergedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MergedMinecraftProvider.java
+index a3531821e250bf4e83fbd178487389474f5dcdfe..4949d185020fb112faf472e516faa767191a2bb0 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MergedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MergedMinecraftProvider.java
+@@ -86,11 +86,10 @@ public class MergedMinecraftProvider extends MinecraftProvider {
+ 					try {
+ 						mergeJars();
+ 					} catch (Throwable e) {
+-						Files.deleteIfExists(getMinecraftClientJar().toPath());
+-						Files.deleteIfExists(getMinecraftServerJar().toPath());
+-						Files.deleteIfExists(minecraftMergedJar);
+-
+-						getProject().getLogger().error("Could not merge JARs! Deleting source JARs - please re-run the command and move on.", e);
++						// 失败路径不删除共享产物：client/server 输入 jar 与合并产物都在跨进程共享的 <userCache>/<mcVersion> 下，
++						// 删掉会破坏其它进程（或其它工作树）正在读的文件，并引发无谓的重新下载与重建。
++						// 合并的中间结果只存在于同目录临时文件里，由 AtomicFiles.publish 在失败时清理。
++						getProject().getLogger().error("合并 JAR 失败！已保留原有产物，请重新运行命令以重试。", e);
+ 						throw e;
+ 					}
+ 				}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SingleJarMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SingleJarMinecraftProvider.java
+index 197060f990f062d61fd5d813193bb7fe9c99a464..9e5878559ecc790cc6cd12077f162d2e54a03be8 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SingleJarMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SingleJarMinecraftProvider.java
+@@ -112,10 +112,10 @@ public abstract class SingleJarMinecraftProvider extends MinecraftProvider {
+ 			try {
+ 				remapper = TinyRemapper.newRemapper(TinyRemapperLoggerAdapter.INSTANCE).build();
+ 
+-				Files.deleteIfExists(minecraftEnvOnlyJar);
+-
+ 				final TinyRemapper effectiveRemapper = remapper;
+-				// 原子发布：remapper 先写到同目录唯一临时 jar，完整后再原子 move 到 minecraftEnvOnlyJar
++				// 原子发布：remapper 先写到同目录唯一临时 jar，完整后再原子 move 到 minecraftEnvOnlyJar。
++				// 这里不先 deleteIfExists(minecraftEnvOnlyJar)：那会制造「产物不存在」窗口，与上面无锁快路径的
++				// 存在性检查直接冲突（读方误判为未就绪，于是争抢重建锁）；原子替换本身也不需要先删。
+ 				AtomicFiles.publish(minecraftEnvOnlyJar, tmpJar -> {
+ 					// Pass through tiny remapper to fix the meta-inf
+ 					try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(tmpJar).build()) {
+@@ -125,7 +125,8 @@ public abstract class SingleJarMinecraftProvider extends MinecraftProvider {
+ 					}
+ 				});
+ 			} catch (Exception e) {
+-				Files.deleteIfExists(minecraftEnvOnlyJar);
++				// 失败路径不删除共享产物：旧的有效文件可能正被其它进程读取；
++				// 本次未完成的中间结果只存在于临时文件里，由 publish 负责清理。
+ 				throw new RuntimeException("Failed to process %s only jar".formatted(type()), e);
+ 			} finally {
+ 				if (remapper != null) {
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SplitMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SplitMinecraftProvider.java
+index 01cc94b79585d62e2495b3f63f19fdd915ca5071..dc949748615c7530e26879356410b6dfb133bf30 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SplitMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SplitMinecraftProvider.java
+@@ -104,9 +104,9 @@ public final class SplitMinecraftProvider extends MinecraftProvider {
+ 				AtomicFiles.move(tmpClientOnly, minecraftClientOnlyJar);
+ 				AtomicFiles.move(tmpCommon, minecraftCommonJar);
+ 			} catch (Exception e) {
+-				Files.deleteIfExists(minecraftClientOnlyJar);
+-				Files.deleteIfExists(minecraftCommonJar);
+-
++				// 失败路径不删除共享产物：两个拆分产物都在跨进程共享的 <userCache>/<mcVersion> 下，
++				// 删掉会破坏其它进程（或其它工作树）正在读的文件，并引发无谓的重建。
++				// 本次未完成的中间结果只存在于临时文件里，由下面的 finally 清理。
+ 				throw new RuntimeException("Failed to split minecraft", e);
+ 			} finally {
+ 				// 原子 move 成功后临时文件已不存在；失败时清理残留
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
+index 3c2741e6ba575ef6a825be60e95cdaf8439f7566..513438d0155706956740df8ae761baf2cac65022 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
+@@ -110,7 +110,7 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 			throw new IllegalStateException("No remapped jars provided");
+ 		}
+ 
+-		// 无锁快路径：shouldRefreshOutputs 仅做存在性检查，缓存就绪时不会进入下面的锁
++		// 无锁快路径：shouldRefreshOutputs 只做只读检查（产物存在且内容可复用），缓存就绪时不会进入下面的锁
+ 		if (shouldRefreshOutputs(context)) {
+ 			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
+ 			final Path lockRoot = extension.getFiles().getCacheLocks().toPath();
+@@ -244,7 +244,7 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 	 * {@return 产物是否已就绪（无需重建）}.
+ 	 *
+ 	 * <p>供外部（如 {@code minecraft-provision} 事务锁的无锁快路径）在锁外做只读判定；
+-	 * 实现即 {@link #shouldRefreshOutputs} 的取反，同样仅做文件存在性与脏标志检查。
++	 * 实现即 {@link #shouldRefreshOutputs} 的取反，判定产物存在且内容可复用（见下）。
+ 	 */
+ 	public boolean isUpToDate(ProvideContext context) {
+ 		return !shouldRefreshOutputs(context);
+@@ -268,8 +268,11 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 		}
+ 
+ 		for (OutputJar outputJar : outputJars) {
+-			if (!getMavenHelper(outputJar.type()).exists(null)) {
+-				LOGGER.info("Refreshing outputs for mapped jar, as {} does not exist", outputJar.outputJar());
++			// 就绪判据必须含内容校验：产物位于跨 daemon／跨 loom 版本共享的 maven 仓库，旧版本 loom 以最终路径
++			// 为输出就地写，被中断会留下 0 字节或截断的 jar。只判存在会把这类残骸当成就绪产物，作为 Gradle
++			// 依赖进入编译链，形成「标记是新的、内容是坏的」的静默损坏。
++			if (!getMavenHelper(outputJar.type()).isReusable(null)) {
++				LOGGER.info("Refreshing outputs for mapped jar, as {} is missing or not reusable", outputJar.outputJar());
+ 				return true;
+ 			}
+ 		}
+@@ -326,7 +329,10 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 			configureRemapper(remappedJars, builder);
+ 		}, classNames);
+ 
+-		// 原子发布：remapper 先写到同目录唯一临时 jar，完整后再原子 move 到 outputJarPath
++		// 原子发布：remapper 先写到同目录唯一临时 jar，其余加工（Forge/NeoForge 的 object holder 改写）
++		// 也全部在这个临时文件上完成，最后才原子 move 到 outputJarPath。
++		// 发布出去的必须是终态：否则共享 maven 仓库里的 jar 会有一段「已落位但未完成加工」的中间态，
++		// 被锁外的读方读到（读到未改写 object holder 的 jar；内容校验只能发现截断，发现不了「完整但没加工完」）。
+ 		try {
+ 			AtomicFiles.publish(remappedJars.outputJarPath(), tmpJar -> {
+ 				try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(tmpJar).build()) {
+@@ -339,6 +345,23 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 					remapper.readInputs(remappedJars.inputJar());
+ 					remapper.apply(outputConsumer);
+ 				}
++
++				// object holder 的类名字符串同样要在落位前改写掉，理由见上面对「终态」的说明
++				if (extension.isForgeLikeAndOfficial()) {
++					final MappingOption mappingOption = MappingOption.forPlatform(extension);
++					final TinyMappingsService mappingsService = extension.getMappingConfiguration().getMappingsService(project, configContext.serviceFactory(), mappingOption);
++					final String className;
++
++					if (extension.isNeoForge()) {
++						className = "net.neoforged.neoforge.registries.ObjectHolderRegistry";
++					} else {
++						className = "net.minecraftforge.registries.ObjectHolderRegistry";
++					}
++
++					final String sourceNamespace = extension.getProductionNamespace().get();
++					final MemoryMappingTree mappings = mappingsService.getMappingTree();
++					RemapObjectHolderVisitor.remapObjectHolder(tmpJar, className, mappings, sourceNamespace, "named");
++				}
+ 			});
+ 		} catch (Exception e) {
+ 			throw new RuntimeException("Failed to remap JAR " + remappedJars.inputJar() + " with mappings from " + mappingConfiguration.tinyMappings, e);
+@@ -347,22 +370,6 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 		}
+ 
+ 		getMavenHelper(remappedJars.type()).savePom();
+-
+-		if (extension.isForgeLikeAndOfficial()) {
+-			final MappingOption mappingOption = MappingOption.forPlatform(extension);
+-			final TinyMappingsService mappingsService = extension.getMappingConfiguration().getMappingsService(project, configContext.serviceFactory(), mappingOption);
+-			final String className;
+-
+-			if (extension.isNeoForge()) {
+-				className = "net.neoforged.neoforge.registries.ObjectHolderRegistry";
+-			} else {
+-				className = "net.minecraftforge.registries.ObjectHolderRegistry";
+-			}
+-
+-			final String sourceNamespace = extension.getProductionNamespace().get();
+-			final MemoryMappingTree mappings = mappingsService.getMappingTree();
+-			RemapObjectHolderVisitor.remapObjectHolder(remappedJars.outputJar().getPath(), className, mappings, sourceNamespace, "named");
+-		}
+ 	}
+ 
+ 	protected void configureRemapper(RemappedJars remappedJars, TinyRemapper.Builder tinyRemapperBuilder) {
+diff --git a/src/main/java/net/fabricmc/loom/task/service/UnpickService.java b/src/main/java/net/fabricmc/loom/task/service/UnpickService.java
+index e322aa3926eeae56a39c3313629c66e664a8f8c6..192d55e0d9f6fec46873fae1968cd5f33229a4e3 100644
+--- a/src/main/java/net/fabricmc/loom/task/service/UnpickService.java
++++ b/src/main/java/net/fabricmc/loom/task/service/UnpickService.java
+@@ -73,6 +73,7 @@ import net.fabricmc.loom.util.Checksum;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.FileSystemUtil;
+ import net.fabricmc.loom.util.SLF4JAdapterHandler;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.loom.util.service.Service;
+ import net.fabricmc.loom.util.service.ServiceFactory;
+ import net.fabricmc.loom.util.service.ServiceType;
+@@ -155,23 +156,36 @@ public class UnpickService extends Service<UnpickService.Options> {
+ 				Stream.ofNullable(existingClasses)
+ 			).flatMap(Function.identity()).toList();
+ 		final Path outputJar = getOptions().getUnpickOutputJar().get().getAsFile().toPath();
+-		Files.deleteIfExists(outputJar);
+-
+-		try (ZipFsClasspath zipFsClasspath = ZipFsClasspath.create(classpath);
+-				InputStream unpickDefinitions = getUnpickDefinitionsInputStream()) {
+-			IClassResolver classResolver = zipFsClasspath.createClassResolver().chain(ClassResolvers.classpath());
+-			ConstantUninliner uninliner = ConstantUninliner.builder()
+-					.logger(JAVA_LOGGER)
+-					.classResolver(classResolver)
+-					.grouper(ConstantGroupers.dataDriven()
+-							.logger(JAVA_LOGGER)
+-							.lenient(getOptions().getLenient().get())
+-							.classResolver(classResolver)
+-							.mappingSource(unpickDefinitions)
+-							.build())
+-					.build();
+-
+-			AsyncZipProcessor.processEntries(inputJar, outputJar, new UnpickZipProcessor(uninliner));
++		// 输出位于共享工作目录 <userCache>/<mcVersion>/<mappingsIdentifier>/：同一套 mappings 的多个项目会指向
++		// 同一个文件。旧写法先 deleteIfExists 再以最终路径为输出就地写，会让并发读方看到缺失窗口或半截 jar；
++		// 改为在同目录临时文件上生成、再原子落位。临时文件本就不存在，因此同样保证输出是全新而非追加。
++		final Path staging = AtomicFiles.tempSibling(outputJar);
++		boolean published = false;
++
++		try {
++			try (ZipFsClasspath zipFsClasspath = ZipFsClasspath.create(classpath);
++					InputStream unpickDefinitions = getUnpickDefinitionsInputStream()) {
++				IClassResolver classResolver = zipFsClasspath.createClassResolver().chain(ClassResolvers.classpath());
++				ConstantUninliner uninliner = ConstantUninliner.builder()
++						.logger(JAVA_LOGGER)
++						.classResolver(classResolver)
++						.grouper(ConstantGroupers.dataDriven()
++								.logger(JAVA_LOGGER)
++								.lenient(getOptions().getLenient().get())
++								.classResolver(classResolver)
++								.mappingSource(unpickDefinitions)
++								.build())
++						.build();
++
++				AsyncZipProcessor.processEntries(inputJar, staging, new UnpickZipProcessor(uninliner));
++			}
++
++			AtomicFiles.move(staging, outputJar);
++			published = true;
++		} finally {
++			if (!published) {
++				Files.deleteIfExists(staging);
++			}
+ 		}
+ 
+ 		return outputJar;
+diff --git a/src/main/java/net/fabricmc/loom/util/cache/AtomicFiles.java b/src/main/java/net/fabricmc/loom/util/cache/AtomicFiles.java
+index a238c86a8be21ff43994646cad7087fb3671b8f7..f7d2d4cc16b1cf474f62824272420b5d6aebe210 100644
+--- a/src/main/java/net/fabricmc/loom/util/cache/AtomicFiles.java
++++ b/src/main/java/net/fabricmc/loom/util/cache/AtomicFiles.java
+@@ -25,22 +25,44 @@
+ package net.fabricmc.loom.util.cache;
+ 
+ import java.io.IOException;
++import java.nio.file.AccessDeniedException;
+ import java.nio.file.AtomicMoveNotSupportedException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.StandardCopyOption;
++import java.time.Duration;
+ import java.util.UUID;
+ 
+ /**
+  * 原子发布工具：保证「文件存在 ⟺ 内容完整」这一不变量成立.
+  *
+- * <p>各最终产物先写入「与 target 同目录的唯一临时文件」，写完整后再用原子 move 落位。
++ * <p>各最终产物先写入「与目标同目录的唯一临时文件」，写完整后再用原子 move 落位。
+  * 这样跨 daemon 的无锁存在性检查不会在写入期间看到半成品：读方要么看到旧文件、要么看到完整的新文件。
++ *
++ * <h2>Windows 的替换限制</h2>
++ *
++ * <p>POSIX 的 {@code rename(2)} 可以覆盖任何同名文件，但 Windows 不允许替换（或删除）正被其它句柄打开的文件：
++ * 只要读方还持有句柄，{@code MoveFileEx(REPLACE_EXISTING)} 就会以 {@code ERROR_ACCESS_DENIED} 失败，
++ * Java 侧表现为 {@link AccessDeniedException}。实测 {@code InputStream}、{@code FileChannel}、
++ * {@code ZipFile} 与 {@code FileSystem}(zipfs) 的读取句柄都会触发该限制。
++ *
++ * <p>因此 {@link #move} 对这种情况做「有上限的退避重试」：短生命周期的读方（例如反复读取的构建）会被自动让过，
++ * 持续占用则最终抛出带诊断信息的异常，而不是把平台限制原样丢给调用方。读方的不变量不受影响——
++ * 重试期间目标始终是旧的完整文件。
+  */
+ public final class AtomicFiles {
+ 	private AtomicFiles() {
+ 	}
+ 
++	/**
++	 * 替换被读方占用时的重试预算.
++	 *
++	 * <p>超过该时长仍无法替换即判定为「读方长期持有句柄」，抛出可诊断的异常。
++	 */
++	private static final Duration REPLACE_RETRY_BUDGET = Duration.ofSeconds(30);
++	private static final long RETRY_INITIAL_MILLIS = 5;
++	private static final long RETRY_MAX_MILLIS = 250;
++
+ 	/**
+ 	 * 接收一个 Path 并向其写入内容的回调，允许抛出 {@link IOException}.
+ 	 */
+@@ -103,12 +125,56 @@ public final class AtomicFiles {
+ 	 *
+ 	 * <p>用于调用方已将内容写入同目录临时文件、需把其原子落位到 target 的场景
+ 	 * （例如一次产生多个输出、不便用 {@link #publish} 逐个包裹时）。
++	 *
++	 * <p>目标被其它进程/线程的读取句柄占用时（Windows 的替换限制，见类注释）会做有上限的退避重试，
++	 * 让过短生命周期的读方；持续占用则抛出带诊断信息的 {@link IOException}。
+ 	 */
+ 	public static void move(Path source, Path target) throws IOException {
++		final long deadline = System.nanoTime() + REPLACE_RETRY_BUDGET.toNanos();
++		long backoffMillis = RETRY_INITIAL_MILLIS;
++
++		while (true) {
++			try {
++				try {
++					Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
++				} catch (AtomicMoveNotSupportedException e) {
++					Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
++				}
++
++				return;
++			} catch (AccessDeniedException e) {
++				// Windows 上读方持有目标句柄时的表现。读方是短生命周期的，重试即可成功；
++				// 因此这里不立刻失败，避免把「另一个进程正在读」变成构建失败。
++				if (System.nanoTime() >= deadline) {
++					throw new IOException(describeShareConflict(target), e);
++				}
++
++				sleepBriefly(backoffMillis);
++				backoffMillis = Math.min(backoffMillis * 2, RETRY_MAX_MILLIS);
++			}
++		}
++	}
++
++	/**
++	 * 构造可诊断的替换冲突说明.
++	 *
++	 * <p>把平台限制、最可能的原因与用户可采取的动作写进消息里——原始 {@link AccessDeniedException}
++	 * 只给出「拒绝访问」，无法指向真正的问题。
++	 */
++	private static String describeShareConflict(Path target) {
++		return "无法替换共享缓存产物 %s：目标文件正被其它进程或线程读取。".formatted(target.toAbsolutePath())
++				+ " Windows 不允许替换（或删除）已被打开的文件，已等待 %d 秒仍未能落位。"
++				.formatted(REPLACE_RETRY_BUDGET.toSeconds())
++				+ " 若同时运行多个工作树或 Gradle daemon 共享同一 userCache，请错开构建；"
++				+ "单个构建内出现该提示通常意味着另一个 Loom 进程长期持有该文件。";
++	}
++
++	private static void sleepBriefly(long millis) throws IOException {
+ 		try {
+-			Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+-		} catch (AtomicMoveNotSupportedException e) {
+-			Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
++			Thread.sleep(millis);
++		} catch (InterruptedException e) {
++			Thread.currentThread().interrupt();
++			throw new IOException("等待替换共享缓存产物时被中断", e);
+ 		}
+ 	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/util/cache/JarReusability.java b/src/main/java/net/fabricmc/loom/util/cache/JarReusability.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d980be06e2d7f28357ec3b40613bd68640cecf6
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/util/cache/JarReusability.java
+@@ -0,0 +1,70 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2025 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.util.cache;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++
++import net.fabricmc.loom.util.FileSystemUtil;
++
++/**
++ * 「产物可作为输入复用」的判定工具：把 jar/zip 的内容校验收敛到唯一实现.
++ *
++ * <p>共享缓存里的产物可能被其它进程写坏：仍在用「先删除再就地写」的旧版本 loom 会在替换窗口内让目标路径
++ * 出现 22 字节的空 zip（本仓库实测到的形态），进程被中断还会留下截断文件。只做存在性判定会把这种半成品
++ * 当成就绪产物，一路传到最终产物里，形成「标记是新的、内容是坏的」的静默损坏。因此这里的口径是：
++ * 能作为 zip 打开（中央目录完整），且至少含一个条目（不是空 zip 壳）。
++ *
++ * <p>该口径只拒绝「已经损坏」的产物：正常写入流程（临时文件 + 原子落位）产生的 jar 必然满足它，
++ * 所以不会把正常产物永久判为不可用、把读方拖进「每次构建都重建」的循环。
++ *
++ * <p>普通 {@code .zip}（例如 {@code mcp.zip}）与 jar 走的是同一条 zipfs 路径，同样适用本判定。
++ */
++public final class JarReusability {
++	private JarReusability() {
++	}
++
++	/**
++	 * {@return 该 jar/zip 是否可作为输入复用}.
++	 *
++	 * @param jar 待判定的产物路径
++	 */
++	public static boolean isReusable(Path jar) {
++		if (Files.notExists(jar)) {
++			return false;
++		}
++
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar, false); var entries = Files.list(fs.getPath("/"))) {
++			// 至少一个条目：空 zip（0 条目）虽然能被 zipfs 打开，但作为 Minecraft/Forge 链的输入必然是残骸
++			return entries.findAny().isPresent();
++		} catch (IOException e) {
++			// 打不开即视为不可复用：截断文件、空文件、非 zip 内容都会在此抛 IOException。
++			// 刻意不吞 FileSystemUtil.UnrecoverableZipException（RuntimeException）：它表示本 JVM 之后再也打不开
++			// 该路径，吞掉只会让上层陷入「重建 → 仍然打不开」的循环，应当尽早暴露。
++			return false;
++		}
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/ConfigurationCacheTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/ConfigurationCacheTest.groovy
+index 7ecde867944cd6bcd82a9f94ec6a54ca044ee94b..007e17bd8921806c90161c1af3f9256fcf25f99d 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/ConfigurationCacheTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/ConfigurationCacheTest.groovy
+@@ -165,8 +165,8 @@ class ConfigurationCacheTest extends Specification implements GradleProjectTestT
+ 		// 残留锁文件不得让配置缓存失效：第 2 轮必须直接复用
+ 		result2.output.contains("Reusing configuration cache")
+ 		result3.task(":help").outcome != FAILED
+-		// 重新配置时识别残留锁并重建 loom 缓存
+-		result3.output.contains("rebuilding loom cache")
++		// 重新配置时识别残留锁，但仅作诊断：复用既有 loom 缓存，不再全量重建
++		result3.output.contains("reusing the existing loom cache")
+ 		// 后续构建不得再因锁文件被删除或内容变化而失效
+ 		// （loom 缓存产物被创建导致的失效属于既有行为，不在本用例范围内）
+ 		!result4.output.contains(".lock' has been removed")
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/OfflineModeTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/OfflineModeTest.groovy
+index 17a492f388427f8ad2cd9f0fc8906ddd45694d92..88f56128cc773979141aca6ac854467cfc07264c 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/OfflineModeTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/OfflineModeTest.groovy
+@@ -58,7 +58,8 @@ class OfflineModeTest extends Specification implements GradleProjectTestTrait {
+ 
+ 		def projectHash = result1.output.split("%%")[1]
+ 
+-		// Create a dummy lock file to ensure that the loom cache is rebuilt on the next run
++		// 写入一个伪造的残留锁文件：下一次运行只会把它当作「上次构建未干净收尾」的诊断信息，
++		// 不再触发 loom 缓存重建，因此缓存必须保持完好且可离线复用
+ 		def lockFile = new File(gradle.gradleHomeDir, "caches/fabric-loom/.${projectHash}.lock")
+ 		lockFile.text = "12345"
+ 
+@@ -69,6 +70,6 @@ class OfflineModeTest extends Specification implements GradleProjectTestTrait {
+ 		result2.task(":build").outcome == SUCCESS
+ 
+ 		result2.output.contains("was left by a previous build, assuming abrupt termination.")
+-		result2.output.contains("rebuilding loom cache")
++		result2.output.contains("reusing the existing loom cache")
+ 	}
+ }
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/cache/AtomicFilesTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/cache/AtomicFilesTest.groovy
+index 3fc571cb2acb35522a2dbdc8a4f2046b993e7434..2d3044d37d52ea92991399240892b59a3a3c061d 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/cache/AtomicFilesTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/cache/AtomicFilesTest.groovy
+@@ -26,7 +26,11 @@ package net.fabricmc.loom.test.unit.cache
+ 
+ import java.nio.charset.StandardCharsets
+ import java.nio.file.Files
++import java.nio.file.NoSuchFileException
+ import java.nio.file.Path
++import java.util.concurrent.CopyOnWriteArrayList
++import java.util.concurrent.atomic.AtomicBoolean
++import java.util.concurrent.atomic.AtomicInteger
+ import java.util.stream.Collectors
+ 
+ import spock.lang.Specification
+@@ -216,4 +220,54 @@ class AtomicFilesTest extends Specification {
+ 			fs.close()
+ 		}
+ 	}
++
++	def "并发读方在反复发布期间始终读到完整内容（无缺失窗口、无半截文件）"() {
++		given:
++		// 这条不变式是整个共享缓存并发方案的地基：跨进程读方只做存在性判定、然后直接打开文件，
++		// 因此目标路径必须满足「要么还没被替换、要么已是完整的新文件」，绝不能出现缺失窗口或半截文件。
++		// 旧实现「先 deleteIfExists(target) 再以 target 为输出就地写」正是靠删除制造了缺失窗口，
++		// 所以这里用一个持续读取的并发读方把它钉住：任何一次读到缺失或半截长度都会让用例失败。
++		def target = tempDir.resolve("shared.bin")
++		byte[] oldContent = new byte[4096]
++		byte[] newContent = new byte[8192]
++		Arrays.fill(oldContent, (byte) 1)
++		Arrays.fill(newContent, (byte) 2)
++		def oldSource = tempDir.resolve("old-source.bin")
++		def newSource = tempDir.resolve("new-source.bin")
++		Files.write(oldSource, oldContent)
++		Files.write(newSource, newContent)
++		AtomicFiles.copy(oldSource, target)
++
++		def stopped = new AtomicBoolean(false)
++		def failures = new CopyOnWriteArrayList<String>()
++		def reads = new AtomicInteger(0)
++		def reader = Thread.start {
++			while (!stopped.get()) {
++				try {
++					byte[] bytes = Files.readAllBytes(target)
++					reads.incrementAndGet()
++
++					if (bytes.length != oldContent.length && bytes.length != newContent.length) {
++						failures.add("读到半截内容: ${bytes.length} 字节")
++					}
++				} catch (NoSuchFileException e) {
++					failures.add("读到缺失窗口: ${e.file}")
++				} catch (IOException e) {
++					failures.add("读取失败: ${e}")
++				}
++			}
++		}
++
++		when:
++		(1..200).each { i ->
++			AtomicFiles.copy(i % 2 == 0 ? newSource : oldSource, target)
++		}
++		stopped.set(true)
++		reader.join(10_000)
++
++		then:
++		failures.isEmpty()
++		// 读方必须真的读到过内容，否则本用例会在「读线程没被调度」时空转通过，失去意义
++		reads.get() > 0
++	}
+ }

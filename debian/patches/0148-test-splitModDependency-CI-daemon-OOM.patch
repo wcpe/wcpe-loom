@@ -1,0 +1,32 @@
+From 870c58e86abfa8f593b8915018f966a82fb6031f Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Fri, 23 Oct 2026 01:57:02 +0800
+Subject: [PATCH 148/151] =?UTF-8?q?test:=20=E7=BB=99=20splitModDependency=20?=
+ =?UTF-8?q?=E5=A4=B9=E5=85=B7=E6=98=BE=E5=BC=8F=E8=AE=BE=E5=A0=86=EF=BC=8C?=
+ =?UTF-8?q?=E4=BF=AE=20CI=20=E4=B8=8A=E7=9A=84=20daemon=20OOM?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+SplitModDependencyProducerTest 在同一次构建里处理三条 mod 依赖并做完整 build（含重映射
+与 AT），内层 Gradle daemon 的默认堆不够。实测 CI 上 daemon 抛 OutOfMemoryError 后退出，
+外层拿到 DaemonStoppedException、用例失败——堆耗尽时会先打印「The Daemon will expire
+immediately since the JVM garbage collector is thrashing」，不是断言失败。
+
+与 MigrateMappingsTest / DataGenerationTest / RemapTaskCacheTest 同款做法：把 -Xmx2G 写进
+测试工程的 gradle.properties，不再依赖默认值。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/test/resources/projects/splitModDependency/gradle.properties b/src/test/resources/projects/splitModDependency/gradle.properties
+new file mode 100644
+index 0000000000000000000000000000000000000000..5a96cf3ae39994820ee8a1824a1b71df927fa27d
+--- /dev/null
++++ b/src/test/resources/projects/splitModDependency/gradle.properties
+@@ -0,0 +1,5 @@
++# 本用例要在同一次构建里处理三条 mod 依赖并做完整 build（含重映射与 AT），
++# 内层 Gradle daemon 的默认堆不够，CI 上会 OutOfMemoryError 后退出、外层拿到
++# DaemonStoppedException。与 MigrateMappingsTest / DataGenerationTest / RemapTaskCacheTest
++# 同款处理：把堆显式写进测试工程的 gradle.properties，不再依赖默认值。
++org.gradle.jvmargs=-Xmx2G

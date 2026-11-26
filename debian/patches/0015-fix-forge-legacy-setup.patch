@@ -1,0 +1,682 @@
+From 0434d00354822cefed97ff120563a9ecac6fd170 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:28 +0800
+Subject: [PATCH 015/147] =?UTF-8?q?fix(forge):=20=E4=BF=AE=E5=A4=8D?=
+ =?UTF-8?q?=E8=BF=81=E7=A7=BB=E4=B8=AD=E4=B8=A2=E5=A4=B1=E7=9A=84=20legacy?=
+ =?UTF-8?q?=20=E6=94=AF=E6=8C=81=E4=B8=8E=20setup=20=E6=97=B6=E5=BA=8F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+补回 SrgProvider 的 FG2 joined.srg 回退、McpConfigProvider 的 legacy 内联 MCP 配置、
+ModMetadataFiles 的 mcmod.info 注册、FabricModJsonFactory 的 mcmod.info 侦测、
+legacy 判定与映射特例、LocalMavenHelper 的 .zip 接受条件；并修正 setup 时序
+（跨进程锁位置与 provider 注册顺序），新增 GeneratedIntermediateMappingsProvider
+与 LWJGL2UpgradeLibraryProcessor。
+
+Origin: backport, essential dev/1.15
+Forwarded: no
+
+diff --git a/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java b/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
+index 284c2f3865cb14cdaa480ce5f99553d1b97fd427..c520356bc234b005396260915097d2187b6e36b9 100644
+--- a/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
++++ b/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
+@@ -53,6 +53,13 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
+ 	@Override
+ 	protected void manipulateMappings(Project project, Path mappingsJar) throws IOException {
+ 		LoomGradleExtension extension = LoomGradleExtension.get(project);
++
++		if (extension.isLegacyForge()) {
++			// Legacy forge patches are in official namespace, so if the type of a field is changed by them, then that
++			// is effectively a new field and not traceable to any mapping. Therefore this does not apply to it.
++			return;
++		}
++
+ 		final Path forgeCache = ForgeProvider.getForgeCache(project);
+ 		Files.createDirectories(forgeCache);
+ 
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java
+index a654a8abc3ed8b4e5d61fca423d70e3cacd1c175..50d7d0240ec69bce5907af2d71f871711683452c 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java
+@@ -180,7 +180,9 @@ public class ForgeLibrariesProvider {
+ 			DependencyProvider.addDependency(project, dep, Constants.Configurations.FORGE_DEPENDENCIES);
+ 		}
+ 
+-		if (!extension.disableObfuscation()) {
++		// Excluded on legacy forge because it pulls in a log4j-api version newer than what forge wants and we don't
++		// need it anyway
++		if (extension.isModernForgeLike() && !extension.disableObfuscation()) {
+ 			LoomVersions unprotect = isFancyModLoader10OrNewer ? LoomVersions.UNPROTECT_FANCYMODLOADER10 : LoomVersions.UNPROTECT_MODLAUNCHER;
+ 			DependencyProvider.addDependency(project, unprotect.mavenNotation(), Constants.Configurations.FORGE_EXTRA);
+ 		}
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/SrgProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/SrgProvider.java
+index ea0ab552fc6ac89527c7e91cc9b4424612a6f681..f628e84ccfba6ac52662b743e5fa88b282a4a001 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/SrgProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/SrgProvider.java
+@@ -25,10 +25,15 @@
+ package dev.architectury.loom.forge.dependency;
+ 
+ import java.io.BufferedReader;
++import java.io.ByteArrayInputStream;
+ import java.io.File;
+ import java.io.IOException;
++import java.io.InputStreamReader;
++import java.io.Reader;
+ import java.io.UncheckedIOException;
++import java.io.Writer;
+ import java.nio.file.Files;
++import java.nio.file.NoSuchFileException;
+ import java.nio.file.Path;
+ import java.util.HashMap;
+ import java.util.Map;
+@@ -36,6 +41,8 @@ import java.util.Map;
+ import dev.architectury.loom.forge.tool.ForgeToolValueSource;
+ import dev.architectury.loom.util.DependencyDownloader;
+ import dev.architectury.loom.util.Stopwatch;
++import org.cadixdev.lorenz.io.srg.SrgReader;
++import org.cadixdev.lorenz.io.srg.tsrg.TSrgWriter;
+ import org.gradle.api.Project;
+ import org.jspecify.annotations.Nullable;
+ 
+@@ -75,7 +82,22 @@ public class SrgProvider extends DependencyProvider {
+ 
+ 		if (!Files.exists(srg) || refreshDeps()) {
+ 			Path srgZip = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve srg")).toPath();
+-			Files.write(srg, ZipUtils.unpack(srgZip, "config/joined.tsrg"));
++
++			try {
++				Files.write(srg, ZipUtils.unpack(srgZip, "config/joined.tsrg"));
++			} catch (NoSuchFileException e) {
++				try {
++					// FG2-era MCP uses the older SRG format, convert it on the fly
++					byte[] srgBytes = ZipUtils.unpack(srgZip, "joined.srg");
++
++					try (Reader reader = new InputStreamReader(new ByteArrayInputStream(srgBytes)); Writer writer = Files.newBufferedWriter(srg)) {
++						new TSrgWriter(writer).write(new SrgReader(reader).read());
++					}
++				} catch (NoSuchFileException e1) {
++					e.addSuppressed(e1);
++					throw e;
++				}
++			}
+ 		}
+ 
+ 		try (BufferedReader reader = Files.newBufferedReader(srg)) {
+diff --git a/src/main/java/dev/architectury/loom/mcpconfig/McpConfigProvider.java b/src/main/java/dev/architectury/loom/mcpconfig/McpConfigProvider.java
+index 074f4c45c3472387621600a773fb2ad43fac90d4..ffc5df2aac9879c4602ff7953363596c3886488f 100644
+--- a/src/main/java/dev/architectury/loom/mcpconfig/McpConfigProvider.java
++++ b/src/main/java/dev/architectury/loom/mcpconfig/McpConfigProvider.java
+@@ -28,6 +28,7 @@ import java.io.Reader;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.StandardCopyOption;
++import java.util.Objects;
+ 
+ import com.google.gson.Gson;
+ import com.google.gson.JsonObject;
+@@ -53,6 +54,37 @@ public class McpConfigProvider extends DependencyProvider {
+ 	public void provide(DependencyInfo dependency) throws Exception {
+ 		init(dependency.getDependency().getVersion());
+ 
++		if (getExtension().isLegacyForge()) {
++			//CHECKSTYLE:OFF
++			String json = """
++{
++  "version": "$version",
++  "data": {
++    "mappings": "TODO mappings"
++  },
++  "steps": {
++    "joined": [
++      {
++        "type": "downloadClient"
++      },
++      {
++        "type": "downloadServer"
++      },
++      {
++        "name": "rename",
++        "type": "downloadManifest"
++      }
++    ]
++  },
++  "functions": {}
++}
++					""".replace("$version", Objects.requireNonNull(dependency.getDependency().getVersion()));
++			//CHECKSTYLE:ON
++
++			data = McpConfigData.fromJson(new Gson().fromJson(json, JsonObject.class));
++			return;
++		}
++
+ 		Path mcpZip = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve MCPConfig")).toPath();
+ 
+ 		if (!Files.exists(mcp) || !Files.exists(unpacked) || refreshDeps()) {
+diff --git a/src/main/java/dev/architectury/loom/metadata/ModMetadataFiles.java b/src/main/java/dev/architectury/loom/metadata/ModMetadataFiles.java
+index c7d489321c231bc0215c4dae045f145e3f34d4e7..d19b372548d098ef38634ce49c456e0454aae113 100644
+--- a/src/main/java/dev/architectury/loom/metadata/ModMetadataFiles.java
++++ b/src/main/java/dev/architectury/loom/metadata/ModMetadataFiles.java
+@@ -32,6 +32,7 @@ public final class ModMetadataFiles {
+ 			QuiltModJson.FILE_NAME, QuiltModJson::of,
+ 			QuiltModJson.JSON5_FILE_NAME, convertJson5ToJson(QuiltModJson::of),
+ 			ArchitecturyCommonJson.FILE_NAME, ArchitecturyCommonJson::of,
++			McmodInfo.FILE_PATH, onError(McmodInfo::of, "Could not load mcmod.info", () -> new ErroringModMetadataFile("mcmod.info")),
+ 			ModsToml.FILE_PATH, onError(ModsToml::of, "Could not load mods.toml", () -> new ErroringModMetadataFile("mods.toml")),
+ 			ModsToml.NEOFORGE_FILE_PATH, onError(ModsToml::of, "Could not load neoforge.mods.toml", () -> new ErroringModMetadataFile("neoforge.mods.toml"))
+ 	);
+diff --git a/src/main/java/dev/architectury/loom/util/LoggerFilter.java b/src/main/java/dev/architectury/loom/util/LoggerFilter.java
+index 31e1c0f38359766265d67bd2bfe93aeb0b0b01a2..0768028a1267079e67d9b85ba9e3b3d991bbc139 100644
+--- a/src/main/java/dev/architectury/loom/util/LoggerFilter.java
++++ b/src/main/java/dev/architectury/loom/util/LoggerFilter.java
+@@ -46,4 +46,31 @@ public class LoggerFilter {
+ 			// Failed to replace logger filter, just ignore
+ 		}
+ 	}
++
++	public static <T extends Throwable> void withSystemOutAndErrSuppressed(CheckedRunnable<T> block) throws T {
++		PrintStream previousOut = System.out;
++		PrintStream previousErr = System.err;
++
++		try {
++			System.setOut(new PrintStream(NullOutputStream.INSTANCE));
++			System.setErr(new PrintStream(NullOutputStream.INSTANCE));
++		} catch (SecurityException ignored) {
++			// Failed to replace logger, just ignore
++		}
++
++		try {
++			block.run();
++		} finally {
++			try {
++				System.setOut(previousOut);
++				System.setErr(previousErr);
++			} catch (SecurityException ignored) {
++				// Failed to replace logger, just ignore
++			}
++		}
++	}
++
++	public interface CheckedRunnable<T extends Throwable> {
++		void run() throws T;
++	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/LoomRepositoryPlugin.java b/src/main/java/net/fabricmc/loom/LoomRepositoryPlugin.java
+index 012e2c7bb32932d987de92c6142f19a7d243d9a8..44cff7395ba29b3f47a9acf8cc4eaff309aec1bb 100644
+--- a/src/main/java/net/fabricmc/loom/LoomRepositoryPlugin.java
++++ b/src/main/java/net/fabricmc/loom/LoomRepositoryPlugin.java
+@@ -37,6 +37,7 @@ import org.gradle.api.invocation.Gradle;
+ import org.gradle.api.plugins.ExtensionAware;
+ import org.gradle.api.plugins.PluginAware;
+ 
++import net.fabricmc.loom.configuration.providers.minecraft.library.processors.LWJGL2UpgradeLibraryProcessor;
+ import net.fabricmc.loom.extension.LoomFiles;
+ import net.fabricmc.loom.util.MirrorUtil;
+ 
+@@ -71,6 +72,7 @@ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
+ 
+ 	private void declareRepositories(RepositoryHandler repositories, LoomFiles files, ExtensionAware target) {
+ 		declareLocalRepositories(repositories, files);
++		LWJGL2UpgradeLibraryProcessor.legacyFabricLWJGL(repositories);
+ 
+ 		repositories.maven(repo -> {
+ 			repo.setName("Architectury");
+@@ -94,6 +96,10 @@ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
+ 				sources.artifact();
+ 				sources.ignoreGradleMetadataRedirection();
+ 			});
++
++			// Fallback to maven central for artifacts such as sources or javadocs that are not mirrored on Mojang's repo.
++			// See: https://github.com/FabricMC/fabric-loom/issues/1032
++			repo.artifactUrls(ArtifactRepositoryContainer.MAVEN_CENTRAL_URL);
+ 		});
+ 		repositories.maven(repo -> {
+ 			repo.setName("Forge");
+diff --git a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+index 974542fb02a7cca634378d1178556d3b79683f96..6afa45e003f287c8eeb05fd5c080224cc9682a69 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+@@ -80,8 +80,10 @@ import net.fabricmc.loom.configuration.processors.JsrAnnotationRemapperProcessor
+ import net.fabricmc.loom.configuration.processors.MinecraftJarProcessorManager;
+ import net.fabricmc.loom.configuration.processors.ModJavadocProcessor;
+ import net.fabricmc.loom.configuration.processors.speccontext.DebofConfiguration;
++import net.fabricmc.loom.configuration.providers.mappings.GeneratedIntermediateMappingsProvider;
+ import net.fabricmc.loom.configuration.providers.mappings.LayeredMappingsFactory;
+ import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration;
++import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftMetadataProvider;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftSourceSets;
+@@ -138,26 +140,15 @@ public abstract class CompileConfiguration implements Runnable {
+ 				extension.setRefreshDeps(true);
+ 			}
+ 
+-			// 跨进程缓存锁：getGlobalLockObject 只覆盖 JVM 内（同一 daemon 的多个 classloader），
+-			// 多个 daemon 并发构建同一版本时会同时进入 setupMinecraft 生产共享缓存产物并互相踩踏。
+-			// 外层叠加 per-key 跨进程文件锁，键按 Minecraft 版本 + 映射标识隔离，不同版本仍可并行。
+-			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
+-			final var lockRoot = extension.getFiles().getCacheLocks().toPath();
+-			final String setupLockKey = "minecraft-setup:" + extension.getMinecraftProvider().minecraftVersion()
+-					+ ":" + (extension.disableObfuscation() ? "deobf" : extension.getMappingConfiguration().mappingsIdentifier);
+-
+ 			try {
+-				cacheService.runExclusive(lockRoot, setupLockKey, LoomCacheService.defaultTimeout(), () -> {
+-					// Setting up loom across Gradle projects is not thread safe, synchronize it here to ensure that multiple projects cannot use it.
+-					// There is no easy way around this, as we want to use the same global cache for downloaded or generated files.
+-					synchronized (getGlobalLockObject()) {
+-						setupMinecraft(configContext);
+-					}
++				// Setting up loom across Gradle projects is not thread safe, synchronize it here to ensure that multiple projects cannot use it.
++				// There is no easy way around this, as we want to use the same global cache for downloaded or generated files.
++				synchronized (getGlobalLockObject()) {
++					setupMinecraft(configContext);
++				}
+ 
+-					var dependencyManager = new LoomDependencyManager(getProject(), serviceFactory, extension);
+-					dependencyManager.handleDependencies();
+-					return null;
+-				});
++				var dependencyManager = new LoomDependencyManager(getProject(), serviceFactory, extension);
++				dependencyManager.handleDependencies();
+ 			} catch (Exception e) {
+ 				ExceptionUtil.processException(e, DaemonUtils.Context.fromProject(getProject()));
+ 				disownLock();
+@@ -264,6 +255,12 @@ public abstract class CompileConfiguration implements Runnable {
+ 			// but before MinecraftPatchedProvider.provide.
+ 			setupDependencyProviders(project, extension);
+ 
++			if (extension.isLegacyForge()) {
++				extension.setIntermediateMappingsProvider(GeneratedIntermediateMappingsProvider.class, provider -> {
++					provider.minecraftProvider = minecraftProvider;
++				});
++			}
++
+ 			// Resolve the mapping files from the configuration
+ 			final DependencyInfo mappingsDep = DependencyInfo.create(getProject(), Configurations.MAPPINGS);
+ 			final MappingConfiguration mappingConfiguration = MappingConfiguration.create(getProject(), configContext.serviceFactory(), mappingsDep, minecraftProvider);
+@@ -303,27 +300,50 @@ public abstract class CompileConfiguration implements Runnable {
+ 			namedMinecraftProvider = jarConfiguration.createProcessedNamedMinecraftProvider(namedMinecraftProvider, minecraftJarProcessorManager);
+ 		}
+ 
+-		final var provideContext = new AbstractMappedMinecraftProvider.ProvideContext(true, extension.refreshDeps(), configContext);
++		provideMappedMinecraftJars(extension, project, configContext, jarConfiguration, intermediaryMinecraftProvider, namedMinecraftProvider);
++	}
+ 
+-		if (intermediaryMinecraftProvider != null) {
+-			extension.setIntermediaryMinecraftProvider(intermediaryMinecraftProvider);
+-			intermediaryMinecraftProvider.provide(provideContext);
+-		}
++	/**
++	 * 跨进程供给已映射的 Minecraft jar。
++	 * <p>
++	 * getGlobalLockObject 只覆盖 JVM 内（同一 daemon 的多个 classloader），多个 daemon 并发构建同一版本时
++	 * 仍会同时生产共享缓存产物并互相踩踏；因此按 Minecraft 版本 + 映射标识叠加一把 per-key 跨进程文件锁，
++	 * 不同版本仍可并行。输出检查与重建必须同属一个事务，否则另一进程会在本项目读取 intermediary 时将它删除并重建。
++	 */
++	private void provideMappedMinecraftJars(LoomGradleExtension extension, Project project, ConfigContext configContext,
++			MinecraftJarConfiguration<?, ?, ?> jarConfiguration,
++			IntermediaryMinecraftProvider<?> intermediaryMinecraftProvider,
++			NamedMinecraftProvider<?> namedMinecraftProvider) throws Exception {
++		final var lockRoot = extension.getFiles().getCacheLocks().toPath();
++		final String mappingsIdentifier = extension.disableObfuscation() ? "deobf" : extension.getMappingConfiguration().mappingsIdentifier();
++		final String key = "minecraft-provision:" + extension.getMinecraftProvider().minecraftVersion() + ":" + mappingsIdentifier;
++		final LoomCacheService cacheService = LoomCacheService.get(project).get();
++
++		cacheService.runExclusive(lockRoot, key, LoomCacheService.defaultTimeout(), () -> {
++			final var provideContext = new AbstractMappedMinecraftProvider.ProvideContext(true, extension.refreshDeps(), configContext);
++
++			if (intermediaryMinecraftProvider != null) {
++				extension.setIntermediaryMinecraftProvider(intermediaryMinecraftProvider);
++				intermediaryMinecraftProvider.provide(provideContext);
++			}
+ 
+-		extension.setNamedMinecraftProvider(namedMinecraftProvider);
+-		namedMinecraftProvider.provide(provideContext);
++			extension.setNamedMinecraftProvider(namedMinecraftProvider);
++			namedMinecraftProvider.provide(provideContext);
+ 
+-		if (extension.isForge()) {
+-			final SrgMinecraftProvider<?> srgMinecraftProvider = jarConfiguration.createSrgMinecraftProvider(project);
+-			extension.setSrgMinecraftProvider(srgMinecraftProvider);
+-			srgMinecraftProvider.provide(provideContext);
+-		}
++			if (extension.isForge()) {
++				final SrgMinecraftProvider<?> srgMinecraftProvider = jarConfiguration.createSrgMinecraftProvider(project);
++				extension.setSrgMinecraftProvider(srgMinecraftProvider);
++				srgMinecraftProvider.provide(provideContext);
++			}
+ 
+-		if (extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime() && !extension.isUnobfuscatedForge()) {
+-			final MojangMappedMinecraftProvider<?> mojangMappedMinecraftProvider = jarConfiguration.createMojangMappedMinecraftProvider(project);
+-			extension.setMojangMappedMinecraftProvider(mojangMappedMinecraftProvider);
+-			mojangMappedMinecraftProvider.provide(provideContext);
+-		}
++			if (extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime() && !extension.isUnobfuscatedForge()) {
++				final MojangMappedMinecraftProvider<?> mojangMappedMinecraftProvider = jarConfiguration.createMojangMappedMinecraftProvider(project);
++				extension.setMojangMappedMinecraftProvider(mojangMappedMinecraftProvider);
++				mojangMappedMinecraftProvider.provide(provideContext);
++			}
++
++			return null;
++		});
+ 	}
+ 
+ 	private void registerGameProcessors(ConfigContext configContext) {
+@@ -615,9 +635,9 @@ public abstract class CompileConfiguration implements Runnable {
+ 		}
+ 
+ 		if (extension.isForgeLike()) {
++			dependencyProviders.addProvider(new ForgeUniversalProvider(project));
+ 			dependencyProviders.addProvider(new McpConfigProvider(project));
+ 			dependencyProviders.addProvider(new PatchProvider(project));
+-			dependencyProviders.addProvider(new ForgeUniversalProvider(project));
+ 		}
+ 
+ 		dependencyProviders.handleDependencies(project);
+diff --git a/src/main/java/net/fabricmc/loom/configuration/decompile/SingleJarDecompileConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/decompile/SingleJarDecompileConfiguration.java
+index 78525bb838cfcb8d58291054d07195ca1579f433..79d5cd6c4a57ba65632e946e74bfe880cc547c5c 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/decompile/SingleJarDecompileConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/decompile/SingleJarDecompileConfiguration.java
+@@ -76,7 +76,7 @@ public class SingleJarDecompileConfiguration extends DecompileConfiguration<Mapp
+ 		});
+ 
+ 		// TODO: Support for env-only jars?
+-		if (extension.isForge() && extension.getMinecraftJarConfiguration().get() == MinecraftJarConfiguration.MERGED) {
++		if (extension.isForge() && !extension.isLegacyForge() && extension.getMinecraftJarConfiguration().get() == MinecraftJarConfiguration.MERGED) {
+ 			project.getTasks().register("genForgePatchedSources", GenerateForgePatchedSourcesTask.class, task -> {
+ 				task.setDescription("Decompile Minecraft using Forge's toolchain.");
+ 				task.setGroup(Constants.TaskGroup.FABRIC);
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/LocalMavenHelper.java b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/LocalMavenHelper.java
+index 5d5184f619e520124b3dc150a84c385ef7af90dd..e9438e9ec3493a49c5fa0d112207d3c9f3216d39 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/LocalMavenHelper.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/LocalMavenHelper.java
+@@ -41,7 +41,7 @@ public record LocalMavenHelper(String group, String name, String version, @Nulla
+ 	}
+ 
+ 	public Path copyToMaven(Path artifact, @Nullable String classifier) throws IOException {
+-		if (!artifact.getFileName().toString().endsWith(".jar")) {
++		if (!artifact.getFileName().toString().endsWith(".jar") && !artifact.getFileName().toString().endsWith(".zip")) {
+ 			throw new UnsupportedOperationException();
+ 		}
+ 
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/GeneratedIntermediateMappingsProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/GeneratedIntermediateMappingsProvider.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..88290916122f4bb8cc20f76975806801940d524a
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/GeneratedIntermediateMappingsProvider.java
+@@ -0,0 +1,102 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.configuration.providers.mappings;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++
++import dev.architectury.loom.util.LoggerFilter;
++import dev.architectury.loom.util.Stopwatch;
++import org.jspecify.annotations.NonNull;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import net.fabricmc.loom.api.mappings.intermediate.IntermediateMappingsProvider;
++import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarMerger;
++import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
++import net.fabricmc.mappingio.MappingReader;
++import net.fabricmc.mappingio.MappingWriter;
++import net.fabricmc.mappingio.format.MappingFormat;
++import net.fabricmc.stitch.commands.CommandGenerateIntermediary;
++
++public abstract class GeneratedIntermediateMappingsProvider extends IntermediateMappingsProvider {
++	private static final Logger LOGGER = LoggerFactory.getLogger(GeneratedIntermediateMappingsProvider.class);
++
++	public MinecraftProvider minecraftProvider;
++
++	@Override
++	public void provide(Path tinyMappings) throws IOException {
++		if (Files.exists(tinyMappings)) {
++			return;
++		}
++
++		Stopwatch stopwatch = Stopwatch.createStarted();
++		LOGGER.info(":generating dummy intermediary");
++
++		// create a temporary folder into which stitch will output the v1 file
++		// we cannot just create a temporary file directly, cause stitch will try to read it if it exists
++		Path tmpFolder = Files.createTempDirectory("dummy-intermediary");
++		Path tinyV1 = tmpFolder.resolve("intermediary-v1.tiny");
++		Path mergedJar = tmpFolder.resolve("merged.jar");
++
++		try {
++			File clientJar = minecraftProvider.getMinecraftClientJar();
++			File serverJar = minecraftProvider.getMinecraftServerJar();
++
++			try (var jarMerger = new MinecraftJarMerger(clientJar, serverJar, mergedJar.toFile())) {
++				jarMerger.enableSyntheticParamsOffset();
++				jarMerger.merge();
++			}
++
++			CommandGenerateIntermediary command = new CommandGenerateIntermediary();
++			LoggerFilter.withSystemOutAndErrSuppressed(() -> {
++				try {
++					command.run(new String[]{ mergedJar.toAbsolutePath().toString(), tinyV1.toAbsolutePath().toString() });
++				} catch (IOException e) {
++					throw e;
++				} catch (Exception e) {
++					throw new IOException("Failed to generate intermediary", e);
++				}
++			});
++
++			try (MappingWriter writer = MappingWriter.create(tinyMappings, MappingFormat.TINY_2_FILE)) {
++				MappingReader.read(tinyV1, writer);
++			}
++		} finally {
++			Files.deleteIfExists(mergedJar);
++			Files.deleteIfExists(tinyV1);
++			Files.delete(tmpFolder);
++		}
++
++		LOGGER.info(":generated dummy intermediary in " + stopwatch.stop());
++	}
++
++	@Override
++	public @NonNull String getName() {
++		return "generated-intermediate";
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+index afde8b705dbadb2a6eefa80e1c96593cdce86b35..cbec005cc36e55e2bfb5125f2b3a039826a25cab 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+@@ -347,7 +347,12 @@ public class MappingConfiguration {
+ 
+ 	private static void mergeSrg(Project project, Path source, Path target) throws IOException {
+ 		Stopwatch stopwatch = Stopwatch.createStarted();
+-		ForgeMappingsMerger.ExtraMappings extraMappings = ForgeMappingsMerger.ExtraMappings.ofMojmapTsrg(getMojmapSrgFileIfPossible(project));
++		LoomGradleExtension extension = LoomGradleExtension.get(project);
++
++		// FIXME why is this special case necessary?
++		ForgeMappingsMerger.ExtraMappings extraMappings = extension.isLegacyForge()
++				? null
++				: ForgeMappingsMerger.ExtraMappings.ofMojmapTsrg(getMojmapSrgFileIfPossible(project));
+ 
+ 		try (Tiny2FileWriter writer = new Tiny2FileWriter(Files.newBufferedWriter(target, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING), false)) {
+ 			ForgeMappingsMerger.mergeSrg(getRawSrgFile(project), source, extraMappings, true).accept(writer);
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/library/LibraryProcessorManager.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/library/LibraryProcessorManager.java
+index 56d793d19d95e150f1c2f88c0e2c705e2bc96d37..3ec5e24e1ebdb46803887d2a07f8da5d2f31f2a3 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/library/LibraryProcessorManager.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/library/LibraryProcessorManager.java
+@@ -35,6 +35,7 @@ import org.jetbrains.annotations.VisibleForTesting;
+ 
+ import net.fabricmc.loom.configuration.providers.minecraft.library.processors.ArmNativesLibraryProcessor;
+ import net.fabricmc.loom.configuration.providers.minecraft.library.processors.LWJGL2MavenLibraryProcessor;
++import net.fabricmc.loom.configuration.providers.minecraft.library.processors.LWJGL2UpgradeLibraryProcessor;
+ import net.fabricmc.loom.configuration.providers.minecraft.library.processors.LWJGL3UpgradeLibraryProcessor;
+ import net.fabricmc.loom.configuration.providers.minecraft.library.processors.LegacyASMLibraryProcessor;
+ import net.fabricmc.loom.configuration.providers.minecraft.library.processors.LoomNativeSupportLibraryProcessor;
+@@ -50,6 +51,7 @@ public class LibraryProcessorManager {
+ 			LegacyASMLibraryProcessor::new,
+ 			LoomNativeSupportLibraryProcessor::new,
+ 			LWJGL2MavenLibraryProcessor::new,
++			LWJGL2UpgradeLibraryProcessor::new,
+ 			LWJGL3UpgradeLibraryProcessor::new,
+ 			ObjcBridgeUpgradeLibraryProcessor::new,
+ 			RuntimeLog4jLibraryProcessor::new
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/library/processors/LWJGL2UpgradeLibraryProcessor.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/library/processors/LWJGL2UpgradeLibraryProcessor.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..47ac1cfb0a3d1af85ab0b9c7e14dc20129a77d55
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/library/processors/LWJGL2UpgradeLibraryProcessor.java
+@@ -0,0 +1,103 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2023 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.configuration.providers.minecraft.library.processors;
++
++import java.util.function.Consumer;
++import java.util.function.Predicate;
++import java.util.regex.Pattern;
++
++import org.gradle.api.artifacts.dsl.RepositoryHandler;
++import org.gradle.api.artifacts.repositories.MavenArtifactRepository;
++
++import net.fabricmc.loom.configuration.providers.minecraft.library.Library;
++import net.fabricmc.loom.configuration.providers.minecraft.library.LibraryContext;
++import net.fabricmc.loom.configuration.providers.minecraft.library.LibraryProcessor;
++import net.fabricmc.loom.util.Platform;
++
++/**
++ * A processor to upgrade LWJGL2. Primarily to add support for ARM64.
++ */
++public class LWJGL2UpgradeLibraryProcessor extends LibraryProcessor {
++	private static final String LWJGL_GROUP = "org.lwjgl.lwjgl";
++	private static final String LWJGL_VERSION = "2.9.4+legacyfabric.15";
++
++	public LWJGL2UpgradeLibraryProcessor(Platform platform, LibraryContext context) {
++		super(platform, context);
++	}
++
++	@Override
++	public ApplicationResult getApplicationResult() {
++		if (context.usesLWJGL3()) {
++			// Not using LWJGL2, can never apply this.
++			return ApplicationResult.DONT_APPLY;
++		}
++
++		if (platform.getArchitecture().isArm() && platform.getArchitecture().is64Bit()) {
++			// Original LWJGL2 does not have ARM64 natives
++			return ApplicationResult.MUST_APPLY;
++		}
++
++		return ApplicationResult.CAN_APPLY;
++	}
++
++	@Override
++	public Predicate<Library> apply(Consumer<Library> dependencyConsumer) {
++		return library -> {
++			if (library.is(LWJGL_GROUP)) {
++				dependencyConsumer.accept(library.withVersion(LWJGL_VERSION));
++				return false;
++			}
++
++			return true;
++		};
++	}
++
++	@Override
++	public void applyRepositories(RepositoryHandler repositories) {
++		legacyFabricLWJGL(repositories);
++	}
++
++	public static void legacyFabricLWJGL(RepositoryHandler repositories) {
++		if (repositories.findByName("LegacyFabricLWJGL") != null) {
++			// Already applied.
++			return;
++		}
++
++		MavenArtifactRepository legacyFabric = repositories.maven(repo -> {
++			repo.setName("LegacyFabricLWJGL");
++			repo.setUrl("https://maven.legacyfabric.net/");
++			repo.content(content -> {
++				content.includeVersionByRegex(Pattern.quote(LWJGL_GROUP), ".+", Pattern.quote(LWJGL_VERSION));
++			});
++		});
++
++		repositories.exclusiveContent(repository -> {
++			repository.forRepositories(legacyFabric);
++			repository.filter(filter -> {
++				filter.includeVersionByRegex(Pattern.quote(LWJGL_GROUP), ".+", Pattern.quote(LWJGL_VERSION));
++			});
++		});
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/util/fmj/FabricModJsonFactory.java b/src/main/java/net/fabricmc/loom/util/fmj/FabricModJsonFactory.java
+index ba3935d24783385d90768301690d0f698d7f47cd..45c1f48b59c2903f2a85a508d836d36722c2e1bf 100644
+--- a/src/main/java/net/fabricmc/loom/util/fmj/FabricModJsonFactory.java
++++ b/src/main/java/net/fabricmc/loom/util/fmj/FabricModJsonFactory.java
+@@ -188,7 +188,9 @@ public final class FabricModJsonFactory {
+ 
+ 	public static boolean isModJar(Path input, ModPlatform platform) {
+ 		if (platform.isForgeLike()) {
+-			return ZipUtils.contains(input, "META-INF/mods.toml") || (platform == ModPlatform.NEOFORGE && ZipUtils.contains(input, "META-INF/neoforge.mods.toml"));
++			return ZipUtils.contains(input, "META-INF/mods.toml")
++					|| ZipUtils.contains(input, "mcmod.info")
++					|| (platform == ModPlatform.NEOFORGE && ZipUtils.contains(input, "META-INF/neoforge.mods.toml"));
+ 		} else if (platform == ModPlatform.QUILT) {
+ 			return ZipUtils.contains(input, "quilt.mod.json") || isModJar(input, ModPlatform.FABRIC);
+ 		}
+@@ -212,7 +214,9 @@ public final class FabricModJsonFactory {
+ 		}
+ 
+ 		if (platform.isForgeLike()) {
+-			return Files.exists(fs.getPath("META-INF/mods.toml")) || (platform == ModPlatform.NEOFORGE && Files.exists(fs.getPath("META-INF/neoforge.mods.toml")));
++			return Files.exists(fs.getPath("META-INF/mods.toml"))
++					|| Files.exists(fs.getPath("mcmod.info"))
++					|| (platform == ModPlatform.NEOFORGE && Files.exists(fs.getPath("META-INF/neoforge.mods.toml")));
+ 		} else if (platform == ModPlatform.QUILT) {
+ 			return Files.exists(fs.getPath("quilt.mod.json")) || containsMod(fs, ModPlatform.FABRIC);
+ 		}

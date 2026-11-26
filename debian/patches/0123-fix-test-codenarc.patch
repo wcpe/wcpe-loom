@@ -1,0 +1,45 @@
+From 76079f50868b9636c5e90480b5f7368a0dce8a61 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Sun, 1 Nov 2026 16:17:30 +0800
+Subject: [PATCH 123/147] =?UTF-8?q?fix(test):=20=E4=BF=AE=E6=8E=89?=
+ =?UTF-8?q?=E4=B8=A4=E4=B8=AA=E6=B5=8B=E8=AF=95=E6=96=87=E4=BB=B6=E7=9A=84?=
+ =?UTF-8?q?=20codenarc=20=E8=BF=9D=E8=A7=84?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- CachedJarProcessorTest：删掉未使用的 java.nio.file.WatchService import
+- MinecraftJarsReuseTaskTest：new HashSet<String>() 改为 [] as Set<String>
+  （codenarc 的 ExplicitHashSetInstantiation 规则）
+
+两个都是本批新增测试引入的，`build check` 会因此失败，故单独修掉。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+Patch-Name: codenarc-fix
+
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/cache/CachedJarProcessorTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/cache/CachedJarProcessorTest.groovy
+index e010f138a2a6157c490d50ff011586473215815e..168a843e3aa9fae7079df45c425d448acbc58f48 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/cache/CachedJarProcessorTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/cache/CachedJarProcessorTest.groovy
+@@ -31,7 +31,6 @@ import java.nio.file.Paths
+ import java.nio.file.StandardWatchEventKinds
+ import java.nio.file.WatchEvent
+ import java.nio.file.WatchKey
+-import java.nio.file.WatchService
+ import java.time.Duration
+ import java.util.concurrent.TimeUnit
+ 
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/pipeline/MinecraftJarsReuseTaskTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/pipeline/MinecraftJarsReuseTaskTest.groovy
+index f51b7c590c77edde587c1eda164374776f0f598e..a3961806258b98fbd5da9b59c432fd927f026976 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/pipeline/MinecraftJarsReuseTaskTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/pipeline/MinecraftJarsReuseTaskTest.groovy
+@@ -244,7 +244,7 @@ class MinecraftJarsReuseTaskTest extends Specification {
+ 	}
+ 
+ 	private static Set<String> zipEntries(Path jar) {
+-		def entries = new HashSet<String>()
++		def entries = [] as Set<String>
+ 
+ 		FileSystemUtil.getReadOnlyJarFileSystem(jar).withCloseable { zip ->
+ 			Files.walk(zip.getPath("/")).withCloseable { stream ->

@@ -1,0 +1,32 @@
+From b4f8887cb80762a902219abc44d04fba20437459 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Wed, 25 Nov 2026 20:14:03 +0800
+Subject: [PATCH 147/147] =?UTF-8?q?fix(forge):=20=E6=81=A2=E5=A4=8D?=
+ =?UTF-8?q?=E9=9D=9E=E7=9B=AE=E6=A0=87=E5=B9=B3=E5=8F=B0=E7=9A=84=E5=8F=8D?=
+ =?UTF-8?q?=E7=BC=96=E8=AF=91=E7=9F=AD=E8=B7=AF?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+补齐拆分时遗漏的平台门控，非目标平台不提前读取游戏提供者。目标平台的源码选择保持原样。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+Patch-Name: forge-sources-platform-short-circuit
+
+diff --git a/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java b/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
+index e777de6c8946c980698025b8f3ff4dd0596a8af3..3361ce1ffe2f7f9e1b7459c8f1e6e92b91556b64 100644
+--- a/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
++++ b/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
+@@ -290,10 +290,8 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
+ 
+ 		getDaemonUtilsContext().set(getProject().getObjects().newInstance(DaemonUtils.Context.class, getProject()));
+ 
+-		if (!MinecraftPatchedProvider.usesMavenizer(getExtension(), getExtension().getMinecraftProvider())) {
++		if (!getExtension().isForge() || !MinecraftPatchedProvider.usesMavenizer(getExtension(), getExtension().getMinecraftProvider())) {
+ 			getForgeSourcesOptions().set(ForgeSourcesService.createOptions(getProject()));
+-
+-			// 提前展开 Forge 源码包；延迟探测任务以避免注册顺序约束。
+ 			dependsOn(getProject().getProviders().provider(() ->
+ 					getProject().getTasks().findByName(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME) == null
+ 							? java.util.List.of()

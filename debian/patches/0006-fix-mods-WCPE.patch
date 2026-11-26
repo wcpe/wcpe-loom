@@ -1,0 +1,91 @@
+From 77e2d15958691e2149b9c7b8add8a6b4eb566771 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:23 +0800
+Subject: [PATCH 006/147] =?UTF-8?q?fix(mods):=20=E7=89=88=E6=9C=AC?=
+ =?UTF-8?q?=E6=A0=A1=E9=AA=8C=E5=85=BC=E5=AE=B9=20WCPE=20=E7=89=88?=
+ =?UTF-8?q?=E6=9C=AC=E5=90=8E=E7=BC=80?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+本 fork 的版本号带自定义后缀，原有校验会误判为不兼容。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/ArtifactMetadata.java b/src/main/java/net/fabricmc/loom/configuration/mods/ArtifactMetadata.java
+index 694b3388c5d199db6a0f7cdef617560c851e3fad..09b1744080e00de6d8ef325f1f9d4edd5299d095 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/ArtifactMetadata.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/ArtifactMetadata.java
+@@ -154,13 +154,10 @@ public record ArtifactMetadata(boolean isFabricMod, RemapRequirements remapRequi
+ 			return;
+ 		}
+ 
+-		final String[] versionParts = version.split("\\.");
+-		final String[] currentVersionParts = currentLoomVersion.split("\\.");
+-
+ 		// Check major and minor version
+ 		for (int i = 0; i < 2; i++) {
+-			final int versionPart = Integer.parseInt(versionParts[i]);
+-			final int currentVersionPart = Integer.parseInt(currentVersionParts[i]);
++			final int versionPart = parseVersionPart(version, i);
++			final int currentVersionPart = parseVersionPart(currentLoomVersion, i);
+ 
+ 			if (versionPart > currentVersionPart) {
+ 				if (lenient) {
+@@ -176,6 +173,17 @@ public record ArtifactMetadata(boolean isFabricMod, RemapRequirements remapRequi
+ 		}
+ 	}
+ 
++	private static int parseVersionPart(String version, int part) {
++		final String normalizedVersion = version.replaceFirst("-wcpe-(?:0|[1-9]\\d*|dev|ci)$", "");
++		final String[] versionParts = normalizedVersion.split("\\.");
++
++		if (versionParts.length <= part || !versionParts[part].matches("\\d+")) {
++			throw new IllegalStateException("Invalid Loom version: " + version);
++		}
++
++		return Integer.parseInt(versionParts[part]);
++	}
++
+ 	public boolean shouldRemap() {
+ 		return remapRequirements().getShouldRemap().test(this);
+ 	}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/ArtifactMetadataTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/ArtifactMetadataTest.groovy
+index 50b9932096e674d32af27cb7dbffb9a5b9babbe8..df729da3697d27e609514f1688b52d675d0caf0d 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/ArtifactMetadataTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/ArtifactMetadataTest.groovy
+@@ -140,6 +140,9 @@ class ArtifactMetadataTest extends Specification {
+ 		"1.4"       | "1.4.local"
+ 		"1.5"       | "1.4.99"
+ 		"2.0"       | "1.4.99"
++		"1.17-wcpe-6" | "1.17-wcpe-5"
++		"1.17-wcpe-6" | "1.17-wcpe-6"
++		"1.18-wcpe-6" | "1.17-wcpe-5"
+ 	}
+ 
+ 	// Test that a mod with the same or older version of loom can be read
+@@ -157,6 +160,23 @@ class ArtifactMetadataTest extends Specification {
+ 		"1.4"       | "1.5.00"
+ 		"1.4"       | "2.0"
+ 		"1.4"       | "2.4"
++		"1.17-wcpe-6" | "1.18-wcpe-1"
++	}
++
++	def "Invalid formatted loom version"() {
++		given:
++		def zip = createModWithRemapType(modLoomVersion, "static")
++		when:
++		createMetadata(zip, loomVersion)
++		then:
++		def e = thrown(IllegalStateException)
++		e.message == "Invalid Loom version: $invalidVersion"
++		where:
++		loomVersion      | modLoomVersion      | invalidVersion
++		"1.x"            | "1.17-wcpe-6"      | "1.x"
++		"1.17-wcpe-6"   | "1.x"              | "1.x"
++		"1.17-wcpe-6"   | "1.17-wcpe-x"     | "1.17-wcpe-x"
++		"1.17-wcpe-6"   | "1.17-wcpe-"      | "1.17-wcpe-"
+ 	}
+ 
+ 	def "Accepts all Loom versions for remap 'false'"() {

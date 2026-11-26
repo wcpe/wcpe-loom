@@ -1,0 +1,346 @@
+From cc1beac8cc2e36a6350322811992e3d11680878e Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Sun, 1 Nov 2026 15:07:00 +0800
+Subject: [PATCH 120/147] =?UTF-8?q?perf(cache):=20=E5=85=A8=E5=91=BD?=
+ =?UTF-8?q?=E4=B8=AD=E6=97=B6=E4=B8=8D=E5=86=8D=E5=A4=8D=E5=88=B6=E6=95=B4?=
+ =?UTF-8?q?=E5=8C=85=20classes=20=E8=BF=9B=E4=B8=B4=E6=97=B6=20jar?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+prepareJob() 原先一进来就 createTempFile("loom-cache-existingClasses")，然后对每个
+缓存命中的类都 entry.copyTo(inputFs.getRoot(), existingClassesFs.getRoot())，把这个
+临时 jar 填成一整份「命中类的 classes 副本」。
+
+但这份副本只有 PartialWorkJob 用得上——它被当作反编译器处理未命中类时的 classpath
+（GenerateSourcesTask 把它传给 runDecompileJob / unpickJar）。另外两条分支里它都是
+纯浪费：
+
+  · CompletedWorkJob（全命中）：一个类都不用反编译，紧接着就把这个 jar 删掉；
+    而复制的量级是整包 classes。
+  · FullWorkJob（全 miss）：没有任何命中类，jar 一直是空壳，同样立刻删掉。
+
+改为：命中类先只收集到 cachedClasses 列表；只有在 isIncomplete && hasSomeExisting
+（即确实要走 PartialWorkJob）时，才调用新增的 writeExistingClassesJar(...) 建出
+这个 jar 并逐个 copyTo。FullWorkJob / CompletedWorkJob 两个分支因此不再创建它，
+也就去掉了它们原先的 Files.delete(existingClassesJar)。
+
+partial 分支的行为逐条保持不变：jar 仍由同一个 createTempFile 前缀生成、仍先删空
+文件再建 zipfs、仍包含全部命中类的 class 与内部类（cachedClasses 里的就是原来逐个
+copyTo 的那些 ClassEntry，只在最后统一复制，顺序与集合不变）。字段 existingClassesJar
+仍是 @NullMarked 包里的 Path，故声明为可空并只在 partial 分支有值——正好与
+PartialWorkJob.existingClasses 的唯一消费点一致。
+
+产物的输入输出声明、产物路径、Gradle 参数一律未改。
+
+测试（CachedJarProcessorTest 新增三条，用临时目录的 WatchService 观测 createTempFile
+是否发生，因为这三个 jar 都会在 prepareJob 返回前被删掉，事后无法用文件存在性断言）：
+
+  · 全命中：只创建 existingSources / incomplete / output，existingClasses 从未出现；
+  · 全 miss：同上，仍不创建 existingClasses；
+  · partial：创建 existingClasses，且其中确实含有命中类 Example.class（防止「省掉
+    复制把反编译器 classpath 改坏」）。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: decompile-cache-opt-part2
+
+diff --git a/src/main/java/net/fabricmc/loom/decompilers/cache/CachedJarProcessor.java b/src/main/java/net/fabricmc/loom/decompilers/cache/CachedJarProcessor.java
+index b0a618802c8c79ac6aa20cf0fe3a38249b5363e7..5367a7893b1c33cb16256714b8dc4872c2e12df9 100644
+--- a/src/main/java/net/fabricmc/loom/decompilers/cache/CachedJarProcessor.java
++++ b/src/main/java/net/fabricmc/loom/decompilers/cache/CachedJarProcessor.java
+@@ -27,6 +27,7 @@ package net.fabricmc.loom.decompilers.cache;
+ import java.io.IOException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.Iterator;
+@@ -49,25 +50,30 @@ public record CachedJarProcessor(CachedFileStore<CachedData> fileStore, String b
+ 		boolean hasSomeExisting = false;
+ 
+ 		Path incompleteJar = Files.createTempFile("loom-cache-incomplete", ".jar");
+-		Path existingClassesJar = Files.createTempFile("loom-cache-existingClasses", ".jar");
+ 		Path existingSourcesJar = Files.createTempFile("loom-cache-existingSources", ".jar");
+ 
+ 		// We must delete the empty files, so they can be created as a zip
+ 		Files.delete(incompleteJar);
+-		Files.delete(existingClassesJar);
+ 		Files.delete(existingSourcesJar);
+ 
+ 		// Sources name -> hash
+ 		Map<String, String> outputNameMap = new HashMap<>();
+ 		Map<String, ClassLineNumbers.Entry> lineNumbersMap = new HashMap<>();
++		// Classes that came from the cache, kept around to be copied into the existing classes jar
++		// only if there is some work left to do (see below).
++		List<ClassEntry> cachedClasses = new ArrayList<>();
++
++		// A jar containing the classes that came from the cache, used as the classpath of the classes
++		// that still have to be decompiled. Left null when there is nothing to decompile, in which
++		// case nothing would ever read it (see the CompletedWorkJob branch below).
++		Path existingClassesJar = null;
+ 
+ 		int hits = 0;
+ 		int misses = 0;
+ 
+ 		try (FileSystemUtil.Delegate inputFs = FileSystemUtil.getReadOnlyJarFileSystem(inputJar);
+ 				FileSystemUtil.Delegate incompleteFs = FileSystemUtil.getJarFileSystem(incompleteJar, true);
+-				FileSystemUtil.Delegate existingSourcesFs = FileSystemUtil.getJarFileSystem(existingSourcesJar, true);
+-				FileSystemUtil.Delegate existingClassesFs = FileSystemUtil.getJarFileSystem(existingClassesJar, true)) {
++				FileSystemUtil.Delegate existingSourcesFs = FileSystemUtil.getJarFileSystem(existingSourcesJar, true)) {
+ 			final List<ClassEntry> inputClasses = JarWalker.findClasses(inputFs);
+ 			final Map<String, String> rawEntryHashes = getEntryHashes(inputClasses, inputFs.getRoot());
+ 
+@@ -90,7 +96,9 @@ public record CachedJarProcessor(CachedFileStore<CachedData> fileStore, String b
+ 					createParentDirectories(outputPath);
+ 					Files.writeString(outputPath, entryData.sources());
+ 
+-					entry.copyTo(inputFs.getRoot(), existingClassesFs.getRoot());
++					// The copy into the existing classes jar is deferred until we know whether anything
++					// is left to decompile.
++					cachedClasses.add(entry);
+ 
+ 					if (entryData.lineNumbers() != null) {
+ 						lineNumbersMap.put(entryData.className(), entryData.lineNumbers());
+@@ -104,6 +112,12 @@ public record CachedJarProcessor(CachedFileStore<CachedData> fileStore, String b
+ 					hits++;
+ 				}
+ 			}
++
++			if (isIncomplete && hasSomeExisting) {
++				// Some classes still have to be decompiled, and they need the cached classes as their
++				// classpath.
++				existingClassesJar = writeExistingClassesJar(cachedClasses, inputFs.getRoot());
++			}
+ 		}
+ 
+ 		// A jar file that will be created by the work action, containing the newly processed items.
+@@ -116,7 +130,6 @@ public record CachedJarProcessor(CachedFileStore<CachedData> fileStore, String b
+ 		if (isIncomplete && !hasSomeExisting) {
+ 			// The cache contained nothing of use, fully process the input jar
+ 			Files.delete(incompleteJar);
+-			Files.delete(existingClassesJar);
+ 			Files.delete(existingSourcesJar);
+ 
+ 			LOGGER.info("No cached entries found, going to process the whole jar");
+@@ -131,12 +144,37 @@ public record CachedJarProcessor(CachedFileStore<CachedData> fileStore, String b
+ 			// The cached contained everything we need, so the existing jar is the output
+ 			LOGGER.info("All cached entries found, using completed work job");
+ 			Files.delete(incompleteJar);
+-			Files.delete(existingClassesJar);
+ 			return new CompletedWorkJob(existingSourcesJar)
+ 					.asRequest(stats, lineNumbers);
+ 		}
+ 	}
+ 
++	/**
++	 * Write the given classes (copied from the input jar) into a fresh temporary jar.
++	 *
++	 * <p>Only called when at least one class still has to be decompiled, in which case the jar is used
++	 * as the classpath of the decompiler. When every class was a cache hit nobody would ever read the
++	 * jar, so copying the whole set of classes into it is pure waste.
++	 *
++	 * @param entries the classes to copy
++	 * @param inputRoot the root of the jar the classes are read from
++	 * @return the path of the written jar
++	 */
++	private static Path writeExistingClassesJar(List<ClassEntry> entries, Path inputRoot) throws IOException {
++		Path existingClassesJar = Files.createTempFile("loom-cache-existingClasses", ".jar");
++
++		// We must delete the empty file, so it can be created as a zip
++		Files.delete(existingClassesJar);
++
++		try (FileSystemUtil.Delegate existingClassesFs = FileSystemUtil.getJarFileSystem(existingClassesJar, true)) {
++			for (ClassEntry entry : entries) {
++				entry.copyTo(inputRoot, existingClassesFs.getRoot());
++			}
++		}
++
++		return existingClassesJar;
++	}
++
+ 	private static Map<String, String> getEntryHashes(List<ClassEntry> entries, Path root) throws IOException {
+ 		final Map<String, String> rawEntryHashes = new HashMap<>();
+ 
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/cache/CachedJarProcessorTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/cache/CachedJarProcessorTest.groovy
+index 0a85a05ce17590fa66f1e2a7144026302288711f..e010f138a2a6157c490d50ff011586473215815e 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/cache/CachedJarProcessorTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/cache/CachedJarProcessorTest.groovy
+@@ -24,9 +24,16 @@
+ 
+ package net.fabricmc.loom.test.unit.cache
+ 
++import java.nio.file.FileSystems
+ import java.nio.file.Files
+ import java.nio.file.Path
++import java.nio.file.Paths
++import java.nio.file.StandardWatchEventKinds
++import java.nio.file.WatchEvent
++import java.nio.file.WatchKey
++import java.nio.file.WatchService
+ import java.time.Duration
++import java.util.concurrent.TimeUnit
+ 
+ import org.objectweb.asm.ClassWriter
+ import org.objectweb.asm.Opcodes
+@@ -57,6 +64,14 @@ class CachedJarProcessorTest extends Specification {
+ 	static String TestHash = "abc123/62db36eda67a8bdb19626126176aa0fccc64a509ac808db166e9795caac5a784"
+ 	static String TestDanglingHash = "abc123/6659d90f0ac7ee783c8b44e51c08d4388477ef3fa998f1d6d4fc95f4adf628ca"
+ 
++	// The temporary jars prepareJob creates, by createTempFile prefix.
++	static final List<String> CACHE_JAR_PREFIXES = [
++		"loom-cache-incomplete",
++		"loom-cache-existingClasses",
++		"loom-cache-existingSources",
++		"loom-cache-output",
++	]
++
+ 	static CachedData ExampleCachedData = new CachedData("net/fabricmc/Example", "Example sources", lineNumber("net/fabricmc/Example"))
+ 	static CachedData TestCachedData = new CachedData("net/fabricmc/other/Test", "Test sources", lineNumber("net/fabricmc/other/Test"))
+ 	static CachedData TestDanglingCachedData = new CachedData("net/fabricmc/other/Test\$Dangling", "Test\$Dangling sources", lineNumber("net/fabricmc/other/Test\$Dangling"))
+@@ -228,6 +243,90 @@ class CachedJarProcessorTest extends Specification {
+ 		0 * _ // Strict mock
+ 	}
+ 
++	/**
++	 * When every class is a cache hit nothing is going to be decompiled, so the jar holding the cached
++	 * classes — which the partial branch hands to the decompiler as its classpath — is never read.
++	 * Copying the whole set of classes into it is pure waste (the jar was discarded again right away),
++	 * so it must not be created at all.
++	 */
++	def "prepare job does not create the existing classes jar when every class is a cache hit"() {
++		given:
++		def jar = ZipTestUtils.createZipFromBytes(jarEntries)
++		def cache = Mock(CachedFileStore)
++		def processor = new CachedJarProcessor(cache, "abc123")
++
++		when:
++		def createdJars = createJarsOf(processor, jar)
++
++		then: "no classes jar is created, only the ones the completed branch still uses"
++		createdJars.sort() == [
++			"loom-cache-existingSources",
++			"loom-cache-incomplete",
++			"loom-cache-output"
++		]
++
++		and: "the cache is still consulted for every class"
++		1 * cache.getEntry(ExampleHash) >> ExampleCachedData
++		1 * cache.getEntry(TestHash) >> TestCachedData
++		1 * cache.getEntry(TestDanglingHash) >> TestDanglingCachedData
++
++		0 * _ // Strict mock
++	}
++
++	/**
++	 * A full miss needs no classes jar either: the whole input jar is decompiled, so nothing from the
++	 * cache has to be put on the decompiler classpath.
++	 */
++	def "prepare job does not create the existing classes jar on a full miss"() {
++		given:
++		def jar = ZipTestUtils.createZipFromBytes(jarEntries)
++		def cache = Mock(CachedFileStore)
++		def processor = new CachedJarProcessor(cache, "abc123")
++
++		when:
++		def createdJars = createJarsOf(processor, jar)
++
++		then:
++		createdJars.sort() == [
++			"loom-cache-existingSources",
++			"loom-cache-incomplete",
++			"loom-cache-output"
++		]
++
++		3 * cache.getEntry(_) >> null
++
++		0 * _ // Strict mock
++	}
++
++	/**
++	 * The partial branch still has to hand the decompiler the classes that came from the cache, so the
++	 * jar is created there and contains them.
++	 */
++	def "prepare job creates the existing classes jar when some classes are left to decompile"() {
++		given:
++		def jar = ZipTestUtils.createZipFromBytes(jarEntries)
++		def cache = Mock(CachedFileStore)
++		def processor = new CachedJarProcessor(cache, "abc123")
++
++		when:
++		def createdJars = createJarsOf(processor, jar)
++		def workJob = processor.prepareJob(jar).job() as CachedJarProcessor.PartialWorkJob
++
++		then:
++		createdJars.sort() == [
++			"loom-cache-existingClasses",
++			"loom-cache-existingSources",
++			"loom-cache-incomplete",
++			"loom-cache-output"
++		]
++		ZipUtils.unpackNullable(workJob.existingClasses(), "net/fabricmc/Example.class") == newClass("net/fabricmc/Example")
++
++		2 * cache.getEntry(ExampleHash) >> ExampleCachedData
++		4 * cache.getEntry(_) >> null
++
++		0 * _ // Strict mock
++	}
++
+ 	def "complete completed work job"() {
+ 		given:
+ 		def jar = ZipTestUtils.createZipFromBytes(jarEntries)
+@@ -316,6 +415,53 @@ class CachedJarProcessorTest extends Specification {
+ 		newWorkJob instanceof CachedJarProcessor.FullWorkJob
+ 	}
+ 
++	/**
++	 * Run {@code prepareJob} while watching the temporary directory, and return which of the cache jars
++	 * it created. The expected names are reported by prefix, as every one of them is a
++	 * {@code createTempFile} temp file with a random suffix.
++	 *
++	 * <p>Watched rather than asserted by path because all of these jars are deleted again before
++	 * {@code prepareJob} returns, so listing the directory before/after cannot see them; watching is
++	 * done from the outside so the code under test needs no test hook. The watch is non-recursive, which
++	 * is all {@code createTempFile} in the temp dir itself needs.
++	 */
++	private Set<String> createJarsOf(CachedJarProcessor processor, Path jar) {
++		def tempDir = Paths.get(System.getProperty("java.io.tmpdir"))
++		def created = new LinkedHashSet<String>()
++		def watchService = FileSystems.getDefault().newWatchService()
++
++		try {
++			tempDir.register(watchService, StandardWatchEventKinds.ENTRY_CREATE)
++			processor.prepareJob(jar)
++
++			// Drain everything the watch service queued up while the job was being prepared.
++			WatchKey key
++
++			while ((key = watchService.poll(500, TimeUnit.MILLISECONDS)) != null) {
++				for (WatchEvent<?> event : key.pollEvents()) {
++					def name = event.context()?.toString()
++
++					if (name == null) {
++						// Overflow event, nothing to identify.
++						continue
++					}
++
++					def prefix = CACHE_JAR_PREFIXES.find { name.startsWith(it) }
++
++					if (prefix != null) {
++						created.add(prefix)
++					}
++				}
++
++				key.reset()
++			}
++		} finally {
++			watchService.close()
++		}
++
++		return created
++	}
++
+ 	private static ClassLineNumbers lineNumbers(List<String> names) {
+ 		return new ClassLineNumbers(names.collectEntries { [it, lineNumber(it)] })
+ 	}

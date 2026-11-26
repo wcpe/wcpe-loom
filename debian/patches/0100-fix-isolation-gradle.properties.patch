@@ -1,0 +1,114 @@
+From 68189ad0845a27894e2bc7da2a868d946b733a28 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Mon, 26 Oct 2026 16:46:17 +0800
+Subject: [PATCH 100/147] =?UTF-8?q?fix(isolation):=20=E9=9A=94=E7=A6=BB?=
+ =?UTF-8?q?=E9=A1=B9=E7=9B=AE=E4=B8=8B=E8=83=BD=E8=AF=BB=E5=88=B0=E5=AD=90?=
+ =?UTF-8?q?=E9=A1=B9=E7=9B=AE=E8=87=AA=E5=B7=B1=E7=9A=84=20gradle.properti?=
+ =?UTF-8?q?es?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+隔离项目模式下 getProperty 走 providers.gradleProperty，而它只覆盖
+GRADLE_USER_HOME 与**根项目**的 gradle.properties，读不到子项目目录下那份。
+子项目把自己的属性写在各自 gradle.properties 是合法且常见的用法——本仓库
+Forge 车道就靠 <sub>/gradle.properties 的 loom.platform=forge 声明平台。
+
+读不到的后果是静默的：platform 退化为默认的 FABRIC → isForgeLike() 为
+false → LoomConfigurations 跳过注册 forge/neoforge 相关 configuration，
+最终表现为项目执行 add("forge", ...) 时报
+
+  Configuration with name 'forge' not found
+
+而同一份代码关掉 Isolated Projects 就正常，因此很容易被误判成项目自身配置
+问题。实测 MultiPlatformModTemplate 的 :platform:forge:forge-1.12.2 车道
+即栽在此处。
+
+改法：gradleProperty 未命中时再读**本项目目录**的 gradle.properties，并把
+该文件登记为配置缓存输入。刻意不用 project.findProperty()——它在属性未定义
+时沿层级向父项目查找，隔离项目下会被判定为跨项目访问；这里只读自己目录，
+不回溯父级，因此安全。
+
+影响面不止 forge：loom.platform / loom.forge / loom.sandbox /
+loom.runtimeJavaCompatibilityVersion 等走同一入口的配置项在隔离项目下都会
+静默失效，修这一处覆盖全部。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/util/gradle/GradleUtils.java b/src/main/java/net/fabricmc/loom/util/gradle/GradleUtils.java
+index 41be1647596bc630333ab1bba003429df1175800..982d931c38923bed25eca7b1ed52a55836bdf8ab 100644
+--- a/src/main/java/net/fabricmc/loom/util/gradle/GradleUtils.java
++++ b/src/main/java/net/fabricmc/loom/util/gradle/GradleUtils.java
+@@ -25,6 +25,10 @@
+ package net.fabricmc.loom.util.gradle;
+ 
+ import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.file.Files;
++import java.util.Properties;
+ import java.util.function.Consumer;
+ 
+ import org.gradle.api.Project;
+@@ -136,12 +140,59 @@ public final class GradleUtils {
+ 		LoomGradleExtension extension = LoomGradleExtension.get(project);
+ 
+ 		if (extension.isProjectIsolationActive()) {
+-			return project.getProviders().gradleProperty(key).getOrNull();
++			final String gradleProperty = project.getProviders().gradleProperty(key).getOrNull();
++
++			if (gradleProperty != null) {
++				return gradleProperty;
++			}
++
++			// gradleProperty 只覆盖 GRADLE_USER_HOME 与**根项目**的 gradle.properties，
++			// 读不到子项目目录下那份。而子项目把自己的属性写在各自的 gradle.properties 是
++			// 合法且常见的用法（本仓库的 Forge 车道就靠 <sub>/gradle.properties 里的
++			// loom.platform=forge 声明平台）。早期这里直接返回 null，导致 platform 退化为
++			// 默认的 FABRIC → isForgeLike() 为 false → forge/neoforge 相关 configuration
++			// 根本不注册，最终表现为项目执行 add("forge", ...) 时报
++			// 「Configuration with name 'forge' not found」。
++			//
++			// 刻意不用 project.findProperty()：它在属性未定义时会沿层级向父项目查找，
++			// 隔离项目下会被判定为跨项目访问（cannot dynamically look up a property in
++			// the parent project）。这里只读**本项目目录**下的文件，不产生任何跨项目读取。
++			return readOwnGradleProperties(project, key);
+ 		}
+ 
+ 		return project.findProperty(key);
+ 	}
+ 
++	/**
++	 * 从**本项目目录**的 {@code gradle.properties} 读取属性；不存在该文件时返回 {@code null}.
++	 *
++	 * <p>只读本项目目录，不向父项目回溯，因此在隔离项目模式下是安全的。
++	 * 文件内容变化会进入配置缓存输入（见 {@link #configurationInputFile}），
++	 * 与 Gradle 自身对该文件的处理一致。
++	 */
++	@Nullable
++	private static String readOwnGradleProperties(Project project, String key) {
++		final File propertiesFile = new File(project.getProjectDir(), "gradle.properties");
++
++		if (!propertiesFile.isFile()) {
++			return null;
++		}
++
++		configurationInputFile(project, propertiesFile);
++
++		final Properties properties = new Properties();
++
++		try (InputStream input = Files.newInputStream(propertiesFile.toPath())) {
++			properties.load(input);
++		} catch (IOException e) {
++			// 读不出来时按「没有这个属性」处理，与 gradleProperty 未命中的语义保持一致，
++			// 不把可选的属性读取升级成构建失败。
++			return null;
++		}
++
++		return properties.getProperty(key);
++	}
++
+ 	// A hack to include the given file in the configuration cache input
+ 	// this ensures that configuration cache is invalidated when the file changes
+ 	public static File configurationInputFile(Project project, File file) {

@@ -1,0 +1,44 @@
+From 232199b8e05265d47bce6dd5f6e7cf2e6e7f75f3 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:35 +0800
+Subject: [PATCH 027/147] =?UTF-8?q?ci:=20=E6=B5=8B=E8=AF=95=E5=B7=A5?=
+ =?UTF-8?q?=E4=BD=9C=E6=B5=81=E9=99=90=E5=AE=9A=E5=88=86=E6=94=AF=E5=B9=B6?=
+ =?UTF-8?q?=E6=8E=92=E9=99=A4=20tag=20=E6=8E=A8=E9=80=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上游基底的 .github/workflows/test-push.yml 使用裸 `on: push`，会匹配一切 ref。
+本仓库的 patch-queue/<线> 是可移动的队列标记 tag，每次向队列插入补丁都会 force-push
+前移一次，于是每个这样的 tag 推送都会白跑一轮完整测试（实测单次约 40 分钟）。正式版
+tag wcpe-v* 与分支推送的分工由 publish.yml 承担，本工作流不需要响应任何 tag。
+
+- on.push 增加 branches 限定为 dev/1.17-wcpe，并加 tags-ignore: '**' 排除全部 tag。
+
+修正必须落在补丁段：推送 tag 时 GitHub 读取的是该 tag 所指向提交上的工作流文件，
+而 patch-queue/1.17 指向补丁段提交（即本提交所在的段）。仅在默认分支的元数据提交上
+修正对队列 tag 无效。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/.github/workflows/test-push.yml b/.github/workflows/test-push.yml
+index 1556ae6c73611e2afdaf590cd0c48981b9062bc2..b57dcbe1f0b4717ed7127728df4f8e2000b1e7e2 100644
+--- a/.github/workflows/test-push.yml
++++ b/.github/workflows/test-push.yml
+@@ -1,6 +1,15 @@
+ name: Run Tests
+ on:
+   push:
++    branches:
++      - dev/1.17-wcpe
++    # 显式排除所有 tag。本仓库的 patch-queue/<线> 是可移动的队列标记 tag，每次插入补丁
++    # 都会 force-push 前移一次；wcpe-v* 正式版 tag 的发布由 publish.yml 负责。
++    # 上游原版此处为 `on: push`（无过滤），会匹配一切 ref，导致每次前移队列标记都白跑
++    # 一轮完整测试（实测约 40 分钟）。注意此文件随补丁队列一起被重放，tag 推送触发时
++    # GitHub 读取的正是本提交上的版本，故修正必须落在队列内。
++    tags-ignore:
++      - '**'
+   pull_request:
+   workflow_dispatch:
+     inputs:

@@ -1,0 +1,430 @@
+From aaa01d87fec30cae93dcc3a3cce163f1247fc98f Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Wed, 28 Oct 2026 13:04:41 +0800
+Subject: [PATCH 103/147] =?UTF-8?q?fix(configuration):=20=E5=8E=BB?=
+ =?UTF-8?q?=E6=8E=89=E5=B9=B6=E8=A1=8C=E9=85=8D=E7=BD=AE=E4=B8=8B=E4=BC=9A?=
+ =?UTF-8?q?=E6=AD=BB=E9=94=81=E7=9A=84=E8=B7=A8=E9=A1=B9=E7=9B=AE=E5=85=A8?=
+ =?UTF-8?q?=E5=B1=80=E9=94=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+CompileConfiguration.run() 曾把整个 setupMinecraft() 包在一把经系统属性共享、
+跨 classloader 的 String monitor（getGlobalLockObject）里，用来让同一 JVM 内各项目
+串行化共享缓存的生产。这把锁在 --parallel 下会与 Gradle 的项目状态转换构成锁序反转：
+
+  持锁线程在 setupMinecraft 里往上走，而 setupMinecraft 内部会回到 Gradle 的项目配置机制
+  （MinecraftJarProcessorManager.create → RemappedSpecContext.create → getDependentMods
+  → LoomProjectData.fromDependency → configuration.getSingleFile()
+  → Gradle ensureConfigured → DefaultSynchronizer.takeOwnership），takeOwnership 是阻塞
+  调用、要求所有 worker lease 归还；与此同时其余配置线程正各自持着 lease、BLOCKED 在这把
+  monitor 上。于是谁也动不了，daemon 永久卡死。
+
+实测症状：下游七子项目工程在 --parallel 下构建卡住不动，jstack 显示两个 daemon 各 7 个线程
+停在 CompileConfiguration:161，其中 6 个 BLOCKED (on object monitor)、1 个持锁线程在
+Configuration.resolve() 里等 takeOwnership，日志从某一刻起零增长。清理 loom 缓存里的
+.lock 文件无效——那些 inode 由活进程持有，且死锁发生在 JVM 内。
+
+改动两点：
+
+1. 删除 getGlobalLockObject() 及其唯一调用点。该锁原本要保证的「同一共享缓存条目只被生产
+   一次」已由每个生产点各自的 per-key 跨进程锁承担（CacheEntryLock / LoomService.runExclusive，
+   键覆盖 mc 版本+映射标识、mappings、download、remap、processed、forge 补丁链等全部产出路径，
+   且同 JVM 内还叠加按 key 的监视器）；该锁覆盖的静态可变状态也各自有锁
+   （LoomGradleSharedData.REGISTRATION_LOCK、IdeaDownloadSourcesRegistry.REGISTRATION_LOCK、
+   RemapMinecraftTaskRegistry 对 extensions 的同步），落盘一律走 AtomicFiles.publish。
+   它剩下来的唯一作用是把各项目的 setup 串成一条，而这正是死锁的成因。
+
+2. LoomProjectData.fromDependency 先按约定路径探测 <依赖项目>/build/loom/project-data.json，
+   命中就直接读文件，不再为读一个小 JSON 去解析含 ProjectDependency 的 detachedConfiguration
+   （解析会让 Gradle 去配置对端项目，是上面那条跨项目求值链的入口）。探测失败/自定义
+   buildDirectory/Isolated Projects 时原路返回既有解析路径，语义不变。
+
+新增回归用例 ParallelProjectDataDeadlockTest：两个 Loom 子项目 + project 依赖 + parallel=true，
+带 @Timeout 把「不推进」转成失败（死锁时 TestKit 会一直等，没有超时就只能等 CI 被强杀），
+断言落在两个项目都真实产出 project-data.json 而不是「任务成功」——死锁时任务根本没跑。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+index 5c6591925689c1e0efd7a335e29898ec31897e9f..86d9d3f485856f08ed713f10d16768f288e6ddf6 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+@@ -37,7 +37,6 @@ import java.nio.file.NoSuchFileException;
+ import java.nio.file.Path;
+ import java.nio.file.StandardOpenOption;
+ import java.time.Duration;
+-import java.util.Objects;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.function.Consumer;
+@@ -110,7 +109,6 @@ import net.fabricmc.loom.util.service.ScopedServiceFactory;
+ import net.fabricmc.loom.util.service.ServiceFactory;
+ 
+ public abstract class CompileConfiguration implements Runnable {
+-	private static final String LOCK_PROPERTY_KEY = "fabric.loom.internal.global.lock";
+ 	// 本进程当前持有的构建锁路径，用于识别同一进程内的重复加锁
+ 	private static final Set<Path> OWNED_LOCKS = ConcurrentHashMap.newKeySet();
+ 	private FileLock processLock;
+@@ -155,11 +153,24 @@ public abstract class CompileConfiguration implements Runnable {
+ 			}
+ 
+ 			try {
+-				// Setting up loom across Gradle projects is not thread safe, synchronize it here to ensure that multiple projects cannot use it.
+-				// There is no easy way around this, as we want to use the same global cache for downloaded or generated files.
+-				synchronized (getGlobalLockObject()) {
+-					setupMinecraft(configContext);
+-				}
++				// 刻意**不**在这里包一层「跨项目全局锁」。历史上这里是一把经系统属性共享的 String monitor，
++				// 目的是让同一 JVM 内所有项目（含不同 classloader 的多份 Loom）串行化共享缓存的生产。
++				// 它现在同时是 --parallel 下必然可复现的死锁源：
++				//
++				//   持锁线程正在 setupMinecraft 里往上走，而 setupMinecraft 内部会回到 Gradle 的项目配置机制
++				//   （MinecraftJarProcessorManager.create → RemappedSpecContext → LoomProjectData.fromDependency
++				//   → configuration.getSingleFile() → Gradle ensureConfigured → DefaultSynchronizer.takeOwnership，
++				//   后者是阻塞调用，要求所有 worker lease 归还）；与此同时其余配置线程正各自持着 lease
++				//   BLOCKED 在这把 monitor 上。锁序反转成立 → 整个 daemon 永久卡死（实测两个 daemon 各 7 个线程）。
++				//
++				// 删掉它是安全的：锁原本要保证的「同一共享缓存条目只被生产一次」已经由每个生产点各自的 per-key 跨进程锁
++				// 承担（CacheEntryLock / LoomCacheService.runExclusive，键覆盖 mc 版本+映射标识、mappings、download、
++				// remap、processed、forge 补丁链等全部产出路径，且同 JVM 内还叠加了按 key 的监视器）；
++				// 该锁覆盖的静态可变状态也各自有锁（LoomGradleSharedData.REGISTRATION_LOCK、
++				// IdeaDownloadSourcesRegistry.REGISTRATION_LOCK、RemapMinecraftTaskRegistry 对 extensions 的同步），
++				// 落盘一律走 AtomicFiles.publish。剩下的唯一作用只是「把各项目的 setup 串成一条」，
++				// 而这恰好就是把 Gradle 的项目状态转换拖进临界区、造出上述死锁的原因。
++				setupMinecraft(configContext);
+ 
+ 				var dependencyManager = new LoomDependencyManager(getProject(), serviceFactory, extension);
+ 				dependencyManager.handleDependencies();
+@@ -328,9 +339,8 @@ public abstract class CompileConfiguration implements Runnable {
+ 	/**
+ 	 * 跨进程供给已映射的 Minecraft jar.
+ 	 *
+-	 * <p>getGlobalLockObject 只覆盖 JVM 内（同一 daemon 的多个 classloader），多个 daemon 并发构建同一版本时
+-	 * 仍会同时生产共享缓存产物并互相踩踏；因此按 Minecraft 版本 + 映射标识叠加一把 per-key 跨进程文件锁，
+-	 * 不同版本仍可并行。输出检查与重建必须同属一个事务，否则另一进程会在本项目读取 intermediary 时将它删除并重建。
++	 * <p>共享缓存的生产互斥由每个生产点各自的 per-key 跨进程锁承担（见 {@link LoomCacheService}），
++	 * 多个 daemon 并发构建同一版本时也不会互相踩踏；不同版本仍可并行。输出检查与重建必须同属一个事务，否则另一进程会在本项目读取 intermediary 时将它删除并重建。
+ 	 */
+ 	private void provideMappedMinecraftJars(LoomGradleExtension extension, Project project, ConfigContext configContext,
+ 			MinecraftJarConfiguration<?, ?, ?> jarConfiguration,
+@@ -773,17 +783,8 @@ public abstract class CompileConfiguration implements Runnable {
+ 		});
+ 	}
+ 
+-	// This is a nasty piece of work, but seems to work quite nicely.
+-	// We need a lock that works across classloaders, a regular synchronized method will not work here.
+-	// We can abuse system properties as a shared object store that we know for sure will be on the same classloader regardless of what Gradle does to loom.
+-	// This allows us to ensure that all instances of loom regardless of classloader get the same object to lock on.
+-	private static Object getGlobalLockObject() {
+-		if (!System.getProperties().contains(LOCK_PROPERTY_KEY)) {
+-			// The .intern resolves a possible race where two difference value objects (remember not the same classloader) are set.
+-			//noinspection StringOperationCanBeSimplified
+-			System.getProperties().setProperty(LOCK_PROPERTY_KEY, LOCK_PROPERTY_KEY.intern());
+-		}
+-
+-		return Objects.requireNonNull(System.getProperty(LOCK_PROPERTY_KEY));
+-	}
++	// 这里曾有 getGlobalLockObject()：一把经系统属性共享、跨 classloader 的 String monitor，
++	// 用来把同一 JVM 内各项目的 setupMinecraft 串行化。它已随 run() 里的调用点一起删除，
++	// 原因是它在 --parallel 下与 Gradle 的项目状态转换构成锁序反转，会让 daemon 永久死锁；
++	// 具体分析见 run() 中该调用点位置的注释。
+ }
+diff --git a/src/main/java/net/fabricmc/loom/internal/LoomProjectData.java b/src/main/java/net/fabricmc/loom/internal/LoomProjectData.java
+index 6aff282e4370d05116c08bee63f29e309946a34e..0f95e4ca346b53b34b856a337fa418e16965a614 100644
+--- a/src/main/java/net/fabricmc/loom/internal/LoomProjectData.java
++++ b/src/main/java/net/fabricmc/loom/internal/LoomProjectData.java
+@@ -284,6 +284,16 @@ public final class LoomProjectData implements Serializable {
+ 			return Optional.of(data);
+ 		}
+ 
++		// 先按约定路径直接探测导出文件，**不解析配置**：解析含 ProjectDependency 的 configuration 会让 Gradle
++		// 去配置对端项目（ensureConfigured → 状态转换需要全部 worker lease）。在 --parallel 下这是一条能把
++		// 配置线程卡死的跨项目求值入口（它曾经与 CompileConfiguration 的全局 monitor 构成锁序反转），
++		// 而暖构建下这里的产物只是一个已经存在于磁盘上的小 JSON，没必要为此去配置另一个项目。
++		final Optional<Path> probed = probeExportedFile(project, dependency);
++
++		if (probed.isPresent()) {
++			return read(probed.get());
++		}
++
+ 		final Path path;
+ 
+ 		try {
+@@ -310,6 +320,46 @@ public final class LoomProjectData implements Serializable {
+ 		return read(path);
+ 	}
+ 
++	/**
++	 * 按约定路径探测依赖项目导出的数据文件，避开「解析 configuration 会触发对端项目配置」这条路径.
++	 *
++	 * <p>约定路径与 {@code ExportLoomProjectDataTask} 的 {@code @OutputFile} 同源：
++	 * {@code <依赖项目目录>/build/loom/project-data.json}。依赖项目自定义了 {@code layout.buildDirectory}
++	 * 时探测会落空，此时返回 {@link Optional#empty()} 并由调用方退回解析路径（解析能拿到真实路径，
++	 * 代价是跨项目求值），保持行为不变。
++	 *
++	 * <p><b>隔离模式（Isolated Projects）下直接返回空</b>：{@code findProject(...).getProjectDir()} 是
++	 * 被 Gradle 禁止的跨项目模型访问，本方法不能在那里碰其它项目的状态。隔离模式原本就不会因为
++	 * 这条回退路径而崩——下方解析会被 Gradle 判为非法访问并抛出，再由 {@code catch} 降级为空。
++	 *
++	 * @param project 发起查询的项目
++	 * @param dependency 待查询的项目依赖
++	 * @return 已存在的导出文件路径；不存在 / 不可探测时为空
++	 */
++	private static Optional<Path> probeExportedFile(Project project, ProjectDependency dependency) {
++		if (LoomGradleExtension.get(project).isProjectIsolationActive()) {
++			return Optional.empty();
++		}
++
++		try {
++			final Project dependent = project.findProject(dependency.getPath());
++
++			if (dependent == null) {
++				// 依赖替换、复合构建等场景下项目的路径可能不在本构建里，交给解析路径处理
++				return Optional.empty();
++			}
++
++			// 只读本项目的布局约定与对端项目目录（不触发对端配置）
++			final Path candidate = dependent.getProjectDir().toPath().resolve("build/loom/project-data.json");
++
++			return Files.isRegularFile(candidate) ? Optional.of(candidate) : Optional.empty();
++		} catch (RuntimeException e) {
++			// 探测只是优化，任何失败都退回解析路径，不得改变原有语义
++			LOGGER.debug("Failed to probe exported data of {}", dependency.getPath(), e);
++			return Optional.empty();
++		}
++	}
++
+ 	/**
+ 	 * 读取跨项目数据文件.
+ 	 *
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/ParallelProjectDataDeadlockTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/ParallelProjectDataDeadlockTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..bd3f3a85676f9af7c99b74190f7f100a4c88c149
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/ParallelProjectDataDeadlockTest.groovy
+@@ -0,0 +1,101 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration
++
++import java.util.concurrent.TimeUnit
++
++import spock.lang.Specification
++import spock.lang.Timeout
++
++import net.fabricmc.loom.test.util.GradleProjectTestTrait
++
++import static org.gradle.testkit.runner.TaskOutcome.UP_TO_DATE
++
++/**
++ * 并行配置下的跨项目数据读取不得死锁.
++ *
++ * <h2>曾经的事故</h2>
++ * {@code CompileConfiguration.run()} 曾把整个 {@code setupMinecraft()} 包在一把经系统属性共享、
++ * 跨 classloader 的 {@code String} monitor 里（{@code getGlobalLockObject()}）。而 {@code setupMinecraft}
++ * 内部会回到 Gradle 的项目配置机制：
++ *
++ * <pre>
++ * MinecraftJarProcessorManager.create → RemappedSpecContext.create → getDependentMods
++ *   → LoomProjectData.fromDependency → configuration.getSingleFile()
++ *   → Gradle ensureConfigured → DefaultSynchronizer.takeOwnership（阻塞，要求全部 worker lease 归还）
++ * </pre>
++ *
++ * <p>其余配置线程此时正各自持着 worker lease、BLOCKED 在那把 monitor 上。锁序反转成立，
++ * daemon 永久卡死：实测下游工程（7 个 Loom 子项目）两个 daemon 各 7 个线程全部停在
++ * {@code CompileConfiguration.java:161}，{@code jstack} 显示 6 个 {@code BLOCKED (on object monitor)} +
++ * 1 个持锁线程在 {@code Configuration.resolve()} 里等 {@code takeOwnership}，永不推进。
++ *
++ * <h2>为什么这个用例必须自己带超时</h2>
++ * 死锁的表现不是报错而是**不动**：TestKit 的 {@code build()} 会一直等下去，CI 上表现为作业拖满
++ * timeout 被强杀，看不到任何失败原因。因此本用例用 {@link Timeout} 把“不推进”转成失败。
++ *
++ * <p>同样重要的还有判据：不能只看“任务成功”——死锁时任务根本没有跑，报错也不会出现。所以断言落在
++ * **两个子项目的配置都真实完成**（各自产出 {@code project-data.json}，即配置期收尾并执行了导出任务）。
++ */
++class ParallelProjectDataDeadlockTest extends Specification implements GradleProjectTestTrait {
++	/** 首次构建要下载 MC 产物，宽松一些；比对目的是“没有卡死”而不是“多快”。 */
++	@Timeout(value = 20, unit = TimeUnit.MINUTES)
++	def "并行配置下子项目间读取跨项目数据不会死锁"() {
++		setup:
++		def gradle = gradleProject(project: "parallelProjectData", version: "9.5.0")
++		gradle.buildSrc("loomClasspath")
++
++		// 两个子项目的 exportLoomProjectData 都跑过，才说明两边的 CompileConfiguration 都走到了
++		// 收尾（而不是卡在某把锁上）。这里显式指定两个项目的任务，确保两者都要被配置。
++		def tasks = [
++			":core:exportLoomProjectData",
++			":consumer:exportLoomProjectData",
++		]
++
++		when:
++		def result = gradle.run(tasks: tasks)
++
++		then: "两个项目都配置并执行完毕——死锁时一个也回不来"
++		result.task(":core:exportLoomProjectData")?.outcome != null
++		result.task(":consumer:exportLoomProjectData")?.outcome != null
++
++		and: "各自把跨项目数据落了盘"
++		new File(gradle.projectDir, "core/build/loom/project-data.json").isFile()
++		new File(gradle.projectDir, "consumer/build/loom/project-data.json").isFile()
++
++		when: "暖构建再来一次，确认不会重新卡住"
++		def warm = gradle.run(tasks: tasks)
++
++		then: "暖构建下 project-data.json 已存在，按约定路径探测就能免掉跨项目求值"
++		warm.task(":core:exportLoomProjectData").outcome in [
++			UP_TO_DATE,
++			org.gradle.testkit.runner.TaskOutcome.SUCCESS
++		]
++		warm.task(":consumer:exportLoomProjectData").outcome in [
++			UP_TO_DATE,
++			org.gradle.testkit.runner.TaskOutcome.SUCCESS
++		]
++	}
++}
+diff --git a/src/test/resources/projects/parallelProjectData/build.gradle b/src/test/resources/projects/parallelProjectData/build.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..ef0576eb9bbe64a7740449d75f5d8653875dce7e
+--- /dev/null
++++ b/src/test/resources/projects/parallelProjectData/build.gradle
+@@ -0,0 +1,11 @@
++// 根项目本身不应用 Loom，只用来驱动两个子项目的并行配置。
++// 应用 Loom 的只有 core 与 consumer，这样每个子项目各持一个 CompileConfiguration，
++// 才能复现“多个配置线程同时进 setupMinecraft”的条件。
++plugins {
++	id 'java'
++}
++
++allprojects {
++	version = "1.0.0"
++	group = "com.example"
++}
+diff --git a/src/test/resources/projects/parallelProjectData/consumer/build.gradle b/src/test/resources/projects/parallelProjectData/consumer/build.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..108303388f378f2f7bc987d8d3dc64f662d1cc52
+--- /dev/null
++++ b/src/test/resources/projects/parallelProjectData/consumer/build.gradle
+@@ -0,0 +1,29 @@
++plugins {
++	id 'dev.architectury.loom'
++}
++
++version = "1.0.0"
++group = "com.example"
++
++base {
++	archivesName = "consumer"
++}
++
++dependencies {
++	minecraft "com.mojang:minecraft:1.20.4"
++	mappings loom.officialMojangMappings()
++	modImplementation "net.fabricmc:fabric-loader:0.15.6"
++
++	// 关键：子项目之间的 project 依赖。它让 consumer 的 jar processor spec 需要读 core 的
++	// 跨项目数据（mod 元数据、mixin 映射），也就是走上 LoomProjectData.fromDependency。
++	// 修复前那条路径会解析一个含 ProjectDependency 的 detachedConfiguration，从而在配置期
++	// 触发对 core 的求值，并在 --parallel 下与其它配置线程互相等待。
++	//
++	// 刻意用 implementation 而不是 modImplementation：modImplementation 属于 Loom 的 remap 配置，
++	// 它在配置期就要打开对端的 dev jar 读元数据（ModConfigurationRemapper.getMetadata），
++	// 而 dev jar 要等 jar 任务跑完才存在——那会让本用例在配置期就以
++	// “NoSuchFileException: core/build/devlibs/core-1.0.0-dev.jar”失败，走不到要验证的路径。
++	// implementation 同样会出现在 runtimeClasspath / compileClasspath 上，因此
++	// SpecContext.getDependentProjectData 仍会经 ProjectView 读到 core 的跨项目数据。
++	implementation project(path: ":core", configuration: "namedElements")
++}
+diff --git a/src/test/resources/projects/parallelProjectData/consumer/src/main/resources/fabric.mod.json b/src/test/resources/projects/parallelProjectData/consumer/src/main/resources/fabric.mod.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..cf55c207daaaf5d0df0bd7c71800e5e3afe655e0
+--- /dev/null
++++ b/src/test/resources/projects/parallelProjectData/consumer/src/main/resources/fabric.mod.json
+@@ -0,0 +1,7 @@
++{
++  "schemaVersion": 1,
++  "id": "paralleldata-consumer",
++  "version": "1.0.0",
++  "name": "Parallel Project Data Consumer",
++  "environment": "*"
++}
+diff --git a/src/test/resources/projects/parallelProjectData/core/build.gradle b/src/test/resources/projects/parallelProjectData/core/build.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..0fa05983e35e622bf19a2e40fae3a2c4fe81e62a
+--- /dev/null
++++ b/src/test/resources/projects/parallelProjectData/core/build.gradle
+@@ -0,0 +1,16 @@
++plugins {
++	id 'dev.architectury.loom'
++}
++
++version = "1.0.0"
++group = "com.example"
++
++base {
++	archivesName = "core"
++}
++
++dependencies {
++	minecraft "com.mojang:minecraft:1.20.4"
++	mappings loom.officialMojangMappings()
++	modImplementation "net.fabricmc:fabric-loader:0.15.6"
++}
+diff --git a/src/test/resources/projects/parallelProjectData/core/src/main/resources/fabric.mod.json b/src/test/resources/projects/parallelProjectData/core/src/main/resources/fabric.mod.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..10e7b8ce18317718fe5a0cbfc99e56864e349bf9
+--- /dev/null
++++ b/src/test/resources/projects/parallelProjectData/core/src/main/resources/fabric.mod.json
+@@ -0,0 +1,7 @@
++{
++  "schemaVersion": 1,
++  "id": "paralleldata-core",
++  "version": "1.0.0",
++  "name": "Parallel Project Data Core",
++  "environment": "*"
++}
+diff --git a/src/test/resources/projects/parallelProjectData/gradle.properties b/src/test/resources/projects/parallelProjectData/gradle.properties
+new file mode 100644
+index 0000000000000000000000000000000000000000..c50cc8917d5142c07ae2b62054e85c59d5417f87
+--- /dev/null
++++ b/src/test/resources/projects/parallelProjectData/gradle.properties
+@@ -0,0 +1,6 @@
++# 回归用例的原形：AllinGame 的 platform-fabric 多子项目。
++# 关键开关是 org.gradle.parallel=true + 多个 Loom 子项目 + 子项目之间用 project 依赖相连——
++# 三者同时具备时，配置期会并行跑多个 CompileConfiguration，曾经的全局 monitor 会把它们锁成死锁。
++org.gradle.jvmargs=-Xmx1G
++org.gradle.parallel=true
++org.gradle.workers.max=8
+diff --git a/src/test/resources/projects/parallelProjectData/settings.gradle b/src/test/resources/projects/parallelProjectData/settings.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..ee4df6145fd24fa4ded8caed1b669cc00fbe445b
+--- /dev/null
++++ b/src/test/resources/projects/parallelProjectData/settings.gradle
+@@ -0,0 +1,4 @@
++rootProject.name = "parallel-project-data"
++
++include "core"
++include "consumer"

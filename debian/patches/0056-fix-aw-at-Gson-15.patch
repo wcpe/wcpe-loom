@@ -1,0 +1,379 @@
+From d632c73febb7af1661813d76d61699313726bc36 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:56 +0800
+Subject: [PATCH 056/147] =?UTF-8?q?fix(aw,at):=20=E8=AE=A9=E6=9D=A1?=
+ =?UTF-8?q?=E7=9B=AE=E5=8F=AA=E6=8C=81=E6=9C=89=E7=BA=AF=E5=80=BC=EF=BC=8C?=
+ =?UTF-8?q?=E9=81=BF=E5=85=8D=20Gson=20=E7=BB=93=E6=9E=84=E8=BF=9B?=
+ =?UTF-8?q?=E5=85=A5=E5=BA=8F=E5=88=97=E5=8C=96=E8=B7=AF=E5=BE=84=20(#15)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* fix(aw,at): 让条目只持有纯值，避免 Gson 结构进入序列化路径
+
+ModAccessWidenerEntry 与 AccessTransformerEntry.Mod 原先各自持有整个
+FabricModJson，其内部 jsonObject 是 Gson 的 JsonObject（底层
+com.google.gson.internal.LinkedTreeMap）。@Internal 只免掉输入指纹、不免掉
+序列化，因此一旦该 spec 需要被写入配置缓存，就会以
+'value {...} is not assignable to com.google.gson.internal.LinkedTreeMap' 失败。
+
+改为条目只保存纯值：
+- ModAccessWidenerEntry：modId、元数据 schema 版本、路径、环境、transitive
+  标志，以及规则文件字节
+- AccessTransformerEntry.Mod：modId、version、规则字节、hash
+
+规则字节在配置期读取是安全的：依赖 mod 的元数据本就由同一来源读出（项目依赖
+走 LoomProjectData 已复制的资源，jar 依赖走 jar 条目），buildSpec 原本就为
+计算 hash 读取过同一份字节。
+
+spec 身份保持不变：AccessTransformerJarProcessorTest 的
+'consistent spec hash' 用例在未做任何修改的原始版本下通过，说明该 spec 的
+hashCode（产物路径与缓存值的来源）未发生漂移。
+
+本分支已验证可独立 compileJava 并通过上述用例。
+
+* test(aw): 为 AccessWidenerJarProcessorTest 的依赖 mod 补齐 getSource 桩
+
+条目改为在建条目时就取出规则文件内容（理由见 ModAccessWidenerEntry），
+因此测试里模拟的 FabricModJson 必须提供可读的来源，否则 read 时 NPE。
+ModAccessWidenerEntryTest 当时已补该桩，此处是同源遗漏。
+
+该缺口此前未被发现：所有验证都按 pattern 跑指定测试类，从未跑过完整的
+unit 包；补齐后 AccessWidenerJarProcessorTest 三条用例全部通过。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerEntry.java b/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerEntry.java
+index 8fe36220b34a2b319ca49fc5847096aad296b365..8c14094fe3364af2f501a4a16559b0218fae6671 100644
+--- a/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerEntry.java
++++ b/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerEntry.java
+@@ -31,8 +31,8 @@ import java.io.Reader;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.util.Objects;
+ 
+-import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.fmj.FabricModJson;
+ 
+ public interface AccessTransformerEntry {
+@@ -50,16 +50,62 @@ public interface AccessTransformerEntry {
+ 		}
+ 	}
+ 
+-	record Mod(FabricModJson fmj, String hash) implements AccessTransformerEntry {
++	/**
++	 * 来自 mod 自带的 {@code META-INF/accesstransformer.cfg}.
++	 *
++	 * <h2>为什么这里不持有 {@link FabricModJson}</h2>
++	 * 它是 {@code AccessTransformerJarProcessor.Spec} 的元素，而 spec 会作为
++	 * {@code ProcessMinecraftJarTask} 的任务状态写进配置缓存。{@link FabricModJson} 的两个部分都不可序列化：
++	 * 规则内容的来源可能是源码集（{@code SourceSetSource} 持有 {@code Project} 与 {@code SourceSet}），
++	 * 元数据本体是 Gson 的 {@code JsonObject}。实测（Gradle 9.5，{@code --configuration-cache}）：
++	 * 带 project 自带 accesstransformer.cfg 的 Forge 工程在存储阶段直接以
++	 * {@code cannot serialize object of type 'org.gradle.api.internal.project.DefaultProject'} 失败。
++	 * 规则内容本来就已在 {@code buildSpec} 里读过一遍（为了算 hash），故这里直接持有它。
++	 *
++	 * <h2>为什么身份是显式写出来的</h2>
++	 * 改造前的身份来自 record 自动生成的实现（对 [{@code FabricModJson.hashCode()}, hash] 做
++	 * <b>从 0 开始</b>的 31 折），{@code spec.hashCode()} 是处理产物路径与缓存值的来源，
++	 * 不能因为改造而漂移（{@code AccessTransformerJarProcessorTest} 钉住了这个值）。
++	 * 显式写法必须与 record 的合并方式一致：{@code Objects.hash(...)} 是「从 1 开始」，会得到另一个数。
++	 *
++	 * @param modId mod 的 id（原 {@code FabricModJson.getId()}）
++	 * @param modSchemaVersion mod 元数据的 schema 版本（原 {@code FabricModJson.getVersion()}，只参与身份）
++	 * @param data 规则文件内容
++	 * @param hash 规则内容的 sha256（只参与身份，与改造前同源）
++	 */
++	record Mod(String modId, int modSchemaVersion, byte[] data, String hash) implements AccessTransformerEntry {
+ 		@Override
+ 		public Reader openReader() throws IOException {
+-			final byte[] bytes = fmj.getSource().read(Constants.Forge.ACCESS_TRANSFORMER_PATH);
+-			return new InputStreamReader(new ByteArrayInputStream(bytes), StandardCharsets.UTF_8);
++			return new InputStreamReader(new ByteArrayInputStream(data), StandardCharsets.UTF_8);
++		}
++
++		/** 身份与改造前逐位一致（合并方式见 record 的注释：从 0 开始的 31 折）. */
++		@Override
++		public int hashCode() {
++			int result = Objects.hash(modId, modSchemaVersion);
++			result = 31 * result + (hash == null ? 0 : hash.hashCode());
++			return result;
++		}
++
++		/** 与 {@link #hashCode()} 同源的等值判定：只比身份，不比规则文件字节. */
++		@Override
++		public boolean equals(Object o) {
++			if (this == o) {
++				return true;
++			}
++
++			if (!(o instanceof Mod other)) {
++				return false;
++			}
++
++			return modSchemaVersion == other.modSchemaVersion
++					&& Objects.equals(modId, other.modId)
++					&& Objects.equals(hash, other.hash);
+ 		}
+ 
+ 		@Override
+ 		public String toString() {
+-			return fmj.toString();
++			return "AccessTransformerEntry.Mod[%s, hash=%s]".formatted(modId, hash);
+ 		}
+ 	}
+ }
+diff --git a/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerJarProcessor.java b/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerJarProcessor.java
+index 9c5204ead7854e46af5d349edce4fabee42ef4ec..8671d0d497eab62571a98200b2a446bcb92a4f5f 100644
+--- a/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerJarProcessor.java
++++ b/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerJarProcessor.java
+@@ -96,7 +96,8 @@ public class AccessTransformerJarProcessor implements MinecraftJarProcessor<Acce
+ 			}
+ 
+ 			final String hash = Checksum.of(bytes).sha256().hex();
+-			entries.add(new AccessTransformerEntry.Mod(localMod, hash));
++			// 规则内容随条目一起带走：mod 元数据的来源（源码集/jar）不能进任务状态，理由见 Mod 的注释
++			entries.add(new AccessTransformerEntry.Mod(localMod.getId(), localMod.getVersion(), bytes, hash));
+ 		}
+ 
+ 		return !entries.isEmpty() ? new Spec(entries) : null;
+diff --git a/src/main/java/net/fabricmc/loom/configuration/accesswidener/ModAccessWidenerEntry.java b/src/main/java/net/fabricmc/loom/configuration/accesswidener/ModAccessWidenerEntry.java
+index 1614acf29ec5065293d3be74617a0935a5e0551a..7c7b4e9fc1d99bb39218988b31cf72b43a69b4e5 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/accesswidener/ModAccessWidenerEntry.java
++++ b/src/main/java/net/fabricmc/loom/configuration/accesswidener/ModAccessWidenerEntry.java
+@@ -25,10 +25,12 @@
+ package net.fabricmc.loom.configuration.accesswidener;
+ 
+ import java.io.IOException;
++import java.io.UncheckedIOException;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Objects;
+ 
+ import org.jspecify.annotations.Nullable;
+ 
+@@ -44,26 +46,123 @@ import net.fabricmc.tinyremapper.TinyRemapper;
+ 
+ /**
+  * {@link AccessWidenerEntry} implementation for a {@link FabricModJson}.
++ *
++ * <h2>为什么这里不持有 {@link FabricModJson}</h2>
++ * 本 record 的实例会随 {@code AccessWidenerJarProcessor.Spec} 进入
++ * {@code ProcessMinecraftJarTask} 的任务状态（spec 是该任务的 {@code @Internal} 属性，但 {@code @Internal}
++ * 只免掉指纹，不免掉序列化）。任务状态整体必须能写进配置缓存，而 {@link FabricModJson} 持有的东西
++ * 恰恰都不是配置缓存能序列化的值：
++ * <ul>
++ *   <li>元数据本体是 Gson 的 {@code JsonObject}，其内部映射类型是 {@code com.google.gson.internal.LinkedTreeMap}；</li>
++ *   <li>资源来源形状不定——jar 路径、源码集，甚至跨项目数据重建出来的 lambda 闭包。</li>
++ * </ul>
++ * 实测（Gradle 9.5/9.6，{@code org.gradle.configuration-cache=true} 且 {@code problems=fail}）：
++ * 带着依赖 mod 的 access widener 构建时，存储阶段直接以
++ * {@code value '{...}' is not assignable to 'com.google.gson.internal.LinkedTreeMap'} 失败，
++ * 整个构建无法通过配置缓存。因此这里只保留链真正需要的纯值：元数据身份（id 与 schema 版本）、
++ * 规则文件路径、环境、以及「是否只取 transitive 规则」标志，外加**规则文件本身的字节**。
++ *
++ * <h2>为什么规则文件字节可以在配置期读</h2>
++ * 依赖 mod 的元数据本来就是从同一份来源读出来的（jar 依赖读 jar 条目，项目依赖读
++ * {@code LoomProjectData} 已复制的资源），所以「配置期读不到、只有执行期才读得到」的情形不存在；
++ * 本包的 {@code LocalAccessWidenerEntry} 也早就在建 spec 时读文件并在缺失时直接失败。
++ * 把字节在配置期取出来，链在执行期就不需要再碰任何一句「怎么读」的上下文。
++ *
++ * <h2>为什么身份是显式写出来的</h2>
++ * {@code spec.hashCode()} 是 loom 既有协议里的链身份（缓存值与产物路径都由它派生，
++ * 见 {@code MinecraftJarProcessorManager.getCacheValue()}），所以改造不能让它漂移。
++ * 改造前的身份是
++ * {@code Objects.hash(FabricModJson.hashCode() = Objects.hash(id, schemaVersion), path, environment, transitiveOnly)}，
++ * 下面的 {@link #hashCode()} 逐位复现这一串。规则文件字节只是载荷、不进身份：把它算进去会让
++ * 「同一个 mod 的同一份规则文件、内容不同」被当成两条链，而既有协议只看 mod 身份。
++ *
++ * @param modId mod 的 id（原 {@code FabricModJson.getId()}）
++ * @param modSchemaVersion mod 元数据的 schema 版本（原 {@code FabricModJson.getVersion()}，只参与身份）
++ * @param path 规则文件在 mod 内的路径
++ * @param environment 规则适用的环境
++ * @param transitiveOnly 是否只取 {@code transitive-} 规则
++ * @param data 规则文件内容
+  */
+-public record ModAccessWidenerEntry(FabricModJson mod, String path, ModEnvironment environment, boolean transitiveOnly) implements AccessWidenerEntry {
++public record ModAccessWidenerEntry(String modId, int modSchemaVersion, String path, ModEnvironment environment,
++		boolean transitiveOnly, byte[] data) implements AccessWidenerEntry {
+ 	public static List<ModAccessWidenerEntry> readAll(FabricModJson modJson, boolean transitiveOnly) {
+ 		var entries = new ArrayList<ModAccessWidenerEntry>();
+ 
+ 		for (Map.Entry<String, ModEnvironment> entry : modJson.getClassTweakers().entrySet()) {
+-			entries.add(new ModAccessWidenerEntry(modJson, entry.getKey(), entry.getValue(), transitiveOnly));
++			entries.add(new ModAccessWidenerEntry(modJson.getId(), modJson.getVersion(), entry.getKey(), entry.getValue(),
++					transitiveOnly, read(modJson, entry.getKey())));
+ 		}
+ 
+ 		return Collections.unmodifiableList(entries);
+ 	}
+ 
++	/** {@return 规则文件内容} 读不到时按「配置期就失败」处理，与 {@code LocalAccessWidenerEntry} 的缺失检查同源. */
++	private static byte[] read(FabricModJson modJson, String path) {
++		try {
++			return modJson.getSource().read(path);
++		} catch (IOException e) {
++			throw new UncheckedIOException("Could not read access widener %s of mod %s".formatted(path, modJson.getId()), e);
++		}
++	}
++
++	/**
++	 * 身份与改造前逐位一致.
++	 *
++	 * <p>改造前的身份来自 record 自动生成的实现，合并方式是<b>从 0 开始</b>的 31 折：
++	 * {@code result = 0; result = 31 * result + h(i)}，与 {@code Objects.hash(...)} 的<b>从 1 开始</b>
++	 * （{@code result = 1; ...}）差着最前面一个 ×31。这里必须按前者的写法显式复现：
++	 * 用 {@code Objects.hash(第一个组件, 第二个, ...)} 铺开整条链会得到另一个数，
++	 * 而 {@code spec.hashCode()} 是产物路径与缓存值的来源（见类注释），差一个数就意味着所有工作区
++	 * 都要重新处理一遍 Minecraft jar。
++	 */
++	@Override
++	public int hashCode() {
++		// 第一个组件是原来的 FabricModJson，它自己的 hashCode 是 Objects.hash(id, schemaVersion)
++		int result = Objects.hash(modId, modSchemaVersion);
++		result = 31 * result + (path == null ? 0 : path.hashCode());
++		result = 31 * result + (environment == null ? 0 : environment.hashCode());
++		result = 31 * result + Boolean.hashCode(transitiveOnly);
++		return result;
++	}
++
++	/**
++	 * 与 {@link #hashCode()} 同源的等值判定：只比身份，不比规则文件字节.
++	 *
++	 * <p>刻意与 {@link #hashCode()} 用同一组字段：record 自动生成的实现会把 {@code data} 按引用比较，
++	 * 那既与身份不一致，又让两条内容相同的链永远不相等。
++	 */
++	@Override
++	public boolean equals(Object o) {
++		if (this == o) {
++			return true;
++		}
++
++		if (!(o instanceof ModAccessWidenerEntry other)) {
++			return false;
++		}
++
++		return modSchemaVersion == other.modSchemaVersion
++				&& transitiveOnly == other.transitiveOnly
++				&& Objects.equals(modId, other.modId)
++				&& Objects.equals(path, other.path)
++				&& Objects.equals(environment, other.environment);
++	}
++
++	@Override
++	public String toString() {
++		// 默认实现会把字节打成 [B@1a2b3c4d（既不是内容也不可读），这里给出链上真正有意义的身份
++		return "ModAccessWidenerEntry[%s:%s, environment=%s, transitiveOnly=%s, bytes=%d]"
++				.formatted(modId, path, environment, transitiveOnly, data.length);
++	}
++
+ 	@Override
+ 	public @Nullable String mappingId() {
+-		return transitiveOnly ? mod.getId() : null;
++		return transitiveOnly ? modId : null;
+ 	}
+ 
+ 	@Override
+ 	public String getSortKey() {
+-		return mod.getId() + ":" + path;
++		return modId + ":" + path;
+ 	}
+ 
+ 	@Override
+@@ -73,7 +172,6 @@ public record ModAccessWidenerEntry(FabricModJson mod, String path, ModEnvironme
+ 			visitor = new TransitiveOnlyFilter(visitor);
+ 		}
+ 
+-		final byte[] data = readRaw();
+ 		final ClassTweakerReader.Header header = ClassTweakerReader.readHeader(data);
+ 
+ 		if (!header.getNamespace().equals(MappingsNamespace.NAMED.toString())) {
+@@ -92,11 +190,10 @@ public record ModAccessWidenerEntry(FabricModJson mod, String path, ModEnvironme
+ 			visitor = new TransitiveOnlyFilter(visitor);
+ 		}
+ 
+-		final byte[] data = readRaw();
+ 		final ClassTweakerReader.Header header = ClassTweakerReader.readHeader(data);
+ 
+ 		if (!header.getNamespace().equals(MappingsNamespace.OFFICIAL.toString())) {
+-			throw new IOException("Expected official namespace for access widener entry, found: " + header.getNamespace() + " in mod: " + mod.getId());
++			throw new IOException("Expected official namespace for access widener entry, found: " + header.getNamespace() + " in mod: " + modId);
+ 		}
+ 
+ 		var reader = ClassTweakerReader.create(visitor);
+@@ -111,8 +208,4 @@ public record ModAccessWidenerEntry(FabricModJson mod, String path, ModEnvironme
+ 				MappingsNamespace.NAMED.toString()
+ 		);
+ 	}
+-
+-	private byte[] readRaw() throws IOException {
+-		return mod.getSource().read(path);
+-	}
+ }
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/processor/AccessWidenerJarProcessorTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/processor/AccessWidenerJarProcessorTest.groovy
+index b2041064e3ae5b85ada629213e963cc7630be2fe..f32751f542f2b33457ea48c97011f4ca65767efe 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/processor/AccessWidenerJarProcessorTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/processor/AccessWidenerJarProcessorTest.groovy
+@@ -30,6 +30,7 @@ import net.fabricmc.loom.api.processor.SpecContext
+ import net.fabricmc.loom.configuration.accesswidener.AccessWidenerJarProcessor
+ import net.fabricmc.loom.test.util.GradleTestUtil
+ import net.fabricmc.loom.util.fmj.FabricModJson
++import net.fabricmc.loom.util.fmj.FabricModJsonSource
+ import net.fabricmc.loom.util.fmj.ModEnvironment
+ 
+ class AccessWidenerJarProcessorTest extends Specification {
+@@ -56,10 +57,14 @@ class AccessWidenerJarProcessorTest extends Specification {
+ 		def mod1 = Mock(FabricModJson.Mockable)
+ 		mod1.getClassTweakers() >> ["test.accesswidener": ModEnvironment.UNIVERSAL]
+ 		mod1.getId() >> "modid1"
++		// 规则文件内容在**建条目时**就取出来（条目要能进配置缓存，不能再带着 FabricModJson，
++		// 理由见 ModAccessWidenerEntry 的注释），所以这里必须给出可读的来源。
++		mod1.getSource() >> ({ String path -> "accessWidener\tv2\tnamed\n".getBytes() } as FabricModJsonSource)
+ 
+ 		def mod2 = Mock(FabricModJson.Mockable)
+ 		mod2.getClassTweakers() >> ["test2.accesswidener": ModEnvironment.UNIVERSAL]
+ 		mod2.getId() >> "modid2"
++		mod2.getSource() >> ({ String path -> "accessWidener\tv2\tnamed\n".getBytes() } as FabricModJsonSource)
+ 
+ 		specContext.modDependenciesCompileRuntime() >> [mod1, mod2].shuffled()
+ 
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/processor/ModAccessWidenerEntryTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/processor/ModAccessWidenerEntryTest.groovy
+index 34366330492f2ae80eff8b5fdfb800a34aab8182..e5a95a4829dcc4c3b293a87c364dcb8b2ac88adc 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/processor/ModAccessWidenerEntryTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/processor/ModAccessWidenerEntryTest.groovy
+@@ -28,13 +28,18 @@ import spock.lang.Specification
+ 
+ import net.fabricmc.loom.configuration.accesswidener.ModAccessWidenerEntry
+ import net.fabricmc.loom.util.fmj.FabricModJson
++import net.fabricmc.loom.util.fmj.FabricModJsonSource
+ import net.fabricmc.loom.util.fmj.ModEnvironment
+ 
+ class ModAccessWidenerEntryTest extends Specification {
+ 	def "read local mod"() {
+ 		given:
++		def aw = "accessWidener\tv2\tnamed\n"
+ 		def mod = Mock(FabricModJson.Mockable)
+ 		mod.getClassTweakers() >> ["test.accesswidener": ModEnvironment.UNIVERSAL]
++		// 规则文件内容在**建条目时**就取出来（条目要能进配置缓存，不能再带着 FabricModJson，
++		// 理由见 ModAccessWidenerEntry 的注释），所以这里必须给出可读的来源。
++		mod.getSource() >> ({ String path -> aw.getBytes() } as FabricModJsonSource)
+ 
+ 		when:
+ 		def entries = ModAccessWidenerEntry.readAll(mod, true)
+@@ -45,6 +50,12 @@ class ModAccessWidenerEntryTest extends Specification {
+ 		entry.path() == "test.accesswidener"
+ 		entry.environment() == ModEnvironment.UNIVERSAL
+ 		entry.transitiveOnly()
++		entry.modId() == null
++		// 身份判据：这个哈希是 spec 指纹，产物路径与缓存值（getJarHash）由它派生，所以条目不再持有
++		// FabricModJson 之后它必须逐位不变。改造前它来自 record 自动生成的实现
++		// （对 [FabricModJson.hashCode(), path, environment, transitiveOnly] 做「从 0 开始」的 31 折），
++		// 本次改造把它显式写出来复现。
++		// 注意别用 Objects.hash(...) 去复现：「从 1 开始」的写法会得到 -1218057875，与本期望值不同。
+ 		entry.hashCode() == -1218981396
+ 	}
+ }

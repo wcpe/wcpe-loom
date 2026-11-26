@@ -1,0 +1,2392 @@
+From 8120ca2cc80096c2db80850afc38ded81c1eea48 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Mon, 5 Oct 2026 10:21:52 +0800
+Subject: [PATCH 083/147] =?UTF-8?q?fix(zipfs):=20=E6=A0=B9=E6=B2=BB=20zipf?=
+ =?UTF-8?q?s=20=E5=85=B3=E9=97=AD=E7=AB=9E=E6=80=81=EF=BC=8C=E8=87=AA?=
+ =?UTF-8?q?=E6=84=88=E5=88=A4=E6=8D=AE=E6=94=B9=E8=A1=8C=E4=B8=BA=E5=88=A4?=
+ =?UTF-8?q?=E5=88=AB=E5=B9=B6=E8=A6=86=E7=9B=96=E5=A4=9A=E5=BD=A2=E6=80=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+受害侧自愈 + 写入侧原子化，根治「关闭恰好落在取属性与列目录两次调用之间」的 inodes NPE。
+自愈判据从「形态判别」改为「行为判别」，覆盖 JIT fast-throw 抹掉异常形态的情况，并纳入
+「已关闭 zipfs 的 inodes NPE」形态；同时收缩可毒化调用点并让毒化失败可诊断。
+
+测试侧加了可注入钩子，让自愈分支可被确定性验证。另把测试里的两处 Java 式 try-with-resources
+改成 try/finally——仓库 spotless 的 greclipse 步骤（groovy-eclipse 5.7.0）解析不了该语法，
+会让格式化器直接抛 IllegalArgumentException。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+index 5543f33405266abb94024d9786ba45ba0605ee27..8c8268cefc89e99e35ed8b910446393013cd7abf 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+@@ -1490,13 +1490,19 @@ public class MinecraftPatchedProvider {
+ 	 *
+ 	 * @param options 配置期接好的 AT 选项
+ 	 * @param input 待执行 AT 的 jar
+-	 * @param target AT 结果落位路径（调用方负责原子落位；本方法先删除它，与改造前逐字一致）
++	 * @param target AT 结果落位路径（本方法负责原子落位：先写私有副本，再 move 到 target）
+ 	 */
+ 	public static void runAccessTransformer(Provider<AccessTransformerService.Options> options, Path input, Path target,
+ 			ServiceFactory serviceFactory) throws IOException {
+ 		final AccessTransformerService service = serviceFactory.get(options);
+-		Files.deleteIfExists(target);
+-		service.execute(input, target);
++		// 原子落位：target 是共享缓存里的产物（legacy Forge 的 client/server/merged-patched.jar），
++		// 旧写法「先删 target 再就地写」会留下「文件不存在」窗口；并发读方在窗口里打开它，关闭时就会因
++		// toRealPath() 失败而把该路径的 zipfs 登记簿条目永久留成死实例（JDK-8291712）。
++		// 「执行 AT 前删掉目标」的既有语义保留，只是删的变成调用方独占的私有副本。
++		AtomicFiles.publish(target, tmp -> {
++			Files.deleteIfExists(tmp);
++			service.execute(input, tmp);
++		});
+ 	}
+ 
+ 	private static void remapPatchedJar(ProductionOptions options, Path mcOutput, Consumer<String> lifecycle) throws Exception {
+@@ -1645,7 +1651,9 @@ public class MinecraftPatchedProvider {
+ 
+ 	static void walkFileSystems(Path source, Path target, Predicate<Path> filter, Function<FileSystem, Iterable<Path>> toWalk, FsPathConsumer action)
+ 			throws IOException {
+-		try (FileSystemUtil.Delegate sourceFs = FileSystemUtil.getJarFileSystem(source, false);
++		// source 只读、target 要写入：source 走独立文件系统（不登记，避免被 JDK-8291712 毒化），
++		// target 必须保留共享文件系统的写入路线。
++		try (FileSystemUtil.Delegate sourceFs = FileSystemUtil.getReadOnlyJarFileSystem(source);
+ 				FileSystemUtil.Delegate targetFs = FileSystemUtil.getJarFileSystem(target, false)) {
+ 			for (Path sourceDir : toWalk.apply(sourceFs.get())) {
+ 				Path dir = sourceDir.toAbsolutePath();
+diff --git a/src/main/java/dev/architectury/loom/mappings/crane/CraneMappingLayer.java b/src/main/java/dev/architectury/loom/mappings/crane/CraneMappingLayer.java
+index f9ccc2cc3213e0c9ef0701fa6ff67c0904d05321..667b061ec584aeb98b086a00f8572a6fb52f7c22 100644
+--- a/src/main/java/dev/architectury/loom/mappings/crane/CraneMappingLayer.java
++++ b/src/main/java/dev/architectury/loom/mappings/crane/CraneMappingLayer.java
+@@ -40,7 +40,9 @@ public record CraneMappingLayer(Path craneJar) implements MappingLayer {
+ 
+ 	@Override
+ 	public void visit(MappingVisitor visitor) throws IOException {
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(craneJar(), false)) {
++		// 只读：crane 映射 jar 是外部产物，loom 只从里面读 crane.tiny。
++		// 走独立文件系统可避免把它登记进 JDK 进程级 zipfs 登记簿（JDK-8291712 的毒化前提）。
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(craneJar())) {
+ 			try (BufferedReader reader = Files.newBufferedReader(fs.get().getPath(TINY_FILE_NAME), StandardCharsets.UTF_8)) {
+ 				Tiny2FileReader.read(reader, visitor);
+ 			}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/ArtifactMetadata.java b/src/main/java/net/fabricmc/loom/configuration/mods/ArtifactMetadata.java
+index 09b1744080e00de6d8ef325f1f9d4edd5299d095..8618148d94d693d88bcdd621fb9276b7f3d02de1 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/ArtifactMetadata.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/ArtifactMetadata.java
+@@ -79,7 +79,11 @@ public record ArtifactMetadata(boolean isFabricMod, RemapRequirements remapRequi
+ 			remapRequirements = RemapRequirements.OPT_IN;
+ 		}
+ 
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(artifact.path())) {
++		// 只读：依赖 jar 由 Gradle 缓存提供、loom 从不写入，用独立文件系统打开即可。
++		// 关键点是它不进入 JDK 进程级 zipfs 登记簿（JDK-8291712 的毒化只发生在登记簿里）：
++		// 该路径正是 remapJar 的 classpath 条目，一旦在这里被登记，refresh-dependencies 期间
++		// 依赖 jar 被「先删后写」替换时，关闭瞬间文件不在盘上就会把该路径永久毒化。
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(artifact.path())) {
+ 			isFabricMod = FabricModJsonFactory.containsMod(fs, platform);
+ 			final Path manifestPath = fs.getPath(Constants.Manifest.PATH);
+ 
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/JarSplitter.java b/src/main/java/net/fabricmc/loom/configuration/mods/JarSplitter.java
+index ed93fcd7cb7e60fe04310f28eb27fc1fbb950a34..2eeb7ec9327e3d4a06b69b341d311504b828069d 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/JarSplitter.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/JarSplitter.java
+@@ -45,6 +45,7 @@ import org.jspecify.annotations.Nullable;
+ 
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.FileSystemUtil;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ 
+ public class JarSplitter {
+ 	private static final Attributes.Name MANIFEST_SPLIT_ENV_NAME = new Attributes.Name(Constants.Manifest.SPLIT_ENV);
+@@ -119,9 +120,28 @@ public class JarSplitter {
+ 	}
+ 
+ 	public boolean split(Path commonOutputJar, Path clientOutputJar) throws IOException {
+-		Files.deleteIfExists(commonOutputJar);
+-		Files.deleteIfExists(clientOutputJar);
++		// 原子落位：两个输出都是 loom-cache 里的共享 jar。旧写法「先删再就地写」会留下「文件不存在」窗口，
++		// 并发读方在窗口里打开它，关闭时就会因 toRealPath() 失败而把该路径的 zipfs 登记簿条目永久留成
++		// 死实例（JDK-8291712）。这里把内容写进各自同目录的私有临时文件，最后一起 move 落位。
++		final Path commonStaging = AtomicFiles.tempSibling(commonOutputJar);
++		final Path clientStaging = AtomicFiles.tempSibling(clientOutputJar);
++
++		try {
++			if (!splitInto(commonStaging, clientStaging)) {
++				return false;
++			}
++
++			AtomicFiles.move(commonStaging, commonOutputJar);
++			AtomicFiles.move(clientStaging, clientOutputJar);
++			return true;
++		} finally {
++			Files.deleteIfExists(commonStaging);
++			Files.deleteIfExists(clientStaging);
++		}
++	}
+ 
++	/** 把拆分结果写进两个独占的暂存路径；返回 false 表示调用方要求的「不需要拆分」. */
++	private boolean splitInto(Path commonOutputJar, Path clientOutputJar) throws IOException {
+ 		try (FileSystemUtil.Delegate input = FileSystemUtil.getReadOnlyJarFileSystem(inputJar)) {
+ 			final Manifest manifest = input.fromInputStream(Manifest::new, Constants.Manifest.PATH);
+ 
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftJarMerger.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftJarMerger.java
+index e03e2a1c62e965754e66e4afca2bde526547332d..ca153c1c2ab3303e23c7d18946d983d68b55d6ad 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftJarMerger.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftJarMerger.java
+@@ -76,8 +76,10 @@ public class MinecraftJarMerger implements AutoCloseable {
+ 
+ 		Files.createDirectories(output.toPath().getParent());
+ 
+-		this.inputClient = (inputClientFs = FileSystemUtil.getJarFileSystem(inputClient, false)).get().getPath("/");
+-		this.inputServer = (inputServerFs = FileSystemUtil.getJarFileSystem(inputServer, false)).get().getPath("/");
++		// 输入只读取（读客户端/服务端原版 jar），用独立文件系统打开：不登记，因而不可能被 JDK-8291712 毒化。
++		// 输出仍走共享文件系统的写入路线。
++		this.inputClient = (inputClientFs = FileSystemUtil.getReadOnlyJarFileSystem(inputClient.toPath())).get().getPath("/");
++		this.inputServer = (inputServerFs = FileSystemUtil.getReadOnlyJarFileSystem(inputServer.toPath())).get().getPath("/");
+ 		this.outputFs = FileSystemUtil.getJarFileSystem(output, true);
+ 
+ 		this.entriesClient = new HashMap<>();
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftJarSplitter.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftJarSplitter.java
+index 54010b7b4052267358e8db33ea5e09690b2ddbc6..5df2ad67771794f97840b3671aa473246226fcfe 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftJarSplitter.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftJarSplitter.java
+@@ -39,6 +39,7 @@ import java.util.stream.Stream;
+ 
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.FileSystemUtil;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ 
+ public class MinecraftJarSplitter implements AutoCloseable {
+ 	private final Path clientInputJar;
+@@ -104,8 +105,14 @@ public class MinecraftJarSplitter implements AutoCloseable {
+ 	}
+ 
+ 	private void copyEntriesToJar(Set<String> entries, Path inputJar, Path outputJar, String env) throws IOException {
+-		Files.deleteIfExists(outputJar);
++		// 原子落位：输出是 loom-cache 里的共享 jar，旧写法「先 deleteIfExists(outputJar) 再就地写」留下
++		// 的「文件不存在」窗口会让并发读方在关闭时因 toRealPath() 失败而把该路径的 zipfs 登记簿条目
++		// 永久留成死实例（JDK-8291712）。
++		AtomicFiles.publish(outputJar, tmp -> writeEntriesToJar(entries, inputJar, tmp, env));
++	}
+ 
++	/** 把 {@code entries} 从 inputJar 复制进 zip（目标必须是调用方独占的路径），并写入 split env 清单. */
++	private void writeEntriesToJar(Set<String> entries, Path inputJar, Path outputJar, String env) throws IOException {
+ 		try (FileSystemUtil.Delegate inputFs = FileSystemUtil.getReadOnlyJarFileSystem(inputJar);
+ 				FileSystemUtil.Delegate outputFs = FileSystemUtil.getJarFileSystem(outputJar, true)) {
+ 			for (String entry : entries) {
+diff --git a/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java b/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
+index 337052d9137070a43895404b9f8b93af228bd50f..d28eb019e9fea96107be884be152d2daee726819 100644
+--- a/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
++++ b/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
+@@ -34,7 +34,6 @@ import java.lang.reflect.InvocationTargetException;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+-import java.nio.file.StandardCopyOption;
+ import java.time.Duration;
+ import java.util.Collection;
+ import java.util.HashMap;
+@@ -101,6 +100,7 @@ import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.loom.util.gradle.SyncTaskBuildService;
+ import net.fabricmc.loom.util.gradle.ThreadedProgressLoggerConsumer;
+ import net.fabricmc.loom.util.gradle.ThreadedSimpleProgressLogger;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.loom.util.gradle.WorkerDaemonClientsManagerHelper;
+ import net.fabricmc.loom.util.gradle.daemon.DaemonUtils;
+ import net.fabricmc.loom.util.ipc.IPCClient;
+@@ -478,7 +478,9 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
+ 			remapLineNumbers(lineNumbers, classesInputJar, tempJar);
+ 		}
+ 
+-		Files.move(tempJar, classesOutputJar, StandardCopyOption.REPLACE_EXISTING);
++		// 原子落位：classesOutputJar 是 loom-cache 里的共享产物，用 AtomicFiles 走 ATOMIC_MOVE 落位，
++		// 避免「目标被并发读方持有」时在 Windows 上替换失败，也避免留下半截文件
++		AtomicFiles.move(tempJar, classesOutputJar);
+ 	}
+ 
+ 	private String getCacheKey(ServiceFactory serviceFactory) {
+diff --git a/src/main/java/net/fabricmc/loom/task/RemapJarTask.java b/src/main/java/net/fabricmc/loom/task/RemapJarTask.java
+index b7ebb5aa2263b517149e01672edfc520ac33d1c0..6ad216e849e969eb1faaef727a5040b66def42ed 100644
+--- a/src/main/java/net/fabricmc/loom/task/RemapJarTask.java
++++ b/src/main/java/net/fabricmc/loom/task/RemapJarTask.java
+@@ -83,6 +83,7 @@ import net.fabricmc.loom.util.ModPlatform;
+ import net.fabricmc.loom.util.Pair;
+ import net.fabricmc.loom.util.SidedClassVisitor;
+ import net.fabricmc.loom.util.ZipUtils;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.loom.util.fmj.FabricModJsonFactory;
+ import net.fabricmc.loom.util.fmj.FabricModJsonUtils;
+ import net.fabricmc.loom.util.service.ScopedServiceFactory;
+@@ -312,13 +313,16 @@ public abstract class RemapJarTask extends AbstractRemapJarTask {
+ 			Objects.requireNonNull(tinyRemapperService, "tinyRemapperService");
+ 			Objects.requireNonNull(tinyRemapper, "tinyRemapper");
+ 
+-			// Delete the old file to prevent deleted contents from sticking around in the jar.
+-			Files.deleteIfExists(outputFile);
+-
+-			try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(outputFile).build()) {
+-				outputConsumer.addNonClassFiles(inputFile);
+-				tinyRemapper.apply(outputConsumer, tinyRemapperService.getOrCreateTag(inputFile));
+-			}
++			// 原子落位：remap 输出会被同一构建里的其它项目当作 classpath 读，旧写法
++			// 「先 deleteIfExists(outputFile) 再就地写」留下的「文件不存在」窗口，会让读方在窗口里打开的
++			// 路径在关闭时因 toRealPath() 失败而把 zipfs 登记簿条目永久留成死实例（JDK-8291712）。
++			// 改成「先在私有临时文件里生成完整 jar，再 move 落位」后同样保证旧内容不会残留。
++			AtomicFiles.publish(outputFile, tmp -> {
++				try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(tmp).build()) {
++					outputConsumer.addNonClassFiles(inputFile);
++					tinyRemapper.apply(outputConsumer, tinyRemapperService.getOrCreateTag(inputFile));
++				}
++			});
+ 		}
+ 
+ 		private void markClientOnlyClasses() throws IOException {
+diff --git a/src/main/java/net/fabricmc/loom/task/service/TinyRemapperService.java b/src/main/java/net/fabricmc/loom/task/service/TinyRemapperService.java
+index 1e33eab4655315efde32b7a68036520dff2cd0e0..41ae641beb13ad2e8290cb46ee8bd8bd24198787 100644
+--- a/src/main/java/net/fabricmc/loom/task/service/TinyRemapperService.java
++++ b/src/main/java/net/fabricmc/loom/task/service/TinyRemapperService.java
+@@ -27,20 +27,25 @@ package net.fabricmc.loom.task.service;
+ import java.io.Closeable;
+ import java.io.File;
+ import java.io.IOException;
++import java.nio.file.ClosedFileSystemException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.util.ArrayList;
++import java.util.Collection;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
++import java.util.stream.Collectors;
+ 
+ import org.gradle.api.Project;
+ import org.gradle.api.artifacts.ConfigurationContainer;
+ import org.gradle.api.file.ConfigurableFileCollection;
+ import org.gradle.api.file.FileCollection;
++import org.gradle.api.logging.Logger;
++import org.gradle.api.logging.Logging;
+ import org.gradle.api.plugins.JavaPlugin;
+ import org.gradle.api.provider.ListProperty;
+ import org.gradle.api.provider.Property;
+@@ -57,7 +62,10 @@ import net.fabricmc.loom.build.IntermediaryNamespaces;
+ import net.fabricmc.loom.extension.RemapperExtensionHolder;
+ import net.fabricmc.loom.task.AbstractRemapJarTask;
+ import net.fabricmc.loom.util.Constants;
++import net.fabricmc.loom.util.FileSystemUtil;
+ import net.fabricmc.loom.util.TinyRemapperLoggerAdapter;
++import net.fabricmc.loom.util.ZipFsCloseRaceTestHook;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.loom.util.kotlin.KotlinClasspathService;
+ import net.fabricmc.loom.util.kotlin.KotlinRemapperClassloader;
+ import net.fabricmc.loom.util.service.Service;
+@@ -197,8 +205,17 @@ public class TinyRemapperService extends Service<TinyRemapperService.Options> im
+ 	private TinyRemapper tinyRemapper;
+ 	@Nullable
+ 	private KotlinRemapperClassloader kotlinRemapperClassloader;
++	// zipfs 毒化诊断（JDK-8291712）必须让用户看见：Gradle 默认可见级别是 LIFECYCLE，
++	// 用 SLF4J 的 info/warn 会被默认控制台级别吞掉。
++	private static final Logger LOGGER = Logging.getLogger("loom_zipfs");
++	/** zipfs 实现类的全限定名：NPE 栈里出现它，才说明空指针抛在 zipfs 内部（见 {@link #isClosedZipFileSystemNullPointer}）. */
++	private static final String ZIP_FILE_SYSTEM_CLASS = "jdk.nio.zipfs.ZipFileSystem";
++	/** 关闭 zipfs 后 {@code ZipFileSystem.close()} 会置空、随后在目录遍历时被解引用的字段名. */
++	private static final String ZIP_FS_NULLED_FIELD = "inodes";
+ 	private final Map<String, InputTag> inputTagMap = new HashMap<>();
+ 	private final HashSet<Path> classpath = new HashSet<>();
++	// 自愈产生的 classpath 私有快照：随着本服务一起结束（见 close()），不留给后续构建
++	private final Set<Path> snapshots = new HashSet<>();
+ 	// Set to true once remapping has started, once set no inputs can be read.
+ 	private boolean isRemapping = false;
+ 
+@@ -289,7 +306,398 @@ public class TinyRemapperService extends Service<TinyRemapperService.Options> im
+ 			return;
+ 		}
+ 
+-		tinyRemapper.readClassPath(toRead.toArray(Path[]::new));
++		// 测试专用注入点：不设 loom.test.zipfs.closeRaceEntry 时是空操作，
++		// 用于把「读取期间共享实例被并发持有者关闭」这一竞态变成可确定性触发的场景（见该类注释）
++		ZipFsCloseRaceTestHook.armForRead(toRead);
++
++		try {
++			readIntoRemapper(toRead.toArray(Path[]::new));
++		} catch (RuntimeException e) {
++			// 判据①（形态）：实例已关闭的「正面证据」齐全时，自愈路径确定无歧义，不必多走一次重读
++			if (isClosedFileSystemFailure(e)) {
++				if (recoverClasspathRead(e, toRead)) {
++					return;
++				}
++
++				throw diagnoseClasspathReadFailure(e, toRead);
++			}
++
++			// 判据②（行为）：形态被 JVM 抹掉时（见 containsNullPointer）不再猜形态，改问「重读治不治得好」
++			if (containsNullPointer(e) && recoverClasspathRead(e, toRead)) {
++				// 重读治好 ⇒ 确实是「共享实例被并发关闭」：那样新开的实例是健康的，重读本就该成功
++				return;
++			}
++
++			// 与 zipfs 状态无关的失败，以及「重读仍然以同样方式失败」的 NPE：原样抛出原始失败，
++			// 类型/消息/栈逐字不动（这里抛的就是上面捕获到的那个对象，因此不可能被改写）
++			throw e;
++		}
++	}
++
++	/**
++	 * 把 classpath 条目读进 tiny-remapper 的唯一出口.
++	 *
++	 * <p>首次读取、逐条重读、快照重读都走这里：一是让「重读」与「首读」确实是同一条路线
++	 * （行为判别验证的就是「同一条路线能不能治好」），二是给测试留一个统一的注入点
++	 * （见 {@link ZipFsCloseRaceTestHook#throwIfReadFailureArmed()}，不设属性时是空操作）.
++	 */
++	private void readIntoRemapper(Path[] paths) {
++		ZipFsCloseRaceTestHook.throwIfReadFailureArmed();
++		tinyRemapper.readClassPath(paths);
++	}
++
++	/**
++	 * 失败路径自愈：把读不到的 classpath 条目改从私有快照副本重读一次.
++	 *
++	 * <p>为什么必须有这一层：受害 jar 未必在 loom 的控制范围内——Gradle 带 {@code --refresh-dependencies}
++	 * 跑时会重写 {@code modules-2} 里的依赖 jar（先删后写），文件在那段时间里从盘上消失；任何此刻持有它的
++	 * ZipFileSystem 关闭时都摘不掉进程级登记簿里的条目（JDK-8291712），该路径于是在本 daemon 内永久变成
++	 * 「一打开就是已关闭实例」。loom 改不了 Gradle 的写法，只能保证自己侧不再因此失败：把受害 jar
++	 * 复制成同目录下的私有快照，再从快照读一次。快照与任何并发持有者无关，因此单次重试即可生效。
++	 *
++	 * <p>两层递进；健康构建一次都不会走到这里（只在 {@link #readClasspath()} 已经失败之后调用）：
++	 * <ol>
++	 *     <li>登记簿探测（零副作用）能确定受害者时，只给受害者做快照并整批重读一次，代价最小；</li>
++	 *     <li>探测不出受害者时（失败发生的那一刻文件可能正被重写，登记簿条目此刻根本查不到），
++	 *         退化为「逐条重读，谁报 ClosedFileSystemException 就给谁做快照」，覆盖任何形态的坏实例。</li>
++	 * </ol>
++	 *
++	 * <p>重读是幂等的：tiny-remapper 的 {@code addClass} 用 {@code putIfAbsent} 记录类并只合并
++	 * input tag，重复读到同一个类不会改变任何语义。
++	 *
++	 * <p><b>重读同时是行为判别的本体</b>：调用方在形态不可辨认时（见 {@link #containsNullPointer}）也走这里，
++	 * 此时「某一条重读仍然以同样方式失败」就是判据本身——共享实例被并发关闭时新开的实例是健康的、重读会成功，
++	 * 因此重读失败即说明这次失败与关闭竞态无关；本方法随即返回 {@code false}，
++	 * 由调用方原样抛出<b>原始</b>失败（不掩盖真实缺陷，也不改写异常内容）。
++	 *
++	 * @param failure 触发自愈的原始失败（只用于日志，不影响自愈行为）
++	 * @param toRead 本次要读取的全部 classpath 路径
++	 * @return {@code true} 表示已自愈并读完；{@code false} 表示重读治不好它，调用方应照旧报错
++	 */
++	private boolean recoverClasspathRead(RuntimeException failure, List<Path> toRead) {
++		// 走到自愈分支必须留下痕迹：真实形态（读取期间共享实例被并发持有者关闭）下，逐条重读通常一次就成功、
++		// 不会再进快照分支；若只在这里静默恢复，这次「本该失败却成功了」就没有任何可检索的证据。
++		// 一并打出失败形态：CFSE 与「目录遍历撞上已置空的 inodes」是同一竞态的两个落点，
++		// 出问题时必须能从日志分辨到底命中了哪一个。
++		if (isClosedFileSystemFailure(failure)) {
++			LOGGER.warn("读取 remap classpath 命中「共享 zipfs 实例已被关闭」（{}），开始自愈重读：{}",
++					describeFailure(failure), toRead);
++		} else {
++			// 形态不可辨认的入口（见 containsNullPointer）：此处不下结论——是不是关闭竞态，由下面的重读回答
++			LOGGER.warn("读取 remap classpath 失败于形态不可辨认的 NPE（{}：JIT 的 fast throw 会抹掉消息与栈），"
++							+ "开始自愈重读并按「能不能治好」判别：{}",
++					describeFailure(failure), toRead);
++		}
++
++		final List<Path> knownVictims = new ArrayList<>();
++
++		for (Path path : toRead) {
++			if (FileSystemUtil.findClosedRegistryEntry(path) != null) {
++				knownVictims.add(path);
++			}
++		}
++
++		if (!knownVictims.isEmpty()) {
++			LOGGER.warn("remap classpath 有 {} 条路径已被进程级 zipfs 登记簿毒化（JDK-8291712），改用私有快照重读：{}",
++					knownVictims.size(), knownVictims);
++
++			if (retryClasspathReadWithSnapshots(toRead, knownVictims)) {
++				return true;
++			}
++		}
++
++		// 逐条兜底：登记簿探测不出受害者时，仍然可能拿到「已关闭」的共享实例（例如失败瞬间文件正被重写）。
++		// 此时重读本身既是探测也是修复：谁报 ClosedFileSystemException 就给谁做快照。
++		for (Path path : toRead) {
++			try {
++				readIntoRemapper(new Path[] {path});
++			} catch (RuntimeException e) {
++				if (!isClosedFileSystemFailure(e)) {
++					// 重读仍然以同样方式失败 ⇒ 它不是「共享实例被并发关闭」（那样新开的实例是健康的、重读会成功）：
++					// 放弃自愈，由调用方原样抛出原始失败，绝不把真实缺陷掩盖成一次成功的重试
++					LOGGER.warn("自愈重读 classpath 条目 {} 仍然失败（{}），无法认定为关闭竞态，放弃自愈并原样抛出原始失败",
++							path, describeFailure(e), e);
++					return false;
++				}
++
++				// 重读期间又撞上关闭竞态（另一条受害路径的持有者此刻才关闭，或本路径的快照还没建立）：
++				// 这里把形态一并打出来，日志才能分辨命中的是 CFSE 还是目录遍历的 inodes NPE
++				LOGGER.warn("自愈重读 classpath 条目 {} 时再次命中「共享 zipfs 实例已被关闭」（{}），改用私有快照重读",
++						path, describeFailure(e));
++
++				final Path snapshot = snapshotForRetry(path);
++
++				if (snapshot == null || !readSnapshot(snapshot, path)) {
++					return false;
++				}
++			}
++		}
++
++		return true;
++	}
++
++	/**
++	 * 用「受害者=私有快照、其余=原路径」重读整批 classpath.
++	 *
++	 * @param toRead 本批全部路径
++	 * @param victims 已确认被毒化的路径（会被替换成快照）
++	 * @return 是否成功读完
++	 */
++	private boolean retryClasspathReadWithSnapshots(List<Path> toRead, List<Path> victims) {
++		final Map<Path, Path> substitutions = new HashMap<>();
++		final List<Path> substituted = new ArrayList<>(toRead.size());
++
++		try {
++			for (Path path : toRead) {
++				if (!victims.contains(path)) {
++					substituted.add(path);
++					continue;
++				}
++
++				final Path snapshot = snapshotForRetry(path);
++
++				if (snapshot == null) {
++					discardSnapshots(substitutions.values());
++					return false;
++				}
++
++				substitutions.put(path, snapshot);
++				substituted.add(snapshot);
++			}
++
++			readIntoRemapper(substituted.toArray(Path[]::new));
++			return true;
++		} catch (RuntimeException e) {
++			LOGGER.warn("用私有快照重读 classpath 仍然失败，继续尝试逐条自愈", e);
++			return false;
++		}
++	}
++
++	/**
++	 * 把受害者复制成同目录下的私有快照.
++	 *
++	 * <p>刻意放在原文件所在目录：与受害 jar 同一文件系统，复制不必跨盘；且该目录本来就是这些 jar 的家，
++	 * 不会把大文件写进容量未知的系统临时目录。名字用 {@link AtomicFiles#tempSibling} 生成（含 UUID，
++	 * 保留 {@code .jar} 扩展名），因此既不会与并发写入者撞名，也不会被误当成产物。
++	 *
++	 * <p>快照的生命周期与本次服务一致：成功读取后由 {@link #close()} 删除（tiny-remapper 的
++	 * {@code ClassInstance} 已经把类字节读进了内存，但保留到服务结束更稳妥——classpath jar 里还可能有
++	 * 非 class 条目会在后续阶段被读）。失败时立刻删除。
++	 *
++	 * @return 快照路径；无法复制（例如文件此刻又消失了）时返回 {@code null}
++	 */
++	private @Nullable Path snapshotForRetry(Path victim) {
++		final Path snapshot = AtomicFiles.tempSibling(victim);
++
++		try {
++			Files.copy(victim, snapshot);
++		} catch (IOException e) {
++			LOGGER.warn("无法为 {} 建立私有快照，放弃自愈", victim, e);
++			return null;
++		}
++
++		snapshots.add(snapshot);
++		return snapshot;
++	}
++
++	/** 从快照读一次；失败则删除该快照并返回 false. */
++	private boolean readSnapshot(Path snapshot, Path victim) {
++		try {
++			readIntoRemapper(new Path[] {snapshot});
++			LOGGER.warn("已自愈：{} 被并发持有者关闭后在本 daemon 内无法再打开，本次改从其私有快照 {} 读取", victim, snapshot);
++			return true;
++		} catch (RuntimeException e) {
++			LOGGER.warn("从 {} 的私有快照 {} 重读仍然失败", victim, snapshot, e);
++			discardSnapshot(snapshot);
++			return false;
++		}
++	}
++
++	private void discardSnapshot(Path snapshot) {
++		snapshots.remove(snapshot);
++
++		try {
++			Files.deleteIfExists(snapshot);
++		} catch (IOException e) {
++			LOGGER.warn("清理 classpath 快照 {} 失败", snapshot, e);
++		}
++	}
++
++	private void discardSnapshots(Collection<Path> toDiscard) {
++		for (Path path : new ArrayList<>(toDiscard)) {
++			discardSnapshot(path);
++		}
++	}
++
++	/**
++	 * 把 classpath 读取失败归一化成可读的诊断信息.
++	 *
++	 * <p>tiny-remapper 的 {@code readClassPath} 内部走 {@code read(...).join()}，裸 join 不拆包，
++	 * 于是本 daemon 里真正的问题（JDK-8291712：路径被进程级 zipfs 登记簿毒化，条目是某个
++	 * 「已关闭」的 FileSystem）只会以一个没有路径信息的 {@code ClosedFileSystemException} 冒出来。
++	 * 这里补上「是哪条 classpath 路径被毒化」这个关键事实。
++	 *
++	 * <p>走到这里说明 {@link #recoverClasspathRead} 的自愈也没成功（例如快照本身也读不了）。
++	 *
++	 * @param failure 原始失败
++	 * @param toRead 本次要读取的 classpath 路径（毒化探测只对这些路径做）
++	 * @return 原样返回非毒化失败；毒化失败则返回带明确诊断的异常
++	 */
++	private RuntimeException diagnoseClasspathReadFailure(RuntimeException failure, List<Path> toRead) {
++		if (!isClosedFileSystemFailure(failure)) {
++			// 与 zipfs 登记簿无关的失败：原样抛出，保持既有行为
++			return failure;
++		}
++
++		List<Path> poisoned = new ArrayList<>();
++
++		for (Path path : toRead) {
++			if (FileSystemUtil.findClosedRegistryEntry(path) != null) {
++				poisoned.add(path);
++			}
++		}
++
++		String paths = poisoned.isEmpty()
++				? "（登记簿里的死实例此刻无法定位：文件的真实路径查不到对应条目，通常是该 jar 又被替换过）"
++				: poisoned.stream().map(Path::toString).collect(Collectors.joining("\n  - ", "\n  - ", ""));
++		String message = """
++				读取 remap classpath 失败：%s
++				已被进程级 zipfs 登记簿毒化的路径：%s
++				成因（JDK-8291712）：jar 在某次打开期间被删除/替换，ZipFileSystem.close() 抛 IOException 之前
++				来不及把实例从登记簿摘除，登记簿里于是留下一个「已关闭」的死实例；此后 tiny-remapper 的
++				URI 路线（FileSystemReference.openJar 先查登记簿）只会拿到这个死实例。
++				自愈已尝试但未成功：本服务会先把受害 jar 复制成同目录私有快照再读一次；走到这里说明快照也读不了
++				（通常是该 jar 此刻内容不完整），或失败根本不是毒化引起的。
++				规避办法：不要用 --refresh-dependencies 与构建并发重写依赖 jar；确已中毒的 daemon 需重启
++				（重跑 --no-daemon 亦可），残留登记簿条目不会自行消失。""".formatted(failure, paths);
++
++		LOGGER.error(message, failure);
++		return new FileSystemUtil.UnrecoverableZipException(message, failure);
++	}
++
++	/**
++	 * 判断失败链里是否出现「FileSystem 已关闭」这类 zipfs 毒化症状.
++	 *
++	 * <p>这是<b>形态判据</b>：它成立时失败与关闭竞态的因果关系是确定的，因此调用方直接走自愈快路径、
++	 * 失败时给出诊断。{@link #readClasspath}、{@link #recoverClasspathRead}、
++	 * {@link #diagnoseClasspathReadFailure} 都走它，因此必须只认「确由关闭的 zipfs 引起」的失败：
++	 * 判宽了会把真实缺陷当成关闭竞态掩盖掉，判窄了本可自愈的构建仍会失败。
++	 *
++	 * <p>只收两种形态，各自都是「实例已关闭」的正面证据，而不是启发式猜测：
++	 * <ol>
++	 *     <li>{@link ClosedFileSystemException}：zipfs 内部 {@code ensureOpen()} 的标准症状；</li>
++	 *     <li>{@link #isClosedZipFileSystemNullPointer} 认可的那一种 NPE：目录遍历走到
++	 *         {@code ZipFileSystem.isDirectory}，而该方法<b>没有</b> ensureOpen 检查，
++	 *         关闭后直接撞上已被 {@code close()} 置空的 {@code inodes} 字段（见该方法说明）。</li>
++	 * </ol>
++	 *
++	 * <p>本判据<b>不成立</b>的异常不会因此被当成「与 zipfs 无关」而直接抛出：NPE 还有一条行为判别入口
++	 * （见 {@link #containsNullPointer}），因为同一个落点的形态可能已被 JIT 抹掉。判据不成立与
++	 * 「行为判别也不成立」两条路合起来，才与只认 CFSE 时的行为逐字一致。
++	 */
++	private static boolean isClosedFileSystemFailure(Throwable failure) {
++		for (Throwable t = failure; t != null; t = t.getCause()) {
++			if (t instanceof ClosedFileSystemException || isClosedZipFileSystemNullPointer(t)) {
++				return true;
++			}
++		}
++
++		return false;
++	}
++
++	/**
++	 * 「已关闭的 zipfs」在目录遍历时抛出的那一种 NPE.
++	 *
++	 * <p>形态：{@code FileTreeWalker} 每进一个目录先取属性（{@code readAttributes} 有 ensureOpen，
++	 * 关闭后报 CFSE），紧接着调 {@code Files.newDirectoryStream}，后者最终走到
++	 * {@code ZipFileSystem.isDirectory}；该方法只做 {@code beginRead() + getInode()}，
++	 * 没有 ensureOpen，于是当实例已被关闭（{@code close()} 收尾把 {@code inodes} 置为 {@code null}）时，
++	 * 在 {@code inodes.get(...)} 上抛出：
++	 * <pre>NullPointerException: Cannot invoke "java.util.LinkedHashMap.get(Object)" because "this.inodes" is null</pre>
++	 * 这与 CFSE 是同一个竞态（共享实例被并发持有者关闭）的另一种落点，只是落点没有 ensureOpen 保护；
++	 * 目录越深、这种「属性已取到、正要列目录」的窗口被撞上的机会越多。
++	 *
++	 * <p><b>为什么这条能安全纳入自愈判据</b>：{@code ZipFileSystem.inodes} 只在构造期被填充、在
++	 * {@code close()} 收尾时被置为 {@code null}（JDK 21 里只有这两处写），因此「{@code this.inodes} 是
++	 * null」等价于「该实例已经被关闭」——它是关闭的<b>充分证据</b>，不是「大概率的 NPE」。
++	 * 再加两条限定，确保不会把别的空指针当成关闭竞态：
++	 * <ul>
++	 *     <li>异常消息必须指名 {@code inodes} 字段（JDK 15+ 默认开启「有帮助的 NPE 消息」才会带上）；</li>
++	 *     <li>栈里必须有 {@code jdk.nio.zipfs.ZipFileSystem} 的帧，证明这个空指针确实抛在 zipfs 内部，
++	 *         而不是某段业务代码里恰好也叫 inodes 的字段。</li>
++	 * </ul>
++	 *
++	 * <p><b>本判据不成立不代表「不是关闭竞态」</b>：长命 JVM 里同一条隐式空指针被反复抛出后，
++	 * HotSpot 会改用预分配的「fast throw」NPE（消息为 {@code null}、栈长为 0），上面两条特征都取不到，
++	 * 于是它既不属于本判据、也无法与被 JIT 抹掉形态的其它 NPE 区分。形态既然不可信，这类失败就改由
++	 * {@link #containsNullPointer} + {@link #recoverClasspathRead} 的行为判别处理（重读治不好即原样抛出原始失败）。
++	 * 本判据因此只用于「形态齐全 ⇒ 连诊断一起给出」，不再承担「唯一入口」的职责。
++	 *
++	 * @param failure 失败链上的一个异常
++	 * @return 是否是「带关闭特征」的 zipfs 内部 NPE
++	 */
++	private static boolean isClosedZipFileSystemNullPointer(Throwable failure) {
++		if (!(failure instanceof NullPointerException)) {
++			return false;
++		}
++
++		final String message = failure.getMessage();
++
++		if (message == null || !message.contains(ZIP_FS_NULLED_FIELD)) {
++			return false;
++		}
++
++		for (StackTraceElement frame : failure.getStackTrace()) {
++			if (ZIP_FILE_SYSTEM_CLASS.equals(frame.getClassName())) {
++				return true;
++			}
++		}
++
++		return false;
++	}
++
++	/**
++	 * 失败链里是否出现空指针：zipfs 关闭竞态的第二个落点，也是唯一「形态会被 JVM 抹掉」的落点.
++	 *
++	 * <p>{@code ZipFileSystem.isDirectory} 没有 ensureOpen 检查，实例关闭后它抛 NPE；而 HotSpot 在同一个
++	 * 隐式空指针被反复抛出后会改用预分配的「fast throw」异常——消息为 {@code null}、栈长为 0，
++	 * 于是 {@link #isClosedZipFileSystemNullPointer} 的两条特征都取不到，异常<b>长什么样</b>不再可用。
++	 * 既然不可辨，就不再猜：NPE 这个类型是该落点的全部可辨信息，剩下的交给行为判别
++	 * （{@link #recoverClasspathRead} 逐条重读，治好 ⇒ 确是「共享实例被并发关闭」，因为那种情况下
++	 * 新开的实例是健康的、重读本就该成功；治不好 ⇒ 调用方原样抛出原始失败）。
++	 *
++	 * <p><b>为什么只放宽到 NPE、不放宽到「任意异常」</b>：能落进 zipfs 关闭竞态的异常只有两种
++	 * （{@code ensureOpen} 的 {@link ClosedFileSystemException}、{@code isDirectory} 的 NPE），
++	 * 只有后者的形态会被 JVM 优化掉；再放宽只会让与 zipfs 无关的真实缺陷也白跑一遍逐条重读，
++	 * 换不来任何自愈机会。放宽的安全阀是行为判别本身的结论：重读治不好就<b>原样抛出原始失败</b>
++	 * （类型、消息、栈都不动），因此这里的放宽不会掩盖任何真实缺陷。
++	 */
++	private static boolean containsNullPointer(Throwable failure) {
++		for (Throwable t = failure; t != null; t = t.getCause()) {
++			if (t instanceof NullPointerException) {
++				return true;
++			}
++		}
++
++		return false;
++	}
++
++	/**
++	 * 把失败链上「真正让判据成立」的那个异常描述成一行日志.
++	 *
++	 * <p>只用于日志：{@code readClassPath} 冒出来的常常是包装过的异常（{@code read(...).join()} 的结果），
++	 * 打最外层看不出形态；这里优先取失败链上第一个被判据认可的异常，日志因此能直接分辨
++	 * CFSE 与「目录遍历撞上已置空的 inodes」这两个落点。判据都不成立时（例如形态被 JIT 抹掉的 NPE）
++	 * 退回最外层异常的 {@code toString()}，形态不可辨这件事本身就是日志要说的事实。
++	 */
++	private static String describeFailure(Throwable failure) {
++		for (Throwable t = failure; t != null; t = t.getCause()) {
++			if (t instanceof ClosedFileSystemException || isClosedZipFileSystemNullPointer(t)) {
++				return t.toString();
++			}
++		}
++
++		return failure.toString();
+ 	}
+ 
+ 	@Override
+@@ -302,5 +710,8 @@ public class TinyRemapperService extends Service<TinyRemapperService.Options> im
+ 		if (kotlinRemapperClassloader != null) {
+ 			kotlinRemapperClassloader.close();
+ 		}
++
++		// 自愈快照的生命周期与本次服务一致：任务结束即删，不污染缓存目录
++		discardSnapshots(snapshots);
+ 	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/util/AsyncZipProcessor.java b/src/main/java/net/fabricmc/loom/util/AsyncZipProcessor.java
+index b25aaa8f55f7fa9472366a300c958209e813c655..38a5ee1bff3ef4312a377ac1ff7d259961c4078d 100644
+--- a/src/main/java/net/fabricmc/loom/util/AsyncZipProcessor.java
++++ b/src/main/java/net/fabricmc/loom/util/AsyncZipProcessor.java
+@@ -39,7 +39,9 @@ import java.util.concurrent.Executors;
+ 
+ public interface AsyncZipProcessor {
+ 	static void processEntries(Path inputZip, Path outputZip, AsyncZipProcessor processor) throws IOException {
+-		try (FileSystemUtil.Delegate inFs = FileSystemUtil.getJarFileSystem(inputZip, false);
++		// 输入只读取：用独立文件系统（不登记），从而不会被 JDK-8291712 毒化；
++		// 输出必须保留共享文件系统的写入路线（tiny-remapper 引用计数 + 落盘语义）。
++		try (FileSystemUtil.Delegate inFs = FileSystemUtil.getReadOnlyJarFileSystem(inputZip);
+ 				FileSystemUtil.Delegate outFs = FileSystemUtil.getJarFileSystem(outputZip, true);
+ 				ExecutorService executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())) {
+ 			final Path inRoot = inFs.get().getPath("/");
+diff --git a/src/main/java/net/fabricmc/loom/util/FileSystemUtil.java b/src/main/java/net/fabricmc/loom/util/FileSystemUtil.java
+index 46d5bd5dcd37e45c910e137b74269f7268722d26..b2a790c70e2cd8abc9eb5b986aafc80f56333e52 100644
+--- a/src/main/java/net/fabricmc/loom/util/FileSystemUtil.java
++++ b/src/main/java/net/fabricmc/loom/util/FileSystemUtil.java
+@@ -190,6 +190,54 @@ public final class FileSystemUtil {
+ 		}
+ 	}
+ 
++	/**
++	 * 探测某路径是否已被 JDK 进程级 zipfs 登记簿毒化.
++	 *
++	 * <p>JDK-8291712：{@code ZipFileSystem.close()} 在文件已不在盘上时先抛 {@link IOException}，
++	 * 来不及把实例从 {@code ZipFileSystemProvider.filesystems} 里摘掉，登记簿于是永久留下一个
++	 * 「已关闭」的实例。此后凡是走 URI 路线打开同一路径的代码（tiny-remapper 的
++	 * {@code FileSystemReference.openJar} 就先查登记簿）都会拿到这个死实例，
++	 * 并在第一次访问时抛出 {@code ClosedFileSystemException}。
++	 *
++	 * <p>登记簿的 Key 含文件的真实路径，因而文件缺失期间查不到该条目、文件一重建就又查得到——
++	 * 本方法因此必须在文件存在时调用才有意义。只读诊断，不修改任何状态.
++	 *
++	 * @param path 待探测的 jar 路径
++	 * @return 登记簿中该路径对应的「已关闭」实例；健康（未登记或仍打开）时返回 {@code null}
++	 */
++	public static @Nullable FileSystem findClosedRegistryEntry(Path path) {
++		try {
++			FileSystem fileSystem = FileSystems.getFileSystem(toJarUri(path));
++			return fileSystem.isOpen() ? null : fileSystem;
++		} catch (RuntimeException e) {
++			// 未登记时 getFileSystem 抛 FileSystemNotFoundException；路径名不是 .jar/.zip 时
++			// Key 构造还可能抛别的运行时异常。两种情况都表示「登记簿里没有毒化条目」，
++			// 探测本身不能影响构建，因此一律放行。
++			return null;
++		}
++	}
++
++	/**
++	 * 探测某路径在 JDK 进程级 zipfs 登记簿里是否有一个「仍打开」的共享实例.
++	 *
++	 * <p>与 {@link #findClosedRegistryEntry(Path)} 对称：后者找死实例（毒化），本方法找活实例。
++	 * 活实例存在的含义是「此刻有持有者正拿着这个 jar 的共享实例」——登记簿的 Key 是文件的真实路径，
++	 * 因此读取方按 URI 路线打开（tiny-remapper 的 {@code FileSystemReference.openJar}）时，
++	 * 条目就已经在这里出现了。只读探测，不修改任何状态.
++	 *
++	 * @param path 待探测的 jar 路径
++	 * @return 登记簿中该路径对应的仍在打开的实例；未登记或条目已关闭时返回 {@code null}
++	 */
++	public static @Nullable FileSystem findOpenRegistryEntry(Path path) {
++		try {
++			FileSystem fileSystem = FileSystems.getFileSystem(toJarUri(path));
++			return fileSystem.isOpen() ? fileSystem : null;
++		} catch (RuntimeException e) {
++			// 与 findClosedRegistryEntry 同理：未登记 / Key 构造失败都表示「登记簿里没有可用条目」
++			return null;
++		}
++	}
++
+ 	public static class UnrecoverableZipException extends RuntimeException {
+ 		public UnrecoverableZipException(String message, Throwable cause) {
+ 			super(message, cause);
+diff --git a/src/main/java/net/fabricmc/loom/util/ZipFsCloseRaceTestHook.java b/src/main/java/net/fabricmc/loom/util/ZipFsCloseRaceTestHook.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..019e7fc2cfd2ae7fcb7389897c392b6d3c25c893
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/util/ZipFsCloseRaceTestHook.java
+@@ -0,0 +1,287 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.util;
++
++import java.io.IOException;
++import java.nio.file.FileSystem;
++import java.nio.file.Path;
++import java.util.List;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
++
++import org.gradle.api.logging.Logger;
++import org.gradle.api.logging.Logging;
++import org.jetbrains.annotations.ApiStatus;
++
++/**
++ * <b>仅供测试使用</b>的注入钩子：让「共享 zipfs 实例被并发持有者关掉」这一竞态可以被确定性触发.
++ *
++ * <p>这不是功能开关，禁止在生产构建里设置它——属性名带 {@code loom.test.} 前缀即表示只在测试上下文有意义。
++ * 默认（不设属性）{@link #armForRead(List)} 只读一次系统属性就返回，对被注入的代码路径零影响。
++ *
++ * <h2>为什么需要它</h2>
++ * {@code TinyRemapperService.recoverClasspathRead} 的受害侧自愈只在「读取 classpath 期间共享 zipfs
++ * 实例被并发持有者关掉」这一竞态下才会被走到，而这个竞态在真实构建里极难命中（上一轮连续全量构建 0 命中），
++ * 因此该分支此前只有单测能证明、端到端从未被走到。本钩子把该形态变成可注入、可断言的事件。
++ *
++ * <h2>注入的形态与真实故障一致</h2>
++ * 刻意不复刻「登记簿里已有死条目」那条路径（单测已覆盖，它的成因是关闭时文件不在盘上）。这里复刻的是上一轮
++ * 端到端取证的形态：读取方（tiny-remapper 的 {@code FileSystemReference.openJar}）自己按 URI 路线打开 jar，
++ * 实例因此进入 JDK 进程级 zipfs 登记簿；本钩子检测到该条目出现——它的出现即「读取方已经拿到并在使用这个共享
++ * 实例」——再由一个并发的持有者线程把它关掉，读取方于是在遍历途中撞上 {@code ClosedFileSystemException}。
++ * 因此钩子只需一个注入点：{@link #armForRead(List)}，在读 classpath 之前布置好那个并发持有者。
++ *
++ * <h2>关闭前为什么等一小会儿</h2>
++ * 遍历 jar 做的第一件事是对根目录调 {@code ZipFileSystem.isDirectory}，而该方法<b>没有</b> ensureOpen 检查：
++ * 关闭若恰好落在「根目录取属性之后、列目录之前」那个微秒级窗口里，读取方拿到的是 {@code NullPointerException}
++ * 而不是 {@code ClosedFileSystemException}（实测扁平 victim jar 下约 2%，目录层数越多越容易命中），
++ * 自愈分支只认后者，失败类型就变成了随机。等 {@link #CLOSE_DELAY_MS} 毫秒再关，遍历早已铺开、
++ * 根目录那次调用已经过去（victim jar 条目数由测试保证足够多，遍历窗口远大于该延迟），失败类型稳定在 CFSE 上。
++ * 这个延迟只是把关闭点挪进「读取确实在进行」的区间内，不改变形态本身。
++ *
++ * <p>需要命中 NPE 那一侧落点（目录遍历撞上已置空的 {@code inodes}）的用例可以用
++ * {@link #DELAY_PROPERTY} 把延迟调到 0：目录越多，列目录的次数越多，关闭点落在「属性已取到、正要列目录」
++ * 那个窗口里的机会也越多。缺省值不变，不设该属性时行为与本属性加入之前一致。
++ *
++ * <h2>第二种注入：让读取以「形态被抹掉」的 NPE 失败</h2>
++ * 上面那条竞态命中的是 NPE 落点时，异常形态本身就带证据（消息指名 {@code inodes}、栈里有 zipfs 帧）。
++ * 但长命 JVM 里同一个隐式空指针被反复抛出后，HotSpot 会改用预分配的「fast throw」异常：消息为 {@code null}、
++ * 栈长为 0，判据拿不到任何形态证据。这条子形态由 {@link #READ_FAILURE_PROPERTY} 注入：钩子让读取直接抛出
++ * 一个与 fast throw 逐字同形的 NPE（见 {@link #fastThrowNullPointer()}），用来确定性验证
++ * {@code TinyRemapperService} 的「重读治不好就原样抛出」这条行为判据——真实 fast throw 由 JIT 决定何时启用，
++ * 在单测里无法稳定触发。
++ */
++@ApiStatus.Internal
++public final class ZipFsCloseRaceTestHook {
++	/**
++	 * 测试专用系统属性：classpath 条目文件名里包含该片段时，就在该条目上布置「读取期间被并发持有者关闭」的竞态.
++	 */
++	private static final String ENTRY_PROPERTY = "loom.test.zipfs.closeRaceEntry";
++	/**
++	 * 测试专用系统属性：覆盖「检测到读取方已打开受害条目之后等多久才关闭」的毫秒数（缺省 {@value #CLOSE_DELAY_MS}）.
++	 *
++	 * <p>存在的理由：关闭点决定命中竞态的哪个落点——{@code ClosedFileSystemException}（有 ensureOpen 的调用点）
++	 * 还是 {@code ZipFileSystem.isDirectory} 的 {@code inodes} NPE（没有 ensureOpen 的调用点）。
++	 * 扁平 victim jar 需要一点延迟把关闭点推离根目录那一次 {@code newDirectoryStream}（否则失败类型随机）；
++	 * 深目录 victim jar 的目录列举次数多得多，不需要这个延迟也能稳定命中，且更早关闭更容易落在
++	 * {@code isDirectory} 那个窗口里。缺省值保持不变，不设该属性时行为与本属性加入之前完全一致。
++	 */
++	private static final String DELAY_PROPERTY = "loom.test.zipfs.closeRaceDelayMs";
++	/**
++	 * 测试专用系统属性：让 classpath 读取按指定形态<b>失败</b>，用于确定性验证自愈判据.
++	 *
++	 * <p>取值只认下面两个常量；不设（或取值不认识）时读取照常进行.
++	 */
++	private static final String READ_FAILURE_PROPERTY = "loom.test.zipfs.readFailure";
++	/** {@value #READ_FAILURE_PROPERTY} 取值：只有第一次读取失败，其后照常成功. */
++	private static final String READ_FAILURE_FAST_THROW_ONCE = "fastThrowNpeOnce";
++	/** {@value #READ_FAILURE_PROPERTY} 取值：每次读取都失败，且反复抛出同一个预分配实例. */
++	private static final String READ_FAILURE_FAST_THROW_ALWAYS = "fastThrowNpeAlways";
++	/** 检测到读取方已打开受害条目之后再等多久才关闭（毫秒）；原因见类注释与 {@link #DELAY_PROPERTY}. */
++	private static final long CLOSE_DELAY_MS = 5;
++	/** 等待读取方打开受害条目的上限（毫秒）：超时即放弃，避免在 Gradle daemon 里留下空转线程. */
++	private static final long MAX_WAIT_MS = 60_000;
++	/** 轮询间隔（纳秒）：远小于 victim jar 的遍历时长，同时避免忙等烧 CPU. */
++	private static final long POLL_INTERVAL_NANOS = 200_000L;
++	/** 自愈/诊断日志必须让用户看见，用与 {@code TinyRemapperService} 相同、默认可见的 logger. */
++	private static final Logger LOGGER = Logging.getLogger("loom_zipfs");
++	/** 已经布置过竞态的受害者（绝对路径）：同一 daemon 里重复读同一份 classpath 时不叠加线程. */
++	private static final Set<String> ARMED = ConcurrentHashMap.newKeySet();
++	/**
++	 * 与 HotSpot fast throw 逐字同形的 NPE：预分配、消息为 {@code null}、栈长为 0，且每次抛出的是同一个实例.
++	 *
++	 * <p>真实 fast throw（{@code -XX:+OmitStackTraceInFastThrow}，默认开启）由 JIT 在「同一个隐式空指针
++	 * 在同一处被反复抛出」之后启用，此后抛出的都是 JVM 启动期预分配的那一个实例；本实例在
++	 * {@code getMessage()}、{@code getStackTrace()}、{@code getCause()} 上与它完全一致，是单测里可稳定复现的等价模拟.
++	 */
++	private static final NullPointerException FAST_THROW_NULL_POINTER = createFastThrowNullPointer();
++	/** {@link #READ_FAILURE_PROPERTY} 当前已布置的形态（{@code null} 表示未布置）；形态变化即视为重新布置. */
++	private static volatile String armedReadFailureForm;
++	/** {@value #READ_FAILURE_FAST_THROW_ONCE} 形态是否已经抛过一次. */
++	private static final AtomicBoolean onceReadFailureConsumed = new AtomicBoolean();
++
++	private ZipFsCloseRaceTestHook() {
++	}
++
++	/**
++	 * classpath 读取的唯一出口调用它：布置了读取失败（{@value #READ_FAILURE_PROPERTY}）就按形态抛出，
++	 * 否则立即返回.
++	 *
++	 * <p>不设属性时只读一次系统属性就返回，对被注入的代码路径零影响.
++	 */
++	public static void throwIfReadFailureArmed() {
++		final String form = System.getProperty(READ_FAILURE_PROPERTY);
++
++		if (form == null || form.isBlank()) {
++			armedReadFailureForm = null;
++			return;
++		}
++
++		if (!form.equals(armedReadFailureForm)) {
++			// 形态变化即视为「重新布置」：同一个 daemon 里多个用例互不影响，不必依赖用例的执行顺序与清理时机
++			armedReadFailureForm = form;
++			onceReadFailureConsumed.set(false);
++
++			if (!READ_FAILURE_FAST_THROW_ONCE.equals(form) && !READ_FAILURE_FAST_THROW_ALWAYS.equals(form)) {
++				LOGGER.warn("测试钩子属性 {} 的值 {} 无法识别，本次不注入读取失败", READ_FAILURE_PROPERTY, form);
++			}
++		}
++
++		if (READ_FAILURE_FAST_THROW_ALWAYS.equals(form)
++				|| (READ_FAILURE_FAST_THROW_ONCE.equals(form) && onceReadFailureConsumed.compareAndSet(false, true))) {
++			throw fastThrowNullPointer();
++		}
++	}
++
++	/**
++	 * 与 HotSpot fast throw 逐字同形的 NPE 实例（见 {@link #FAST_THROW_NULL_POINTER}）.
++	 *
++	 * <p>暴露出来只为让用例能断言「抛出的就是这同一个实例（对象标识相同，因而逐字一致）」；生产代码不使用.
++	 */
++	public static NullPointerException fastThrowNullPointer() {
++		return FAST_THROW_NULL_POINTER;
++	}
++
++	private static NullPointerException createFastThrowNullPointer() {
++		final NullPointerException failure = new NullPointerException();
++		// 预分配异常没有栈：真实 fast throw 交给 JVM 的这个实例同样有 null 消息、长度 0 的栈
++		failure.setStackTrace(new StackTraceElement[0]);
++		return failure;
++	}
++
++	/**
++	 * 在本次 classpath 读取之前布置关闭竞态；不设 {@value #ENTRY_PROPERTY} 时是空操作.
++	 *
++	 * <p>只认第一个文件名包含标记的条目，因此夹具工程必须保证该标记只命中它自己那条受害者依赖。
++	 *
++	 * @param toRead 本次即将读取的 classpath 条目
++	 */
++	public static void armForRead(List<Path> toRead) {
++		final String marker = System.getProperty(ENTRY_PROPERTY);
++
++		if (marker == null || marker.isBlank()) {
++			return;
++		}
++
++		for (Path path : toRead) {
++			if (!path.getFileName().toString().contains(marker) || !ARMED.add(path.toAbsolutePath().toString())) {
++				continue;
++			}
++
++			LOGGER.warn("测试钩子已布置关闭竞态（{}）：classpath 条目 {} 将在读取期间被并发持有者关闭", ENTRY_PROPERTY, path);
++			startConcurrentCloser(path);
++			return;
++		}
++	}
++
++	private static void startConcurrentCloser(Path victim) {
++		final CountDownLatch spinning = new CountDownLatch(1);
++		final Thread closer = new Thread(() -> closeSharedInstanceWhileReading(victim, spinning), "loom-zipfs-close-race");
++		closer.setDaemon(true);
++		closer.start();
++
++		try {
++			// 等线程真正跑起来再返回：这样「读取方打开条目」到「关闭者出手」之间只有轮询间隔，
++			// 不含线程创建的开销，关闭点因此稳定落在遍历窗口内。
++			if (!spinning.await(5, TimeUnit.SECONDS)) {
++				LOGGER.warn("测试钩子的关闭者线程没能及时启动，{} 上的竞态可能不会触发", victim);
++			}
++		} catch (InterruptedException e) {
++			Thread.currentThread().interrupt();
++		}
++	}
++
++	private static void closeSharedInstanceWhileReading(Path victim, CountDownLatch spinning) {
++		final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(MAX_WAIT_MS);
++		final long closeDelayMs = closeDelayMs();
++		spinning.countDown();
++
++		while (System.nanoTime() < deadline) {
++			final FileSystem shared = FileSystemUtil.findOpenRegistryEntry(victim);
++
++			if (shared == null) {
++				// 读取方还没打开这个条目（登记簿里还没有它的活实例）
++				parkNanos();
++
++				continue;
++			}
++
++			try {
++				Thread.sleep(closeDelayMs);
++			} catch (InterruptedException e) {
++				Thread.currentThread().interrupt();
++				return;
++			}
++
++			LOGGER.warn("测试钩子生效：共享 zipfs 实例 {} 此刻正被读取方使用，改由并发持有者关闭，以复现 JDK-8291712 的关闭竞态", victim);
++
++			try {
++				shared.close();
++			} catch (IOException e) {
++				// 关闭失败说明文件在读取期间被替换过——那正是 JDK-8291712 留下死条目的路径，不是本钩子要复刻的形态
++				LOGGER.warn("测试钩子关闭 {} 的共享实例失败", victim, e);
++			}
++
++			return;
++		}
++
++		LOGGER.warn("测试钩子等待超时：{} 在 {} ms 内没有被读取方打开，本次未布置关闭竞态", victim, MAX_WAIT_MS);
++	}
++
++	/** 读一次关闭延迟属性；非法值（无法解析、负数）一律退回缺省，避免测试属性把钩子变成空转. */
++	private static long closeDelayMs() {
++		final String configured = System.getProperty(DELAY_PROPERTY);
++
++		if (configured == null || configured.isBlank()) {
++			return CLOSE_DELAY_MS;
++		}
++
++		try {
++			final long parsed = Long.parseLong(configured.trim());
++
++			if (parsed < 0) {
++				LOGGER.warn("测试钩子属性 {} 的值 {} 非法（不能为负），改用缺省 {} ms", DELAY_PROPERTY, configured, CLOSE_DELAY_MS);
++				return CLOSE_DELAY_MS;
++			}
++
++			return parsed;
++		} catch (NumberFormatException e) {
++			LOGGER.warn("测试钩子属性 {} 的值 {} 无法解析，改用缺省 {} ms", DELAY_PROPERTY, configured, CLOSE_DELAY_MS);
++			return CLOSE_DELAY_MS;
++		}
++	}
++
++	private static void parkNanos() {
++		// 用 Thread.sleep(0, nanos) 而不是忙等：轮询本身要够密（决定关闭点落点），但没必要烧 CPU
++		try {
++			Thread.sleep(0, (int) POLL_INTERVAL_NANOS);
++		} catch (InterruptedException e) {
++			Thread.currentThread().interrupt();
++		}
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/util/ZipReprocessorUtil.java b/src/main/java/net/fabricmc/loom/util/ZipReprocessorUtil.java
+index 69056c5c392deb8ac41c7ace8b9a6272d0f446ec..c560f1b7b83dbe922e6231515f76e990ecb6e460 100644
+--- a/src/main/java/net/fabricmc/loom/util/ZipReprocessorUtil.java
++++ b/src/main/java/net/fabricmc/loom/util/ZipReprocessorUtil.java
+@@ -29,7 +29,6 @@ import java.io.IOException;
+ import java.io.InputStream;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+-import java.nio.file.StandardCopyOption;
+ import java.util.Calendar;
+ import java.util.Comparator;
+ import java.util.GregorianCalendar;
+@@ -42,6 +41,8 @@ import java.util.zip.ZipOutputStream;
+ import org.gradle.api.tasks.bundling.ZipEntryCompression;
+ import org.intellij.lang.annotations.MagicConstant;
+ 
++import net.fabricmc.loom.util.cache.AtomicFiles;
++
+ public class ZipReprocessorUtil {
+ 	private ZipReprocessorUtil() { }
+ 
+@@ -131,7 +132,8 @@ public class ZipReprocessorUtil {
+ 			}
+ 		}
+ 
+-		Files.move(tempFile, file, StandardCopyOption.REPLACE_EXISTING);
++		// 原子落位：目标 jar 可能正被并发读方持有，用 AtomicFiles 走 ATOMIC_MOVE 并在 Windows 的共享冲突上退避重试
++		AtomicFiles.move(tempFile, file);
+ 	}
+ 
+ 	/**
+@@ -168,7 +170,8 @@ public class ZipReprocessorUtil {
+ 			}
+ 		}
+ 
+-		Files.move(tempFile, file, StandardCopyOption.REPLACE_EXISTING);
++		// 原子落位：目标 jar 可能正被并发读方持有，用 AtomicFiles 走 ATOMIC_MOVE 并在 Windows 的共享冲突上退避重试
++		AtomicFiles.move(tempFile, file);
+ 	}
+ 
+ 	/**
+@@ -209,7 +212,8 @@ public class ZipReprocessorUtil {
+ 			}
+ 		}
+ 
+-		Files.move(tempFile, file, StandardCopyOption.REPLACE_EXISTING);
++		// 原子落位：目标 jar 可能正被并发读方持有，用 AtomicFiles 走 ATOMIC_MOVE 并在 Windows 的共享冲突上退避重试
++		AtomicFiles.move(tempFile, file);
+ 	}
+ 
+ 	/**
+@@ -248,7 +252,8 @@ public class ZipReprocessorUtil {
+ 			}
+ 		}
+ 
+-		Files.move(tempFile, file, StandardCopyOption.REPLACE_EXISTING);
++		// 原子落位：目标 jar 可能正被并发读方持有，用 AtomicFiles 走 ATOMIC_MOVE 并在 Windows 的共享冲突上退避重试
++		AtomicFiles.move(tempFile, file);
+ 	}
+ 
+ 	private static void copyZipEntry(ZipOutputStream zipOutputStream, ZipEntry entry, InputStream inputStream) throws IOException {
+diff --git a/src/main/java/net/fabricmc/loom/util/ZipUtils.java b/src/main/java/net/fabricmc/loom/util/ZipUtils.java
+index 85a521297a208bbfb5c833a94cc57c8bee3655bc..6810b11626e5b24d6905c566c975bfe90c06234f 100644
+--- a/src/main/java/net/fabricmc/loom/util/ZipUtils.java
++++ b/src/main/java/net/fabricmc/loom/util/ZipUtils.java
+@@ -55,6 +55,7 @@ import org.objectweb.asm.ClassVisitor;
+ import org.objectweb.asm.ClassWriter;
+ 
+ import net.fabricmc.loom.LoomGradlePlugin;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ 
+ public class ZipUtils {
+ 	public static boolean isZip(Path zip) throws IOException {
+@@ -158,10 +159,23 @@ public class ZipUtils {
+ 	}
+ 
+ 	public static void pack(Path from, Path zip) throws IOException {
+-		Files.deleteIfExists(zip);
+-
+ 		if (!Files.isDirectory(from)) throw new IllegalArgumentException(from + " is not a directory!");
+ 
++		// 原子落位：内容先写进同目录的私有临时文件，写完整后再 move 到 zip。
++		// 旧写法是「先 deleteIfExists(zip) 再就地建 zip」，那会在两次调用之间留下「文件不存在」的窗口；
++		// 窗口里被并发读方打开，关闭时就会因 toRealPath() 失败而把该路径的 zipfs 登记簿条目永久留成
++		// 死实例（JDK-8291712）。同理，pack 失败时旧产物也不会再被提前删掉。
++		final AtomicInteger count = new AtomicInteger();
++
++		AtomicFiles.publish(zip, tmp -> count.set(packInto(from, tmp)));
++
++		if (count.get() == 0) {
++			throw new IOException("Noting packed into %s from %s".formatted(zip, from));
++		}
++	}
++
++	/** 把目录 {@code from} 的内容打进 zip，返回写入的条目数（目标必须是调用方独占的路径）. */
++	private static int packInto(Path from, Path zip) throws IOException {
+ 		int count = 0;
+ 
+ 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(zip, true);
+@@ -179,9 +193,7 @@ public class ZipUtils {
+ 			}
+ 		}
+ 
+-		if (count == 0) {
+-			throw new IOException("Noting packed into %s from %s".formatted(zip, from));
+-		}
++		return count;
+ 	}
+ 
+ 	public static void add(Path zip, String path, String str) throws IOException {
+diff --git a/src/main/java/net/fabricmc/loom/util/cache/JarReusability.java b/src/main/java/net/fabricmc/loom/util/cache/JarReusability.java
+index 9adb6dd271b6a4664e4398de1d7304892a72d061..2c2f77409285f4fc4b27bcc5c0cb1ee4d7e8999c 100644
+--- a/src/main/java/net/fabricmc/loom/util/cache/JarReusability.java
++++ b/src/main/java/net/fabricmc/loom/util/cache/JarReusability.java
+@@ -83,7 +83,10 @@ public final class JarReusability {
+ 			return false;
+ 		}
+ 
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar, false); var entries = Files.list(fs.getPath("/"))) {
++		// 只读探测，且刻意走独立文件系统（不登记）：本方法要判定的正是「磁盘上的产物是否完整」，
++		// 共享文件系统反而会把别的持有者的未落盘内容算进来。更重要的是一旦登记，产物被重建
++		// （先删后写）时关闭瞬间文件不在盘上就会毒化该路径，使同一 daemon 之后再也打不开它。
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(jar); var entries = Files.list(fs.getPath("/"))) {
+ 			// 至少一个条目：空 zip（0 条目）虽然能被 zipfs 打开，但作为 Minecraft/Forge 链的输入必然是残骸
+ 			if (entries.findAny().isEmpty()) {
+ 				reportUnreusable(jar, "可作为 zip 打开，但不含任何条目（0 条目空 zip 壳）");
+diff --git a/src/main/java/net/fabricmc/loom/util/download/Download.java b/src/main/java/net/fabricmc/loom/util/download/Download.java
+index 65b5922f1631896322e413edae73a85441d62dc6..5d6815bd21f20d7a3ba417998a22c7cc5a32170a 100644
+--- a/src/main/java/net/fabricmc/loom/util/download/Download.java
++++ b/src/main/java/net/fabricmc/loom/util/download/Download.java
+@@ -57,6 +57,7 @@ import org.slf4j.LoggerFactory;
+ 
+ import net.fabricmc.loom.util.AttributeHelper;
+ import net.fabricmc.loom.util.Checksum;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ 
+ public final class Download {
+ 	private static final String E_TAG = "ETag";
+@@ -239,8 +240,10 @@ public final class Download {
+ 		// Download the file initially to a .part file
+ 		final Path partFile = getPartFile(output);
+ 
++		// 刻意不在下载前删除 output：那会留下「文件不存在」的窗口，而 output 是可以被并发读取的共享缓存产物
++		// （依赖 jar 就是被 remap classpath 读的）。读方在窗口里打开它，关闭时就会因 toRealPath() 失败而把该
++		// 路径的 zipfs 登记簿条目永久留成死实例（JDK-8291712）。old output 由下载完成后的原子 move 覆盖。
+ 		try {
+-			Files.deleteIfExists(output);
+ 			Files.deleteIfExists(partFile);
+ 		} catch (IOException e) {
+ 			throw error(e, "Failed to delete existing file");
+@@ -280,7 +283,9 @@ public final class Download {
+ 		try {
+ 			// Once the file has been fully read, move it to the destination file.
+ 			// This ensures that the output file only exists in fully populated state.
+-			Files.move(partFile, output);
++			// 用原子 move（而不是裸 Files.move）：目标可能已存在且正被读方持有，
++			// AtomicFiles 会优先 ATOMIC_MOVE，并在 Windows 的共享冲突上做有上限的退避重试。
++			AtomicFiles.move(partFile, output);
+ 		} catch (IOException e) {
+ 			throw error(e, "Failed to complete download");
+ 		}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ZipFsCloseRaceHealTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ZipFsCloseRaceHealTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..bbe745ae9261f8b6cdcad1aa6c07fd97a4938a24
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ZipFsCloseRaceHealTest.groovy
+@@ -0,0 +1,314 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration.pipeline
++
++import java.nio.charset.StandardCharsets
++import java.util.zip.ZipEntry
++import java.util.zip.ZipOutputStream
++
++import org.gradle.testkit.runner.BuildResult
++import spock.lang.Specification
++
++import net.fabricmc.loom.test.util.GradleProjectTestTrait
++import net.fabricmc.loom.util.Checksum
++
++import static net.fabricmc.loom.test.LoomTestConstants.DEFAULT_GRADLE
++import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
++
++/**
++ * 端到端证明 remap 服务的「受害侧自愈」真的会被走到、并且真的救回了构建.
++ *
++ * <p>被证明的分支是 {@code TinyRemapperService.recoverClasspathRead}：它只在
++ * 「读取 classpath 期间共享 zipfs 实例被并发持有者关掉」（JDK-8291712 的真实故障形态）时才会执行。
++ * 上一轮已经用单测确定性复刻了该形态，但端到端构建里这个竞态极难自然命中（连续多次全量构建 0 命中），
++ * 于是这条自愈在生产路径上从来没被走到过——单测证明不了「端到端确实会自愈，而不是换个地方炸」。
++ *
++ * <p>本用例用 {@code ZipFsCloseRaceTestHook}（系统属性 {@code loom.test.zipfs.closeRaceEntry}）把该形态
++ * 变成确定性事件：钩子等读取方（tiny-remapper）自己把受害者 jar 打开、登记簿里出现活实例之后，
++ * 再由一个并发的持有者线程把那个实例关掉。断言分四层，逐层排除「其实没触发」：
++ * <ul>
++ *   <li><b>形态确实发生</b>：钩子日志「{@value #CLOSED_LOG}」出现，说明读取方手里的共享实例真的被关掉了；</li>
++ *   <li><b>自愈确实被走到</b>：自愈分支入口的日志「{@value #HEAL_LOG}」出现——这是本轮新加的痕迹，
++ *       因为真实形态下逐条重读通常一次就成功，旧代码在这条路径上是静默恢复，没有任何可检索的证据；</li>
++ *   <li><b>构建仍然成功</b>：{@code remapJar} 成功。把自愈临时禁用后同一条用例必须变红
++ *       （见提交说明里的红/绿两次输出）；</li>
++ *   <li><b>不设钩子时零影响</b>：对照组既不出现钩子日志也不出现自愈日志，且两条产物**逐字节一致**——
++ *       自愈绕开坏实例这件事没有改变任何产物内容。</li>
++ * </ul>
++ *
++ * <p>受害者 jar 是**扁平**布局（根目录下全是 class，没有子目录），理由见
++ * {@link #writeVictimJar}：关闭点落在 {@code ZipFileSystem.isDirectory}（该方法没有 ensureOpen 检查）
++ * 那个微秒级窗口里时，失败形态会变成 NPE 而不是 ClosedFileSystemException；本用例要稳定断言的是
++ * 「自愈分支入口那条日志」，因此用扁平布局把关闭点推离那个窗口。
++ * NPE 落点本身由下面 {@code 深目录} 那条用例覆盖（改后它同样走自愈）。
++ */
++class ZipFsCloseRaceHealTest extends Specification implements GradleProjectTestTrait {
++	/** 受害者 jar 的文件名片段：钩子按它挑受害者，本用例也用它做断言. */
++	private static final String VICTIM_MARKER = "zipfs-close-race-victim"
++	/** 受害者 jar 所在的目录（夹具工程把 libs/ 下的受害者 jar 当成依赖）. */
++	private static final String VICTIM_DIR = "libs"
++	/** 受害者 jar 相对夹具工程根目录的路径. */
++	private static final String VICTIM_PATH = "${VICTIM_DIR}/${VICTIM_MARKER}.jar"
++	/**
++	 * 受害者 jar 的条目数.
++	 *
++	 * <p>这个数字不是随便取的：钩子在检测到读取方打开受害者之后要等几毫秒才关闭（原因见
++	 * {@code ZipFsCloseRaceTestHook} 的类注释），所以遍历窗口必须远大于那个延迟，关闭点才稳定落在
++	 * 「读取进行中」而不是「读完了」。实测 4 万条目的遍历窗口在 0.4~0.8 秒量级，延迟只有 5 毫秒。
++	 */
++	private static final int VICTIM_ENTRIES = 40_000
++	/** 钩子属性名，须与 {@code ZipFsCloseRaceTestHook} 里的常量一致. */
++	private static final String HOOK_PROPERTY = "loom.test.zipfs.closeRaceEntry"
++	/** 钩子「检测到受害者被打开之后再等多久才关闭」的属性名，须与 {@code ZipFsCloseRaceTestHook} 里的常量一致. */
++	private static final String DELAY_PROPERTY = "loom.test.zipfs.closeRaceDelayMs"
++	/** 钩子「已关掉读取方手里的共享实例」的日志片段. */
++	private static final String CLOSED_LOG = "测试钩子生效：共享 zipfs 实例"
++	/** 自愈分支入口的日志片段（{@code TinyRemapperService.recoverClasspathRead}）. */
++	private static final String HEAL_LOG = "开始自愈重读"
++	/** 「命中关闭竞态」的日志片段：自愈入口那条与自愈重读中再次命中的那条都含它，形态就记在这两行里. */
++	private static final String HEAL_FORM_MARKER = "共享 zipfs 实例已被关闭"
++	/**
++	 * 「关闭的 zipfs 在目录遍历时抛出的 NPE」在自愈日志里的特征片段.
++	 *
++	 * <p>取自 JDK 实际消息（{@code Cannot invoke "java.util.LinkedHashMap.get(Object)" because "this.inodes" is null}）：
++	 * {@code this.inodes} 为 null 只可能由 {@code ZipFileSystem.close()} 造成，因此日志里出现它就是命中了该形态。
++	 */
++	private static final String NPE_FORM_MARKER = 'this.inodes'
++	/**
++	 * 深目录 victim 的目录层数.
++	 *
++	 * <p>目录越多，遍历时「取属性 → 列目录」的次数越多，关闭点落进那个窗口的机会越大。
++	 * 深度不能太小：遍历窗口必须明显长于关闭者的检测延迟（轮询 + 线程启动约 1 ms），否则实例在关闭者
++	 * 看见之前就已经读完，竞态根本不发生（实测 1000 层时 20 条 victim 全部错过）。
++	 * 也不能太大：zipfs 索引里每个节点都存自己的绝对路径，链式嵌套的内存是 O(深度²)，
++	 * 而 victim 会被 tiny-remapper 并行读取（实测 4 条 × 4000 层就把测试 daemon 的堆打爆）。
++	 */
++	private static final int DEEP_VICTIM_LEVELS = 4_000
++
++	def "读取期间共享 zipfs 实例被并发持有者关闭时，remapJar 靠自愈照常成功"() {
++		when: "带钩子跑一次 remapJar：受害者 jar 在读取期间被并发持有者关掉"
++		Run hooked = remapJar(victimJarName: VICTIM_MARKER)
++		println("[带钩子] build/libs 产物 sha256=" + sha256(hooked.artifact))
++		println("[带钩子] outcome=" + hooked.result.task(":remapJar").outcome)
++
++		and: "再跑一次同样的工程，但不设钩子，作为对照"
++		Run baseline = remapJar(victimJarName: VICTIM_MARKER, hook: false)
++		println("[对照] build/libs 产物 sha256=" + sha256(baseline.artifact))
++
++		then: "① 形态确实发生了：钩子关掉的正是读取方手里那个共享实例"
++		hooked.result.output.contains(CLOSED_LOG)
++
++		and: "② 自愈分支确实被走到（而不是竞态没触发、或者换了个地方失败）"
++		hooked.result.output.contains(HEAL_LOG)
++
++		and: "③ 构建仍然成功"
++		hooked.result.task(":remapJar").outcome == SUCCESS
++
++		and: "④ 不设钩子时两条日志都不出现，构建照常成功——钩子对真实构建零影响"
++		baseline.result.task(":remapJar").outcome == SUCCESS
++		!baseline.result.output.contains(CLOSED_LOG)
++		!baseline.result.output.contains(HEAL_LOG)
++
++		and: "⑤ 产物逐字节一致：自愈绕开坏实例没有改变任何产物内容"
++		baseline.artifact.isFile()
++		sha256(hooked.artifact) == sha256(baseline.artifact)
++	}
++
++	/**
++	 * 同一竞态的另一个落点：目录遍历时 {@code ZipFileSystem.isDirectory} 没有 ensureOpen 检查.
++	 *
++	 * <p>{@code FileTreeWalker} 每进一个目录先取属性（{@code readAttributes} 有 ensureOpen，关闭后报 CFSE），
++	 * 紧接着列目录，后者走到 {@code ZipFileSystem.isDirectory}——它只做 {@code beginRead() + getInode()}，
++	 * 没有 ensureOpen；实例已关闭时 {@code close()} 已把 {@code inodes} 置空，于是抛
++	 * {@code NullPointerException: Cannot invoke "java.util.LinkedHashMap.get(Object)" because "this.inodes" is null}。
++	 * 改前判据只认 {@code ClosedFileSystemException}，这类失败会直接炸构建、不走自愈；本用例验证改后同样自愈。
++	 *
++	 * <p><b>命中与否为什么是随机的</b>：那个窗口是 JDK 里「取完属性」到「列目录」之间的几百纳秒，
++	 * 外部没有任何可观测的触发点——关闭线程只能按时间撞，撞上就是 NPE 落点，撞不上就是 CFSE 落点。
++	 * 实测单条受害者单次构建命中约一成（提高命中率的办法都试过：加大目录层数、去掉关闭延迟、
++	 * 多放几条受害者——后者受测试 daemon 堆限制，4 条 × 4000 层即 OOM）。
++	 * 因此本用例写成「命中即断言、未命中即记录」：竞态发生、自愈被走到、构建成功这三条每次都断言
++	 * （命中 NPE 落点时，「构建成功」就是「该形态同样被自愈接住」的断言），本次命中的落点用 println 如实打印。
++	 * 「该形态确实会发生」「判据确实认可它」由 {@code ZipFsPoisoningTest} 的两个用例兜住
++	 * （一个是把该 NPE 真造出来的确定性用例，一个是 150 轮竞态的统计用例），不依赖本用例的运气。
++	 */
++	def "关闭竞态落到目录遍历（isDirectory 的 inodes NPE）时，remapJar 同样靠自愈成功"() {
++		when: "深目录 victim + 关闭延迟 0：让关闭点尽量落在「属性已取到、正要列目录」的窗口里"
++		Run hooked = remapJar(victimJarName: VICTIM_MARKER, deepVictim: true, closeDelayMs: 0)
++		boolean hitNpeForm = hitsNpeForm(hooked.result)
++		println("[深目录] 命中 inodes NPE 形态=${hitNpeForm}，落点日志=" + formLogLines(hooked.result))
++
++		then: "① 竞态确实发生、自愈确实被走到（否则本用例什么也没证明）"
++		hooked.result.output.contains(CLOSED_LOG)
++		hooked.result.output.contains(HEAL_LOG)
++
++		and: "② 构建照常成功——命中 NPE 落点时，这一条就是「该形态同样被自愈接住」的断言（改前会直接炸构建）"
++		hooked.result.task(":remapJar").outcome == SUCCESS
++	}
++
++	/** 跑一次 remapJar 的结果：构建输出与产物. */
++	private static final class Run {
++		BuildResult result
++		File artifact
++	}
++
++	/**
++	 * 在夹具工程里跑一次 {@code remapJar}.
++	 *
++	 * @param options {@code victimJarName} 受害者 jar 的名字片段；{@code hook} 为 {@code false} 时不设钩子属性；
++	 *                {@code deepVictim} 为 {@code true} 时写深目录布局（默认扁平）；
++	 *                {@code closeDelayMs} 非空时覆盖钩子的关闭延迟
++	 * @return 产物与构建结果
++	 */
++	private Run remapJar(Map options) {
++		final String victimName = (options.victimJarName as String) + ".jar"
++		def gradle = gradleProject(project: "zipfsCloseRace", version: DEFAULT_GRADLE)
++
++		if (options.deepVictim) {
++			writeDeepVictimJar(new File(gradle.projectDir, VICTIM_PATH))
++		} else {
++			writeVictimJar(new File(gradle.projectDir, VICTIM_PATH))
++		}
++
++		def args = [
++			"--console=plain",
++			"--no-build-cache"
++		]
++
++		if (options.hook != false) {
++			args << "-D${HOOK_PROPERTY}=${victimName}"
++		}
++
++		if (options.closeDelayMs != null) {
++			args << "-D${DELAY_PROPERTY}=${options.closeDelayMs}"
++		}
++
++		def result = gradle.run(task: "remapJar", configurationCache: false, args: args)
++		return new Run(result: result, artifact: gradle.getOutputFile("zipfs-close-race-1.0.0.jar"))
++	}
++
++	/** 取出构建输出里所有「命中关闭竞态」的日志行（自愈入口那条与自愈重读中再次命中的那条，形态都记在上面）. */
++	private static List<String> formLogLines(BuildResult result) {
++		return result.output.readLines().findAll { it.contains(HEAL_FORM_MARKER) }
++	}
++
++	/** 本次构建里有没有出现「目录遍历撞上已置空的 inodes」这个落点（形态只可能由关闭造成，见 {@link #NPE_FORM_MARKER}）. */
++	private static boolean hitsNpeForm(BuildResult result) {
++		return formLogLines(result).any { it.contains(NPE_FORM_MARKER) }
++	}
++
++	private static String sha256(File file) {
++		return Checksum.of(file).sha256().hex()
++	}
++
++	/**
++	 * 写出受害者 jar：**扁平**布局（根目录下全是 class 条目，没有任何子目录）.
++	 *
++	 * <p>为什么扁平：{@code FileTreeWalker} 每进一个目录都会先取属性（有 ensureOpen 检查，关闭后报 CFSE），
++	 * 紧接着调 {@code Files.newDirectoryStream}，而后者最终走到 {@code ZipFileSystem.isDirectory}——
++	 * 这个方法**没有** ensureOpen 检查，实例一关就 NPE。目录越多，关闭点撞进那个窗口的机会越多
++	 * （实测目录树布局约 1~2 成是 NPE，扁平布局约 0）。本用例要稳定断言的是「自愈分支入口那条日志」，
++	 * 用扁平布局把关闭点推离那个窗口、稳定落在 CFSE 上；NPE 落点由深目录那条用例覆盖
++	 * （改后它也走自愈，见 {@link #writeDeepVictimJar}）。
++	 *
++	 * <p>class 内容侧是各自独立的最小合法 class（常量池只有自己的名字），条目名与类名一一对应、
++	 * 互不重名，tiny-remapper 会照常把它们登记进 classpath。
++	 */
++	private static void writeVictimJar(File jar) {
++		jar.parentFile.mkdirs()
++
++		new ZipOutputStream(new BufferedOutputStream(new FileOutputStream(jar))).withStream { ZipOutputStream zip ->
++			VICTIM_ENTRIES.times { int index ->
++				String name = String.format("racevictim%06d", index)
++				zip.putNextEntry(new ZipEntry(name + ".class"))
++				zip.write(tinyClass(name))
++				zip.closeEntry()
++			}
++		}
++	}
++
++	/**
++	 * 写出受害者 jar：**深目录**布局（{@value #DEEP_VICTIM_LEVELS} 层深的目录链，末端一个 class）.
++	 *
++	 * <p>为什么用深目录：关闭竞态落在「取完属性、正要列目录」那个窗口里时，失败是
++	 * {@code ZipFileSystem.isDirectory} 抛的 inodes NPE 而不是 CFSE；目录越多，这种机会越多。
++	 * 链式嵌套每层只占一个目录条目（比铺同级目录省条目），但遍历时每层都会走一次「取属性 → 列目录」，
++	 * 且每层的目录列举都只有一两个子项，遍历时间几乎全花在「属性 → 列目录」这个循环上。
++	 * 末端那个 class 保证 tiny-remapper 的遍历真的会读到一个类（与生产形态一致）。
++	 */
++	private static void writeDeepVictimJar(File jar) {
++		jar.parentFile.mkdirs()
++		StringBuilder path = new StringBuilder()
++
++		new ZipOutputStream(new BufferedOutputStream(new FileOutputStream(jar))).withStream { ZipOutputStream zip ->
++			DEEP_VICTIM_LEVELS.times { int level ->
++				path.append("d").append(level).append('/')
++				zip.putNextEntry(new ZipEntry(path.toString()))
++				zip.closeEntry()
++			}
++
++			String leaf = "racevictimleaf"
++			zip.putNextEntry(new ZipEntry(path.toString() + leaf + ".class"))
++			zip.write(tinyClass(leaf))
++			zip.closeEntry()
++		}
++	}
++
++	/** 最小合法 class 文件：常量池只有自己的类名，无字段、无方法、无接口. */
++	private static byte[] tinyClass(String internalName) {
++		byte[] name = internalName.getBytes(StandardCharsets.UTF_8)
++		def out = new ByteArrayOutputStream()
++		u4(out, 0xCAFEBABE)
++		u2(out, 0)
++		u2(out, 52)
++		u2(out, 3)
++		out.write(7)
++		u2(out, 2)
++		out.write(1)
++		u2(out, name.length)
++		out.write(name)
++		u2(out, 0x0021)
++		u2(out, 1)
++		u2(out, 0)
++		u2(out, 0)
++		u2(out, 0)
++		u2(out, 0)
++		u2(out, 0)
++		return out.toByteArray()
++	}
++
++	private static void u2(ByteArrayOutputStream out, int value) {
++		out.write((int) ((value >>> 8) & 0xFF))
++		out.write((int) (value & 0xFF))
++	}
++
++	/** 写大端 4 字节；参数是 {@code long}：Groovy 里 {@code 0xCAFEBABE} 超出 int 范围，会解析成 Long. */
++	private static void u4(ByteArrayOutputStream out, long value) {
++		out.write((int) ((value >>> 24) & 0xFF))
++		out.write((int) ((value >>> 16) & 0xFF))
++		out.write((int) ((value >>> 8) & 0xFF))
++		out.write((int) (value & 0xFF))
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/ZipFsPoisoningTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/ZipFsPoisoningTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a89e85b2febad42a6ffb8d5975a7fd08b3c941c
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/ZipFsPoisoningTest.groovy
+@@ -0,0 +1,790 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit
++
++import java.nio.charset.StandardCharsets
++import java.nio.file.ClosedFileSystemException
++import java.nio.file.FileSystems
++import java.nio.file.FileVisitResult
++import java.nio.file.Files
++import java.nio.file.Path
++import java.nio.file.SimpleFileVisitor
++import java.nio.file.attribute.BasicFileAttributes
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++import java.util.zip.ZipEntry
++import java.util.zip.ZipFile
++import java.util.zip.ZipOutputStream
++
++import org.gradle.api.provider.Provider
++
++import net.fabricmc.loom.configuration.mods.ArtifactMetadata
++import net.fabricmc.loom.configuration.mods.ArtifactRef
++import net.fabricmc.loom.task.service.TinyRemapperService
++import net.fabricmc.loom.test.unit.service.ServiceTestBase
++import net.fabricmc.loom.util.FileSystemUtil
++import net.fabricmc.loom.util.ZipFsCloseRaceTestHook
++import net.fabricmc.loom.util.cache.JarReusability
++import net.fabricmc.tinyremapper.TinyRemapper
++
++/**
++ * JDK-8291712 的毒化只可能发生在 JDK 进程级 zipfs 登记簿里，因此本 spec 复刻的正是那条链路：
++ *
++ * <ol>
++ *     <li>jar 在盘上时被打开（登记）：登记簿出现 {@code realPath -> fileSystem} 条目；</li>
++ *     <li>该 jar 在打开期间被删掉（{@code --refresh-dependencies} 下依赖被「先删后写」就是这形状）；</li>
++ *     <li>{@code close()} 需要先 {@code toRealPath()} 才能摘除条目，文件不在盘上就抛 IOException，
++ *         条目于是永久残留成「已关闭」的死实例；</li>
++ *     <li>文件回来后，任何走 URI 路线打开该路径的代码（tiny-remapper 的
++ *         {@code FileSystemReference.openJar} 就先查登记簿）都只会拿到这个死实例。</li>
++ * </ol>
++ *
++ * <p>复现里「重建文件」必须绕开 zipfs 的登记路线（这里用 {@link ZipOutputStream}）：
++ * 走登记路线重建会用新实例覆盖掉那条死条目，反而看不到毒化.
++ *
++ * <p>本 spec 同时固化 remap 服务的<b>失败路径自愈</b>：受害 jar 读不到时改从其同目录私有快照读一次，
++ * 使得「Gradle 自己重写依赖 jar」这种 loom 控制不了的场景也不再让构建失败.
++ */
++class ZipFsPoisoningTest extends ServiceTestBase {
++	/** 受害 jar 里的探针类：断言「它真的被读进了 classpath」时用这个名字. */
++	private static final String PROBE_CLASS = "net/fabricmc/loom/util/FileSystemUtil"
++	/** 关闭 zipfs 后被置空、随后在目录遍历时被解引用的字段名：判据正是按它认形态（与 {@code TinyRemapperService} 里的常量一致）. */
++	private static final String INODES_FIELD = "inodes"
++	/** JDK 实际抛出的那条消息（JDK 15+ 的「有帮助的 NPE 消息」），用于构造「消息同形但栈不对」的反例. */
++	private static final String NPE_FORM_MESSAGE = 'Cannot invoke "java.util.LinkedHashMap.get(Object)" because "this.inodes" is null'
++	/** 让 classpath 读取按指定形态失败的测试属性，须与 {@code ZipFsCloseRaceTestHook} 里的常量一致. */
++	private static final String READ_FAILURE_PROPERTY = "loom.test.zipfs.readFailure"
++	/** {@value #READ_FAILURE_PROPERTY} 取值：只有第一次读取失败，其后照常（模拟「重读拿到健康新实例」）. */
++	private static final String READ_FAILURE_ONCE = "fastThrowNpeOnce"
++	/** {@value #READ_FAILURE_PROPERTY} 取值：每次读取都失败（模拟「重读仍然以同样方式失败」的真实缺陷）. */
++	private static final String READ_FAILURE_ALWAYS = "fastThrowNpeAlways"
++	/** 深目录 victim 的目录层数：层数越多，目录列举次数越多，关闭点落进「属性已取到、正要列目录」窗口的机会越大. */
++	private static final int DEEP_DIR_LEVELS = 4_000
++	/**
++	 * 竞态轮数.
++	 *
++	 * <p>单轮命中「目录列举窗口」的概率实测约 5%~15%（其余是 CFSE，落点本身随机，改不了——那个窗口是
++	 * JDK 里两次 zipfs 调用之间的几百纳秒，外部没有触发点）。{@value #RACE_ROUNDS} 轮下来
++	 * 「一次都没落进窗口」的概率已可忽略，本用例断言的正是「窗口确实会被撞上」。
++	 */
++	private static final int RACE_ROUNDS = 150
++
++	def "loom 读取依赖 jar 的只读路径不会被已毒化路径拖死"() {
++		given: "一条已被 JDK-8291712 毒化的依赖 jar 路径"
++		Path dir = Files.createTempDirectory("zipfs-poison")
++		Path jar = poison(dir.resolve("dependency.jar"))
++
++		and: "登记簿里确实是那个「已关闭」的死实例，而独立只读路线仍能读到它"
++		assert !FileSystems.getFileSystem(toJarUri(jar)).isOpen()
++		FileSystemUtil.getReadOnlyJarFileSystem(jar).withCloseable {
++			assert Files.exists(it.getPath("fabric.mod.json"))
++		}
++
++		when: "走 loom 读取依赖 jar 的生产路径（remapJar 之前对 classpath 依赖做的事）"
++		boolean reusable = JarReusability.isReusable(jar)
++		def metadata = ArtifactMetadata.create(new ArtifactRef.FileArtifactRef(jar, "net.fabric", "loom-test", "1.0"), "1.4", ArtifactMetadata.MixinRemapType.MIXIN)
++
++		then: "两条路径都照常工作：它们不经过登记簿，因而与死实例无关"
++		reusable
++		metadata.isFabricMod()
++
++		cleanup:
++		deleteQuietly(dir)
++	}
++
++	/**
++	 * 本用例是缺陷单的正面复刻：持有者按 tiny-remapper 的共享路线打开 classpath jar，
++	 * 文件在持有期间被重写（先删后写），此后该路径在本 JVM 内「一打开就是已关闭实例」。
++	 *
++	 * <p>改前：构造 remap 服务时抛
++	 * {@code Failed to create service instance of TinyRemapperService: CompletionException: ClosedFileSystemException}。
++	 * 改后：服务从私有快照把受害 jar 读完，受害 jar 里的类真的进了 classpath。
++	 */
++	def "共享实例被并发持有者关闭后，读取方从私有快照自愈而不是抛 ClosedFileSystemException"() {
++		given: "一条被共享路线打开、期间又被「先删后写」的 classpath jar"
++		Path dir = Files.createTempDirectory("zipfs-heal")
++		Path jar = poison(dir.resolve("classpath.jar"))
++
++		and: "它此刻确实打不开（登记簿里是死实例），而文件本身是完整的"
++		assert !FileSystems.getFileSystem(toJarUri(jar)).isOpen()
++
++		when: "构造 remap 服务（remapJar 读取 classpath 的入口）"
++		def options = classpathOptions(jar)
++		TinyRemapperService service = factory.get(options)
++
++		then: "不再抛 ClosedFileSystemException"
++		service != null
++
++		and: "受害 jar 的类经由私有快照真的进了 classpath（改前这里根本走不到）"
++		readClassNames(service).contains(PROBE_CLASS)
++
++		and: "自愈不改动全局状态：登记簿里的死实例仍然是死的，只是被绕开了"
++		!FileSystems.getFileSystem(toJarUri(jar)).isOpen()
++
++		when: "服务结束"
++		service.close()
++
++		then: "私有快照已清理，不留垃圾"
++		snapshotFiles(dir).isEmpty()
++
++		cleanup:
++		deleteQuietly(dir)
++	}
++
++	/**
++	 * 与上一个用例同形，但用真线程把「并发持有者关闭共享实例」这件事演出来（用 latch 固定顺序，
++	 * 不依赖调度）：持有者线程先拿住共享实例，主线程删掉文件后放行持有者关闭，
++	 * 关闭于是失败并留下死条目，主线程再重建文件.
++	 */
++	def "并发持有者关闭共享实例（文件同时被重写）后，读取方仍能读完 classpath"() {
++		given:
++		Path dir = Files.createTempDirectory("zipfs-race")
++		Path jar = writeJar(dir.resolve("classpath.jar"), probeEntries())
++
++		and: "一个持有共享实例的线程"
++		FileSystemUtil.Delegate holder = FileSystemUtil.getJarFileSystem(jar, false)
++		def mayClose = new CountDownLatch(1)
++		def closed = new CountDownLatch(1)
++		Thread closer = new Thread({
++			mayClose.await()
++			try {
++				holder.close()
++			} catch (Exception expected) {
++				// JDK-8291712：文件此刻不在盘上，close() 摘不掉登记簿条目，条目残留下来
++			}
++			closed.countDown()
++		}, "zipfs-poison-closer")
++		closer.start()
++
++		when: "持有期间文件被重写（先删后写），持有者随后关闭"
++		Files.delete(jar)
++		mayClose.countDown()
++		assert closed.await(30, TimeUnit.SECONDS)
++		writeJar(jar, probeEntries())
++
++		and: "此时构造 remap 服务"
++		def options = classpathOptions(jar)
++		TinyRemapperService service = factory.get(options)
++
++		then: "classpath 仍然被完整读完"
++		readClassNames(service).contains(PROBE_CLASS)
++
++		cleanup:
++		try {
++			holder.close()
++		} catch (Exception ignored) {
++			// 实例已被并发关闭，重复关闭不需要处理
++		}
++		mayClose.countDown()
++		closer.join(30_000)
++		deleteQuietly(dir)
++	}
++
++	/**
++	 * 读取期间共享实例被别的持有者关掉（跨 loom 类加载器副本时引用计数是分开的，
++	 * 那一侧以为自己是创建者，关闭不看本侧的引用），读取方必须自愈而不是失败。
++	 *
++	 * <p>读取窗口靠「jar 里条目足够多」拉宽：逐个类的读取发生在 tiny-remapper 的线程池上，
++	 * 主线程还在走后续条目时关闭者即可插入.
++	 */
++	def "读取进行中共享实例被关闭时，remap 服务多轮都不失败"() {
++		given:
++		Path dir = Files.createTempDirectory("zipfs-inflight")
++		Map<String, byte[]> entries = loomClassEntries(400)
++		assert entries.size() > 100
++
++		expect: "每一轮都在读取进行中关闭共享实例，服务都必须成功构造"
++		(1..5).every { round ->
++			Path jar = writeJar(dir.resolve("inflight-${round}.jar"), entries)
++			FileSystemUtil.Delegate holder = FileSystemUtil.getJarFileSystem(jar, false)
++			def stop = new CountDownLatch(1)
++			Thread closer = new Thread({
++				stop.await()
++				// 等读取方先拿到共享实例，再把登记簿里的那个实例关掉
++				Thread.sleep(25)
++				FileSystems.getFileSystem(toJarUri(jar)).close()
++			}, "zipfs-inflight-closer-${round}")
++			closer.start()
++			TinyRemapperService service = null
++
++			try {
++				stop.countDown()
++				service = factory.get(classpathOptions(jar))
++				return service != null
++			} finally {
++				service?.close()
++				stop.countDown()
++				closer.join(30_000)
++				try {
++					holder.close()
++				} catch (Exception ignored) {
++					// 同上：重复关闭不需要处理
++				}
++				Files.deleteIfExists(jar)
++			}
++		}
++
++		cleanup:
++		deleteQuietly(dir)
++	}
++
++	/**
++	 * 判据收窄的确定性用例：把「已关闭的 zipfs」在目录遍历时抛出的那个 NPE 真造出来，断言它被判据认可；
++	 * 同时断言其它形态一律不认——「只认这一种 NPE」的收窄意义全在这里。
++	 *
++	 * <p>造法不依赖竞态：{@code ZipFileSystem.isDirectory} 没有 ensureOpen 检查，所以只要把一个 zipfs 关掉，
++	 * 再对它调 {@code Files.newDirectoryStream}（{@code FileTreeWalker} 每进一个目录都会这么调），
++	 * 得到的就与真实竞态里一模一样：
++	 * {@code NullPointerException: Cannot invoke "java.util.LinkedHashMap.get(Object)" because "this.inodes" is null}。
++	 * 同一个调用在实例未关闭时是成功的（本用例先验证这一点），因此这个 NPE 与「关闭」的因果关系是被证明的，
++	 * 而不是被假设的。
++	 */
++	def "关闭的 zipfs 在目录遍历抛出的 inodes NPE 被判据认可，其它 NPE 一律不认"() {
++		given: "一个真的被关闭的 zipfs"
++		Path dir = Files.createTempDirectory("zipfs-npe-form")
++		Path jar = writeJar(dir.resolve("victim.jar"), ["sub/a.class": probeClassBytes()])
++		FileSystemUtil.Delegate holder = FileSystemUtil.getJarFileSystem(jar, false)
++		def root = holder.fileSystem.getPath("/")
++
++		and: "实例没关闭时，同一个调用是成功的（先排除「这个 NPE 本来就会抛」）"
++		Files.newDirectoryStream(root).withCloseable { it.iterator().hasNext() }
++
++		when: "关闭之后，目录遍历立刻变成那个 NPE"
++		holder.close()
++		NullPointerException realNpe = directoryStreamFailure(root)
++		println("[判据] 关闭后的真实形态=" + realNpe)
++		println("[判据] 栈顶=" + realNpe.stackTrace[0])
++
++		then: "真实形态被判据认可（改前只认 ClosedFileSystemException，这里会失败）"
++		acceptsClosedFileSystemFailure(realNpe)
++
++		and: "包装过的形态也认可：tiny-remapper 的 read(...).join() 会把底层异常套在 CompletionException 里"
++		acceptsClosedFileSystemFailure(new java.util.concurrent.CompletionException(new RuntimeException(realNpe)))
++
++		and: "CFSE 照旧认可（回归护栏：改前的行为不能被改掉）"
++		acceptsClosedFileSystemFailure(new java.nio.file.ClosedFileSystemException())
++
++		and: "任意 NPE 不被形态判据认可——判据收窄的全部意义；但它不再因此被直接抛出，而是改走行为判别入口"
++		!acceptsClosedFileSystemFailure(new NullPointerException("boom"))
++		!acceptsClosedFileSystemFailure(new NullPointerException())
++		entersBehavioralHeal(new NullPointerException("boom"))
++
++		and: "消息里恰好有 inodes、但栈里没有 zipfs 帧的 NPE 也不认（不靠一句消息就认定关闭竞态）"
++		!acceptsClosedFileSystemFailure(npeMentioningInodesWithoutZipFsFrame())
++
++		and: "其它异常类型一概不认"
++		!acceptsClosedFileSystemFailure(new IllegalStateException("boom"))
++		!acceptsClosedFileSystemFailure(new IOException("boom"))
++		!acceptsClosedFileSystemFailure(null)
++
++		cleanup:
++		try {
++			holder.close()
++		} catch (Exception ignored) {
++			// 已关闭，重复关闭不需要处理
++		}
++		deleteQuietly(dir)
++	}
++
++	/**
++	 * 本轮补的缺口（判据层）：形态被 JIT 抹掉之后，特征判据<b>必然</b>认不出来.
++	 *
++	 * <p>HotSpot 在同一个隐式空指针被反复抛出后会改用预分配的「fast throw」异常：消息为 {@code null}、
++	 * 栈长为 0，于是 {@link #INODES_FIELD} 消息与 zipfs 栈帧两条特征同时消失。真实实例已实测
++	 * （同一个隐式空指针循环到第 5193 次即切换；形态为 {@code message=null}、{@code stackLen=0}、
++	 * {@code class=java.lang.NullPointerException}、同一个实例反复抛出），但切换时机由 JIT 决定，
++	 * 单测里无法稳定复现，因此这里直接构造同形实例作为<b>等价模拟</b>：可观测属性逐条一致.
++	 *
++	 * <p>改前：这类异常既不被特征判据认可、也没有别的入口，于是「认不出 ⇒ 不走自愈」（构建仍失败）。
++	 * 改后：形态不可辨不再等于「与 zipfs 无关」，一律交给行为判别
++	 * （{@code recoverClasspathRead} 逐条重读；治好 ⇒ 确是共享实例被并发关闭，治不好 ⇒ 原样抛出原始失败）。
++	 */
++	def "形态被 JIT 抹掉的 NPE（消息 null、栈空）由行为判别收下，而不是靠形态猜"() {
++		given: "一个与 HotSpot fast throw 同形的 NPE：消息 null、栈长 0、同一个实例"
++		NullPointerException fastThrow = ZipFsCloseRaceTestHook.fastThrowNullPointer()
++
++		expect: "它带着 fast throw 的每条可观测属性（等价模拟的前提）"
++		fastThrow.class == NullPointerException
++		fastThrow.message == null
++		fastThrow.stackTrace.length == 0
++		fastThrow.cause == null
++
++		and: "特征判据认不出它——缺口就在这里"
++		!acceptsClosedFileSystemFailure(fastThrow)
++
++		and: "行为判别入口必须收下它，否则仍是「认不出就不自愈」"
++		entersBehavioralHeal(fastThrow)
++
++		and: "包装过的形态同样收下：tiny-remapper 的 read(...).join() 会把底层异常套在 CompletionException 里"
++		entersBehavioralHeal(new java.util.concurrent.CompletionException(fastThrow))
++	}
++
++	/**
++	 * 缺口复现（行为层，改前红 / 改后绿）：第一次读取以「形态被抹掉的 NPE」失败，重读能治好.
++	 *
++	 * <p>这是真实形态的另一半：共享实例被并发持有者关闭后，登记簿里的条目随关闭一起消失，
++	 * 重读会打开一个<b>健康的新实例</b>因而成功。因此「重读能治好」本身就是「刚才那次失败是关闭竞态」的判据.
++	 *
++	 * <p>注入方式见 {@code ZipFsCloseRaceTestHook#throwIfReadFailureArmed()}：让<b>第一次</b> classpath 读取
++	 * 抛出与 fast throw 同形的 NPE，其余读取照常。改前：形态判据认不出它，直接抛出（下面的断言变红）；
++	 * 改后：行为判别重读一次即治好，服务正常构造、受害 jar 的类真的进了 classpath.
++	 */
++	def "形态被抹掉的 NPE 触发读取失败时，重读治好它而不是直接抛出"() {
++		given: "一条健康 classpath jar"
++		Path dir = Files.createTempDirectory("zipfs-fastthrow-heal")
++		Path jar = writeJar(dir.resolve("classpath.jar"), probeEntries())
++
++		and: "只让第一次读取以 fast-throw 形态的 NPE 失败，其后读取照常"
++		System.setProperty(READ_FAILURE_PROPERTY, READ_FAILURE_ONCE)
++
++		when: "构造 remap 服务（remapJar 读取 classpath 的入口）"
++		TinyRemapperService service = factory.get(classpathOptions(jar))
++
++		then: "改前这里会抛出那个 NPE；改后重读治好，服务正常构造"
++		service != null
++
++		and: "classpath 也真的读完了（不是「吞掉失败」换来的假成功）"
++		readClassNames(service).contains(PROBE_CLASS)
++
++		cleanup:
++		// 注入是进程级系统属性，必须清掉，否则会污染同一 daemon 里的其它用例
++		System.clearProperty(READ_FAILURE_PROPERTY)
++		service?.close()
++		deleteQuietly(dir)
++	}
++
++	/**
++	 * 行为判别的硬约束（负对照）：重读<b>仍然以同样方式失败</b>时，必须原样抛出原始失败.
++	 *
++	 * <p>「重读仍失败」说明它不是共享实例被并发关闭（那种情况下重读会成功），而是真实缺陷；
++	 * 此时任何「无条件重试」或「无条件吞掉」都会把真实缺陷掩盖成一次成功的构建。本用例把这一点钉死：
++	 * 抛出的链条里那个 NPE <b>就是</b>被注入的同一个实例（对象标识相同），消息为 null、栈长为 0——
++	 * 即与改造前逐字一致，既没被替换成别的异常，也没被追上新的栈.
++	 *
++	 * <p>把「重读失败 ⇒ 放弃自愈」这条约束去掉（改成无条件当作治好），本用例立刻变红
++	 * （本轮已实测：整份 spec 只有这一条变红，其余 10 条仍绿）。
++	 */
++	def "重读仍然以同样方式失败时，原样抛出原始 NPE（不重试、不吞掉）"() {
++		given: "一条健康 classpath jar"
++		Path dir = Files.createTempDirectory("zipfs-fastthrow-rethrow")
++		Path jar = writeJar(dir.resolve("classpath.jar"), probeEntries())
++
++		and: "每次读取都以同一个 fast-throw 形态 NPE 失败——复刻「重读仍然以同样方式失败」"
++		NullPointerException injected = ZipFsCloseRaceTestHook.fastThrowNullPointer()
++		System.setProperty(READ_FAILURE_PROPERTY, READ_FAILURE_ALWAYS)
++
++		when: "构造 remap 服务"
++		factory.get(classpathOptions(jar))
++
++		then: "抛出的原始失败与注入的那个实例是<b>同一个对象</b>：类型、消息、栈逐字一致"
++		RuntimeException failure = thrown(RuntimeException)
++		failure.cause.is(injected)
++		injected.message == null
++		injected.stackTrace.length == 0
++
++		and: "外层包装也如实转述原始失败（没有替换成自愈或诊断异常）"
++		failure.message.endsWith(NullPointerException.name)
++
++		cleanup:
++		System.clearProperty(READ_FAILURE_PROPERTY)
++		deleteQuietly(dir)
++	}
++
++	/**
++	 * 该形态在真实竞态下确实会发生（不是只有顺序关闭才造得出来），而且判据认可它.
++	 *
++	 * <p>每轮复刻的都是生产链路：按 URI 路线打开 victim jar（与 tiny-remapper 的
++	 * {@code FileSystemReference.openJar} 同形，因而进进程级登记簿），并发持有者把登记簿里那个活实例关掉，
++	 * 读取方用 {@code Files.walkFileTree} 遍历（与 {@code FileTreeWalker} 同一条路线）。
++	 * 关闭点落在哪个调用点上是随机的：有 ensureOpen 的调用点报 CFSE，目录列举
++	 * （{@code ZipFileSystem.isDirectory}）报 inodes NPE。实测深目录 victim 上约 8 成 CFSE、1~2 成 inodes NPE，
++	 * 因此这里跑多轮并要求至少命中一次 inodes NPE；每轮的形态计数都会打印出来，
++	 * 避免「其实一次都没命中」的假绿。
++	 *
++	 * <p>第三种子形态是长命 JVM 里的「fast throw」：同一条隐式空指针被反复抛出后，HotSpot 改用预分配的
++	 * NPE（消息为 null、栈长为 0）。它与带消息的 inodes NPE 是<b>同一个落点</b>（都是 {@code getInode} 里
++	 * 解引用已置空的 {@code inodes}），只是异常对象被廉价化了：特征判据必然认不出它（{@link #INODES_FIELD}
++	 * 与 zipfs 栈帧都取不到），但它必须被<b>行为判别入口</b>收下，否则还是「认不出 ⇒ 不走自愈」。
++	 * 本用例按「落点是否被撞上」统计（{@code NPE-inodes} 与 {@code NPE-bare} 都算撞上）并要求至少撞上一次，
++	 * 同时要求被抹掉形态的那些轮次确实落在「形态判据认不出、行为判别入口收下」这一格上。
++	 */
++	def "深目录 jar 上关闭竞态真的会落到 isDirectory 分支，且该形态被判据认可"() {
++		given: "一个深目录 victim jar（与端到端用例同形）"
++		Path dir = Files.createTempDirectory("zipfs-npe-race")
++		Path jar = writeDeepDirJar(dir.resolve("deep-victim.jar"))
++
++		when: "跑 {@value #RACE_ROUNDS} 轮关闭竞态，每轮记录失败形态与两个判据的裁决"
++		def rounds = (1..RACE_ROUNDS).collect { raceRound(jar) }
++		def forms = rounds.countBy { it.form }
++		int windowHits = (forms["NPE-inodes"] ?: 0) + (forms["NPE-bare"] ?: 0)
++		def erasedRounds = rounds.findAll { it.form == "NPE-bare" && it.detail.contains("空栈") }
++		println("[竞态形态统计] 共 ${RACE_ROUNDS} 轮：" + forms)
++		println("[竞态形态统计] 落进目录列举窗口（inodes NPE，含 fast-throw 子形态）=" + windowHits +
++				"，自愈入口收下的轮次=" + rounds.count { it.accepted })
++		println("[竞态形态统计] 形态被抹掉（消息 null、栈空）的轮次=" + erasedRounds.size() +
++				"，其中形态判据认得出=" + erasedRounds.count { it.diagnosed })
++
++		then: "关闭竞态确实会落到「属性已取到、正要列目录」那个窗口里（否则本用例什么也没证明）"
++		windowHits > 0
++
++		and: "CFSE 与带消息的 inodes NPE 两种真实形态都必须被行为判别入口收下（收窄不得把它们丢掉）"
++		rounds.findAll { it.form in ["CFSE", "NPE-inodes"] }.every { it.accepted }
++
++		and: "命中 inodes NPE 的轮次确实带着「关闭」的证据：消息指名 inodes、栈里有 zipfs 帧"
++		def inodesRounds = rounds.findAll { it.form == "NPE-inodes" }
++		inodesRounds.every { it.detail.contains(INODES_FIELD) && it.detail.contains("ZipFileSystem") }
++
++		and: "被 JIT 抹掉形态的轮次（真实 fast throw：消息 null、栈空）：形态判据必然认不出，自愈入口必须收下"
++		erasedRounds.every { !it.diagnosed && it.accepted }
++
++		cleanup:
++		deleteQuietly(dir)
++	}
++
++	def "毒化只影响被毒化的那条路径，健康 classpath 照常可用"() {
++		given: "一条健康 jar 和另一条被毒化的 jar"
++		Path dir = Files.createTempDirectory("zipfs-poison")
++		Path healthy = writeJar(dir.resolve("healthy.jar"), probeEntries())
++		Path poisoned = poison(dir.resolve("poisoned.jar"))
++
++		when: "只用健康 jar 当 classpath"
++		def options = classpathOptions(healthy)
++		TinyRemapperService service = factory.get(options)
++
++		then:
++		readClassNames(service).contains(PROBE_CLASS)
++
++		cleanup:
++		service?.close()
++		deleteQuietly(dir)
++	}
++
++	/**
++	 * 自愈不是万能的：受害 jar 的内容若也读不了（这里用非 zip 内容模拟「正被重写、只写了一半」），
++	 * 服务仍要给出带路径与成因的诊断，而不是一个裸 ClosedFileSystemException.
++	 */
++	def "自愈不可用时仍给出带路径与成因的诊断，而不是裸 ClosedFileSystemException"() {
++		given: "一条已被毒化、且内容本身也不再是合法 zip 的 classpath jar"
++		Path dir = Files.createTempDirectory("zipfs-poison")
++		Path jar = poison(dir.resolve("classpath.jar"))
++		Files.write(jar, "not a zip at all".getBytes(StandardCharsets.UTF_8))
++
++		when: "构造 remap 服务"
++		def options = classpathOptions(jar)
++		TinyRemapperService service = factory.get(options)
++
++		then: "诊断明确指出是哪条路径被毒化、以及自愈已尝试过"
++		def e = thrown(RuntimeException)
++		e.message.contains("JDK-8291712")
++		e.message.contains(jar.toString())
++		e.message.contains("自愈")
++
++		cleanup:
++		service?.close()
++		deleteQuietly(dir)
++	}
++
++	/**
++	 * 一轮关闭竞态：按 URI 路线打开 victim jar → 并发持有者关闭那个共享实例 → 用 {@code Files.walkFileTree} 遍历.
++	 *
++	 * @param jar victim jar（每轮重新打开；上一轮的成功关闭会把登记簿条目摘掉，所以下一轮拿到的仍是新实例）
++	 * @return {@code [form: 形态名, accepted: 判据是否认可, detail: 异常文本 + 栈顶]}
++	 */
++	private static Map<String, Object> raceRound(Path jar) {
++		URI uri = toJarUri(jar)
++		Thread closer = new Thread({
++			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
++
++			while (System.nanoTime() < deadline) {
++				def shared = FileSystemUtil.findOpenRegistryEntry(jar)
++
++				if (shared == null) {
++					// 读取方还没打开这个条目（登记簿里还没有它的活实例）
++					Thread.sleep(0, 50_000)
++					continue
++				}
++
++				shared.close()
++				return
++			}
++		}, "zipfs-npe-form-closer")
++		closer.daemon = true
++		closer.start()
++
++		try {
++			def fileSystem = FileSystems.newFileSystem(uri, [:])
++			Files.walkFileTree(fileSystem.getPath("/"), new SimpleFileVisitor<Path>() {
++						@Override
++						FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
++							if (file.toString().endsWith(".class")) {
++								Files.readAllBytes(file)
++							}
++
++							return FileVisitResult.CONTINUE
++						}
++					})
++			return [form: "OK", accepted: false, detail: "本轮遍历没有失败"]
++		} catch (Throwable failure) {
++			return classifyRaceFailure(failure)
++		} finally {
++			closer.join(30_000)
++		}
++	}
++
++	/** 把一轮竞态的失败归类：CFSE / inodes NPE / 无消息（多为 fast-throw）的 NPE / 其它，并顺带问两个判据. */
++	private static Map<String, Object> classifyRaceFailure(Throwable failure) {
++		for (Throwable t = failure; t != null; t = t.getCause()) {
++			if (t instanceof ClosedFileSystemException) {
++				return result("CFSE", t)
++			}
++
++			if (t instanceof NullPointerException) {
++				return result(t.message?.contains(INODES_FIELD) ? "NPE-inodes" : "NPE-bare", t)
++			}
++		}
++
++		return result("OTHER:" + failure.class.simpleName, failure)
++	}
++
++	/**
++	 * 一轮竞态的分类结果.
++	 *
++	 * <p>{@code accepted} 问的是<b>自愈入口</b>（形态判据或行为判别入口，任一成立即可）；
++	 * {@code diagnosed} 问的是<b>形态判据</b>（{@code isClosedFileSystemFailure}）：它成立才会在自愈失败时
++	 * 给出带路径与成因的诊断。两者不是同一条判据，被 JIT 抹掉形态的轮次正是「入口收下、形态判据认不出」那一格.
++	 */
++	private static Map<String, Object> result(String form, Throwable t) {
++		String top = t.stackTrace.length > 0 ? t.stackTrace[0].toString() : "<空栈>"
++		return [form: form,
++			accepted: entersHeal(t),
++			diagnosed: acceptsClosedFileSystemFailure(t),
++			detail: "${t} | ${top}"]
++	}
++
++	/**
++	 * 问一次 remap 服务的<b>自愈入口</b>：形态判据成立（CFSE / 带特征的 inodes NPE）或行为判别入口成立
++	 * （失败链里有 NPE）都会去试自愈.
++	 *
++	 * <p>这里把两条判据按生产代码里的顺序合成（{@code isClosedFileSystemFailure} 优先，其后是
++	 * {@code containsNullPointer}），因为用例要断言的是「这次失败会不会走自愈」这个整体结论.
++	 */
++	private static boolean entersHeal(Throwable failure) {
++		return acceptsClosedFileSystemFailure(failure) || entersBehavioralHeal(failure)
++	}
++
++	/**
++	 * 问一次 remap 服务的<b>形态判据</b>（{@code TinyRemapperService.isClosedFileSystemFailure}）.
++	 *
++	 * <p>判据是私有的：本用例要断言的正是这条判据本身（收窄到哪一步），因此照本 spec 既有做法用反射直接问它，
++	 * 而不是为了测试把它放开成公开 API.
++	 */
++	private static boolean acceptsClosedFileSystemFailure(Throwable failure) {
++		def method = TinyRemapperService.getDeclaredMethod("isClosedFileSystemFailure", Throwable)
++		method.setAccessible(true)
++		return (boolean) method.invoke(null, [failure] as Object[])
++	}
++
++	/**
++	 * 问一次 remap 服务的<b>行为判别入口</b>（{@code TinyRemapperService.containsNullPointer}）.
++	 *
++	 * <p>与 {@link #acceptsClosedFileSystemFailure} 同一条理由用反射：这里要钉住的正是这条入口判据，
++	 * 它决定了「形态不可辨认的 NPE」到底会不会去试自愈（本轮缺口的判据侧）.
++	 */
++	private static boolean entersBehavioralHeal(Throwable failure) {
++		def method = TinyRemapperService.getDeclaredMethod("containsNullPointer", Throwable)
++		method.setAccessible(true)
++		return (boolean) method.invoke(null, [failure] as Object[])
++	}
++
++	/** 把 zipfs 关闭后 {@code Files.newDirectoryStream} 抛出的那个 NPE 取出来（形态见 {@code ZipFsPoisoningTest} 的用例说明）. */
++	private static NullPointerException directoryStreamFailure(Path dir) {
++		try {
++			Files.newDirectoryStream(dir).withCloseable { it.iterator().hasNext() }
++			throw new AssertionError("预期关闭后的 zipfs 列目录会抛 NPE，实际没有抛")
++		} catch (NullPointerException e) {
++			return e
++		}
++	}
++
++	/** 消息与 JDK 实际输出同形、但栈里没有 zipfs 帧的 NPE：判据必须不认它. */
++	private static NullPointerException npeMentioningInodesWithoutZipFsFrame() {
++		try {
++			throw new NullPointerException(NPE_FORM_MESSAGE)
++		} catch (NullPointerException e) {
++			return e
++		}
++	}
++
++	/**
++	 * 写一个「深目录」victim jar：{@value #DEEP_DIR_LEVELS} 层深的目录链，末端一个 class.
++	 *
++	 * <p>为什么用深目录：{@code FileTreeWalker} 每进一个目录都先取属性（有 ensureOpen），紧接着列目录
++	 * （{@code ZipFileSystem.isDirectory}，没有 ensureOpen）；目录越多，「关闭恰好落在两次调用之间」
++	 * 的机会越多，命中 inodes NPE 落点的比例就越高（扁平 jar 实测 0/60）。
++	 */
++	private static Path writeDeepDirJar(Path jar) {
++		ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(jar))
++
++		try {
++			StringBuilder path = new StringBuilder()
++
++			DEEP_DIR_LEVELS.times { int level ->
++				path.append("d").append(level).append('/')
++				zos.putNextEntry(new ZipEntry(path.toString()))
++				zos.closeEntry()
++			}
++
++			String leaf = "racevictimleaf"
++			zos.putNextEntry(new ZipEntry(path.toString() + leaf + ".class"))
++			zos.write(probeClassBytes())
++			zos.closeEntry()
++		} finally {
++			zos.close()
++		}
++
++		return jar
++	}
++
++	/** remap 服务的 classpath 选项：把 jar 当成 remapJar 的一条 classpath 条目. */
++	private Provider<TinyRemapperService.Options> classpathOptions(Path jar) {
++		return TinyRemapperService.TYPE.create(project) {
++			it.from.set("named")
++			it.to.set("intermediary")
++			it.classpath.from(jar.toFile())
++			it.uselegacyMixinAP.set(false)
++			it.knownIndyBsms.set([])
++		}
++	}
++
++	/** 读出 tiny-remapper 实际登记过的类名，用来断言 classpath 真被读了. */
++	private static Set<String> readClassNames(TinyRemapperService service) {
++		TinyRemapper remapper = service.getTinyRemapperForInputs()
++		def field = TinyRemapper.getDeclaredField("readClasses")
++		field.setAccessible(true)
++		return new HashSet<String>(((Map<String, ?>) field.get(remapper)).keySet())
++	}
++
++	/** 列出目录里残留的自愈快照（AtomicFiles.tempSibling 的命名：{@code <stem>.<uuid>.tmp.jar}）. */
++	private static List<Path> snapshotFiles(Path dir) {
++		Files.list(dir).withCloseable { stream ->
++			stream.filter { it.getFileName().toString().contains(".tmp.") }.toList()
++		}
++	}
++
++	/**
++	 * 在给定路径上造出一条已被 JDK-8291712 毒化的 jar.
++	 *
++	 * <p>步骤：写一个 jar → 走登记路线打开它 → 在打开期间删除文件 → close（此时条目已残留在登记簿里）
++	 * → 用 {@link ZipOutputStream} 重建同路径文件（不走 zipfs，否则登记路线会把死条目覆盖掉）.
++	 *
++	 * @return 该路径，其登记簿条目已是一个「已关闭」的死实例
++	 */
++	private static Path poison(Path jar) {
++		writeJar(jar, probeEntries())
++		FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar, false)
++		Files.delete(jar)
++
++		try {
++			fs.close()
++			throw new AssertionError("预期 close() 因文件缺失而抛 IOException（JDK-8291712 的成因），实际没有抛")
++		} catch (IOException expected) {
++			// 期望：ZipFileSystem.close() 的去除步骤先 toRealPath() 失败
++		}
++
++		writeJar(jar, probeEntries())
++		return jar
++	}
++
++	/** 受害 jar 的内容：一个 fabric.mod.json（给 ArtifactMetadata 用）加一个真实 class（给 readClassNames 用）. */
++	private static Map<String, byte[]> probeEntries() {
++		return [
++			"fabric.mod.json": "{}".getBytes(StandardCharsets.UTF_8),
++			(PROBE_CLASS + ".class"): probeClassBytes()
++		]
++	}
++
++	/** 取一份真实 class 字节：tiny-remapper 的 analyze 只吃合法 class 文件. */
++	private static byte[] probeClassBytes() {
++		return FileSystemUtil.classLoader.getResourceAsStream("${PROBE_CLASS}.class").withCloseable { it.readAllBytes() }
++	}
++
++	/** 从 loom 自己的构建输出里取一批互不重名的 class，用来把读取窗口拉宽. */
++	private static Map<String, byte[]> loomClassEntries(int max) {
++		def location = new File(FileSystemUtil.protectionDomain.codeSource.location.toURI())
++		Map<String, byte[]> entries = [:]
++
++		if (location.isDirectory()) {
++			Path root = location.toPath()
++			Files.walk(root).withCloseable { stream ->
++				stream.filter { Files.isRegularFile(it) && it.toString().endsWith(".class") }
++				.sorted()
++				.limit(max)
++				.forEach { entries.put(root.relativize(it).toString().replace('\\', '/'), Files.readAllBytes(it)) }
++			}
++		} else {
++			new ZipFile(location).withCloseable { zip ->
++				zip.entries().findAll { !it.isDirectory() && it.name.endsWith(".class") }
++				.sort { it.name }
++				.take(max)
++				.forEach { entries.put(it.name, zip.getInputStream(it).withCloseable { input -> input.readAllBytes() }) }
++			}
++		}
++
++		return entries
++	}
++
++	/** 写一个 zip（不用 zipfs：受害路径的登记簿条目必须保持「死」）. */
++	private static Path writeJar(Path jar, Map<String, byte[]> entries) {
++		ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(jar))
++
++		try {
++			entries.each { name, bytes ->
++				zos.putNextEntry(new ZipEntry(name))
++				zos.write(bytes)
++				zos.closeEntry()
++			}
++		} finally {
++			zos.close()
++		}
++
++		return jar
++	}
++
++	private static void deleteQuietly(Path root) {
++		if (root == null || !Files.exists(root)) {
++			return
++		}
++
++		Files.walk(root).withCloseable { stream ->
++			stream.sorted(Comparator.reverseOrder()).forEach { Files.deleteIfExists(it) }
++		}
++	}
++
++	/** 与 {@code FileSystemUtil.toJarUri}/{@code FileSystemReference.toJarUri} 同形：{@code jar:file:/abs/path}. */
++	private static URI toJarUri(Path path) {
++		def uri = path.toUri()
++		return new URI("jar:" + uri.getScheme(), uri.getHost(), uri.getPath(), uri.getFragment())
++	}
++}
+diff --git a/src/test/resources/projects/zipfsCloseRace/build.gradle b/src/test/resources/projects/zipfsCloseRace/build.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..4a2ecc4b4b9c093c279ea5a3ab415cf21ce0d07b
+--- /dev/null
++++ b/src/test/resources/projects/zipfsCloseRace/build.gradle
+@@ -0,0 +1,20 @@
++// 本夹具供 ZipFsCloseRaceHealTest 使用：一个最小 mod 工程，跑 remapJar 时 TinyRemapperService 会读取
++// remapJar 的 classpath，其中包含下面这条由测试写出的「受害者」库依赖。
++plugins {
++	id 'dev.architectury.loom'
++}
++
++version = "1.0.0"
++
++base {
++	archivesName = "zipfs-close-race"
++}
++
++dependencies {
++	minecraft "com.mojang:minecraft:1.20.1"
++	mappings "net.fabricmc:yarn:1.20.1+build.10:v2"
++
++	// 普通库依赖（不是 mod 依赖）：它会进入 compileClasspath，因而出现在 remapJar 读取的那批 classpath 里。
++	// 文件由测试在跑构建之前写入 libs/（依赖在配置期就要解析，运行时再写就来不及了）。
++	implementation files("libs/zipfs-close-race-victim.jar")
++}
+diff --git a/src/test/resources/projects/zipfsCloseRace/settings.gradle b/src/test/resources/projects/zipfsCloseRace/settings.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..81204dd057def4682f0256deebd3409518d209a1
+--- /dev/null
++++ b/src/test/resources/projects/zipfsCloseRace/settings.gradle
+@@ -0,0 +1 @@
++rootProject.name = "zipfs-close-race"

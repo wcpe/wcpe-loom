@@ -1,0 +1,1386 @@
+From f51df2a64d6e0f83d8a0cc51ab843a6889c22301 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Sat, 3 Oct 2026 04:57:48 +0800
+Subject: [PATCH 074/147] =?UTF-8?q?feat(forge):=20patched=20jar=20?=
+ =?UTF-8?q?=E7=9A=84=E6=9C=80=E7=BB=88=E7=94=9F=E4=BA=A7=E8=BF=81=E5=88=B0?=
+ =?UTF-8?q?=E6=89=A7=E8=A1=8C=E6=9C=9F=E4=BB=BB=E5=8A=A1?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Forge 迁移第 2 步：CompileConfiguration:302 的 remapJar 直调改为执行期任务
+（GenerateForgePatchedJarTask），产出 patched jar 与 client-extra。
+
+生产方法（remapPatchedJar 及其调用链）改为只认 ProductionOptions 并静态化，使其可被
+任务执行期调用；MinecraftProvider 新增 registerTaskProducedArtifact 统一登记产出。
+legacy provider 的 copyReplacing 同步改静态形式。
+
+本步**不解除** Forge 的整批回退（provide() 仍在配置期），故 Forge 仍走配置期路径；
+解除需第 3+4 步（provide 与映射迁移同批任务化）。
+
+验证：
+- 等价性：任务确实执行（:generateForgePatchedJar 非 UP-TO-DATE），9227 个 entry 逐条
+  SHA-256 与配置期实现完全一致；client-extra 逐 entry 一致，其条目集合由测试 JVM 从
+  client jar 独立重算后相等
+- 负对照三条（均实测变红）：at-patched 指向未 AT 中间 jar、对照侧换成 userdev jar、
+  常驻扰动对照证明映射与输入确实参与产物内容
+- 新增「任务声明输入 == 配置期实现读入的输入」断言，抓出并修掉两个真实缺陷：
+  ① server jar 误接 bootstrap 而非抽取产物；② server jar 被过度声明（1.17 及更早非 bundle
+  版本该文件不存在，会导致任务直接失败）
+- AccessTransformerTest + Forge1206Test（NeoForge 1.20.6，开配置缓存）BUILD SUCCESSFUL
+- build -x test（排除环境性不可达的 spotlessGroovy）BUILD SUCCESSFUL
+- forge.* + pipeline.* 共 65 用例：4 条失败中 1 条为已知既存缺口
+  （PatchedDecompileTest 1.19.2 的 runtimeJar 无产出方），其余 3 条为 /tmp 写满所致，
+  清理后定向重跑全部 PASSED
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
+index bea46a718143f11007aa25447af455edd624022d..a5f9d4f71809a28eeb4cdc5a726fa08bc6cd0437 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
+@@ -232,7 +232,7 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 				// AT、Forge 文件复制与补丁版本标记全部在临时文件上完成，最后原子落位
+ 				publishAtomically(minecraftPatchedAtJar, output -> {
+ 					accessTransform(minecraftPatchedJar, output);
+-					walkFileSystems(forgeJar, output, (path) -> true, this::copyReplacing);
++					walkFileSystems(forgeJar, output, (path) -> true, MinecraftPatchedProvider::copyReplacing);
+ 					applyLoomPatchVersion(output);
+ 				});
+ 			}
+@@ -306,7 +306,7 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 				.orElse(null);
+ 		if (log4jBeta9 != null) {
+ 			Predicate<Path> isHelper = path -> path.startsWith("/org/apache/logging/log4j/core/helpers");
+-			walkFileSystems(log4jBeta9, output, isHelper, this::copyReplacing);
++			walkFileSystems(log4jBeta9, output, isHelper, MinecraftPatchedProvider::copyReplacing);
+ 		}
+ 
+ 		// While Forge will discover mods on the classpath, it won't do the same for ATs, coremods or tweakers.
+@@ -348,7 +348,7 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 
+ 		// Patching only preserves affected classes, everything else we need to copy manually
+ 		copyMissingClasses(clean, output);
+-		walkFileSystems(clean, output, file -> !file.toString().endsWith(".class"), this::copyReplacing);
++		walkFileSystems(clean, output, file -> !file.toString().endsWith(".class"), MinecraftPatchedProvider::copyReplacing);
+ 
+ 		// Workaround Forge patches apparently violating the JVM spec (see ParameterAnnotationsFixer for details)
+ 		modifyClasses(output, ParameterAnnotationsFixer::new);
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+index 663cd8ab089800236b58d1fa1c8c0bab0c631675..5bb0eea71b426b6ad7da1b35f1795568b33e41fc 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+@@ -39,10 +39,12 @@ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Objects;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.function.BiFunction;
++import java.util.function.Consumer;
+ import java.util.function.Function;
+ import java.util.function.Predicate;
+ import java.util.jar.Attributes;
+@@ -72,8 +74,10 @@ import dev.architectury.loom.util.ThreadingUtils;
+ import dev.architectury.loom.util.Version;
+ import dev.architectury.loom.util.function.FsPathConsumer;
+ import org.gradle.api.Project;
++import org.gradle.api.file.ConfigurableFileCollection;
+ import org.gradle.api.file.FileCollection;
+ import org.gradle.api.logging.Logger;
++import org.jspecify.annotations.Nullable;
+ import org.objectweb.asm.ClassReader;
+ import org.objectweb.asm.ClassVisitor;
+ import org.objectweb.asm.ClassWriter;
+@@ -86,6 +90,9 @@ import net.fabricmc.loom.build.IntermediaryNamespaces;
+ import net.fabricmc.loom.configuration.providers.mappings.TinyMappingsService;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
++import net.fabricmc.loom.pipeline.GenerateForgePatchedJarTask;
++import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
++import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry.Producer;
+ import net.fabricmc.loom.util.Check;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.FileSystemUtil;
+@@ -377,7 +384,44 @@ public class MinecraftPatchedProvider {
+ 		provide();
+ 	}
+ 
++	/**
++	 * {@return 不能把最终 patched jar 的生产投影成执行期任务的原因；可以投影时为 {@code null}}.
++	 *
++	 * <p>与 {@code MinecraftProvider.projectionBlocker()} 同一风格：每一条都是一个「本形态的生产链不在本阶段
++	 * 定义之内」的形态，命中即整段退回配置期路径（那条路径与改造前逐字一致），并留下 lifecycle 留痕。
++	 *
++	 * <ul>
++	 *   <li><b>legacy Forge（1.8-1.16）</b>：它的产物是一组 FG2 工作目录下的 jar
++	 *       （{@code client/server/merged-patched.jar}、{@code forge.jar}），且 {@code remapJar} 是与父类
++	 *       不同的整链实现（见 {@code MinecraftLegacyPatchedProvider.remapJar}），形态与 modern 不同。</li>
++	 *   <li><b>disableObfuscation / unobfuscated Forge</b>：最终 jar 走
++	 *       {@code mergeUnobfuscatedPatchedJar}（把 userdev jar 合进 AT 后的 jar）且映射树为空，
++	 *       同样不在本次迁移的形态之内。</li>
++	 * </ul>
++	 */
++	protected @Nullable String remapJarProjectionBlocker() {
++		if (getExtension().isLegacyForge()) {
++			return "legacy Forge（1.8-1.16）的 patched jar 是 FG2 工作目录下的一组产物，生产链与 modern 不同";
++		}
++
++		if (getExtension().disableObfuscation()) {
++			return "disableObfuscation / unobfuscated Forge 的最终 jar 走 userdev 合并分支，形态不同";
++		}
++
++		return null;
++	}
++
+ 	public void remapJar(ServiceFactory serviceFactory) throws Exception {
++		final String blocker = remapJarProjectionBlocker();
++
++		if (blocker == null) {
++			// 任务路径：本次只做接线（登记产物与 FORGE_EXTRA 依赖），真正生产交给任务图与构建缓存
++			registerPatchedJarTask();
++			return;
++		}
++
++		logger.lifecycle("Forge 的 patched jar 保持配置期生产：{}", blocker);
++
+ 		// 无锁快路径：provide 已判定无需重建（dirty=false）时，此处仅注册依赖（纯内存操作），不取锁
+ 		if (!dirty) {
+ 			registerExtraDependencies();
+@@ -387,19 +431,91 @@ public class MinecraftPatchedProvider {
+ 		withPatchedLock(() -> remapPatchedJarWithDirty(serviceFactory));
+ 	}
+ 
++	/**
++	 * 把最终 patched jar（与 client-extra）的生产登记成执行期任务.
++	 *
++	 * <p>两件产物由同一次生产写出（同一次重映射 + 同一次 client-extra 填充），故用同一个任务；
++	 * server-only 配置下 client-extra 既不生成也不进 classpath（见 {@link #providesClientJar()}），
++	 * 此时不声明该输出。
++	 *
++	 * <p>登记之后必须把产物交给 {@code MinecraftProvider} 的记录：消费侧
++	 * （{@code getMinecraftJarsCollection(OFFICIAL)}、mapped provider 的重映射任务）正是从这里拿到
++	 * 「我的输入由哪个任务产出」的任务依赖。
++	 */
++	private void registerPatchedJarTask() {
++		final Path patchedJar = minecraftPatchedJar.toAbsolutePath().normalize();
++		final Path clientExtra = providesClientJar() ? minecraftClientExtra.toAbsolutePath().normalize() : null;
++		final var extension = getExtension();
++		final var mappingConfiguration = extension.getMappingConfiguration();
++		// 与 buildRemapper / remapCoreMods / generateNeoForgeDistManifest 取映射树用的是同一个映射选项
++		final var mappingsOptions = mappingConfiguration.getMappingsServiceOptions(project, MappingOption.forPlatform(extension));
++		// 平台开关与命名空间：与 productionOptions 同一处取值，保证任务声明与配置期实现逐项同源
++		final String remapNamespace = IntermediaryNamespaces.intermediary(project);
++		final String coreModNamespace = extension.getProductionNamespace().get();
++		final String distAttribute = type.getNeoForgeDistsAttribute();
++		final File serverJar = needsServerJarForDistManifest(extension) ? getServerJarForDistManifest() : null;
++		final Path lockRoot = ForgeProvider.getForgeCache(project).resolve(Constants.Cache.LOCKS_DIR);
++		final String lockKey = patchedLockKey();
++
++		final Producer producer = RemapMinecraftTaskRegistry.claim(project, patchedJar, Map.of(
++				"stage", "forge-patched-jar",
++				"mcVersion", extension.getMinecraftProvider().minecraftVersion(),
++				"forgeVersion", extension.getForgeProvider().getVersion().getCombined(),
++				"type", type.id,
++				"clientExtra", Boolean.toString(providesClientJar())
++		), () -> project.getTasks().register(GenerateForgePatchedJarTask.NAME, GenerateForgePatchedJarTask.class, task -> {
++			task.setGroup(Constants.TaskGroup.FABRIC);
++			task.setDescription("Produces the patched Minecraft jar for %s".formatted(
++					extension.getMinecraftProvider().minecraftVersion()));
++			task.getAtPatchedJar().set(minecraftPatchedIntermediateAtJar.toFile());
++			task.getForgeJar().set(getForgeJar());
++			task.getForgeUserdevJar().set(getForgeUserdevJar());
++			task.getMappingsServiceOptions().set(mappingsOptions);
++			task.getClientExtraEnabled().set(providesClientJar());
++			task.getPatchVersion().set(CURRENT_LOOM_PATCH_VERSION);
++			task.getNeoForge().set(extension.isNeoForge());
++			task.getForge().set(extension.isForge());
++			task.getUnobfuscatedForge().set(extension.isUnobfuscatedForge());
++			task.getRuntimeMojang().set(extension.getForgeProvider().usesMojangAtRuntime());
++			task.getMerged().set(type == Type.MERGED);
++			task.getRemapNamespace().set(remapNamespace);
++			task.getCoreModNamespace().set(coreModNamespace);
++			task.getDistAttribute().set(distAttribute);
++			task.getRefreshDeps().set(extension.refreshDeps());
++			task.getLockKey().set(lockKey);
++			task.getLockRoot().set(lockRoot.toAbsolutePath().toString());
++			task.getOutputJar().set(patchedJar.toFile());
++
++			if (clientExtra != null) {
++				task.getClientJar().set(minecraftProvider.getMinecraftClientJar());
++				task.getClientExtraJar().set(clientExtra.toFile());
++
++				if (serverJar != null) {
++					// NeoForge 的 dist 清单要按 client/server 分边（见 generateNeoForgeDistManifest）；
++					// 服务端侧取的是与生产同一判据的那一件（bootstrap 版本是抽取产物，否则是下载下来的 server jar）
++					task.getServerJar().set(serverJar);
++				}
++			}
++
++			// at-patched jar 由本链上一阶段（配置期 provide / 或任务化后的 intermediate 任务）产出：
++			// 未迁移时它已落盘，无需依赖；迁移后由产出方另行登记，这里按路径声明即可
++			minecraftProvider.addProducerDependency(task, minecraftPatchedIntermediateAtJar);
++		}));
++
++		minecraftProvider.registerTaskProducedArtifact(patchedJar, producer);
++		registerExtraDependencies(producer.taskPath());
++	}
++
+ 	private Void remapPatchedJarWithDirty(ServiceFactory serviceFactory) throws Exception {
+ 		// 锁内二次确认：等锁期间其它进程可能已完成生产（dirty 为幂等判定）；本方法不删除共享产物
+ 		// dirty 也可能只表示「client-extra 需要重建」（见 providePatched）：此时最终 jar 会被幂等地重发一次，
+ 		// 而 client-extra 的修复不会被跳过
+ 		if (dirty) {
+-			if (getExtension().isUnobfuscatedForge()) {
+-				publishAtomically(minecraftPatchedJar, this::mergeUnobfuscatedPatchedJar);
+-			} else {
+-				publishAtomically(minecraftPatchedJar, output -> remapPatchedJar(output, serviceFactory));
+-			}
++			final ProductionOptions options = productionOptions(serviceFactory);
++			publishAtomically(minecraftPatchedJar, output -> runProduction(options, output, null, logger::lifecycle));
+ 
+ 			if (providesClientJar()) {
+-				publishAtomically(minecraftClientExtra, output -> fillClientExtraJar(serviceFactory, output));
++				publishAtomically(minecraftClientExtra, output -> runProduction(options, null, output, logger::lifecycle));
+ 			}
+ 		}
+ 
+@@ -407,16 +523,249 @@ public class MinecraftPatchedProvider {
+ 		return null;
+ 	}
+ 
+-	private void registerExtraDependencies() {
++	/**
++	 * 一次最终产物生产所需的全部输入与平台开关.
++	 *
++	 * <p>逐项对应执行期任务声明的输入，也逐项对应配置期路径自己持有的状态：两条路径都构造这一个对象，
++	 * 生产实现只认它。这样「任务声明的输入」与「生产真正读入的输入」不可能不一致——否则 up-to-date
++	 * 判定就是假的（改了输入却不重建），而等价性对照也验不出「接线接错了哪个输入」。
++	 *
++	 * <p>它必须**完全不依赖 Gradle 项目模型**（只有路径、布尔与字符串）：任务对象会被配置缓存序列化，
++	 * 任何指向 {@code Project}/{@code SourceSet} 的引用都会让整个 Forge 工程无法使用配置缓存。
++	 * 平台开关因此在这里显式取值，而不是在执行期回读 extension。
++	 *
++	 * @param atPatchedJar 打过补丁并做过 access transform 的中间 Minecraft jar（重映射的输入）
++	 * @param forgeJar Forge 的 universal jar
++	 * @param forgeUserdevJar Forge 的 userdev jar
++	 * @param clientJar client jar；不产出 client-extra 时为 {@code null}
++	 * @param serverJar 服务端侧 jar（bootstrap 版本是抽取产物，否则是下载下来的 server jar）；
++	 *         只有 NeoForge 的 MERGED dist 清单会读它，其余情形为 {@code null}
++	 * @param mappings 映射树；unobfuscated Forge 下为 {@code null}（那时没有映射配置）
++	 * @param clientExtra 本次是否产出 client-extra
++	 * @param neoForge 是否 NeoForge（决定是否挂 mixin 扩展、是否写 dist 清单）
++	 * @param forge 是否 Forge（决定 client-extra 是否写空 MANIFEST）
++	 * @param unobfuscatedForge 是否 unobfuscated Forge（最终 jar 走 userdev 合并分支、dist 清单用空映射树）
++	 * @param runtimeMojang 是否在运行时使用 mojang 映射（决定 coremod 重映射的方向）
++	 * @param merged 是否 MERGED 形态（决定 dist 清单是否按 client/server 分边）
++	 * @param remapNamespace 重映射的源命名空间（Forge 为 {@code srg}、NeoForge 为 {@code mojang}）
++	 * @param coreModNamespace coremod 重映射使用的源命名空间（生产命名空间）
++	 * @param distAttribute 写进 dist 清单的 {@code Minecraft-Dists} 取值
++	 */
++	public record ProductionOptions(
++			Path atPatchedJar,
++			Path forgeJar,
++			Path forgeUserdevJar,
++			@Nullable Path clientJar,
++			@Nullable Path serverJar,
++			@Nullable MemoryMappingTree mappings,
++			boolean clientExtra,
++			boolean neoForge,
++			boolean forge,
++			boolean unobfuscatedForge,
++			boolean runtimeMojang,
++			boolean merged,
++			String remapNamespace,
++			String coreModNamespace,
++			String distAttribute) {
++	}
++
++	/**
++	 * {@return 本 provider 当前状态对应的生产输入与平台开关}.
++	 *
++	 * <p>任务接线侧同样用它：任务声明的每一个输入都取自这里，因此两侧的输入逐项同源。
++	 * 唯一例外是映射树——任务在执行期从它自己的 {@code @Nested} 映射配置取（见 {@code GenerateForgePatchedJarTask}），
++	 * 与这里的 {@link #getMappingTree(ServiceFactory)} 用的是同一个映射选项。
++	 */
++	public ProductionOptions productionOptions(ServiceFactory serviceFactory) {
++		final var extension = getExtension();
++		final boolean clientExtra = providesClientJar();
++		// unobfuscated Forge 不走映射配置（setupMinecraft 不为它创建 MappingConfiguration）
++		final MemoryMappingTree mappings = extension.isUnobfuscatedForge() ? null : getMappingTree(serviceFactory);
++
++		return new ProductionOptions(
++				minecraftPatchedIntermediateAtJar,
++				getForgeJar().toPath(),
++				getForgeUserdevJar().toPath(),
++				clientExtra ? minecraftProvider.getMinecraftClientJar().toPath() : null,
++				needsServerJarForDistManifest(extension) ? getServerJarForDistManifest().toPath() : null,
++				mappings,
++				clientExtra,
++				extension.isNeoForge(),
++				extension.isForge(),
++				extension.isUnobfuscatedForge(),
++				extension.getForgeProvider().usesMojangAtRuntime(),
++				type == Type.MERGED,
++				IntermediaryNamespaces.intermediary(project),
++				extension.getProductionNamespace().get(),
++				type.getNeoForgeDistsAttribute());
++	}
++
++	/**
++	 * {@return 本次生产是否会读服务端侧 jar}.
++	 *
++	 * <p>只有 NeoForge 的 MERGED dist 清单会读它（见 {@link #generateNeoForgeDistManifest}）。
++	 * 判定必须与那一处逐字对应：**多声明**会让任务把一件生产从不读的文件当输入，1.17 及更早的
++	 * 非 bundle 版本上那件文件根本不存在，任务会以「输入文件不存在」直接失败；**少声明**则会让
++	 * 改了服务端 jar 却不重建产物。
++	 */
++	private boolean needsServerJarForDistManifest(LoomGradleExtension extension) {
++		return providesClientJar() && type == Type.MERGED && extension.isNeoForge();
++	}
++
++	/**
++	 * {@return NeoForge dist 清单用于分边的服务端 jar}.
++	 *
++	 * <p>判据与改造前 {@code generateNeoForgeDistManifest} 里那一处逐字一致：bootstrap 版本的抽取产物
++	 * 优先，缺失时退回下载下来的 server jar。
++	 */
++	private File getServerJarForDistManifest() {
++		return Objects.requireNonNullElse(minecraftProvider.getMinecraftExtractedServerJar(), minecraftProvider.getMinecraftServerJar());
++	}
++
++	/**
++	 * 把最终 patched jar（与 client-extra）生产到给定路径.
++	 *
++	 * <p>配置期路径（{@link #remapJar(ServiceFactory)}）与执行期任务
++	 * （{@link GenerateForgePatchedJarTask}）共用这一处实现，因此两条路径的产物逐字节一致——
++	 * 同一次重映射、同一批输入，不存在「两套实现各自近似」的分叉。
++	 *
++	 * <p>本方法不做任何「是否需要生产」的判定，也不落位：判定由调用方负责（配置期看 {@code dirty}，
++	 * 任务侧看 {@code needsFinalJarWork}），落位一律由 {@code AtomicFiles} 的原子发布完成。
++	 *
++	 * <p>静态：任务对象要能被配置缓存序列化，因此生产不能经由 provider 实例（见 {@link ProductionOptions}）。
++	 *
++	 * @param options 生产输入与平台开关
++	 * @param patchedJarOutput 最终 patched jar 的落位路径；为 {@code null} 表示本次不产出它
++	 * @param clientExtraOutput client-extra 的落位路径；为 {@code null} 表示本次不产出它
++	 * @param lifecycle lifecycle 日志出口（配置期是项目 logger，执行期是任务 logger）
++	 */
++	public static void runProduction(ProductionOptions options, @Nullable Path patchedJarOutput, @Nullable Path clientExtraOutput,
++			Consumer<String> lifecycle) throws Exception {
++		if (patchedJarOutput != null) {
++			if (options.unobfuscatedForge()) {
++				mergeUnobfuscatedPatchedJar(options, patchedJarOutput, lifecycle);
++			} else {
++				remapPatchedJar(options, patchedJarOutput, lifecycle);
++			}
++		}
++
++		if (clientExtraOutput != null) {
++			fillClientExtraJar(options, clientExtraOutput);
++		}
++	}
++
++	/**
++	 * 把最终 patched jar（与 client-extra）生产到**指定路径**，不触碰共享缓存路径、不取跨进程锁.
++	 *
++	 * <p>供电线验证使用：它让「配置期实现」可以被独立调用一次作为对照，对照产物落在独立文件上，
++	 * 因此被测产物的路径上只有被测任务一个写入者——不会出现「配置期先写一份、任务再覆盖」这类别名，
++	 * 否则「两者一致」可以由「读到了同一份文件」伪造出来。
++	 *
++	 * @param options 生产输入（通常取自 {@link #productionOptions(ServiceFactory)}）
++	 * @param patchedJarOutput 最终 patched jar 的落位路径
++	 * @param clientExtraOutput client-extra 的落位路径；为 {@code null} 表示不产出它
++	 * @param lifecycle lifecycle 日志出口
++	 */
++	public static void produceFinalJarsInto(ProductionOptions options, Path patchedJarOutput, @Nullable Path clientExtraOutput,
++			Consumer<String> lifecycle) throws Exception {
++		runProduction(options, patchedJarOutput, clientExtraOutput, lifecycle);
++	}
++
++	/**
++	 * 执行期任务的生产入口：按需把最终 patched jar 与 client-extra 原子落位到任务声明的输出路径.
++	 *
++	 * <p>「是否需要生产」的判据与配置期路径同源（见 {@code needsFinalJarWork}），
++	 * 齐备时不写任何文件：于是任务路径与配置期路径在同一份共享缓存上「写了哪些文件」完全一致。
++	 * 执行时机与跨进程并发保护分别由任务图与这里取的文件锁承担。
++	 *
++	 * @param options 生产输入与平台开关（任务从自己声明的输入构造）
++	 * @param patchedJarOutput 最终 patched jar 的落位路径（与配置期同一条路径）
++	 * @param clientExtraOutput client-extra 的落位路径；本配置不产出它时为 {@code null}
++	 * @param lockRoot 跨进程锁所在目录（与配置期 {@code withPatchedLock} 同一个目录）
++	 * @param lockKey 跨进程锁的 key（与配置期同一个 key）
++	 * @param refreshDeps 是否显式要求刷新（对应 {@code --refresh-dependencies}）
++	 * @param lifecycle lifecycle 日志出口
++	 */
++	public static void produceFinalJarsForTask(ProductionOptions options, Path patchedJarOutput, @Nullable Path clientExtraOutput,
++			Path lockRoot, String lockKey, boolean refreshDeps, Consumer<String> lifecycle) throws Exception {
++		if (!needsFinalJarWork(patchedJarOutput, clientExtraOutput, refreshDeps, lifecycle)) {
++			return;
++		}
++
++		withLock(lockRoot, lockKey, () -> {
++			// 锁内二次确认：等锁期间其它进程可能已完成生产
++			if (!needsFinalJarWork(patchedJarOutput, clientExtraOutput, refreshDeps, lifecycle)) {
++				return null;
++			}
++
++			publishAtomically(patchedJarOutput, output -> runProduction(options, output, null, lifecycle));
++
++			if (clientExtraOutput != null) {
++				publishAtomically(clientExtraOutput, output -> runProduction(options, null, output, lifecycle));
++			}
++
++			return null;
++		});
++	}
++
++	/**
++	 * {@return 最终 patched jar（与 client-extra）是否需要重建}.
++	 *
++	 * <p>判据取自配置期 {@link #needsWork()} 中与最终产物相关的那些：显式刷新、产物不可复用
++	 * （存在且能作为 jar 打开、至少含一个条目）、或补丁版本标记过期。
++	 *
++	 * <p>静态：任务侧要用它做锁内二次确认，而任务不持有 provider（见 {@link ProductionOptions}）。
++	 *
++	 * @param refreshDeps 是否显式要求刷新
++	 * @param lifecycle lifecycle 日志出口
++	 */
++	private static boolean needsFinalJarWork(Path patchedJar, @Nullable Path clientExtra, boolean refreshDeps,
++			@Nullable Consumer<String> lifecycle) {
++		if (refreshDeps || !isReusableJar(patchedJar)
++				|| (clientExtra != null && !isReusableJar(clientExtra))) {
++			return true;
++		}
++
++		try {
++			return !isPatchedJarUpToDate(patchedJar, lifecycle);
++		} catch (IOException e) {
++			return true;
++		}
++	}
++
++	/**
++	 * 把最终产物登记进 FORGE_EXTRA 配置.
++	 *
++	 * @param patchedJarTaskPath patched jar（与 client-extra）的产出任务路径；配置期路径下为 {@code null}
++	 */
++	private void registerExtraDependencies(@Nullable String patchedJarTaskPath) {
+ 		if (getExtension().isUnobfuscatedForge()) {
+ 			DependencyProvider.addDependency(project, getForgeJar(), Constants.Configurations.FORGE_EXTRA);
+ 		}
+ 
+ 		if (providesClientJar()) {
+-			DependencyProvider.addDependency(project, minecraftClientExtra, Constants.Configurations.FORGE_EXTRA);
++			// 任务路径下 client-extra 由执行期产出：登记时必须带上产出任务，否则解析该配置的消费方
++			// （compileClasspath / runtimeClasspath 经 FORGE_EXTRA 扩展）会读到尚不存在的文件
++			DependencyProvider.addDependency(project, clientExtraDependency(patchedJarTaskPath), Constants.Configurations.FORGE_EXTRA);
+ 		}
+ 	}
+ 
++	private void registerExtraDependencies() {
++		registerExtraDependencies(null);
++	}
++
++	/** {@return client-extra 的依赖形态} 任务路径下携带产出任务，配置期路径下是裸文件. */
++	private Object clientExtraDependency(@Nullable String patchedJarTaskPath) {
++		if (patchedJarTaskPath == null) {
++			return minecraftClientExtra;
++		}
++
++		// client-extra 与 patched jar 由同一个任务写出，故按 patched jar 的产出任务建依赖
++		final ConfigurableFileCollection files = project.files(minecraftClientExtra);
++		files.builtBy(patchedJarTaskPath);
++		return files;
++	}
++
+ 	/**
+ 	 * 在跨进程锁保护下执行 patched jar 生产.
+ 	 *
+@@ -425,10 +774,25 @@ public class MinecraftPatchedProvider {
+ 	 * 必须整段生产串行化。锁内判定均为幂等二次确认，等锁期间其它进程完成生产后直接复用。
+ 	 */
+ 	protected void withPatchedLock(Callable<Void> action) {
+-		final String lockKey = "forge-patched:" + getExtension().getMinecraftProvider().minecraftVersion()
++		withLock(ForgeProvider.getForgeCache(project).resolve(Constants.Cache.LOCKS_DIR), patchedLockKey(), action);
++	}
++
++	/** {@return 跨进程锁的 key} 配置期与执行期任务必须取同一个 key，否则两边的生产会互相穿插. */
++	private String patchedLockKey() {
++		return "forge-patched:" + getExtension().getMinecraftProvider().minecraftVersion()
+ 				+ ":" + getExtension().getForgeProvider().getVersion().getCombined();
+-		final Path lockRoot = ForgeProvider.getForgeCache(project).resolve(Constants.Cache.LOCKS_DIR);
++	}
+ 
++	/**
++	 * 在跨进程锁保护下执行 patched jar 生产.
++	 *
++	 * <p>产物位于跨 daemon 共享的 forge 缓存目录（不按项目隔离），且 {@code client-extra.jar} 在
++	 * 各 Type 实例间共享同一路径；同一 MC+Forge 版本的多个并发构建会互相读写/删除同一批文件，
++	 * 必须整段生产串行化。锁内判定均为幂等二次确认，等锁期间其它进程完成生产后直接复用。
++	 *
++	 * <p>静态：执行期任务同样要取这把锁，而任务不持有 provider。
++	 */
++	protected static void withLock(Path lockRoot, String lockKey, Callable<Void> action) {
+ 		try {
+ 			CacheEntryLock.withLock(lockRoot, lockKey, LoomCacheService.defaultTimeout(), action);
+ 		} catch (IOException e) {
+@@ -477,12 +841,12 @@ public class MinecraftPatchedProvider {
+ 		return getExtension().getMinecraftJarConfiguration().get() != MinecraftJarConfiguration.SERVER_ONLY;
+ 	}
+ 
+-	private void mergeUnobfuscatedPatchedJar(Path output) throws IOException {
+-		logger.lifecycle(":merging userdev into minecraft");
+-		Path forgeUserdevJar = getForgeUserdevJar().toPath();
++	private static void mergeUnobfuscatedPatchedJar(ProductionOptions options, Path output, Consumer<String> lifecycle) throws IOException {
++		lifecycle.accept(":merging userdev into minecraft");
++		Path forgeUserdevJar = options.forgeUserdevJar();
+ 
+ 		// output 是本次独占的临时文件：整份写入后在它上面完成全部加工，再由调用方原子落位
+-		Files.copy(minecraftPatchedIntermediateAtJar, output);
++		Files.copy(options.atPatchedJar(), output);
+ 
+ 		// No manifest available to reuse here (mergetool's output has none, Forge's own jar is signed).
+ 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(output, false)) {
+@@ -555,14 +919,14 @@ public class MinecraftPatchedProvider {
+ 		}
+ 	}
+ 
+-	private void fillClientExtraJar(ServiceFactory serviceFactory, Path output) throws IOException {
++	private static void fillClientExtraJar(ProductionOptions options, Path output) throws IOException {
+ 		// output 是本次独占的临时文件：原子发布要求生产者自行创建目标，故无需（也不应）先删除任何共享产物
+ 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(output, true)) {
+ 			Path manifestPath = fs.getPath("META-INF", "MANIFEST.MF");
+ 
+-			if (getExtension().isNeoForge()) {
+-				generateNeoForgeDistManifest(serviceFactory, manifestPath);
+-			} else if (getExtension().isForge()) {
++			if (options.neoForge()) {
++				generateNeoForgeDistManifest(options, manifestPath);
++			} else if (options.forge()) {
+ 				// Generates an empty manifest for forge client-extra jar.
+ 				// In ForgeGradle, it copies the client manifest when generating client-extra.
+ 				//
+@@ -573,29 +937,26 @@ public class MinecraftPatchedProvider {
+ 			}
+ 		}
+ 
+-		copyNonClassFiles(minecraftProvider.getMinecraftClientJar().toPath(), output);
++		copyNonClassFiles(Objects.requireNonNull(options.clientJar(), "本次生产不产出 client-extra，故没有 client jar"), output);
+ 	}
+ 
+ 	// Generates the jar manifest for NeoForge client-extra jars.
+ 	// The manifest includes a Minecraft-Dists attribute that specifies the dists in the current dev env,
+ 	// as well as Minecraft-Dist attributes on every dist-only file.
+-	private void generateNeoForgeDistManifest(ServiceFactory serviceFactory, Path manifestPath) throws IOException {
++	private static void generateNeoForgeDistManifest(ProductionOptions options, Path manifestPath) throws IOException {
+ 		// For unobfuscated NeoForge the classes are already in official namespace; an empty tree is safe
+ 		// because SidedJarIndexGenerator falls back to the original name when no mapping is found.
+-		MemoryMappingTree mappings = getExtension().isUnobfuscatedForge()
++		MemoryMappingTree mappings = options.unobfuscatedForge()
+ 				? new MemoryMappingTree()
+-				: getMappingTree(serviceFactory);
++				: Objects.requireNonNull(options.mappings(), "NeoForge 的 dist 清单需要映射树");
+ 
+ 		Manifest manifest = new Manifest();
+ 		manifest.getMainAttributes().put(Attributes.Name.MANIFEST_VERSION, "1.0");
+-		manifest.getMainAttributes().putValue("Minecraft-Dists", type.getNeoForgeDistsAttribute());
+-
+-		if (type == Type.MERGED) {
+-			Path clientJar = minecraftProvider.getMinecraftClientJar().toPath();
+-			Path serverJar = Objects.requireNonNullElse(
+-					minecraftProvider.getMinecraftExtractedServerJar(),
+-					minecraftProvider.getMinecraftServerJar()
+-			).toPath();
++		manifest.getMainAttributes().putValue("Minecraft-Dists", options.distAttribute());
++
++		if (options.merged()) {
++			Path clientJar = Objects.requireNonNull(options.clientJar(), "MERGED 形态必须提供 client jar");
++			Path serverJar = Objects.requireNonNull(options.serverJar(), "MERGED 形态必须提供服务端 jar");
+ 			SidedJarIndexGenerator generator = new SidedJarIndexGenerator(clientJar, serverJar, mappings);
+ 			generator.split((filePath, dist) -> {
+ 				var fileAttributes = new Attributes();
+@@ -617,9 +978,9 @@ public class MinecraftPatchedProvider {
+ 		return mappingsService.getMappingTree();
+ 	}
+ 
+-	private TinyRemapper buildRemapper(ServiceFactory serviceFactory, Path input) throws IOException {
+-		final String sourceNamespace = IntermediaryNamespaces.intermediary(project);
+-		MemoryMappingTree mappings = getMappingTree(serviceFactory);
++	private static TinyRemapper buildRemapper(ProductionOptions options, Path input) throws IOException {
++		final String sourceNamespace = options.remapNamespace();
++		MemoryMappingTree mappings = Objects.requireNonNull(options.mappings(), "patched jar 的重映射需要映射树");
+ 
+ 		TinyRemapper.Builder builder = TinyRemapper.newRemapper()
+ 				.withMappings(TinyRemapperHelper.create(mappings, sourceNamespace, "official", true, true))
+@@ -627,7 +988,7 @@ public class MinecraftPatchedProvider {
+ 				.renameInvalidLocals(true)
+ 				.rebuildSourceFilenames(true);
+ 
+-		if (getExtension().isNeoForge()) {
++		if (options.neoForge()) {
+ 			builder.extension(new MixinExtension(inputTag -> true));
+ 		}
+ 
+@@ -734,6 +1095,15 @@ public class MinecraftPatchedProvider {
+ 	}
+ 
+ 	protected boolean isPatchedJarUpToDate(Path jar) throws IOException {
++		return isPatchedJarUpToDate(jar, logger::lifecycle);
++	}
++
++	/**
++	 * {@return 产物的 manifest 是否标记为当前补丁版本}.
++	 *
++	 * @param lifecycle lifecycle 日志出口；为 {@code null} 时不输出「版本过期」的诊断行
++	 */
++	private static boolean isPatchedJarUpToDate(Path jar, @Nullable Consumer<String> lifecycle) throws IOException {
+ 		if (Files.notExists(jar)) return false;
+ 
+ 		byte[] manifestBytes = ZipUtils.unpackNullable(jar, "META-INF/MANIFEST.MF");
+@@ -749,7 +1119,10 @@ public class MinecraftPatchedProvider {
+ 		if (Objects.equals(value, CURRENT_LOOM_PATCH_VERSION)) {
+ 			return true;
+ 		} else {
+-			logger.lifecycle(":forge patched jars not up to date. current version: " + value);
++			if (lifecycle != null) {
++				lifecycle.accept(":forge patched jars not up to date. current version: " + value);
++			}
++
+ 			return false;
+ 		}
+ 	}
+@@ -779,14 +1152,14 @@ public class MinecraftPatchedProvider {
+ 		logger.lifecycle(":access transformed minecraft in " + stopwatch.stop());
+ 	}
+ 
+-	private void remapPatchedJar(Path mcOutput, ServiceFactory serviceFactory) throws Exception {
+-		logger.lifecycle(":remapping minecraft (TinyRemapper, {} -> official)", IntermediaryNamespaces.intermediary(project));
+-		Path mcInput = minecraftPatchedIntermediateAtJar;
+-		Path forgeJar = getForgeJar().toPath();
+-		Path forgeUserdevJar = getForgeUserdevJar().toPath();
++	private static void remapPatchedJar(ProductionOptions options, Path mcOutput, Consumer<String> lifecycle) throws Exception {
++		lifecycle.accept(":remapping minecraft (TinyRemapper, %s -> official)".formatted(options.remapNamespace()));
++		Path mcInput = options.atPatchedJar();
++		Path forgeJar = options.forgeJar();
++		Path forgeUserdevJar = options.forgeUserdevJar();
+ 		// mcOutput 是本次独占的临时文件（尚不存在），tiny-remapper 自行创建；无需先删任何共享产物
+ 
+-		TinyRemapper remapper = buildRemapper(serviceFactory, mcInput);
++		TinyRemapper remapper = buildRemapper(options, mcInput);
+ 
+ 		try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(mcOutput).build()) {
+ 			outputConsumer.addNonClassFiles(forgeJar, NonClassCopyMode.FIX_META_INF, remapper);
+@@ -804,17 +1177,13 @@ public class MinecraftPatchedProvider {
+ 		}
+ 
+ 		copyUserdevFiles(forgeUserdevJar, mcOutput);
+-		remapCoreMods(mcOutput, serviceFactory);
++		remapCoreMods(mcOutput, Objects.requireNonNull(options.mappings(), "coremod 重映射需要映射树"),
++				options.coreModNamespace(), options.runtimeMojang());
+ 		applyLoomPatchVersion(mcOutput);
+ 	}
+ 
+-	private void remapCoreMods(Path patchedJar, ServiceFactory serviceFactory) throws Exception {
+-		final MappingOption mappingOption = MappingOption.forPlatform(getExtension());
+-		final TinyMappingsService mappingsService = getExtension().getMappingConfiguration().getMappingsService(project, serviceFactory, mappingOption);
+-		final MappingTree mappings = mappingsService.getMappingTree();
+-
+-		final boolean isRuntimeMojang = getExtension().getForgeProvider().usesMojangAtRuntime();
+-		CoreModClassRemapper.remapJar(project, isRuntimeMojang, patchedJar, mappings);
++	private static void remapCoreMods(Path patchedJar, MappingTree mappings, String sourceNamespace, boolean runtimeMojang) throws Exception {
++		CoreModClassRemapper.remapJar(runtimeMojang, patchedJar, mappings, sourceNamespace);
+ 	}
+ 
+ 	/**
+@@ -896,7 +1265,7 @@ public class MinecraftPatchedProvider {
+ 		return mainClass;
+ 	}
+ 
+-	private void walkFileSystems(Path source, Path target, Predicate<Path> filter, Function<FileSystem, Iterable<Path>> toWalk, FsPathConsumer action)
++	static void walkFileSystems(Path source, Path target, Predicate<Path> filter, Function<FileSystem, Iterable<Path>> toWalk, FsPathConsumer action)
+ 			throws IOException {
+ 		try (FileSystemUtil.Delegate sourceFs = FileSystemUtil.getJarFileSystem(source, false);
+ 				FileSystemUtil.Delegate targetFs = FileSystemUtil.getJarFileSystem(target, false)) {
+@@ -921,7 +1290,7 @@ public class MinecraftPatchedProvider {
+ 		}
+ 	}
+ 
+-	protected void walkFileSystems(Path source, Path target, Predicate<Path> filter, FsPathConsumer action) throws IOException {
++	static void walkFileSystems(Path source, Path target, Predicate<Path> filter, FsPathConsumer action) throws IOException {
+ 		walkFileSystems(source, target, filter, FileSystem::getRootDirectories, action);
+ 	}
+ 
+@@ -938,16 +1307,16 @@ public class MinecraftPatchedProvider {
+ 		});
+ 	}
+ 
+-	private void copyNonClassFiles(Path source, Path target) throws IOException {
++	private static void copyNonClassFiles(Path source, Path target) throws IOException {
+ 		Predicate<Path> filter = file -> {
+ 			String s = file.toString();
+ 			return !s.endsWith(".class") && !s.startsWith("/META-INF");
+ 		};
+ 
+-		walkFileSystems(source, target, filter, this::copyReplacing);
++		walkFileSystems(source, target, filter, MinecraftPatchedProvider::copyReplacing);
+ 	}
+ 
+-	protected void copyReplacing(FileSystem sourceFs, FileSystem targetFs, Path sourcePath, Path targetPath) throws IOException {
++	static void copyReplacing(FileSystem sourceFs, FileSystem targetFs, Path sourcePath, Path targetPath) throws IOException {
+ 		Path parent = targetPath.getParent();
+ 
+ 		if (parent != null) {
+@@ -957,7 +1326,7 @@ public class MinecraftPatchedProvider {
+ 		Files.copy(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING);
+ 	}
+ 
+-	private void copyUserdevFiles(Path source, Path target) throws IOException {
++	private static void copyUserdevFiles(Path source, Path target) throws IOException {
+ 		// Removes the Forge name mapping service definition so that our own is used.
+ 		// If there are multiple name mapping services with the same "understanding" pair
+ 		// (source -> target namespace pair), modlauncher throws a fit and will crash.
+@@ -975,7 +1344,7 @@ public class MinecraftPatchedProvider {
+ 		});
+ 	}
+ 
+-	public void applyLoomPatchVersion(Path target) throws IOException {
++	static void applyLoomPatchVersion(Path target) throws IOException {
+ 		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(target, false)) {
+ 			Path manifestPath = delegate.get().getPath("META-INF/MANIFEST.MF");
+ 
+@@ -995,7 +1364,7 @@ public class MinecraftPatchedProvider {
+ 		}
+ 	}
+ 
+-	private void createEmptyJarManifest(Path manifestPath) throws IOException {
++	private static void createEmptyJarManifest(Path manifestPath) throws IOException {
+ 		if (Files.exists(manifestPath)) {
+ 			return;
+ 		}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
+index 386231497432765fb03aa3db67c12e8a8e31dc14..b0675750d7f395cd1e672f85264d1f679d8228b6 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
+@@ -313,6 +313,26 @@ public abstract class MinecraftProvider {
+ 		getExtension().setMinecraftJarsTaskOutputs(getOfficialNamespace(), outputs);
+ 	}
+ 
++	/**
++	 * 登记一个由**本 provider 之外的接线方**（Forge 的 patch 链）产出的最终 jar.
++	 *
++	 * <p>这些 jar 同样出现在 {@link #getMinecraftJars()} 里，因此必须走同一条登记路径：
++	 * 消费侧（{@code getMinecraftJarsCollection(OFFICIAL)}、mapped provider 的重映射任务）靠这里拿到
++	 * 「我的输入由哪个任务产出」的任务依赖。只把产物当成路径交给它们，冷缓存下消费方就会在产物落位前开跑。
++	 *
++	 * <p>只能在 {@link #provide()} 之后调用：那时 {@link #getMinecraftJars()} 才有意义，
++	 * 且首次 {@link #registerJarOutputs()} 已经把命名空间下的集合实例发出去，这里的重复登记是「并进」语义。
++	 *
++	 * @param artifact 产物路径（绝对规范化）
++	 * @param producer 该产物的生产者（携带任务路径）
++	 */
++	public void registerTaskProducedArtifact(Path artifact, Producer producer) {
++		final Map<Path, Producer> merged = new LinkedHashMap<>(jarProducers);
++		merged.put(normalize(artifact), producer);
++		jarProducers = Map.copyOf(merged);
++		registerJarOutputs();
++	}
++
+ 	/** {@return 本批登记中该产物的生产者；未登记时为 {@code null}} 供子 provider 建任务依赖用. */
+ 	protected static @Nullable Producer producerOf(Map<Path, Producer> producers, Path artifact) {
+ 		return producers.get(normalize(artifact));
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/GenerateForgePatchedJarTask.java b/src/main/java/net/fabricmc/loom/pipeline/GenerateForgePatchedJarTask.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae2189065dec0c89c270a89845ebca7b318a3f23
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/pipeline/GenerateForgePatchedJarTask.java
+@@ -0,0 +1,243 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.pipeline;
++
++import java.nio.file.Path;
++
++import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
++import org.gradle.api.DefaultTask;
++import org.gradle.api.file.RegularFileProperty;
++import org.gradle.api.provider.Property;
++import org.gradle.api.tasks.CacheableTask;
++import org.gradle.api.tasks.Input;
++import org.gradle.api.tasks.InputFile;
++import org.gradle.api.tasks.Internal;
++import org.gradle.api.tasks.Nested;
++import org.gradle.api.tasks.Optional;
++import org.gradle.api.tasks.OutputFile;
++import org.gradle.api.tasks.PathSensitive;
++import org.gradle.api.tasks.PathSensitivity;
++import org.gradle.api.tasks.TaskAction;
++import org.jspecify.annotations.Nullable;
++
++import net.fabricmc.loom.configuration.providers.mappings.TinyMappingsService;
++import net.fabricmc.loom.util.service.ScopedServiceFactory;
++import net.fabricmc.mappingio.tree.MemoryMappingTree;
++
++/**
++ * L3 流水线：生产 modern Forge 的最终 patched jar（与 client-extra）.
++ *
++ * <p>它取代的是 {@code MinecraftPatchedProvider.remapJar} 里那段配置期同步执行的
++ * 「判断是否需要重建 → 取跨进程锁 → 重映射 patched jar / 填充 client-extra → 原子落位」。
++ *
++ * <table>
++ *   <caption>旧路径 vs 本任务</caption>
++ *   <tr><th></th><th>旧路径</th><th>本任务</th></tr>
++ *   <tr><td>是否需要重建</td><td>配置期 {@code provide()} 设的 {@code dirty} + 锁内二次确认</td>
++ *       <td>Gradle up-to-date 检查（输入内容 + 输出快照）+ 锁内按可复用性二次确认</td></tr>
++ *   <tr><td>并发保护</td><td>跨进程文件锁</td><td>任务图 + 跨进程文件锁（产物仍在共享缓存）</td></tr>
++ *   <tr><td>执行时机</td><td>配置期（{@code CompileConfiguration.setupMinecraft}）</td><td>执行期</td></tr>
++ * </table>
++ *
++ * <h2>生产逻辑不在这里</h2>
++ * 真正的生产仍由 {@link MinecraftPatchedProvider#produceFinalJarsForTask} 持有：它和配置期路径共用
++ * 同一份实现（{@code remapFinalJar} / {@code fillClientExtraJar}），因此两条路径的产物逐字节一致。
++ * 本任务另写一套「等价」的实现就会引入分叉——同一个输入产出两份略有差异的 jar，正是这次迁移要消灭的东西。
++ * 与 {@code GenerateSrgNamedMappingsTask} 处置一致：同一份实现被两条路径共用。
++ *
++ * <h2>为什么输出是共享缓存里的那两个绝对路径</h2>
++ * 产物位置必须与配置期逐字一致（{@code <userCache>/<mcVersion>/forge/minecraft-<type>-patched.jar}
++ * 与 {@code client-extra.jar}）：消费侧（{@code getMinecraftJars()}/
++ * {@code getMinecraftJarsCollection(OFFICIAL)}、{@code FORGE_EXTRA} 配置的依赖项）按路径找它们。
++ * 该目录跨项目、跨 daemon 共享，因此「同一个路径只有一个生产者」由
++ * {@link RemapMinecraftTaskRegistry} 在同一构建内保证，跨构建由 {@code @OutputFile} 的 up-to-date 判定
++ * 与产物自身的原子落位承担。
++ *
++ * <h2>输入为什么是这些</h2>
++ * 输入逐项对应生产时真正读入的文件与判据，而不是「把 provider 的对象搬进来」：
++ * <ul>
++ *   <li>{@link #getAtPatchedJar()}：重映射的输入（打过补丁并做过 AT 的中间 jar）；</li>
++ *   <li>{@link #getForgeJar()}：参与重映射的类解析，并作为产物里的非 class 文件来源；</li>
++ *   <li>{@link #getForgeUserdevJar()}：{@code inject/} 下的文件会被复制进产物；</li>
++ *   <li>{@link #getClientJar()}：client-extra 的非 class 文件来源；</li>
++ *   <li>{@link #getServerJar()}：NeoForge 的 dist 清单要按它分边（bootstrap 版本是抽取产物，
++ *       否则是下载下来的 server jar）；</li>
++ *   <li>{@link #getMappingsServiceOptions()}：上述重映射、coremod 重映射与 dist 清单都从它取映射树，
++ *       与配置期 {@code buildRemapper}/{@code remapCoreMods} 用的是同一个映射选项；</li>
++ *   <li>{@link #getPatchVersion()}：写在产物 manifest 里的补丁版本，也是配置期路径的就绪判据。</li>
++ * </ul>
++ */
++@CacheableTask
++public abstract class GenerateForgePatchedJarTask extends DefaultTask {
++	/** 任务名：消费侧（本仓库的测试与诊断）按它引用产出任务. */
++	public static final String NAME = "generateForgePatchedJar";
++
++	/** 打补丁并做过 access transform 的中间 Minecraft jar，即重映射的输入. */
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getAtPatchedJar();
++
++	/** Forge 的 universal jar. */
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getForgeJar();
++
++	/** Forge 的 userdev jar. */
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getForgeUserdevJar();
++
++	/** client jar（client-extra 的内容来源）；server-only 配置下不设置. */
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	@Optional
++	public abstract RegularFileProperty getClientJar();
++
++	/** 服务端侧 jar；仅 MERGED 形态用于 NeoForge 的 dist 清单. */
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	@Optional
++	public abstract RegularFileProperty getServerJar();
++
++	/** 映射服务配置：产出 jar 的重映射、coremod 重映射与 dist 清单都读它. */
++	@Nested
++	public abstract Property<TinyMappingsService.Options> getMappingsServiceOptions();
++
++	/** 本配置是否产出 client-extra（与配置期 {@code providesClientJar()} 同判据）. */
++	@Input
++	public abstract Property<Boolean> getClientExtraEnabled();
++
++	/** Loom 补丁版本：写在产物 manifest 里，也是配置期路径的就绪判据. */
++	@Input
++	public abstract Property<String> getPatchVersion();
++
++	/** 是否 NeoForge（决定是否挂 mixin 扩展、是否写 dist 清单）. */
++	@Input
++	public abstract Property<Boolean> getNeoForge();
++
++	/** 是否 Forge（决定 client-extra 是否写空 MANIFEST）. */
++	@Input
++	public abstract Property<Boolean> getForge();
++
++	/** 是否 unobfuscated Forge（最终 jar 走 userdev 合并分支、dist 清单用空映射树）. */
++	@Input
++	public abstract Property<Boolean> getUnobfuscatedForge();
++
++	/** 是否在运行时使用 mojang 映射（决定 coremod 重映射的方向）. */
++	@Input
++	public abstract Property<Boolean> getRuntimeMojang();
++
++	/** 是否 MERGED 形态（决定 dist 清单是否按 client/server 分边）. */
++	@Input
++	public abstract Property<Boolean> getMerged();
++
++	/** 重映射的源命名空间（Forge 为 {@code srg}、NeoForge 为 {@code mojang}）. */
++	@Input
++	public abstract Property<String> getRemapNamespace();
++
++	/** coremod 重映射使用的源命名空间（生产命名空间）. */
++	@Input
++	public abstract Property<String> getCoreModNamespace();
++
++	/** 写进 dist 清单的 {@code Minecraft-Dists} 取值. */
++	@Input
++	public abstract Property<String> getDistAttribute();
++
++	/** 是否显式要求刷新（对应 {@code --refresh-dependencies}）；与配置期 {@code refreshDeps} 同源. */
++	@Input
++	public abstract Property<Boolean> getRefreshDeps();
++
++	/**
++	 * 跨进程锁的 key：与配置期 {@code withPatchedLock} 取同一个 key，两侧的生产才不会互相穿插.
++	 *
++	 * <p>是 {@code @Input} 而不是 {@code @Internal}：换了 MC/Forge 版本就是换了一份产物身份。
++	 */
++	@Input
++	public abstract Property<String> getLockKey();
++
++	/**
++	 * 跨进程锁所在目录.
++	 *
++	 * <p>{@code @Internal}：它只决定「在哪里互斥」，不决定产物内容；把它算进指纹会让同一份产物
++	 * 因为缓存目录搬家而重建。
++	 */
++	@Internal
++	public abstract Property<String> getLockRoot();
++
++	/** 产物：最终 patched jar（与配置期同一条路径）. */
++	@OutputFile
++	public abstract RegularFileProperty getOutputJar();
++
++	/** 产物：client-extra（与配置期同一条路径）；不产出时为未设置. */
++	@OutputFile
++	@Optional
++	public abstract RegularFileProperty getClientExtraJar();
++
++	@TaskAction
++	public void generate() throws Exception {
++		try (var serviceFactory = new ScopedServiceFactory()) {
++			// 映射树在执行期从本任务声明的映射配置取：它与配置期路径
++			// （MinecraftPatchedProvider.getMappingTree）用的是同一个映射选项
++			final TinyMappingsService.Options mappingsOptions = getMappingsServiceOptions().get();
++			final TinyMappingsService mappingsService = serviceFactory.get(mappingsOptions);
++			final MemoryMappingTree mappings = mappingsService.getMappingTree();
++
++			final var options = new MinecraftPatchedProvider.ProductionOptions(
++					path(getAtPatchedJar()),
++					path(getForgeJar()),
++					path(getForgeUserdevJar()),
++					optionalPath(getClientJar()),
++					optionalPath(getServerJar()),
++					mappings,
++					getClientExtraEnabled().get(),
++					getNeoForge().get(),
++					getForge().get(),
++					getUnobfuscatedForge().get(),
++					getRuntimeMojang().get(),
++					getMerged().get(),
++					getRemapNamespace().get(),
++					getCoreModNamespace().get(),
++					getDistAttribute().get());
++
++			// 生产实现与配置期路径共用（见类注释）；输入与平台开关逐项取自本任务的声明
++			MinecraftPatchedProvider.produceFinalJarsForTask(
++					options,
++					path(getOutputJar()),
++					optionalPath(getClientExtraJar()),
++					Path.of(getLockRoot().get()),
++					getLockKey().get(),
++					getRefreshDeps().get(),
++					getLogger()::lifecycle);
++		}
++	}
++
++	private static Path path(RegularFileProperty property) {
++		return property.get().getAsFile().toPath();
++	}
++
++	private static @Nullable Path optionalPath(RegularFileProperty property) {
++		return property.isPresent() ? property.get().getAsFile().toPath() : null;
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgePatchedJarTaskEquivalenceTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgePatchedJarTaskEquivalenceTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..d6530798f869314bd1f8b0666f6505c82dd44668
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgePatchedJarTaskEquivalenceTest.groovy
+@@ -0,0 +1,321 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration.pipeline
++
++import java.security.MessageDigest
++import java.util.zip.ZipFile
++
++import spock.lang.Specification
++
++import net.fabricmc.loom.test.util.GradleProjectTestTrait
++
++import static net.fabricmc.loom.test.LoomTestConstants.DEFAULT_GRADLE
++import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
++import static org.gradle.testkit.runner.TaskOutcome.UP_TO_DATE
++
++/**
++ * Forge 的最终 patched jar / client-extra 由执行期任务产出的**产物内容**等价性与接线检查.
++ *
++ * <p>被切到任务的是 {@code CompileConfiguration.setupMinecraft} 里的
++ * {@code patched.getPatchedProvider().remapJar(...)}：改造前它把最终 patched jar 与 client-extra
++ * 写在配置期，现在由 {@code :generateForgePatchedJar} 在执行期写同一对路径。
++ *
++ * <h2>对照怎么构造</h2>
++ * 配置期路径已从调用点上切走，产出不再自动可得，因此本测试在探针里**手工调用被切走的那一处实现**：
++ * {@code MinecraftPatchedProvider.produceFinalJarsInto(inputs, …)}——即生产逻辑本身（配置期与执行期
++ * 共用它），参数取自被测 provider 自己的 {@code productionOptions(sf)}。参照产物写在
++ * {@code build/probe/configtime-*.jar}，因此**被测产物的路径上只有被测任务一个写入者**——不会出现
++ * 「配置期先写一份、任务再覆盖」这类别名，否则「两者一致」可以由「读到了同一份文件」伪造出来。
++ *
++ * <p>该实现与任务共用，故「两者一致」在实现层面是构造性的；本测试真正要钉住的是**接线**：
++ * 任务读的是不是那几个输入、写的是不是那两个路径、消费方（MC jar 集合与 {@code forgeExtra} 配置）
++ * 有没有拿到任务依赖。为了不让「构造性一致」掩盖接线错误，下面每一条内容断言都配了扰动对照。
++ *
++ * <h2>比对口径</h2>
++ * 解压后比**每一个 entry 的字节摘要**（SHA-256），entry 名集合也必须一致——不是整文件哈希：
++ * 中央目录顺序与时间戳不属于语义。任何一条 entry 的字节不同即判为差异。
++ *
++ * <h2>扰动对照（每一条内容断言都配一条）</h2>
++ * <ul>
++ *   <li><b>空映射树</b>：其余输入原样、只把映射树换成空树 → patched jar 必须与对照不同。
++ *       它同时证明「映射树确实参与产物内容」以及比对口径能识别「名字相同、字节不同」；</li>
++ *   <li><b>错位的 client jar</b>：把 client-extra 的输入换成服务端 jar → client-extra 必须与对照不同。
++ *       它证明 client-extra 的内容确实来自它声明的那个输入；</li>
++ *   <li><b>反向排除</b>：patched jar 必须与它自己的输入（at-patched 中间 jar）不同——排除「复制而非
++ *       重映射」这种假通过；</li>
++ *   <li><b>独立重算的 client-extra 条目集合</b>：client-extra 的条目集合由测试 JVM 直接从 client jar
++ *       算出（非 class 且非 {@code META-INF/} 下的条目 + 空 MANIFEST），与任务产出对集合相等。
++ *       这一条完全不经过 loom 的实现，是「内容确实来自 client jar」的独立证据。</li>
++ * </ul>
++ *
++ * <h2>覆盖边界（如实记录）</h2>
++ * <ul>
++ *   <li>覆盖 **MERGED 形态 + Forge 1.20.1**（client-extra 产出、dist 清单不产出）。</li>
++ *   <li>**NeoForge 的 dist 清单分支没有覆盖**：它要按 client/server 分边，需要 NeoForge 夹具
++ *       （另需 Java 21）。本测试只把「Forge 下走的是空 MANIFEST 分支、因此不读服务端侧 jar」断言下来；
++ *       NeoForge 那条链的端到端覆盖在 {@code Forge1206Test}。</li>
++ *   <li>**legacy Forge 与 disableObfuscation 没有覆盖**：两者的最终 jar 形态不同，
++ *       按 {@code remapJarProjectionBlocker()} 整批留在配置期，本次未迁移。</li>
++ *   <li>**server-only / client-only 形态没有覆盖**：{@code SingleJarForgeMinecraftProvider} 的
++ *       client/server binpatch 在本环境产不出来（见 {@code SrgMojangMappedRemapEquivalenceTest}
++ *       的覆盖边界说明），因此它们的任务接线没有被执行到。</li>
++ * </ul>
++ */
++class ForgePatchedJarTaskEquivalenceTest extends Specification implements GradleProjectTestTrait {
++	/** 被测任务名（见 {@code GenerateForgePatchedJarTask.NAME}）. */
++	private static final String TASK = "generateForgePatchedJar"
++
++	def "patched jar 与 client-extra 由执行期任务产出，且与配置期实现逐 entry 一致"() {
++		setup:
++		def gradle = gradleProject(project: "forge/simple", version: DEFAULT_GRADLE)
++		gradle.buildGradle.text = gradle.buildGradle.text.replace('@MCVERSION@', '1.20.1')
++				.replace('@FORGEVERSION@', '47.2.1')
++				.replace('@MAPPINGS@', 'loom.officialMojangMappings()')
++				.replace('@REPOSITORIES@', '')
++				.replace('@PACKAGE@', 'net.minecraftforge:forge')
++				.replace('@JAVA_VERSION@', '17')
++		gradle.buildGradle << probeScript().stripIndent()
++
++		when: "跑消费方：产出任务必须先在任务图里跑过"
++		// 探针在配置期调用被切走的实现（它需要 Gradle 项目模型），故显式关掉配置缓存；
++		// 同时关掉构建缓存：本用例要断言被测任务**真的执行了**，而不是从缓存恢复了别的产物
++		def result = gradle.run(task: "remapJar", configurationCache: false, args: [
++			"--console=plain",
++			"--no-build-cache"
++		])
++		def report = parseReport(new File(gradle.projectDir, "probe-report.properties"))
++		def subject = entries(new File(report.SUBJECT_JAR))
++		def subjectExtra = entries(new File(report.SUBJECT_CLIENT_EXTRA))
++		def reference = entries(new File(report.REFERENCE_JAR))
++		def referenceExtra = entries(new File(report.REFERENCE_CLIENT_EXTRA))
++		def perturbedForgeJar = entries(new File(report.PERTURBED_FORGE_JAR))
++		def perturbedExtra = entries(new File(report.PERTURBED_CLIENT_EXTRA_JAR))
++		def inputJar = entries(new File(report.INPUT_JAR))
++		def clientJar = new File(report.CLIENT_JAR)
++		printEvidence(report, subject, reference)
++
++		then: "产出任务被注册，且写的就是配置期路径下那两个产物"
++		report.TASK_FOUND == "true"
++		report.TASK_OUTPUT == report.PROVIDER_JAR
++		report.TASK_CLIENT_EXTRA == report.CLIENT_EXTRA_JAR
++		report.TASK_AT_PATCHED == report.INPUT_JAR
++		report.TASK_CLIENT_EXTRA_ENABLED == "true"
++
++		and: "任务声明的每一个输入都等于配置期实现读入的那个文件"
++		report.TASK_FORGE_JAR == report.BASE_FORGE_JAR
++		report.TASK_USERDEV_JAR == report.BASE_USERDEV_JAR
++		report.TASK_CLIENT_JAR == report.BASE_CLIENT_JAR
++
++		and: "本夹具（Forge，非 NeoForge）不读服务端侧 jar，两侧都必须不声明它"
++		// 「多声明」会让任务把一件生产从不读的文件当输入，1.17 及更早的非 bundle 版本上那件文件
++		// 根本不存在，任务会以「输入文件不存在」直接失败（本次实测过）
++		report.BASE_SERVER_JAR == "<未设置>"
++		report.TASK_SERVER_JAR == "<未设置>"
++
++		and: "任务声明的命名空间与 dist 取值就是配置期实现用的那几个（决定重映射方向与清单内容）"
++		report.TASK_REMAP_NAMESPACE == "srg"
++		report.TASK_COREMOD_NAMESPACE == "srg"
++		report.TASK_DIST_ATTRIBUTE == "client server"
++		report.TASK_LOCK_KEY == "forge-patched:1.20.1:1.20.1-47.2.1"
++
++		and: "消费方的任务图里带着产出任务（MC jar 集合与 forgeExtra 两条消费路径都接上了）"
++		result.task(":remapJar").outcome == SUCCESS
++		[
++			result.task(":" + TASK)?.outcome
++		].every { it == SUCCESS || it == UP_TO_DATE }
++		report.EXTENSION_JARS.contains(report.TASK_OUTPUT)
++
++		and: "产物非空，且 patched jar 不是它自己的输入（反向排除「复制而非重映射」）"
++		subject.size() > 0
++		subjectExtra.size() > 0
++		diff(subject, inputJar).size() > 0
++
++		and: "patched jar 与配置期实现逐 entry 一致"
++		diff(subject, reference).isEmpty()
++
++		and: "client-extra 与配置期实现逐 entry 一致"
++		diff(subjectExtra, referenceExtra).isEmpty()
++
++		and: "扰动对照①：把 Forge universal jar 换成 userdev jar，patched jar 必须变（forgeJar 确实参与产物内容）"
++		diff(subject, perturbedForgeJar).size() > 0
++
++		and: "扰动对照②：把 client-extra 的输入换成 Forge universal jar，client-extra 必须变"
++		diff(subjectExtra, perturbedExtra).size() > 0
++
++		and: "独立重算：client-extra 的条目集合就是 client jar 的非 class / 非 META-INF 条目 + 空 MANIFEST"
++		subjectExtra.keySet() == expectedClientExtraEntries(clientJar)
++	}
++
++	/**
++	 * 追加到夹具 build.gradle 的探针.
++	 *
++	 * <p>它在配置期（{@code afterEvaluate}，晚于 Loom 自己的 setup job）做四件事：记录被测任务声明的
++	 * 输入输出、调用配置期实现产出对照、产出两份扰动对照、把结果写进报告文件。
++	 */
++	private static String probeScript() {
++		return '''
++		afterEvaluate {
++			def extension = net.fabricmc.loom.LoomGradleExtension.get(project)
++			def provider = dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider.get(project)
++			def task = project.tasks.findByName('generateForgePatchedJar')
++			def probeDir = new File(project.buildDir, 'probe')
++			probeDir.mkdirs()
++
++			def lines = []
++			lines << 'TASK_FOUND=' + (task != null)
++			lines << 'TASK_OUTPUT=' + task.outputJar.get().asFile.absolutePath
++			lines << 'TASK_CLIENT_EXTRA=' + task.clientExtraJar.get().asFile.absolutePath
++			lines << 'TASK_AT_PATCHED=' + task.atPatchedJar.get().asFile.absolutePath
++			lines << 'TASK_CLIENT_EXTRA_ENABLED=' + task.clientExtraEnabled.get()
++			lines << 'TASK_PATCH_VERSION=' + task.patchVersion.get()
++			lines << 'PROVIDER_JAR=' + extension.minecraftProvider.minecraftJars[0].toString()
++			lines << 'CLIENT_EXTRA_JAR=' + dev.architectury.loom.forge.dependency.ForgeProvider.getForgeCache(project).resolve('client-extra.jar').toString()
++			lines << 'EXTENSION_JARS=' + extension.getMinecraftJarsCollection(net.fabricmc.loom.api.mappings.layered.MappingsNamespace.OFFICIAL).files.collect { it.absolutePath }.join(',')
++			lines << 'CLIENT_JAR=' + extension.minecraftProvider.minecraftClientJar.absolutePath
++
++			def serviceFactory = new net.fabricmc.loom.util.service.ScopedServiceFactory()
++			def base = provider.productionOptions(serviceFactory)
++			lines << 'INPUT_JAR=' + base.atPatchedJar().toString()
++			lines << 'BASE_FORGE_JAR=' + base.forgeJar().toString()
++			lines << 'BASE_USERDEV_JAR=' + base.forgeUserdevJar().toString()
++			lines << 'BASE_CLIENT_JAR=' + base.clientJar().toString()
++			lines << 'BASE_SERVER_JAR=' + (base.serverJar() == null ? '<未设置>' : base.serverJar().toString())
++			lines << 'TASK_FORGE_JAR=' + task.forgeJar.get().asFile.absolutePath
++			lines << 'TASK_USERDEV_JAR=' + task.forgeUserdevJar.get().asFile.absolutePath
++			lines << 'TASK_CLIENT_JAR=' + task.clientJar.get().asFile.absolutePath
++			lines << 'TASK_SERVER_JAR=' + (task.serverJar.isPresent() ? task.serverJar.get().asFile.absolutePath : '<未设置>')
++			lines << 'TASK_REMAP_NAMESPACE=' + task.remapNamespace.get()
++			lines << 'TASK_COREMOD_NAMESPACE=' + task.coreModNamespace.get()
++			lines << 'TASK_DIST_ATTRIBUTE=' + task.distAttribute.get()
++			lines << 'TASK_LOCK_KEY=' + task.lockKey.get()
++
++			def lifecycle = { String message -> project.logger.lifecycle(message) }
++			def reference = new File(probeDir, 'configtime-patched.jar')
++			def referenceExtra = new File(probeDir, 'configtime-client-extra.jar')
++			provider.produceFinalJarsInto(base, reference.toPath(), referenceExtra.toPath(), lifecycle)
++
++			// 扰动①：把 Forge universal jar 换成 userdev jar，其余输入原样（产物里的非 class 文件与类解析都随之改变）
++			def wrongForge = new dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider.ProductionOptions(
++					base.atPatchedJar(), base.forgeUserdevJar(), base.forgeUserdevJar(), base.clientJar(), base.serverJar(),
++					base.mappings(), base.clientExtra(), base.neoForge(), base.forge(), base.unobfuscatedForge(),
++					base.runtimeMojang(), base.merged(), base.remapNamespace(), base.coreModNamespace(), base.distAttribute())
++			def perturbedForgeJar = new File(probeDir, 'perturbed-forge-jar.jar')
++			provider.produceFinalJarsInto(wrongForge, perturbedForgeJar.toPath(), null, lifecycle)
++
++			// 扰动②：把 client-extra 的输入换成 Forge universal jar，其余输入原样
++			def wrongClient = new dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider.ProductionOptions(
++					base.atPatchedJar(), base.forgeJar(), base.forgeUserdevJar(), base.forgeJar(), base.serverJar(),
++					base.mappings(), true, base.neoForge(), base.forge(), base.unobfuscatedForge(),
++					base.runtimeMojang(), base.merged(), base.remapNamespace(), base.coreModNamespace(), base.distAttribute())
++			def perturbedExtra = new File(probeDir, 'perturbed-client-extra.jar')
++			provider.produceFinalJarsInto(wrongClient, new File(probeDir, 'perturbed-patched.jar').toPath(), perturbedExtra.toPath(), lifecycle)
++
++			serviceFactory.close()
++
++			lines << 'REFERENCE_JAR=' + reference.absolutePath
++			lines << 'REFERENCE_CLIENT_EXTRA=' + referenceExtra.absolutePath
++			lines << 'PERTURBED_FORGE_JAR=' + perturbedForgeJar.absolutePath
++			lines << 'PERTURBED_CLIENT_EXTRA_JAR=' + perturbedExtra.absolutePath
++			lines << 'SUBJECT_JAR=' + task.outputJar.get().asFile.absolutePath
++			lines << 'SUBJECT_CLIENT_EXTRA=' + task.clientExtraJar.get().asFile.absolutePath
++
++			file('probe-report.properties').text = lines.join(System.lineSeparator()) + System.lineSeparator()
++		}
++		'''
++	}
++
++	/** 读报告文件；键值各占一行. */
++	private static Map<String, String> parseReport(File file) {
++		if (!file.exists()) {
++			throw new FileNotFoundException("未生成报告文件: " + file)
++		}
++
++		return file.readLines().findAll { it.contains('=') }.collectEntries {
++			def split = it.split('=', 2)
++			[(split[0]): split[1]]
++		}
++	}
++
++	/**
++	 * 在测试 JVM 里独立算出 client-extra 应有的条目集合.
++	 *
++	 * <p>口径取自 {@code MinecraftPatchedProvider.copyNonClassFiles} 的过滤器（非 class 且不在
++	 * {@code /META-INF} 下）加上 {@code createEmptyJarManifest} 写出的那个 MANIFEST。刻意不调用 loom 的
++	 * 实现：这样「client-extra 读的是别的 jar」这类接线错误会被抓到，而不是自我印证。
++	 */
++	private static Set<String> expectedClientExtraEntries(File clientJar) {
++		def expected = ["META-INF/MANIFEST.MF"] as Set<String>
++
++		new ZipFile(clientJar).withCloseable { zip ->
++			for (def e : zip.entries()) {
++				if (e.directory) {
++					continue
++				}
++
++				if (e.name.endsWith(".class") || e.name.startsWith("META-INF")) {
++					continue
++				}
++
++				expected << e.name
++			}
++		}
++
++		assert expected.size() > 1
++		return expected
++	}
++
++	private static Map<String, String> entries(File jar) {
++		final Map<String, String> result = [:]
++
++		new ZipFile(jar).withCloseable { zip ->
++			for (def e : zip.entries()) {
++				if (e.directory) {
++					continue
++				}
++
++				def digest = MessageDigest.getInstance("SHA-256")
++
++				zip.getInputStream(e).withCloseable { input ->
++					digest.update(input.readAllBytes())
++				}
++
++				result[e.name] = digest.digest().encodeHex().toString()
++			}
++		}
++
++		return result
++	}
++
++	private static List<String> diff(Map<String, String> actual, Map<String, String> expected) {
++		return actual.findResults { name, hash -> hash == expected[name] ? null : name }
++	}
++
++	private static void printEvidence(Map<String, String> report, Map<String, String> subject, Map<String, String> reference) {
++		println("被测产物: " + report.SUBJECT_JAR + "（" + subject.size() + " 个条目）")
++		println("配置期对照: " + report.REFERENCE_JAR + "（" + reference.size() + " 个条目）")
++		println("任务声明的输入: at-patched=" + report.TASK_AT_PATCHED)
++		println("MC jar 集合: " + report.EXTENSION_JARS)
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/SrgMojangMappedRemapEquivalenceTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/SrgMojangMappedRemapEquivalenceTest.groovy
+index 6d7072953c0a6a6d046467f01c8d692cf9a4f63e..99f97f9254d158875432fdf09f51a342e5f5d285 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/SrgMojangMappedRemapEquivalenceTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/SrgMojangMappedRemapEquivalenceTest.groovy
+@@ -443,6 +443,11 @@ project.afterEvaluate {
+ 		def output = new File(probeDir, outputName)
+ 
+ 		project.tasks.register(perturbationTask, net.fabricmc.loom.pipeline.RemapMinecraftTask) { task ->
++			// 输入 jar（Forge 打过补丁的官方 jar）现在由执行期任务产出：被测任务通过
++			// getMinecraftJarsCollection(OFFICIAL) 拿到那个依赖，本探针是手工注册的，必须自己接上，
++			// 否则 Gradle 的隐式依赖校验会直接拒绝它（"uses this output ... without declaring ..."）。
++			task.dependsOn(net.fabricmc.loom.LoomGradleExtension.get(project)
++					.getMinecraftJarsCollection(net.fabricmc.loom.api.mappings.layered.MappingsNamespace.OFFICIAL))
+ 			task.getInputJar().set(realTask.getInputJar())
+ 			task.getRemapClasspath().from(realTask.getRemapClasspath())
+ 			task.getMappingsServiceOptions().set(realTask.getMappingsServiceOptions())

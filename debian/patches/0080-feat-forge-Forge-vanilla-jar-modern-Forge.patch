@@ -1,0 +1,982 @@
+From 5961d38f3d604bbe7388c8f896227c19fabffccf Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Mon, 5 Oct 2026 10:21:51 +0800
+Subject: [PATCH 080/147] =?UTF-8?q?feat(forge):=20=E8=A7=A3=E9=99=A4=20For?=
+ =?UTF-8?q?ge=20=E7=9A=84=20vanilla=20jar=20=E6=95=B4=E6=89=B9=E5=9B=9E?=
+ =?UTF-8?q?=E9=80=80=E9=97=A8=EF=BC=8Cmodern=20Forge=20=E8=B5=B0=E4=BB=BB?=
+ =?UTF-8?q?=E5=8A=A1=E5=8C=96?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+modern Forge 的 vanilla jar 生产改由执行期任务承担，不再整批回退到配置期。
+
+随带的等价性用例断言内层构建「由执行期任务承担」，而这条路径有一个自身声明的前提：
+MinecraftProvider.earlyProjectionBlocker() 要求 provideServer() 时 isServerBundleMetadataCached()
+为真（只看 spec/bundle-metadata/<server 制品 sha1>/v1-server-bundle.json 是否存在）。冷缓存下该条目
+不存在，构建会合法地整批回退并打印「保持配置期生产」，断言随之失败。用例改为在正式构建前先跑一次
+只要求成功、不断言走哪条路径的预热构建，把这条前提显式建立起来；断言仍全部落在正式构建的留痕、
+接线与依赖上（把本改造回退，预热后的正式构建照样打印回退留痕，断言照红）。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java b/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
+index 915248033e1577525864bff37c1becff9ae0f4c6..76357c26e60763552b33f419d9ad53a04de3f887 100644
+--- a/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
++++ b/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
+@@ -163,9 +163,19 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
+ 		this.hashPath = mappingsWorkingDir().resolve("mappings-migrated.hash");
+ 		this.hash = 1;
+ 
+-		this.rawTinyMappings = this.tinyMappings;
+-		this.rawTinyMappingsWithSrg = this.tinyMappingsWithSrg;
+-		this.rawTinyMappingsWithMojang = this.tinyMappingsWithMojang;
++		// 只在**首次**调用时捕获「原始 mappings 路径」。
++		//
++		// 本实例经 {@code MappingConfiguration.SHARED_INSTANCES} 在同一 daemon 内跨构建复用，
++		// 而下面会把 tinyMappings* 重写成迁移产物的路径：第二次调用起 this.tinyMappings 已经不是原始
++		// mappings，再照抄一次就会把**迁移产物自己**当成输入（迁移器读自己的输出，任务声明的输入也随之
++		// 指向错误的文件）。本仓库实测：同一 daemon 内第三次构建起 rawTinyMappings 变成
++		// mappings-migrated.tiny，任务输入随即错位。
++		if (this.rawTinyMappings == null) {
++			this.rawTinyMappings = this.tinyMappings;
++			this.rawTinyMappingsWithSrg = this.tinyMappingsWithSrg;
++			this.rawTinyMappingsWithMojang = this.tinyMappingsWithMojang;
++		}
++
+ 		Path rawTinyMappingsWithNs = hasSrg ? this.rawTinyMappingsWithSrg : hasMojang ? this.rawTinyMappingsWithMojang : this.rawTinyMappings;
+ 
+ 		// 产物路径在两条路径下都必须重写成迁移后的位置：消费方（getMappingsPath / getPlatformMappingFile）
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MergedForgeMinecraftProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MergedForgeMinecraftProvider.java
+index 6df3451f647e1c4062ecb2c065ec28bd8cb521a4..8fd5756adedd6c063e66ffbb242b8c3676d636cd 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MergedForgeMinecraftProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MergedForgeMinecraftProvider.java
+@@ -27,11 +27,13 @@ package dev.architectury.loom.forge.minecraft;
+ import java.io.IOException;
+ import java.nio.file.Path;
+ import java.util.List;
++import java.util.Map;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.configuration.ConfigContext;
+ import net.fabricmc.loom.configuration.providers.minecraft.MergedMinecraftProvider;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftMetadataProvider;
++import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry.Producer;
+ 
+ public final class MergedForgeMinecraftProvider extends MergedMinecraftProvider implements ForgeMinecraftProvider {
+ 	private MinecraftPatchedProvider patchedProvider;
+@@ -49,11 +51,36 @@ public final class MergedForgeMinecraftProvider extends MergedMinecraftProvider
+ 		}
+ 	}
+ 
++	/**
++	 * Forge 的合并形态不产出 {@code minecraft-merged.jar}，因此不登记基类的合并任务.
++	 *
++	 * <p>本形态的产物是 patched jar（见 {@link #getMinecraftJars()}），而 {@link #mergeJars()} 也不做合并、
++	 * 只抽取内嵌 server jar——抽取本身已由基类生产段按 {@code serverBundleMetadata} 登记成
++	 * {@code extractMinecraftServerJar}。沿用基类的登记会凭空多出一个无人消费的 {@code mergeMinecraftJars}：
++	 * 它写的 {@code minecraft-merged.jar} 不在 {@link #getMinecraftJars()} 里，没有任何消费方，
++	 * 却会白跑一次（并把两个 vanilla jar 的产出方拉进任务图）。
++	 */
++	@Override
++	protected void registerProviderTasks(Map<Path, Producer> producers) {
++	}
++
+ 	@Override
+ 	public Path getMergedJar() {
+ 		return getPatchedProvider().getMinecraftPatchedJar();
+ 	}
+ 
++	/**
++	 * patched jar 的路径要等 {@code MinecraftPatchedProvider.provide()} 里的 {@code initPatchedFiles()}
++	 * 之后才有值（本形态的最终产物全部来自那条链），因此生产段登记产物时先问一句「能不能求值」.
++	 *
++	 * <p>不能求值即跳过：patch 链自己会走 {@code registerTaskProducedArtifact} 登记同一批产物
++	 * （那时路径已经算出来了），登记是「以最后一次为准」的并进语义，不会丢。
++	 */
++	@Override
++	protected boolean isFinalProductKnown() {
++		return getPatchedProvider().getMinecraftPatchedJar() != null;
++	}
++
+ 	@Override
+ 	public List<Path> getMinecraftJars() {
+ 		return List.of(getPatchedProvider().getMinecraftPatchedJar());
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+index e5d0031147c4c34486e866d9904d5339c2229bc8..5543f33405266abb94024d9786ba45ba0605ee27 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+@@ -382,6 +382,9 @@ public class MinecraftPatchedProvider {
+ 					throw new UncheckedIOException("无法声明 pre-patch jar 的 MCP 执行器选项", e);
+ 				}
+ 			}
++
++			// 本任务的输入是 vanilla jar（两条分支都读它，见 wireVanillaJarDependencies）
++			wireVanillaJarDependencies(task);
+ 		}));
+ 
+ 		final Producer patchedProducer = RemapMinecraftTaskRegistry.claim(project, patchedIntermediate, Map.of(
+@@ -457,6 +460,30 @@ public class MinecraftPatchedProvider {
+ 		return prePatchJarProducer != null ? prePatchJarProducer.taskPath() : null;
+ 	}
+ 
++	/**
++	 * 把「本任务读 vanilla jar」表达成任务依赖.
++	 *
++	 * <p>本形态的输入是 vanilla jar：MCP {@code rename} 步经 {@code downloadClient}/{@code downloadServer}
++	 * 读它们，NeoForge installer tools 分支的 {@code --input} 也指向它们。但它们在任务里只以**路径**形式
++	 * 出现（MCP 执行器选项、工具参数模板），Gradle 无从据此建依赖：vanilla jar 一旦改由执行期任务产出
++	 * （见 {@code MinecraftProvider.provideMinecraftJars()}），冷缓存下本任务会在输入落位前开跑。
++	 *
++	 * <p>未投影时（legacy / unobfuscated）这些产物早已在配置期落盘，登记表里查不到产出方，本方法为空操作。
++	 *
++	 * <p>逐形态取用的 jar 与 {@link #createNeoForgeInstallerTools()} 的输入参数、以及 MCP 配置里
++	 * {@code joined}/{@code client}/{@code server} 三个环境的步进集合逐项对应：
++	 * {@code MERGED} 两个都读，单边形态只读自己那一边。
++	 */
++	private void wireVanillaJarDependencies(Task task) {
++		if (type == Type.MERGED || type == Type.CLIENT_ONLY) {
++			minecraftProvider.addProducerDependency(task, minecraftProvider.getMinecraftClientJar().toPath());
++		}
++
++		if (type == Type.MERGED || type == Type.SERVER_ONLY) {
++			minecraftProvider.addProducerDependency(task, minecraftProvider.getMinecraftServerJar().toPath());
++		}
++	}
++
+ 	/** 把上一级产物的产出方登记成任务依赖；未建任务（已有其它生产者）时什么也不做. */
+ 	private static void dependsOnProducer(Task task, Producer producer) {
+ 		if (producer.taskPath() != null) {
+@@ -693,7 +720,11 @@ public class MinecraftPatchedProvider {
+ 					// NeoForge 的 dist 清单要按 client/server 分边（见 generateNeoForgeDistManifest）；
+ 					// 服务端侧取的是与生产同一判据的那一件（bootstrap 版本是抽取产物，否则是下载下来的 server jar）
+ 					task.getServerJar().set(serverJar);
++					minecraftProvider.addProducerDependency(task, serverJar.toPath());
+ 				}
++
++				// client-extra 读 client jar：投影后它由执行期任务产出，按路径声明输入不带任务依赖
++				minecraftProvider.addProducerDependency(task, minecraftProvider.getMinecraftClientJar().toPath());
+ 			}
+ 
+ 			// at-patched jar 由本链上一阶段（配置期 provide / 或任务化后的 intermediate 任务）产出：
+diff --git a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+index 3a0fa81a9812d2e994d039f37c85b3ac74aede33..5c6591925689c1e0efd7a335e29898ec31897e9f 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+@@ -256,6 +256,7 @@ public abstract class CompileConfiguration implements Runnable {
+ 		}
+ 
+ 		extension.setMinecraftProvider(minecraftProvider);
++		// 内存配置段：initFiles / java 版本校验 / 库注入。产物生产不在这里，见下面 provideMinecraftJars()
+ 		minecraftProvider.provide();
+ 
+ 		if (!extension.disableObfuscation()) {
+@@ -264,11 +265,19 @@ public abstract class CompileConfiguration implements Runnable {
+ 
+ 			// Created any layered mapping files.
+ 			LayeredMappingsFactory.afterEvaluate(configContext);
++		}
+ 
+-			// This needs to run after MinecraftProvider.initFiles and MinecraftLibraryProvider.provide
+-			// but before MinecraftPatchedProvider.provide.
++		// 依赖 provider 必须在库注入之后建立：库处理器会往仓库里加自定义源，而依赖解析要求仓库已定稿
++		// （见 MinecraftLibraryProvider）；纯 disableObfuscation（非 unobfuscated Forge）不建立它们。
++		if (!extension.disableObfuscation() || extension.isUnobfuscatedForge()) {
+ 			setupDependencyProviders(project, extension);
++		}
++
++		// 产物生产段：必须在依赖 provider 建立之后——能否投影成执行期任务的判据要读 isLegacyForge()，
++		// 而它经 extension.getDependencyProviders() 取 ForgeUserdevProvider（未解析时会抛异常）。
++		minecraftProvider.provideMinecraftJars();
+ 
++		if (!extension.disableObfuscation()) {
+ 			if (extension.isLegacyForge()) {
+ 				extension.setIntermediateMappingsProvider(GeneratedIntermediateMappingsProvider.class, provider -> {
+ 					provider.minecraftProvider = minecraftProvider;
+@@ -289,7 +298,6 @@ public abstract class CompileConfiguration implements Runnable {
+ 			mappingConfiguration.applyToProject(getProject(), mappingsDep);
+ 		} else if (extension.isUnobfuscatedForge()) {
+ 			// Unobfuscated NeoForge: run the forge patch pipeline without requiring user-provided mappings.
+-			setupDependencyProviders(project, extension);
+ 			ForgeLibrariesProvider.provide(null, project);
+ 			((ForgeMinecraftProvider) minecraftProvider).getPatchedProvider().provide();
+ 		}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/LegacyMergedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/LegacyMergedMinecraftProvider.java
+index 28284f1d74a0ab5e8376163d26a007fc118e0990..336f511bc6d200c3d58f4cff9a5944b114c832d7 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/LegacyMergedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/LegacyMergedMinecraftProvider.java
+@@ -66,6 +66,14 @@ public final class LegacyMergedMinecraftProvider extends MinecraftProvider {
+ 		clientMinecraftProvider.provide();
+ 	}
+ 
++	@Override
++	public void provideMinecraftJars() throws Exception {
++		// 两个子 provider 都是 env-only 形态（判据见 SingleJarMinecraftProvider.earlyProjectionBlocker），
++		// 生产必定留在它们各自的 provide() 里，因此这里恒为空操作；保留覆写是为了让「本类不自己生产」显式可见。
++		serverMinecraftProvider.provideMinecraftJars();
++		clientMinecraftProvider.provideMinecraftJars();
++	}
++
+ 	@Override
+ 	public List<Path> getMinecraftJars() {
+ 		return List.of(
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MergedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MergedMinecraftProvider.java
+index 5c8d843de436d7354aac84693f56035b013dfa60..d0f3a6b37902f299fe5a7a3193d3d95afd1fcb11 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MergedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MergedMinecraftProvider.java
+@@ -80,9 +80,12 @@ public class MergedMinecraftProvider extends MinecraftProvider {
+ 		if (!provideServer() || !provideClient()) {
+ 			throw new UnsupportedOperationException("This version does not provide both the client and server jars - please select the client-only or server-only jar configuration!");
+ 		}
++	}
+ 
++	@Override
++	protected void produceOwnJars() throws Exception {
+ 		if (isTaskProduction()) {
+-			// 产物已由 mergeMinecraftJars 任务承担（在 super.provide() 里登记），这里不再写任何产物
++			// 产物已由 mergeMinecraftJars 任务承担（在基类的生产段里登记），这里不再写任何产物
+ 			return;
+ 		}
+ 
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
+index 8ea0b954814fd78844ca583b6640844dfb1c588f..91f6078aff621f7048d6157df12831b0c90c8292 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
+@@ -90,6 +90,15 @@ public abstract class MinecraftProvider {
+ 	 */
+ 	private boolean taskProduction;
+ 
++	/**
++	 * 本次是否把产物生产推迟到 {@link #provideMinecraftJars()}.
++	 *
++	 * <p>{@link #provide()} 与 {@link #provideMinecraftJars()} 合起来恰好生产一次：判据能在
++	 * {@link #provide()} 里算完的形态就地生产并把本字段留为假，只有 Forge 系（判据要读
++	 * {@code isLegacyForge()}）才置真。
++	 */
++	private boolean productionDeferred;
++
+ 	/**
+ 	 * 本次登记给执行期任务的生产产物：产物路径（绝对规范化）→ 生产者.
+ 	 *
+@@ -111,6 +120,19 @@ public abstract class MinecraftProvider {
+ 		return true;
+ 	}
+ 
++	/**
++	 * 内存配置段：与产物是否已落位无关的那部分.
++	 *
++	 * <p>产物生产（下载/抽取，子类再含合并/拆分/env-only 透传）**不在这里**，由
++	 * {@link #provideMinecraftJars()} 承担。拆开的理由是判据的求值时机：
++	 * {@link #projectionBlocker()} 里那条 Forge 系判据要读 {@code isLegacyForge()}，而它依赖已解析的
++	 * userdev 配置——依赖 provider 只能在库处理器把仓库定稿之后建立
++	 * （见 {@code CompileConfiguration.setupDependencyProviders} 的注释），因此生产整体推迟到那之后。
++	 *
++	 * <p>库注入（{@link MinecraftLibraryProvider}）仍留在本段：它必须在依赖 provider 之前完成，
++	 * 且服务端库列表取自 bundle 元数据。推迟路径下元数据由
++	 * {@link #earlyProjectionBlocker()} 的末条保证命中 L2 规格缓存，读它不会打开 server jar。
++	 */
+ 	public void provide() throws Exception {
+ 		// 内存配置：无论缓存冷热都必须执行
+ 		if (getExtension().shouldGenerateSrgTiny() && !getExtension().isForgeLike()) {
+@@ -121,26 +143,66 @@ public abstract class MinecraftProvider {
+ 
+ 		verifyJavaVersion();
+ 
+-		// 可投影则把产物生产交给执行期任务，否则整批沿用改造前的配置期路径（含留痕，见 projectionBlocker）
+-		if (canProjectToTasks()) {
+-			projectToTasks();
++		// 判据分两段求值：与依赖 provider 无关的那些先算，命中即整批回退，生产留在原位（与改造前逐字一致）
++		final String earlyBlocker = earlyProjectionBlocker();
++		// Forge 系且无其它阻碍时，判据还要读 isLegacyForge()，那要等依赖 provider 建立（见类注释）
++		productionDeferred = earlyBlocker == null && getExtension().isForgeLike();
++
++		if (productionDeferred) {
++			// 库注入（下面）要读 bundle 元数据，而它必须早于依赖 provider：这里从 L2 规格缓存取
++			serverBundleMetadata = readServerBundleMetadata();
+ 		} else {
+-			produceJarsInConfiguration();
++			produceJars(earlyBlocker);
+ 		}
+ 
+ 		// 内存配置：libraryProvider 每次都必须执行
+ 		final MinecraftLibraryProvider libraryProvider = new MinecraftLibraryProvider(this, configContext.project());
+ 		libraryProvider.provide();
++
++		if (!productionDeferred) {
++			// 子类产物在基类产物与库注入之后生产，与改造前同序
++			produceOwnJars();
++		}
+ 	}
+ 
+ 	/**
+-	 * {@return 本 provider 能否把产物生产投影成执行期任务}.
++	 * 产物生产段：由 {@code CompileConfiguration} 在 {@code setupDependencyProviders} 之后调用.
+ 	 *
+-	 * <p>覆写点只有 {@link #projectionBlocker()} 一个：判定与「为什么不能投影」必须在同一处，
+-	 * 否则回退会变成静默的（看不到被拒的具体原因）。
++	 * <p>只有 {@link #provide()} 判定「判据尚不可求值」的形态（Forge 系）才会真正生产；其余形态
++	 * 已在 {@link #provide()} 里就地生产完毕，这里什么也不做——生产段对每个 provider 恰好执行一次。
+ 	 */
+-	protected final boolean canProjectToTasks() {
+-		return taskProduction || projectionBlocker() == null;
++	public void provideMinecraftJars() throws Exception {
++		if (!productionDeferred) {
++			return;
++		}
++
++		productionDeferred = false;
++		produceJars(projectionBlocker());
++		produceOwnJars();
++	}
++
++	/**
++	 * 生产基类产物：可投影则把生产交给执行期任务，否则整批沿用改造前的配置期路径.
++	 *
++	 * @param blocker 本次的投影阻碍（{@code null} 表示可投影）；由调用方传入而不是在这里再算一次，
++	 *        否则「判定」与「留痕里写的原因」会各自求值一次，两者可能不一致
++	 */
++	private void produceJars(@Nullable String blocker) throws Exception {
++		if (blocker == null) {
++			projectToTasks();
++		} else {
++			produceJarsInConfiguration(blocker);
++		}
++	}
++
++	/**
++	 * 子类在此生产自己的产物（合并/拆分/env-only 透传）.
++	 *
++	 * <p>由 {@link #provide()} 与 {@link #provideMinecraftJars()} 在基类产物之后调用，因此
++	 * 「我的输入就是基类产物」这条关系由调用点保证。投影时不会调用本方法：那时产物由
++	 * {@link #registerProviderTasks} 登记的执行期任务承担（子类在那里决定自己怎么接线）。
++	 */
++	protected void produceOwnJars() throws Exception {
+ 	}
+ 
+ 	/** {@return 本次是否已把产物生产交给执行期任务} 子 provider（合并/拆分）据此决定自己怎么生产. */
+@@ -154,10 +216,46 @@ public abstract class MinecraftProvider {
+ 	 * <p>每一条都是一个「配置期必须真读产物 jar（或必须由配置期落盘）」的形态。投影后产物只在执行期落位，
+ 	 * 这些配置期读者会读到不存在（或上一代）的文件，因此必须整批退回配置期生产——那个路径与改造前逐字一致。
+ 	 *
++	 * <p><b>只能在依赖 provider 建立之后调用</b>：最后那条 Forge 系判据要读 {@code isLegacyForge()}，
++	 * 它依赖已解析的 userdev 配置。{@link #provide()} 执行得更早，那里只能求
++	 * {@link #earlyProjectionBlocker()}；两者的差集就是「本形态为什么必须把生产推迟」。
++	 *
++	 * <ul>
++	 *   <li><b>legacy Forge（FG2 形态的 userdev，MC 1.7-1.12.2）</b>：patch 流程走 FG2 工作目录下的一组产物，
++	 *       {@code MinecraftLegacyPatchedProvider} 在配置期按路径读 vanilla jar。</li>
++	 * </ul>
++	 *
++	 * <p>与依赖 provider 无关的那几条见 {@link #earlyProjectionBlocker()}。
++	 */
++	protected @Nullable String projectionBlocker() {
++		final String earlyBlocker = earlyProjectionBlocker();
++
++		if (earlyBlocker != null) {
++			return earlyBlocker;
++		}
++
++		if (getExtension().isForgeLike() && getExtension().isLegacyForge()) {
++			// 前缀 isForgeLike() 不只是语义修饰：isLegacyForge() 要经 getDependencyProviders() 取
++			// ForgeUserdevProvider，而依赖 provider 只在「非 disableObfuscation」与「unobfuscated Forge」
++			// 两个分支里建立；前缀让「依赖 provider 必然存在」这件事在判据里显式可见。
++			//
++			// 分界是 **userdev 配置的形态**（FG2 / userdev3 都算 legacy），不是 MC 版本号：
++			// 实测 1.14.4 / 1.16.5 的 userdev 带 mcp 段、走现代管线，只有 1.7-1.12.2 是 FG2 形态。
++			return "legacy Forge（FG2 形态的 userdev：MC 1.7-1.12.2）的 patch 流程在配置期按路径读 vanilla jar";
++		}
++
++		return null;
++	}
++
++	/**
++	 * {@return 与依赖 provider 无关的那部分判据；子类覆写点}.
++	 *
++	 * <p>本方法能在 {@link #provide()} 里求值（那时依赖 provider 尚未建立），因此它是子类表达
++	 * 「本形态不能投影」的唯一位置：命中即整批回退，生产与库注入都留在改造前的位置与顺序上。
++	 *
+ 	 * <ul>
+-	 *   <li><b>Forge 系</b>：patch 流程、MCP 映射合并、内部类名集合（
+-	 *       {@code InnerClassRemapper.readClassNames}）都在配置期读 vanilla jar。</li>
+-	 *   <li><b>disableObfuscation</b>：mapped 阶段自身整批回退到配置期生产，配置期会按路径读 vanilla jar。</li>
++	 *   <li><b>disableObfuscation</b>：mapped 阶段自身整批回退到配置期生产，配置期会按路径读 vanilla jar；
++	 *       它同时覆盖 unobfuscated Forge，故必须排在 Forge 判据之前——那一条要读依赖 provider。</li>
+ 	 *   <li><b>签名校验开启</b>：校验要打开 jar 读签名与内容，本次未随链迁移（见
+ 	 *       {@link #verificationEnabled()}）。</li>
+ 	 *   <li><b>映射可能不是 tiny v2</b>：V1 映射的字段名补全在配置期读 merged jar，且只支持单 jar 形态。</li>
+@@ -165,16 +263,7 @@ public abstract class MinecraftProvider {
+ 	 *       下载并打开 server jar——那正是本次要移出配置期的动作。</li>
+ 	 * </ul>
+ 	 */
+-	protected @Nullable String projectionBlocker() {
+-		if (getExtension().isForgeLike()) {
+-			// 这一条**不能**细化成「legacy Forge 才回退」：本方法执行得比 setupDependencyProviders 早得多
+-			// （{@code CompileConfiguration.setupMinecraft} 里 minecraftProvider.provide() 在
+-			// setupDependencyProviders 之前），而 isLegacyForge() 要读 ForgeUserdevProvider，
+-			// 那时 getDependencyProviders() 仍是 null，判据会以 NPE 打断配置。
+-			// 真要细化，必须先让依赖 provider 早于本方法建立、或把 vanilla jar 的生产决策整体推迟到那之后。
+-			return "Forge 系的 vanilla jar 在配置期就被真读（patch 流程、MCP 映射合并、内部类名集合）";
+-		}
+-
++	protected @Nullable String earlyProjectionBlocker() {
+ 		if (getExtension().disableObfuscation()) {
+ 			return "disableObfuscation 下 mapped 阶段整批回退到配置期生产，配置期会按路径读 vanilla jar";
+ 		}
+@@ -278,14 +367,32 @@ public abstract class MinecraftProvider {
+ 
+ 		jarProducers = Map.copyOf(producers);
+ 		taskProduction = true;
+-		// 登记任务产出：消费侧（重映射任务、生产环境客户端）据此拿到携带任务依赖的文件集合
+-		registerJarOutputs();
++
++		// 登记任务产出：消费侧（重映射任务、生产环境客户端）据此拿到携带任务依赖的文件集合。
++		// 最终产物尚未确定时跳过：Forge 的合并形态就是这种情形，它的产物由 patch 链稍后自行登记
++		// （见 isFinalProductKnown()）
++		if (isFinalProductKnown()) {
++			registerJarOutputs();
++		}
++
+ 		// 用 Gradle 的 lifecycle 而不是 SLF4J 的 info：默认控制台级别是 LIFECYCLE，
+ 		// 「本次到底走哪条生产路径」必须默认可见，否则回退是静默的
+ 		getProject().getLogger().lifecycle("Minecraft {} 的 jar 生产由执行期任务承担：{}", minecraftVersion(),
+ 				producers.values().stream().map(Producer::taskPath).distinct().toList());
+ 	}
+ 
++	/**
++	 * {@return 此刻 {@link #getMinecraftJars()} 是否已能求值}.
++	 *
++	 * <p>默认恒为真。Forge 的合并形态是唯一例外：它的最终产物是 patched jar，其路径要等
++	 * {@code MinecraftPatchedProvider.initPatchedFiles()} 之后才确定，而那时 patch 链已经自己走过
++	 * {@link #registerTaskProducedArtifact}（同一条 {@link #registerJarOutputs()} 登记路径），
++	 * 因此这里跳过不会让任何产物失去登记。
++	 */
++	protected boolean isFinalProductKnown() {
++		return true;
++	}
++
+ 	/**
+ 	 * 子 provider 在此注册自己的产物（合并/拆分），并把它们的输入登记成任务依赖.
+ 	 *
+@@ -476,13 +583,11 @@ public abstract class MinecraftProvider {
+ 	 * 配置期生产：本次改造前的路径，只对「无法安全投影」的形态保留.
+ 	 *
+ 	 * <p>整段语义与改造前逐字一致——无锁快路径、跨进程互斥、锁内二次确认、抽取、签名校验。
++	 *
++	 * @param blocker 本次的投影阻碍，用于 lifecycle 留痕；由调用方传入，见 {@link #produceJars(String)}
+ 	 */
+-	private void produceJarsInConfiguration() throws Exception {
+-		final String blocker = projectionBlocker();
+-
+-		if (blocker != null) {
+-			getProject().getLogger().lifecycle("Minecraft {} 的 jar 保持配置期生产：{}", minecraftVersion(), blocker);
+-		}
++	private void produceJarsInConfiguration(String blocker) throws Exception {
++		getProject().getLogger().lifecycle("Minecraft {} 的 jar 保持配置期生产：{}", minecraftVersion(), blocker);
+ 
+ 		// 无锁快路径：未要求刷新且所有产物已就绪时，不获取任何文件锁
+ 		if (jarsRequireProduction()) {
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SingleJarMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SingleJarMinecraftProvider.java
+index 703af779eaf777c150d1fc596da9aa76d7177094..d6b17fbf1345276ab17124a43d0dba59b334f2ae 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SingleJarMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SingleJarMinecraftProvider.java
+@@ -88,7 +88,7 @@ public abstract class SingleJarMinecraftProvider extends MinecraftProvider {
+ 	 * <p>legacy merged（MC 1.3 之前）经两个本类实例委托生产，因此同样被这条判据覆盖。
+ 	 */
+ 	@Override
+-	protected @Nullable String projectionBlocker() {
++	protected @Nullable String earlyProjectionBlocker() {
+ 		return "env-only jar（clientOnly/serverOnly 形态）在配置期读 vanilla jar 做 TinyRemapper 透传";
+ 	}
+ 
+@@ -100,7 +100,10 @@ public abstract class SingleJarMinecraftProvider extends MinecraftProvider {
+ 		if (provideClient() && !isLegacyVersion()) {
+ 			getProject().getLogger().warn("Using `clientOnlyMinecraftJar()` is not recommended for Minecraft versions 1.3 or newer.");
+ 		}
++	}
+ 
++	@Override
++	protected void produceOwnJars() throws Exception {
+ 		processJar();
+ 	}
+ 
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SplitMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SplitMinecraftProvider.java
+index a8046136badb991ac9a89a1e01c4d6ae3ca2f626..81a46fc117a107489eec092eff1cb0ad6ce41faf 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SplitMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SplitMinecraftProvider.java
+@@ -68,11 +68,9 @@ public final class SplitMinecraftProvider extends MinecraftProvider {
+ 	}
+ 
+ 	@Override
+-	public void provide() throws Exception {
+-		super.provide();
+-
++	protected void produceOwnJars() throws Exception {
+ 		if (isTaskProduction()) {
+-			// 产物已由 splitMinecraftJars 任务承担（在 super.provide() 里登记），这里不再写任何产物
++			// 产物已由 splitMinecraftJars 任务承担（在基类的生产段里登记），这里不再写任何产物
+ 			return;
+ 		}
+ 
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeVanillaJarTaskEquivalenceTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeVanillaJarTaskEquivalenceTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..dcc50cf46c5ce763f82c57891f7b7961898e931d
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeVanillaJarTaskEquivalenceTest.groovy
+@@ -0,0 +1,456 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration.pipeline
++
++import java.security.MessageDigest
++import java.util.zip.ZipFile
++
++import spock.lang.Shared
++import spock.lang.Specification
++
++import net.fabricmc.loom.test.util.GradleProjectTestTrait
++
++import static net.fabricmc.loom.test.LoomTestConstants.DEFAULT_GRADLE
++import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
++import static org.gradle.testkit.runner.TaskOutcome.UP_TO_DATE
++
++/**
++ * Forge 的 **vanilla jar**（client / server / 抽取出来的 server）由执行期任务产出的
++ * 产物内容等价性与接线检查.
++ *
++ * <p>被切到任务的是 {@code MinecraftProvider.provideMinecraftJars()}：改造前 Forge 系整批回退到
++ * 配置期生产（patch 流程、MCP 映射合并、内部类名集合都要在配置期读 vanilla jar），现在只有
++ * <b>legacy Forge（FG2 形态的 userdev，MC 1.7-1.12.2）</b>回退，modern Forge / NeoForge 走
++ * {@code downloadMinecraftClientJar} / {@code downloadMinecraftServerJar} / {@code extractMinecraftServerJar}。
++ *
++ * <h2>判据怎么被钉住</h2>
++ * 判据（{@code isForgeLike() && isLegacyForge()}）要读已解析的 userdev 配置，因此生产被推迟到
++ * {@code CompileConfiguration.setupDependencyProviders} 之后。本测试用**产物内容**与**任务接线**两条证据
++ * 钉住这次迁移：
++ * <ul>
++ *   <li>lifecycle 留痕：从「保持配置期生产」变为「由执行期任务承担」（断言在 {@code result.output} 上，
++ *       不是读源码）；</li>
++ *   <li>补丁链第一级（{@code generateForgePrePatchJar}）在任务图里依赖 vanilla jar 的产出任务——
++ *       MCP {@code rename} 步与 NeoForge installer tools 分支都只按**路径**读这些 jar，
++ *       Gradle 无从据此建依赖，接线漏了就只能在执行期以「文件不存在」暴露；</li>
++ *   <li>Forge 合并形态不再登记无人消费的 {@code mergeMinecraftJars}（它写的 {@code minecraft-merged.jar}
++ *       不在该形态的 {@code getMinecraftJars()} 里）。</li>
++ * </ul>
++ *
++ * <h2>缓存前提：用例自己建立，不依赖环境恰好是热的</h2>
++ * 判据里还有一条与本次迁移无关但决定「走哪条路径」的：{@code server bundle 元数据未命中 L2 规格缓存}
++ * 即整批回退（服务端库注入是配置期事实）。冷缓存下第一次构建**合法地**走那条回退路径，断言「任务化」
++ * 的用例因此会随机器的缓存冷热红绿——CI 冷缓存首轮就是这样红的。故断言任务化的用例一律先跑一次预热
++ * 构建（{@link #warmUpBundleMetadataSpecCache}，只要求成功、不断言走哪条路径），把前提握在用例手里。
++ *
++ * <h2>金标重建</h2>
++ * 第二条用例把三件 vanilla jar **移出共享缓存**再整链重建：重建后的产物必须与第一次逐 entry 一致。
++ * 它同时钉住「任务确实从零写出了这些产物」——重建前断言产物已不在原位，故比对结果不可能是
++ * 「读到了同一份旧文件」。
++ *
++ * <h2>比对口径</h2>
++ * 解压后比**每一个 entry 的字节摘要**（SHA-256），entry 名集合也必须一致——不是整文件哈希：
++ * 中央目录顺序与时间戳不属于语义。任何一条 entry 的字节不同即判为差异。
++ *
++ * <h2>覆盖边界（如实记录）</h2>
++ * <ul>
++ *   <li>覆盖 **Forge 1.20.1 + officialMojangMappings（MERGED 形态）**的完整执行，以及
++ *       **NeoForge 1.20.6 + officialMojangMappings** 的配置期判据与接线（后者只跑到配置期：
++ *       lifecycle 留痕与任务接线都在配置期就已确定，而它的 patched 链是分钟级）。</li>
++ *   <li>**金标只含 client / server 两件产物**：抽取产物在 plain Forge 下没有任何消费方
++ *       （MCP 的 {@code bundleExtractJar} 步用 installertools 自己抽，NeoForge 的 dist 清单是唯一读方），
++ *       因此 Gradle 不会执行 {@code extractMinecraftServerJar}，产物不落盘也就无从比对。
++ *       本测试按「已登记且路径与配置期一致」断言它，NeoForge 侧再断言「最终 jar 接线到它」。</li>
++ *   <li>**legacy Forge 没有在这里覆盖**：它按设计整批留在配置期，回归由 {@code ForgeTest} 的
++ *       1.16.5 / 1.14.4 用例承担。</li>
++ * </ul>
++ */
++class ForgeVanillaJarTaskEquivalenceTest extends Specification implements GradleProjectTestTrait {
++	private static final String DOWNLOAD_CLIENT_TASK = "downloadMinecraftClientJar"
++	private static final String DOWNLOAD_SERVER_TASK = "downloadMinecraftServerJar"
++	private static final String EXTRACT_SERVER_TASK = "extractMinecraftServerJar"
++	private static final String MERGE_TASK = "mergeMinecraftJars"
++	private static final String PRE_PATCH_TASK = "generateForgePrePatchJar"
++	private static final String PATCHED_TASK = "generateForgePatchedJar"
++
++	/**
++	 * 本 spec 已经预热过的 Minecraft 版本.
++	 *
++	 * <p>预热结果落在共享 gradle_home（{@code LoomTestConstants.TEST_DIR/integration/gradle_home}）里，
++	 * 同一版本只需预热一次：本文件前两条用例都用 1.20.1，共用一次预热即可，不必各自重跑一遍。
++	 */
++	@Shared
++	private Set<String> warmedVersions = [] as Set
++
++	/** 迁移后的留痕：产物生产由执行期任务承担. */
++	private static final String TASK_PRODUCTION_LIFECYCLE = "的 jar 生产由执行期任务承担"
++
++	/** 迁移前的留痕：整批回退到配置期生产. */
++	private static final String CONFIGURATION_PRODUCTION_LIFECYCLE = "的 jar 保持配置期生产"
++
++	def "Forge 1.20.1 的 vanilla jar 由执行期任务产出，且接线到补丁链"() {
++		setup:
++		warmUpBundleMetadataSpecCache("1.20.1", forgeProject())
++		def gradle = forgeProject()
++		gradle.buildGradle << probeScript()
++
++		when: "跑消费方：vanilla jar 的产出任务必须先在任务图里跑过"
++		// 探针在配置期读项目模型，故显式关掉配置缓存；同时关掉构建缓存：
++		// 本用例要断言被测任务**真的执行了**，而不是从缓存恢复了别的产物
++		def result = gradle.run(task: "remapJar", configurationCache: false, args: [
++			"--console=plain",
++			"--no-build-cache"
++		])
++		def report = parseReport(new File(gradle.projectDir, "probe-report.properties"))
++		def client = entries(new File(report.CLIENT_OUTPUT))
++		def server = entries(new File(report.SERVER_OUTPUT))
++		printEvidence(report, client, server)
++
++		then: "lifecycle 留痕从「保持配置期生产」变为「由执行期任务承担」"
++		result.output.contains("Minecraft 1.20.1 " + TASK_PRODUCTION_LIFECYCLE)
++		!result.output.contains("Minecraft 1.20.1 " + CONFIGURATION_PRODUCTION_LIFECYCLE)
++
++		and: "两个下载任务被注册，且写的就是 provider 按路径找的那两件产物"
++		report.CLIENT_TASK_FOUND == "true"
++		report.SERVER_TASK_FOUND == "true"
++		report.CLIENT_OUTPUT == report.PROVIDER_CLIENT
++		report.SERVER_OUTPUT == report.PROVIDER_SERVER
++
++		and: "两个下载任务真的跑过（不是「注册了但没人依赖」）"
++		result.task(":" + DOWNLOAD_CLIENT_TASK)?.outcome in [SUCCESS, UP_TO_DATE]
++		result.task(":" + DOWNLOAD_SERVER_TASK)?.outcome in [SUCCESS, UP_TO_DATE]
++
++		and: "抽取任务按 bundle 元数据登记，产物路径与配置期一致"
++		report.EXTRACT_TASK_FOUND == "true"
++		report.EXTRACT_OUTPUT == report.PROVIDER_EXTRACTED
++
++		and: "补丁链第一级以 vanilla jar 为输入，接线到它们的产出任务"
++		report.PRE_PATCH_TASK_FOUND == "true"
++		report.PRE_PATCH_DEPS.contains(DOWNLOAD_CLIENT_TASK)
++		report.PRE_PATCH_DEPS.contains(DOWNLOAD_SERVER_TASK)
++
++		and: "无人消费的 mergeMinecraftJars 不再登记（Forge 合并形态的产物是 patched jar）"
++		report.MERGE_TASK_FOUND == "false"
++
++		and: "产物非空，且三件产物互不相同"
++		client.size() > 0
++		server.size() > 0
++
++		and: "扰动对照：比对口径能识别「名字相同、字节不同」——拿 server jar 当 client jar 的期望值必须报差异"
++		diff(client, server).size() > 0
++	}
++
++	def "vanilla jar 移出共享缓存后由任务重建，且与金标逐 entry 一致"() {
++		setup:
++		// 金标构建必须走任务化路径：下面要求两个下载任务已登记并真的执行
++		warmUpBundleMetadataSpecCache("1.20.1", forgeProject())
++		def goldProject = forgeProject()
++		goldProject.buildGradle << probeScript()
++
++		when: "第一次产出金标 → 把两件 vanilla jar 移出共享缓存 → 用一个没有任何执行历史的工程重建"
++		goldProject.run(task: "remapJar", configurationCache: false, args: [
++			"--console=plain",
++			"--no-build-cache"
++		])
++		def report = parseReport(new File(goldProject.projectDir, "probe-report.properties"))
++		def goldClient = entries(new File(report.CLIENT_OUTPUT))
++		def goldServer = entries(new File(report.SERVER_OUTPUT))
++
++		// 移到本工程的备份目录：产物路径上不再有任何写入者，重建只能由被测任务完成。
++		// 共享缓存与工程目录未必在同一文件系统（本机实测跨设备），故先复制再删源，而不是 rename。
++		def backup = new File(goldProject.projectDir, "build/gold-backup")
++		backup.mkdirs()
++		def moved = [:]
++		[
++			report.CLIENT_OUTPUT,
++			report.SERVER_OUTPUT
++		].each { path ->
++			def source = new File(path)
++			assert source.exists(): "金标产物不存在: ${path}"
++			def target = new File(backup, source.name)
++			java.nio.file.Files.copy(source.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
++			java.nio.file.Files.delete(source.toPath())
++			moved[path] = true
++		}
++
++		// 必须先确认产物确实不在了：否则下面的重建断言可以读到旧文件而假通过
++		moved.keySet().each { path -> assert !new File(path).exists(): "金标产物仍在原位: ${path}" }
++
++		// 重建用**另一个工程目录**（没有任何任务执行历史）：产出任务因此必然执行，
++		// 不会被「同工程上一轮的 up-to-date 记录」影响
++		def rebuildProject = forgeProject()
++		def second = rebuildProject.run(task: "remapJar", configurationCache: false, args: [
++			"--console=plain",
++			"--no-build-cache"
++		])
++		def rebuiltClient = entries(new File(report.CLIENT_OUTPUT))
++		def rebuiltServer = entries(new File(report.SERVER_OUTPUT))
++
++		then: "两件下载任务这次都必须真的执行（产物缺失且无执行历史 ⇒ 不能是 UP-TO-DATE）"
++		second.task(":" + DOWNLOAD_CLIENT_TASK).outcome == SUCCESS
++		second.task(":" + DOWNLOAD_SERVER_TASK).outcome == SUCCESS
++
++		and: "重建产物与金标逐 entry 一致"
++		diff(rebuiltClient, goldClient).isEmpty()
++		diff(rebuiltServer, goldServer).isEmpty()
++
++		and: "金标本身有效：两件产物互不相同（比对口径能识别差异）"
++		diff(goldClient, goldServer).size() > 0
++
++		cleanup:
++		println("金标备份留在 ${new File(goldProject.projectDir, 'build/gold-backup')}（供人工复核）")
++	}
++
++	def "NeoForge 的 vanilla jar 同样由执行期任务产出，且抽取产物接线到最终 jar"() {
++		setup: "NeoForge 的 patched 链是分钟级；判据与接线都在配置期确定，故只跑到配置期（任务名与留痕此刻已定）"
++		warmUpBundleMetadataSpecCache("1.20.6", neoForgeProject())
++		def gradle = neoForgeProject()
++		gradle.buildGradle << probeScript()
++
++		when:
++		def result = gradle.run(task: "help", configurationCache: false, args: [
++			"--console=plain",
++			"--no-build-cache"
++		])
++		def report = parseReport(new File(gradle.projectDir, "probe-report.properties"))
++
++		then: "lifecycle 留痕同样是「由执行期任务承担」（NeoForge 恒为 modern，不受 legacy 判据影响）"
++		result.output.contains("Minecraft 1.20.6 " + TASK_PRODUCTION_LIFECYCLE)
++		!result.output.contains("Minecraft 1.20.6 " + CONFIGURATION_PRODUCTION_LIFECYCLE)
++
++		and: "三件产物都由任务承担，路径与配置期一致"
++		report.CLIENT_TASK_FOUND == "true"
++		report.SERVER_TASK_FOUND == "true"
++		report.EXTRACT_TASK_FOUND == "true"
++		report.CLIENT_OUTPUT == report.PROVIDER_CLIENT
++		report.SERVER_OUTPUT == report.PROVIDER_SERVER
++		report.EXTRACT_OUTPUT == report.PROVIDER_EXTRACTED
++
++		and: "NeoForge 的 dist 清单读抽取产物：最终 jar 的任务接线到抽取任务的产出"
++		report.PATCHED_TASK_FOUND == "true"
++		report.PATCHED_DEPS.contains(EXTRACT_SERVER_TASK)
++
++		and: "补丁链第一级同样接线到两个下载任务"
++		report.PRE_PATCH_DEPS.contains(DOWNLOAD_CLIENT_TASK)
++		report.PRE_PATCH_DEPS.contains(DOWNLOAD_SERVER_TASK)
++	}
++
++	def "legacy Forge（FG2 1.12.2）的 vanilla jar 仍整批留在配置期"() {
++		setup: "真 legacy Forge 的 patch 流程（MinecraftLegacyPatchedProvider）在配置期按路径读 vanilla jar"
++		def gradle = legacyForgeProject()
++		gradle.buildGradle << probeScript()
++
++		when:
++		def result = gradle.run(task: "help", configurationCache: false, args: [
++			"--console=plain",
++			"--no-build-cache"
++		])
++		def report = parseReport(new File(gradle.projectDir, "probe-report.properties"))
++
++		then: "留痕是「保持配置期生产」，且判据确实认出这是 legacy Forge"
++		result.output.contains("Minecraft 1.12.2 " + CONFIGURATION_PRODUCTION_LIFECYCLE)
++		!result.output.contains("Minecraft 1.12.2 " + TASK_PRODUCTION_LIFECYCLE)
++		report.LEGACY_FORGE == "true"
++
++		and: "vanilla 链一件产物都没被切到任务"
++		report.CLIENT_TASK_FOUND == "false"
++		report.SERVER_TASK_FOUND == "false"
++		report.EXTRACT_TASK_FOUND == "false"
++		report.MERGE_TASK_FOUND == "false"
++
++		and: "补丁链同样留在配置期（legacy patched provider 不登记任务）"
++		report.PATCHED_TASK_FOUND == "false"
++	}
++
++	/**
++	 * 预热：把「server bundle 元数据已在 L2 规格缓存里」这条前提变成用例自己建立的状态.
++	 *
++	 * <p>{@code MinecraftProvider.earlyProjectionBlocker()} 有一条判据是「server bundle 元数据未命中
++	 * L2 规格缓存」——命中即整批回退到配置期生产（服务端库注入是配置期事实，元数据没有缓存就必须先下载
++	 * 并读 server jar）。这是**设计如此**的回退，不是缺陷；但本文件断言任务化路径的用例如果直接开跑，
++	 * 就会随「这台机器的缓存恰好是热的」红绿：CI 冷缓存首轮的失败就是这条（回退留痕
++	 * {@code 保持配置期生产：server bundle 元数据未命中 L2 规格缓存}）。
++	 *
++	 * <p>回退路径本身会把元数据写进规格缓存（运行期真读一次 server jar），所以「先跑一次」就够——
++	 * 预热构建只断言成功，不断言走哪条路径：热缓存下它本身就是任务化，冷缓存下是回退，两者都合法。
++	 * 断言一律留给紧随其后的正式构建。
++	 *
++	 * <p>预热用**另一个工程目录**：探针报告只写一次（见 {@link #probeScript()}），与正式构建共用工程目录
++	 * 会把回退路径的接线当成正式构建的接线读走。
++	 *
++	 * @param mcVersion 被预热的 Minecraft 版本；规格缓存条目按该版本的 server 制品 sha1 索引，故版本即身份
++	 * @param warmUpProject 预热用工程（同一夹具，独立目录）
++	 */
++	private void warmUpBundleMetadataSpecCache(String mcVersion, GradleProject warmUpProject) {
++		if (warmedVersions.contains(mcVersion)) {
++			return
++		}
++
++		// help 足够：配置期生产（下载、抽取、元数据入库）发生在配置阶段，与最终跑哪个任务无关
++		def result = warmUpProject.run(task: "help", configurationCache: false, args: [
++			"--console=plain",
++			"--no-build-cache"
++		])
++		assert result.task(":help").outcome == SUCCESS: "预热构建失败：无法把 Minecraft ${mcVersion} 的 bundle 元数据写进 L2 规格缓存"
++
++		// 断言通过才记账：预热失败时后续用例仍会自己预热，而不是带着未建立的前提往下跑
++		warmedVersions.add(mcVersion)
++	}
++
++	/** 构造 Forge 1.20.1 夹具（与 ForgePatchedChainTaskEquivalenceTest 同一套替换）. */
++	private GradleProject forgeProject() {
++		def gradle = gradleProject(project: "forge/simple", version: DEFAULT_GRADLE)
++		gradle.buildGradle.text = gradle.buildGradle.text.replace('@MCVERSION@', '1.20.1')
++				.replace('@FORGEVERSION@', '47.2.1')
++				.replace('@MAPPINGS@', 'loom.officialMojangMappings()')
++				.replace('@REPOSITORIES@', '')
++				.replace('@PACKAGE@', 'net.minecraftforge:forge')
++				.replace('@JAVA_VERSION@', '17')
++		return gradle
++	}
++
++	/** 构造 NeoForge 1.20.6 夹具（与 NeoForge1206Test 同一套替换：真 neoforge 平台，不是 forge 平台挂 neoforge 制品）. */
++	private GradleProject neoForgeProject() {
++		def gradle = gradleProject(project: "neoforge/1206", version: DEFAULT_GRADLE)
++		gradle.buildGradle.text = gradle.buildGradle.text.replace('@MCVERSION@', '1.20.6')
++				.replace('@NEOFORGEVERSION@', '20.6.5-beta')
++				.replace('MAPPINGS', 'loom.officialMojangMappings()')
++				.replace('PATCHES', "''")
++		return gradle
++	}
++
++	/** 构造真 legacy Forge（FG2，MC 1.12.2 + Forge 14.23.5.2860）夹具，与 LegacyForgeExternalModDependencyTest 同一套. */
++	private GradleProject legacyForgeProject() {
++		return gradleProject(project: "forge/legacy/externalModDependency", version: DEFAULT_GRADLE)
++	}
++
++	/**
++	 * 追加到夹具 build.gradle 的探针.
++	 *
++	 * <p>它在配置期（{@code afterEvaluate}，晚于 Loom 自己的 setup job）记录 vanilla 链各任务声明的输出、
++	 * provider 自己算出来的产物路径，以及补丁链两级任务的任务依赖名集合。报告只写一次：
++	 * 第二条用例的第二次构建不需要重新记录。
++	 */
++	private static String probeScript() {
++		return '''
++		afterEvaluate {
++			def reportFile = file('probe-report.properties')
++
++			if (reportFile.exists()) {
++				return
++			}
++
++			def extension = net.fabricmc.loom.LoomGradleExtension.get(project)
++			def provider = extension.minecraftProvider
++			def lines = []
++
++			lines << 'LEGACY_FORGE=' + (extension.forgeLike && extension.legacyForge)
++
++			def clientTask = project.tasks.findByName('downloadMinecraftClientJar')
++			def serverTask = project.tasks.findByName('downloadMinecraftServerJar')
++			def extractTask = project.tasks.findByName('extractMinecraftServerJar')
++			def mergeTask = project.tasks.findByName('mergeMinecraftJars')
++			def prePatchTask = project.tasks.findByName('generateForgePrePatchJar')
++			def patchedTask = project.tasks.findByName('generateForgePatchedJar')
++
++			lines << 'CLIENT_TASK_FOUND=' + (clientTask != null)
++			lines << 'SERVER_TASK_FOUND=' + (serverTask != null)
++			lines << 'EXTRACT_TASK_FOUND=' + (extractTask != null)
++			lines << 'MERGE_TASK_FOUND=' + (mergeTask != null)
++			lines << 'PRE_PATCH_TASK_FOUND=' + (prePatchTask != null)
++			lines << 'PATCHED_TASK_FOUND=' + (patchedTask != null)
++
++			// 任务侧与 provider 侧一律用「绝对规范化路径」比较，避免「同一文件两种写法」被判成不等。
++			// 任务缺失时写 MISSING 而不是抛异常：判据失败必须由断言（*_TASK_FOUND）报告，
++			// 探针自己炸掉会把「为什么红」藏在堆栈里
++			def canonical = { File file -> file.toPath().toAbsolutePath().normalize().toString() }
++			def outputOf = { task, closure -> task != null ? closure(task) : 'MISSING' }
++
++			lines << 'CLIENT_OUTPUT=' + outputOf(clientTask, { canonical(it.outputFile.get().asFile) })
++			lines << 'SERVER_OUTPUT=' + outputOf(serverTask, { canonical(it.outputFile.get().asFile) })
++			lines << 'EXTRACT_OUTPUT=' + outputOf(extractTask, { canonical(it.outputJar.get().asFile) })
++
++			lines << 'PROVIDER_CLIENT=' + canonical(provider.minecraftClientJar)
++			lines << 'PROVIDER_SERVER=' + canonical(provider.minecraftServerJar)
++			lines << 'PROVIDER_EXTRACTED=' + canonical(provider.minecraftExtractedServerJar)
++
++			def dependencyNames = { task ->
++				task != null ? task.taskDependencies.getDependencies(task).collect { it.name }.sort().join(',') : 'MISSING'
++			}
++
++			lines << 'PRE_PATCH_DEPS=' + dependencyNames(prePatchTask)
++			lines << 'PATCHED_DEPS=' + dependencyNames(patchedTask)
++
++			reportFile.text = lines.join(System.lineSeparator()) + System.lineSeparator()
++		}
++		'''
++	}
++
++	/** 读报告文件；键值各占一行. */
++	private static Map<String, String> parseReport(File file) {
++		if (!file.exists()) {
++			throw new FileNotFoundException("未生成报告文件: " + file)
++		}
++
++		return file.readLines().findAll { it.contains('=') }.collectEntries {
++			def split = it.split('=', 2)
++			[(split[0]): split[1]]
++		}
++	}
++
++	private static Map<String, String> entries(File jar) {
++		final Map<String, String> result = [:]
++
++		new ZipFile(jar).withCloseable { zip ->
++			for (def e : zip.entries()) {
++				if (e.directory) {
++					continue
++				}
++
++				def digest = MessageDigest.getInstance("SHA-256")
++
++				zip.getInputStream(e).withCloseable { input ->
++					digest.update(input.readAllBytes())
++				}
++
++				result[e.name] = digest.digest().encodeHex().toString()
++			}
++		}
++
++		return result
++	}
++
++	private static List<String> diff(Map<String, String> actual, Map<String, String> expected) {
++		return actual.findResults { name, hash -> hash == expected[name] ? null : name }
++	}
++
++	private static void printEvidence(Map<String, String> report, Map<String, String> client, Map<String, String> server) {
++		println("client jar: " + report.CLIENT_OUTPUT + "（" + client.size() + " 个条目）")
++		println("server jar: " + report.SERVER_OUTPUT + "（" + server.size() + " 个条目）")
++		println("抽取产物: " + report.EXTRACT_OUTPUT)
++		println("pre-patch 任务依赖: " + report.PRE_PATCH_DEPS)
++		println("最终 jar 任务依赖: " + report.PATCHED_DEPS)
++	}
++}

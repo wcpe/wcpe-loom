@@ -1,0 +1,138 @@
+From d322e70f87a59c0dad1b5892cf2f40bc415296fe Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Sun, 8 Nov 2026 15:51:11 +0800
+Subject: [PATCH 128/147] =?UTF-8?q?fix(api):=20=E5=8E=BB=E9=99=A4=20source?=
+ =?UTF-8?q?Set=20=E6=89=80=E6=9C=89=E8=80=85=E9=A1=B9=E7=9B=AE=E5=8F=8D?=
+ =?UTF-8?q?=E6=8E=A8=EF=BC=8C=E5=85=BC=E5=AE=B9=20Isolated=20Projects?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Gradle Isolated Projects 下禁止跨项目访问其他 Project 实例，否则报
+`cannot access 'Project.<x>' functionality on another project`。本仓库原先有两处
+靠反推 sourceSet 的“所有者项目”来工作，它们在 IP 下都会触发该限制：
+
+- `SourceSetHelper.getSourceSetProject(SourceSet)` 走
+  `sourceSet.getOutput().getBuildDependencies().getDependencies(null)`，拿到的是**其他项目**
+  的 Task，再调 `Task.getProject()`。
+- `ModSettings.sourceSet(SourceSet)` 在传入非本项目源集时调用上述方法反推项目，
+  再按那条反推结果去挂源集。
+
+改动要点：
+
+- `ModSettings.sourceSet(SourceSet)` 只接受本项目的源集；传入其他项目的源集时不再反推，
+  直接抛 `IllegalArgumentException` 并指向已有的 `sourceSet(String sourceSetName, String projectPath)`
+  重载（它只收项目路径字符串，从不触碰其他 Project 实例）。
+- `ModMetadataFabricModJson.getIdFromSource` 改用 `FabricModJsonSource.SourceSetSource`
+  自带的 `project()`，不再对每个源集调 `getSourceSetProject`。
+- `SourceSetHelper.getSourceSetProject` 与私有的 `getProjectFromSourceSetOutput` 标记 `@Deprecated`，
+  javadoc 写明 IP 不兼容原因、替代方案，以及“保留而不删除是因为 `net.fabricmc.loom.api`
+  是公开 API，删掉会破坏外部插件的编译”。
+
+行为影响：唯一的生产调用方 `CompileConfiguration` 传的是本项目 `main` 源集，走的是原有分支，
+行为不变；跨项目挂源集的用户若曾依赖反推，会得到一条说明清晰的重载指引。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: ip-source-set-access
+
+diff --git a/src/main/java/net/fabricmc/loom/api/ModSettings.java b/src/main/java/net/fabricmc/loom/api/ModSettings.java
+index 31cd98b22d624797ca2b9a0477bc7644605a8d77..1e0907f0969e95035084e08372e24a4c7eb692ba 100644
+--- a/src/main/java/net/fabricmc/loom/api/ModSettings.java
++++ b/src/main/java/net/fabricmc/loom/api/ModSettings.java
+@@ -70,17 +70,24 @@ public abstract class ModSettings implements Named {
+ 
+ 	/**
+ 	 * Add {@link SourceSet}'s output directories from the current project to be grouped with the named mod.
++	 *
++	 * <p>Isolated Projects：本重载**只接受本项目的 sourceSet**。当传入的 sourceSet 不属于本项目时，
++	 * 不再像以前那样反推它的所有者项目：旧实现靠
++	 * {@code sourceSet.getOutput().getBuildDependencies().getDependencies(null)} 拿到其他项目的 Task
++	 * 再取 {@code getProject()}，在 IP 下就是跨项目访问，会报
++	 * {@code cannot access 'Project.<x>' functionality on another project}。
++	 *
++	 * <p>要跨项目挂源集请用 {@link #sourceSet(String, String)}（传项目路径字符串）。
+ 	 */
+ 	public void sourceSet(SourceSet sourceSet) {
+ 		Project project = getProject();
+ 
+ 		if (!SourceSetHelper.isSourceSetOfProject(sourceSet, project)) {
+-			getProject().getLogger().info("Computing owner project for SourceSet {} as it is not a sourceset of {}", sourceSet.getName(), project.getPath());
+-			project = SourceSetHelper.getSourceSetProject(sourceSet);
+-
+-			if (project == getProject()) {
+-				throw new IllegalStateException("isSourceSetOfProject lied, report to loom devs.");
+-			}
++			throw new IllegalArgumentException(
++				("SourceSet '%s' 不属于当前项目 %s。Isolated Projects 下不再反推所有者项目（那会造成跨项目访问）；"
++					+ "请改用 sourceSet(sourceSetName, projectPath) 重载。")
++					.formatted(sourceSet.getName(), project.getPath())
++			);
+ 		}
+ 
+ 		sourceSet(sourceSet, project);
+diff --git a/src/main/java/net/fabricmc/loom/util/fmj/ModMetadataFabricModJson.java b/src/main/java/net/fabricmc/loom/util/fmj/ModMetadataFabricModJson.java
+index 4a00d80bfe913bfbf70913b1c303d457ed7f869b..fcd63f5cf3ffc075fe057bbab32e3a2e25daf503 100644
+--- a/src/main/java/net/fabricmc/loom/util/fmj/ModMetadataFabricModJson.java
++++ b/src/main/java/net/fabricmc/loom/util/fmj/ModMetadataFabricModJson.java
+@@ -35,12 +35,9 @@ import com.google.gson.JsonElement;
+ import com.google.gson.JsonObject;
+ import dev.architectury.loom.metadata.JsonBackedModMetadataFile;
+ import dev.architectury.loom.metadata.ModMetadataFile;
+-import org.gradle.api.Project;
+ import org.gradle.api.tasks.SourceSet;
+ import org.jspecify.annotations.Nullable;
+ 
+-import net.fabricmc.loom.util.gradle.SourceSetHelper;
+-
+ public final class ModMetadataFabricModJson extends FabricModJson {
+ 	private static final int FABRIC_SCHEMA_VERSION = -1;
+ 	private final ModMetadataFile modMetadata;
+@@ -78,10 +75,12 @@ public final class ModMetadataFabricModJson extends FabricModJson {
+ 			return Optional.of(directory.directoryPath().toAbsolutePath().toString());
+ 		} else if (source instanceof FabricModJsonSource.SourceSetSource sourceSets) {
+ 			final StringJoiner joiner = new StringJoiner("+");
++			// Isolated Projects：用 SourceSetSource 自带的 project，不再反推。
++			// 原先对每个 sourceSet 调 SourceSetHelper.getSourceSetProject(sourceSet)，那是靠
++			// getBuildDependencies() 拿其他项目的 Task 再取 getProject()，IP 下会报跨项目访问。
++			final String path = sourceSets.project().getPath();
+ 
+ 			for (SourceSet sourceSet : sourceSets.sourceSets()) {
+-				final Project project = SourceSetHelper.getSourceSetProject(sourceSet);
+-				final String path = project.getPath();
+ 				final StringBuilder sb = new StringBuilder(path);
+ 
+ 				if (!path.endsWith(":")) {
+diff --git a/src/main/java/net/fabricmc/loom/util/gradle/SourceSetHelper.java b/src/main/java/net/fabricmc/loom/util/gradle/SourceSetHelper.java
+index 01a077f8a57b8ea333bafafcbc55e7f8a535a671..976d529ac1d46765b5fbc2c36fd6a646625b952e 100644
+--- a/src/main/java/net/fabricmc/loom/util/gradle/SourceSetHelper.java
++++ b/src/main/java/net/fabricmc/loom/util/gradle/SourceSetHelper.java
+@@ -100,7 +100,17 @@ public final class SourceSetHelper {
+ 	 * Attempts to compute the owning project for the {@link SourceSet}
+ 	 *
+ 	 * <p>A bit of a hack, would be nice for this to be added to the Gradle API.
++	 *
++	 * @deprecated Isolated Projects 不兼容：本方法靠
++	 * {@code sourceSet.getOutput().getBuildDependencies().getDependencies(null)}
++	 * 拿到**其他项目**的 Task 再取 {@code getProject()}，在 IP 下会被判为跨项目访问并报
++	 * {@code cannot access 'Project.<x>' functionality on another project}。
++	 * 需要项目路径的调用方请改用 {@code ModSettings.sourceSet(String, String)}。
++	 * 本项目内的 sourceSet 直接用 {@code ModSettings.sourceSet(SourceSet)} 即可。
++	 *
++	 * <p>保留而不删除，是因为 {@code net.fabricmc.loom.api} 是公开 API：删掉会破坏外部插件的编译。
+ 	 */
++	@Deprecated
+ 	public static Project getSourceSetProject(SourceSet sourceSet) {
+ 		final Project project = getProjectFromSourceSetOutput(sourceSet.getOutput());
+ 
+@@ -111,6 +121,10 @@ public final class SourceSetHelper {
+ 		return project;
+ 	}
+ 
++	/**
++	 * @deprecated 参见 {@link #getSourceSetProject(SourceSet)}：Isolated Projects 下不能使用。
++	 */
++	@Deprecated
+ 	@Nullable
+ 	private static Project getProjectFromSourceSetOutput(SourceSetOutput sourceSetOutput) {
+ 		Set<? extends Task> dependencies = sourceSetOutput.getBuildDependencies().getDependencies(null);

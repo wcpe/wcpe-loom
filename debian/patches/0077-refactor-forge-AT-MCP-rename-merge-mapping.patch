@@ -1,0 +1,612 @@
+From be3f876a7d8bb33814b15d4d0e81dc5c5ebca2c4 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Sat, 3 Oct 2026 07:19:56 +0800
+Subject: [PATCH 077/147] =?UTF-8?q?refactor(forge):=20AT=20/=20MCP=20renam?=
+ =?UTF-8?q?e=20/=20merge-mapping=20=E4=B8=89=E5=A4=84=E5=A4=96=E9=83=A8?=
+ =?UTF-8?q?=E8=B0=83=E7=94=A8=E8=84=B1=E7=A6=BB=E9=85=8D=E7=BD=AE=E6=9C=9F?=
+ =?UTF-8?q?=E6=B1=82=E5=80=BC?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+provide() 与 manipulateMappings 无法整段搬进任务的最后一串阻碍：三处外部工具调用都在
+provide() 内「建选项 → 立即 execute」同步跑。逐处核实并改为执行期形态：
+
+- accessTransform → createAccessTransformerOptions(惰性 Provider<Options>) + static
+  runAccessTransformer(...)
+- createPrePatchJar 的 MCP 分支 → createPrePatchJarMcpOptions + static runMcpExecutor(...)
+  （核实结论：McpExecutorBuilder:310-311 的 ConstantLogic.createOptions 本身是惰性的，把它拽到
+  配置期的是「execute 在配置期」）
+- SrgProvider 的 merge-mapping → 改走 ForgeExternalToolService，去掉 ForgeToolValueSource
+
+零回归证据：
+- 产物级金标：改造前取 5 件 jar 逐 entry SHA-256（45061 entry）+ 2 个 tsrg 整文件 sha256；
+  移出产物后由新代码整链重建，与金标逐 entry 全同（顺带证明重建可复现）
+- 调用级：--info 抽出的 7 次外部调用（主类 + 完整 classpath + argv）改造前后逐项一致
+- 负对照三条（均实测变红后撤销）：AT 退化为拷贝（146 entry 差异）、enqueue("rename") 改
+  merge（binpatch 硬失败且 fart.Main 调用消失）、MERGE_MAPPING 互换 --left/--right（两个
+  tsrg 哈希变红）
+
+验证：compileJava + checkstyleMain 通过；40 例（覆盖全部 18 个 pipeline.* 类 + Forge 回归）
+failures=0。首跑因 /tmp 写满全红，清空授权目录后按同一 filter 分块重跑全绿——**是重跑才绿**，
+首跑红为环境性。
+
+仍未脱离配置期：选项实例化需要 project、createMergeMappingTool 会写 mojmap.tsrg2 并解析
+Mojang 映射、needsWork/checkCache 读 manifest 与 patches、registerExtraDependencies 读项目模型。
+下一手：按 GenerateForgePatchedJarTask 模式为 pre-patch/intermediate/AT 三级建任务并声明
+@Nested 选项。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/SrgProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/SrgProvider.java
+index e6f372d4794499831b056db4d4fea55971d661c1..087e6dfed9c81fe8dbda86e40c5cc34e74be8c38 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/SrgProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/SrgProvider.java
+@@ -39,15 +39,17 @@ import java.nio.file.NoSuchFileException;
+ import java.nio.file.Path;
+ import java.nio.file.StandardCopyOption;
+ import java.util.HashMap;
++import java.util.List;
+ import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
+-import dev.architectury.loom.forge.tool.ForgeToolValueSource;
++import dev.architectury.loom.forge.tool.ForgeExternalToolService;
+ import dev.architectury.loom.util.DependencyDownloader;
+ import dev.architectury.loom.util.Stopwatch;
+ import org.cadixdev.lorenz.io.srg.SrgReader;
+ import org.cadixdev.lorenz.io.srg.tsrg.TSrgWriter;
+ import org.gradle.api.Project;
++import org.gradle.api.file.FileCollection;
+ import org.jspecify.annotations.Nullable;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
+@@ -62,6 +64,8 @@ import net.fabricmc.loom.util.ZipUtils;
+ import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.loom.util.cache.CacheEntryLock;
+ import net.fabricmc.loom.util.gradle.LoomCacheService;
++import net.fabricmc.loom.util.service.ScopedServiceFactory;
++import net.fabricmc.loom.util.service.ServiceFactory;
+ import net.fabricmc.mappingio.MappingReader;
+ import net.fabricmc.mappingio.MappingVisitor;
+ import net.fabricmc.mappingio.MappingWriter;
+@@ -291,32 +295,61 @@ public class SrgProvider extends DependencyProvider {
+ 	 * 成功后再原子落位，读方不会看到半截产物，也不再需要先删除既有产物。
+ 	 */
+ 	private void produceMergedMojangRaw() throws IOException {
+-		Path mojmapTsrg2 = getMojmapTsrg2(getProject(), getExtension());
+ 		final Path temp = AtomicFiles.tempSibling(mergedMojangRaw);
+ 
+-		try {
+-			ForgeToolValueSource.exec(getProject(), settings -> {
+-				settings.classpath(DependencyDownloader.download(getProject(), LoomVersions.FORGE_INSTALLER_TOOLS.mavenNotation()));
+-				settings.getMainClass().set(INSTALLER_TOOLS_MAIN_CLASS);
+-				settings.args(
+-						"--task",
+-						"MERGE_MAPPING",
+-						"--left",
+-						getSrg().toAbsolutePath().toString(),
+-						"--right",
+-						mojmapTsrg2.toAbsolutePath().toString(),
+-						"--classes",
+-						"--output",
+-						temp.toAbsolutePath().toString()
+-				);
+-			});
+-
++		try (var serviceFactory = new ScopedServiceFactory()) {
++			runMergeMapping(createMergeMappingTool(), temp, serviceFactory);
+ 			AtomicFiles.move(temp, mergedMojangRaw);
+ 		} finally {
+ 			Files.deleteIfExists(temp);
+ 		}
+ 	}
+ 
++	/**
++	 * {@return InstallerTools 的 {@code MERGE_MAPPING} 调用声明（工具 classpath、主类与参数模板）}.
++	 *
++	 * <p>配置期只接线：依赖坐标与参数模板都是从项目状态读来的纯值，工具 classpath 是一个惰性的
++	 * {@code FileCollection}（{@code DependencyDownloader} 只建 detached configuration，不解析）。
++	 * 因此本方法既不解析依赖、也不发起进程，返回值可以挂成任务的 {@code @Nested} 输入。
++	 *
++	 * <p>参数模板里的取值分两类，口径与 {@code createNeoForgeInstallerTools} 一致：
++	 * <ul>
++	 *   <li><b>配置期就确定的纯值</b>——{@code --task}/{@code --left}/{@code --right}/{@code --classes}
++	 *       ——就地定死在模板里，于是这条链搬进任务后不需要在执行期回读项目模型；</li>
++	 *   <li><b>只有调用时才知道的路径</b>——{@code {output}}（本次调用的目标 tsrg）——留作占位符。</li>
++	 * </ul>
++	 *
++	 * <p>参数顺序与改造前那串 {@code settings.args(...)} 逐条一致。
++	 */
++	public ForgeExternalToolService.Options createMergeMappingTool() throws IOException {
++		final FileCollection classpath = DependencyDownloader.download(getProject(), LoomVersions.FORGE_INSTALLER_TOOLS.mavenNotation());
++		final ForgeExternalToolService.Options tool = ForgeExternalToolService
++				.createOptions(getProject(), classpath, INSTALLER_TOOLS_MAIN_CLASS).get();
++		tool.getArgsTemplate().set(List.of(
++				"--task",
++				"MERGE_MAPPING",
++				"--left",
++				getSrg().toAbsolutePath().toString(),
++				"--right",
++				getMojmapTsrg2(getProject(), getExtension()).toAbsolutePath().toString(),
++				"--classes",
++				"--output",
++				"{output}"
++		));
++		return tool;
++	}
++
++	/**
++	 * 执行期求值：只认选项、本次调用的目标路径与服务工厂，不读项目模型.
++	 *
++	 * <p>与 {@link #createMergeMappingTool()} 配对，让配置期路径与「把这段搬进任务」之后的路径共用同一份
++	 * 调用声明：实际命令行仍只由 {@link ForgeExternalToolService#settingsFor} 构造一处。
++	 */
++	public static void runMergeMapping(ForgeExternalToolService.Options tool, Path output, ServiceFactory serviceFactory) {
++		final ForgeExternalToolService installerTools = serviceFactory.get(tool);
++		installerTools.exec(Map.of("{output}", output.toAbsolutePath().toString()));
++	}
++
+ 	/**
+ 	 * 从已发布的 raw 产物派生 trimmed 形态并原子发布.
+ 	 */
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+index 2dd80749d95f7a1be71b26362f6d83a89ffb5b78..09ea283af967a9060a2442b7c4c8012842260ee2 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+@@ -77,6 +77,7 @@ import org.gradle.api.Project;
+ import org.gradle.api.file.ConfigurableFileCollection;
+ import org.gradle.api.file.FileCollection;
+ import org.gradle.api.logging.Logger;
++import org.gradle.api.provider.Provider;
+ import org.jspecify.annotations.Nullable;
+ import org.objectweb.asm.ClassReader;
+ import org.objectweb.asm.ClassVisitor;
+@@ -869,15 +870,42 @@ public class MinecraftPatchedProvider {
+ 		}
+ 
+ 		try (var tempFiles = new TempFiles(); var serviceFactory = new ScopedServiceFactory()) {
+-			McpExecutorBuilder builder = createMcpExecutor(tempFiles.directory("loom-mcp"));
+-			builder.enqueue("rename");
+-			McpExecutor executor = serviceFactory.get(builder.build());
+-			Path result = executor.execute();
+-			// output 是本次独占的临时文件，写完后由调用方原子落位到共享缓存
+-			Files.copy(result, output);
++			runMcpExecutor(createPrePatchJarMcpOptions(tempFiles), output, serviceFactory);
+ 		}
+ 	}
+ 
++	/**
++	 * {@return 「跑 rename 步」的 MCP 执行器声明（配置期只接线、不执行）}.
++	 *
++	 * <p>与改造前那段内联代码的唯一区别是「不再顺带执行」：{@link McpExecutorBuilder#build()} 返回的是惰性
++	 * provider，步进逻辑选项、工具 jar 的坐标解析、以及 {@code ConstantLogic} 里 {@code downloadClient} 的
++	 * 输出路径读取都推迟到它被取值时。因此本方法既能在配置期路径里调用，也能把返回值挂成任务的
++	 * {@code @Nested} 输入，由任务在执行期发起同一次调用。
++	 *
++	 * <p>{@code tempFiles} 必须活到那次调用结束：MCP 执行链的步进缓存落在它管理的临时目录里。
++	 */
++	public Provider<McpExecutor.Options> createPrePatchJarMcpOptions(TempFiles tempFiles) throws IOException {
++		McpExecutorBuilder builder = createMcpExecutor(tempFiles.directory("loom-mcp"));
++		builder.enqueue("rename");
++		return builder.build();
++	}
++
++	/**
++	 * 执行期求值：只认选项、本次落位路径与服务工厂，不读项目模型.
++	 *
++	 * <p>把 pre-patch jar 的生产搬进任务之后，执行期这一侧就是本方法；它与配置期路径
++	 * 共用 {@link McpExecutor#execute} 这一处实现，因此两条路径的 MCP 步进集合、命令行与产物不会分叉。
++	 *
++	 * @param options 配置期接好的 MCP 执行器选项
++	 * @param output MCP 最后一步产物的落位路径（调用方负责原子落位）
++	 */
++	public static void runMcpExecutor(Provider<McpExecutor.Options> options, Path output, ServiceFactory serviceFactory) throws IOException {
++		McpExecutor executor = serviceFactory.get(options);
++		Path result = executor.execute();
++		// output 是本次独占的临时文件，写完后由调用方原子落位到共享缓存
++		Files.copy(result, output);
++	}
++
+ 	private void createUnobfuscatedPrePatchJar(Path output) throws IOException {
+ 		try (var tempFiles = new TempFiles(); var serviceFactory = new ScopedServiceFactory()) {
+ 			McpExecutorBuilder builder = createMcpExecutor(tempFiles.directory("loom-mcp"));
+@@ -1180,14 +1208,44 @@ public class MinecraftPatchedProvider {
+ 		logger.lifecycle(":access transforming minecraft");
+ 
+ 		try (var tempFiles = new TempFiles(); var serviceFactory = new ScopedServiceFactory()) {
+-			AccessTransformerService service = serviceFactory.get(AccessTransformerService.createOptionsForLoaderAts(project, tempFiles));
+-			Files.deleteIfExists(target);
+-			service.execute(input, target);
++			runAccessTransformer(createAccessTransformerOptions(tempFiles), input, target, serviceFactory);
+ 		}
+ 
+ 		logger.lifecycle(":access transformed minecraft in " + stopwatch.stop());
+ 	}
+ 
++	/**
++	 * {@return AT 工具的声明式选项（工具 classpath、主类与待应用的 AT 文件）}.
++	 *
++	 * <p>配置期只接线、不求值：{@link AccessTransformerService#createOptionsForLoaderAts} 返回的是惰性
++	 * provider——依赖解析（{@code DependencyDownloader} 只建 detached configuration）与「把 AT 文件从
++	 * userdev jar 里抽出来」都推迟到 {@link #runAccessTransformer} 真正取值的那一刻。因此本方法既能在
++	 * 配置期路径里调用，也能把返回值挂成任务的 {@code @Nested} 输入，由任务在执行期发起同一次调用。
++	 *
++	 * <p>{@code tempFiles} 必须活到那次调用结束：AT 文件抽取到它管理的临时目录里。
++	 */
++	public Provider<AccessTransformerService.Options> createAccessTransformerOptions(TempFiles tempFiles) {
++		return AccessTransformerService.createOptionsForLoaderAts(project, tempFiles);
++	}
++
++	/**
++	 * 执行期求值：只认选项、本次调用的输入输出与服务工厂，不读项目模型.
++	 *
++	 * <p>与 {@link #createAccessTransformerOptions} 配对，让配置期路径与「把 {@code provide()} 链搬进任务」
++	 * 之后的路径共用同一份实现：AT 的实际参数仍只由 {@link AccessTransformerService#execute} 构造一处，
++	 * 因此两条路径跑出来的命令行不会分叉。
++	 *
++	 * @param options 配置期接好的 AT 选项
++	 * @param input 待执行 AT 的 jar
++	 * @param target AT 结果落位路径（调用方负责原子落位；本方法先删除它，与改造前逐字一致）
++	 */
++	public static void runAccessTransformer(Provider<AccessTransformerService.Options> options, Path input, Path target,
++			ServiceFactory serviceFactory) throws IOException {
++		final AccessTransformerService service = serviceFactory.get(options);
++		Files.deleteIfExists(target);
++		service.execute(input, target);
++	}
++
+ 	private static void remapPatchedJar(ProductionOptions options, Path mcOutput, Consumer<String> lifecycle) throws Exception {
+ 		lifecycle.accept(":remapping minecraft (TinyRemapper, %s -> official)".formatted(options.remapNamespace()));
+ 		Path mcInput = options.atPatchedJar();
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeToolExecutionTimeEquivalenceTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeToolExecutionTimeEquivalenceTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..90ea3ba9ccc9102ec1aa660c67b244d23800d042
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeToolExecutionTimeEquivalenceTest.groovy
+@@ -0,0 +1,344 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration.pipeline
++
++import java.nio.file.Path
++import java.security.MessageDigest
++import java.util.zip.ZipFile
++
++import spock.lang.Specification
++
++import net.fabricmc.loom.test.util.GradleProjectTestTrait
++
++import static net.fabricmc.loom.test.LoomTestConstants.DEFAULT_GRADLE
++import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
++
++/**
++ * Forge 链上三处外部工具调用「**执行期可求值**」的判据，以及它们与配置期产物的逐 entry 等价性.
++ *
++ * <p>被改造的三处原先都是「配置期创建选项并**立即**求值」，因此调用点无法搬进任务：
++ * <ol>
++ *   <li>{@code MinecraftPatchedProvider.accessTransform} —— AT 工具（{@code TransformerProcessor}）；</li>
++ *   <li>{@code MinecraftPatchedProvider.createPrePatchJar} 的 McpExecutor 分支 —— MCP 的 {@code rename} 链；</li>
++ *   <li>{@code SrgProvider.produceMergedMojangRaw} —— InstallerTools 的 {@code MERGE_MAPPING}。</li>
++ * </ol>
++ * 三处都拆成「配置期只接线的声明方法」+「执行期求值的静态入口」：后者只认**选项 + 本次调用路径 +
++ * {@code ServiceFactory}**，不读 {@code Project}、不读 provider——这正是「调用点可搬进任务」的判据。
++ *
++ * <h2>对照怎么构造</h2>
++ * 被测是**执行期**发起的那三次调用（探针任务里跑），对照有三类，各有独立来源：
++ * <ol>
++ *   <li><b>共享缓存里的真实产物</b>：本次改造没有搬动 {@code CompileConfiguration} 的调用点，这三条链仍由
++ *       配置期 {@code provide()} 生产，产物就是它们的输出。因此「执行期发起的那次 == 共享缓存里那一份」
++ *       是**跨路径**的等价性，而不是同一份实现的自我印证；</li>
++ *   <li><b>逐条转录的命令行</b>：{@code MERGE_MAPPING} 的参数模板与改造前那段 {@code settings.args(...)}
++ *       逐条比对——标志与顺序写在本测试里（转录自改造前实现），只有两个输入路径取自探针；</li>
++ *   <li><b>反向排除</b>：每一条等价性都配一条「必须不同」的断言（AT 结果必须不同于它的输入；MCP 结果必须
++ *       不同于同一条链上另外两件 jar；merged tsrg 必须不同于同一链条产出的 trimmed tsrg），
++ *       排除「比的是两个都空转的东西」。</li>
++ * </ol>
++ *
++ * <h2>扰动对照（证明断言不是恒真）</h2>
++ * <ul>
++ *   <li>AT：<b>把 AT 规则换成空</b>再跑一次 AT 工具 —— 结果必须与共享缓存里那一份不同。它证明产物确实
++ *       受「AT 规则」影响，而规则文件正是 {@code createAccessTransformerOptions} 接的线；</li>
++ *   <li>MERGE_MAPPING：占位符<b>不展开</b>时 argv 必须留下字面量 {@code {output}}，且与展开后的 argv 不同。
++ *       它证明 argv 断言能识别「命令行变了」。</li>
++ * </ul>
++ *
++ * <h2>比对口径</h2>
++ * 解压后比**每一个 entry 的字节摘要**（SHA-256），entry 名集合也必须一致——不是整文件哈希：
++ * 中央目录顺序与时间戳不属于语义。tsrg 是纯文本，直接比整文件字节。
++ *
++ * <h2>覆盖边界（如实记录）</h2>
++ * <ul>
++ *   <li>覆盖 1.20.1 / Forge 47.2.1 的 **MERGED 形态**：AT 走中间产物路径、pre-patch jar 走 McpExecutor 的
++ *       {@code rename} 链、merged mojmap 走 InstallerTools 的 {@code MERGE_MAPPING}；</li>
++ *   <li>**NeoForge 的 installer-tools 分支（{@code [21.10.57-beta, 21.10.64)}）不在本用例里**：它的
++ *       {@code createNeoForgeInstallerToolsPrePatchJar} 在上一轮已服务化，本轮未改动；</li>
++ *   <li>**unobfuscated / legacy Forge 不在本用例里**：两者走另外的 pre-patch 分支，按既有
++ *       {@code projectionBlocker()} 风格整批留在配置期；</li>
++ *   <li>本探针在配置期与执行期各用一次项目模型（读共享缓存路径、注册任务），故显式关掉配置缓存；
++ *       真实任务路径上选项在配置缓存存储期实例化、服务在执行期执行，两侧都已被 {@code ForgeRunConfigTest}
++ *       等用例覆盖。</li>
++ * </ul>
++ */
++class ForgeToolExecutionTimeEquivalenceTest extends Specification implements GradleProjectTestTrait {
++	/** 三个「执行期发起」的探针任务名. */
++	private static final String AT_TASK = "probeAccessTransformAtExecution"
++	private static final String MCP_TASK = "probePrePatchJarAtExecution"
++	private static final String MERGE_TASK = "probeMergeMappingAtExecution"
++
++	def "三处外部工具调用都可在执行期由静态入口发起，且产物与配置期逐 entry 一致"() {
++		setup:
++		def gradle = gradleProject(project: "forge/simple", version: DEFAULT_GRADLE)
++		gradle.buildGradle.text = gradle.buildGradle.text.replace('@MCVERSION@', '1.20.1')
++				.replace('@FORGEVERSION@', '47.2.1')
++				.replace('@MAPPINGS@', 'loom.officialMojangMappings()')
++				.replace('@REPOSITORIES@', '')
++				.replace('@PACKAGE@', 'net.minecraftforge:forge')
++				.replace('@JAVA_VERSION@', '17')
++		gradle.buildGradle << probeScript().stripIndent()
++
++		when: "跑消费方；三个执行期探针任务必须真的被执行到"
++		// 探针在配置期要读项目模型（共享缓存路径、provider 状态），故显式关掉配置缓存；
++		// 同时关掉构建缓存：本用例要断言探针任务真的执行了，而不是从缓存里恢复产物
++		def result = gradle.run(task: "remapJar", configurationCache: false, args: ["--console=plain", "--no-build-cache"])
++		def report = parseReport(new File(gradle.projectDir, "probe-report.properties"))
++		printEvidence(report)
++
++		def atSubject = entries(new File(report.AT_EXECUTION_OUTPUT))
++		def atReference = entries(new File(report.AT_REFERENCE))
++		def atInput = entries(new File(report.AT_INPUT))
++		def atWithoutRules = entries(new File(report.AT_NO_RULES_OUTPUT))
++		def mcpSubject = entries(new File(report.MCP_EXECUTION_OUTPUT))
++		def mcpReference = entries(new File(report.MCP_REFERENCE))
++		def patchedIntermediate = entries(new File(report.MCP_PATCHED_INTERMEDIATE))
++		def mergeSubject = new File(report.MERGE_EXECUTION_OUTPUT)
++		def mergeReference = new File(report.MERGE_REFERENCE)
++
++		then: "三个探针任务都执行成功"
++		result.task(":" + AT_TASK).outcome == SUCCESS
++		result.task(":" + MCP_TASK).outcome == SUCCESS
++		result.task(":" + MERGE_TASK).outcome == SUCCESS
++
++		and: "① AT：执行期发起的那次与共享缓存里的产物逐 entry 一致"
++		atSubject.size() > 0
++		diff(atSubject, atReference).isEmpty()
++
++		and: "② pre-patch jar：执行期发起的 MCP rename 链与共享缓存里的中间产物逐 entry 一致"
++		mcpSubject.size() > 0
++		diff(mcpSubject, mcpReference).isEmpty()
++
++		and: "③ MERGE_MAPPING：执行期发起的那次与共享缓存里的 merged tsrg 逐字节一致"
++		mergeSubject.bytes.length > 0
++		mergeSubject.bytes == mergeReference.bytes
++
++		and: "反向排除①：AT 结果不是它自己的输入（AT 确实改写了内容，不是复制）"
++		diff(atSubject, atInput).size() > 0
++
++		and: "反向排除②：MCP 的 rename 产物不同于同一链条上更早的两件 jar"
++		diff(mcpSubject, patchedIntermediate).size() > 0
++		diff(mcpSubject, atReference).size() > 0
++
++		and: "反向排除③：merged tsrg 不同于同一链条产出的 trimmed tsrg（同一份对照口径能识别两件不同的 tsrg）"
++		mergeSubject.bytes != new File(report.MERGE_TRIMMED).bytes
++
++		and: "扰动对照①：AT 规则为空时，AT 结果必须与共享缓存那一份不同（AT 规则确实参与产物内容）"
++		atWithoutRules.size() > 0
++		diff(atWithoutRules, atReference).size() > 0
++
++		and: "扰动对照②：占位符不展开时 argv 留下字面量 {output}，且与展开后的 argv 不同"
++		report.MERGE_ARGV_UNEXPANDED.contains("{output}")
++		report.MERGE_ARGV_UNEXPANDED != report.MERGE_ARGV_ORACLE
++
++		and: "MERGE_MAPPING 的参数模板与改造前那串逐条一致（标志与顺序转录自改造前实现）"
++		report.MERGE_ARGS_TEMPLATE == report.MERGE_ORACLE_TEMPLATE
++
++		and: "工具身份与执行期求值口径：主类是常量主类，执行器沿用工具链"
++		report.MERGE_MAIN_CLASS == "net.minecraftforge.installertools.ConsoleTool"
++		report.AT_MAIN_CLASS == "net.minecraftforge.accesstransformer.TransformerProcessor"
++	}
++
++	/**
++	 * 追加到夹具 build.gradle 的探针.
++	 *
++	 * <p>配置期（{@code afterEvaluate}，晚于 Loom 自己的 setup job）只做三件事：读共享缓存里的对照路径、
++	 * 调三个「配置期接线」方法拿到声明、把三个「执行期发起」的探针任务注册进任务图。真正的三条调用全部在
++	 * 那些任务的 {@code doLast} 里发起，且只用到「选项 + 本次路径 + 新的 ServiceFactory」。
++	 */
++	private static String probeScript() {
++		return '''
++		afterEvaluate {
++			def extension = net.fabricmc.loom.LoomGradleExtension.get(project)
++			def provider = dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider.get(project)
++			def srgProvider = extension.srgProvider
++			def probeDir = new File(project.buildDir, 'probe')
++			probeDir.mkdirs()
++			def report = project.file('probe-report.properties')
++			report.text = ''
++
++			def record = { String line -> report << (line + System.lineSeparator()) }
++
++			// —— 对照路径：由配置期 provide() 链生产，本次改造没有搬动那些调用点 ——
++			def provisionFactory = new net.fabricmc.loom.util.service.ScopedServiceFactory()
++			def atReference = provider.productionOptions(provisionFactory).atPatchedJar()
++			provisionFactory.close()
++			def atInput = provider.minecraftPatchedIntermediateJar
++			def mcpReference = provider.minecraftIntermediateJar
++			def mergeReference = srgProvider.mergedMojangRaw
++			def mergeTrimmed = srgProvider.mergedMojangTrimmed
++
++			// —— 配置期只接线：三个声明此刻都不解析依赖、不起进程 ——
++			def atTempFiles = new dev.architectury.loom.util.TempFiles()
++			def atOptions = provider.createAccessTransformerOptions(atTempFiles)
++			def mcpTempFiles = new dev.architectury.loom.util.TempFiles()
++			def mcpOptions = provider.createPrePatchJarMcpOptions(mcpTempFiles)
++			def mergeTool = srgProvider.createMergeMappingTool()
++
++			// 扰动：AT 规则换成「只有注释、没有任何规则」的一份 —— 只改「AT 规则」这一个维度，
++			// 工具、输入 jar、输出路径与原调用完全一致
++			def noRulesAtFile = new File(probeDir, 'at-no-rules.cfg')
++			noRulesAtFile.text = '# 扰动对照：只有注释，没有任何 AT 规则' + System.lineSeparator()
++			def noRulesOptions = dev.architectury.loom.accesstransformer.AccessTransformerService
++					.createOptions(project, [noRulesAtFile])
++
++			// MERGE_MAPPING 的命令行对照：标志与顺序转录自改造前实现，两个输入路径取自探针
++			def srgTsrg = srgProvider.srg.toAbsolutePath().toString()
++			def mojmapTsrg = dev.architectury.loom.forge.dependency.SrgProvider
++					.getMojmapTsrg2(project, extension).toAbsolutePath().toString()
++			def oracleTemplate = ['--task', 'MERGE_MAPPING', '--left', srgTsrg, '--right', mojmapTsrg, '--classes', '--output', '{output}']
++
++			def settingsFactory = new net.fabricmc.loom.util.service.ScopedServiceFactory()
++			def mergeService = settingsFactory.get(mergeTool)
++			def unexpandedArgv = mergeService.settingsFor([:]).programArgs.get().join('|')
++			def expandedArgv = mergeService.settingsFor(['{output}': '<本次调用路径>']).programArgs.get().join('|')
++			def mergeMainClass = mergeService.settingsFor([:]).mainClass.get()
++			settingsFactory.close()
++
++			// AT 工具的主类由 AccessTransformerService.createOptions 决定，这里只独立断言它不是空
++			def atMainClass = dev.architectury.loom.accesstransformer.AccessTransformerService
++					.createOptions(project, []).get().mainClass.get()
++
++			def atOut = new File(probeDir, 'access-transformed-exec-time.jar')
++			def atNoRulesOut = new File(probeDir, 'access-transformed-exec-time-no-rules.jar')
++			def mcpOut = new File(probeDir, 'pre-patch-jar-exec-time.jar')
++			def mergeOut = new File(probeDir, 'srg-mojmap-merged-raw-exec-time.tsrg')
++
++			// ★ 以下三个任务体只认「配置期造好的选项 + 本次调用的路径 + 一个服务工厂」：
++			//   不读 extension、不读 provider、不建任何新选项 —— 这就是「调用点可搬进任务」的判据
++			project.tasks.register('probeAccessTransformAtExecution') {
++				doLast {
++					def f = new net.fabricmc.loom.util.service.ScopedServiceFactory()
++					try {
++						dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider.runAccessTransformer(
++								atOptions, atInput, atOut.toPath(), f)
++						// 扰动：AT 规则为空，其余输入输出与原调用完全一致
++						dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider.runAccessTransformer(
++								noRulesOptions, atInput, atNoRulesOut.toPath(), f)
++					} finally {
++						f.close()
++					}
++				}
++			}
++
++			def mcpTask = project.tasks.register('probePrePatchJarAtExecution') {
++				doLast {
++					def f = new net.fabricmc.loom.util.service.ScopedServiceFactory()
++					try {
++						dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider.runMcpExecutor(
++								mcpOptions, mcpOut.toPath(), f)
++					} finally {
++						f.close()
++					}
++				}
++			}
++
++			def mergeTask = project.tasks.register('probeMergeMappingAtExecution') {
++				doLast {
++					def f = new net.fabricmc.loom.util.service.ScopedServiceFactory()
++					try {
++						dev.architectury.loom.forge.dependency.SrgProvider.runMergeMapping(mergeTool, mergeOut.toPath(), f)
++					} finally {
++						f.close()
++					}
++
++					record('AT_REFERENCE=' + atReference)
++					record('AT_INPUT=' + atInput)
++					record('AT_EXECUTION_OUTPUT=' + atOut.absolutePath)
++					record('AT_NO_RULES_OUTPUT=' + atNoRulesOut.absolutePath)
++					record('AT_MAIN_CLASS=' + atMainClass)
++					record('MCP_REFERENCE=' + mcpReference)
++					record('MCP_PATCHED_INTERMEDIATE=' + provider.minecraftPatchedIntermediateJar)
++					record('MCP_EXECUTION_OUTPUT=' + mcpOut.absolutePath)
++					record('MERGE_REFERENCE=' + mergeReference)
++					record('MERGE_TRIMMED=' + mergeTrimmed)
++					record('MERGE_EXECUTION_OUTPUT=' + mergeOut.absolutePath)
++					record('MERGE_ARGS_TEMPLATE=' + mergeTool.argsTemplate.get().join('|'))
++					record('MERGE_ORACLE_TEMPLATE=' + oracleTemplate.join('|'))
++					record('MERGE_ARGV_UNEXPANDED=' + unexpandedArgv)
++					record('MERGE_ARGV_EXPANDED=' + expandedArgv)
++					record('MERGE_ARGV_ORACLE=' + oracleTemplate.collect { it == '{output}' ? '<本次调用路径>' : it }.join('|'))
++					record('MERGE_MAIN_CLASS=' + mergeMainClass)
++				}
++			}
++
++			mcpTask.get().dependsOn(project.tasks.named('generateForgePatchedJar'))
++			project.tasks.named('remapJar').configure { dependsOn mergeTask.get() }
++			project.tasks.named('remapJar').configure { dependsOn project.tasks.named('probeAccessTransformAtExecution') }
++			project.tasks.named('remapJar').configure { dependsOn mcpTask.get() }
++		}
++		'''
++	}
++
++	/** 读报告文件；键值各占一行. */
++	private static Map<String, String> parseReport(File file) {
++		if (!file.exists()) {
++			throw new FileNotFoundException("未生成报告文件: " + file)
++		}
++
++		return file.readLines().findAll { it.contains('=') }.collectEntries {
++			def split = it.split('=', 2)
++			[(split[0]): split[1]]
++		}
++	}
++
++	private static Map<String, String> entries(File jar) {
++		final Map<String, String> result = [:]
++
++		new ZipFile(jar).withCloseable { zip ->
++			for (def e : zip.entries()) {
++				if (e.directory) {
++					continue
++				}
++
++				def digest = MessageDigest.getInstance("SHA-256")
++
++				zip.getInputStream(e).withCloseable { input ->
++					digest.update(input.readAllBytes())
++				}
++
++				result[e.name] = digest.digest().encodeHex().toString()
++			}
++		}
++
++		return result
++	}
++
++	private static List<String> diff(Map<String, String> actual, Map<String, String> expected) {
++		return actual.findResults { name, hash -> hash == expected[name] ? null : name }
++	}
++
++	private static void printEvidence(Map<String, String> report) {
++		println("AT 执行期产物: " + report.AT_EXECUTION_OUTPUT)
++		println("AT 共享缓存对照: " + report.AT_REFERENCE)
++		println("pre-patch 执行期产物: " + report.MCP_EXECUTION_OUTPUT)
++		println("pre-patch 共享缓存对照: " + report.MCP_REFERENCE)
++		println("merged tsrg 执行期产物: " + report.MERGE_EXECUTION_OUTPUT)
++		println("merged tsrg 对照: " + report.MERGE_REFERENCE)
++		println("MERGE_MAPPING 模板: " + report.MERGE_ARGS_TEMPLATE)
++		println("MERGE_MAPPING 对照模板: " + report.MERGE_ORACLE_TEMPLATE)
++	}
++}

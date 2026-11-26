@@ -1,0 +1,64 @@
+From 85c1356aa9a0a60629b0c183e3022827a3c1e1e3 Mon Sep 17 00:00:00 2001
+From: wxys233 <56812380+wcpe@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 11:44:04 +0800
+Subject: [PATCH 085/147] =?UTF-8?q?test(benchmark):=20=E4=BF=AE=E6=8E=89?=
+ =?UTF-8?q?=20ConfigurationBaselineTest=20=E9=87=8C=E4=BC=A0=E9=94=99?=
+ =?UTF-8?q?=E5=8F=82=E6=95=B0=E7=9A=84=20contains=20=E8=B0=83=E7=94=A8?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+三处 println 里的 `contains(cold.output, '…')` 传参传反了——那是在调 `Object.contains(...)`，
+而不是断言输出里含某段文本；改为 `cold.output.contains('…')`，打印出的才是真实探测结果。
+纯诊断输出，不影响任何断言或产物。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/benchmark/ConfigurationBaselineTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/benchmark/ConfigurationBaselineTest.groovy
+index 8b15ecc016f9d7c4861c3d3aa54ab416f7344f49..b8c017f2951243b76f77b106afa1cc85eacca099 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/benchmark/ConfigurationBaselineTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/benchmark/ConfigurationBaselineTest.groovy
+@@ -67,13 +67,13 @@ class ConfigurationBaselineTest extends Specification implements GradleProjectTe
+ 		def reused = gradle.run(task: task)
+ 
+ 		println("========== [${label}] task=${task} ==========")
+-		println("cold   : cc-stored=${contains(cold.output, 'Configuration cache entry stored')} " +
+-				"cc-reused=${contains(cold.output, 'Configuration cache entry reused')} " +
+-				"problem=${contains(cold.output, 'Configuration cache problems found')}")
+-		println("warm   : cc-reused=${contains(warm.output, 'Configuration cache entry reused')} " +
+-				"problem=${contains(warm.output, 'Configuration cache problems found')}")
+-		println("reused : cc-reused=${contains(reused.output, 'Configuration cache entry reused')} " +
+-				"problem=${contains(reused.output, 'Configuration cache problems found')}")
++		println("cold   : cc-stored=${cold.output.contains('Configuration cache entry stored')} " +
++				"cc-reused=${cold.output.contains('Configuration cache entry reused')} " +
++				"problem=${cold.output.contains('Configuration cache problems found')}")
++		println("warm   : cc-reused=${warm.output.contains('Configuration cache entry reused')} " +
++				"problem=${warm.output.contains('Configuration cache problems found')}")
++		println("reused : cc-reused=${reused.output.contains('Configuration cache entry reused')} " +
++				"problem=${reused.output.contains('Configuration cache problems found')}")
+ 
+ 		// 记录失效原因（若存在），这是后续改造要逐条消灭的清单
+ 		[
+@@ -91,10 +91,6 @@ class ConfigurationBaselineTest extends Specification implements GradleProjectTe
+ 		println("================================================")
+ 	}
+ 
+-	private static boolean contains(String output, String text) {
+-		return output.contains(text)
+-	}
+-
+ 	/**
+ 	 * 观测「配置阶段本身」的耗时，与任务执行耗时分离。
+ 	 *
+@@ -131,8 +127,8 @@ class ConfigurationBaselineTest extends Specification implements GradleProjectTe
+ 		].each { name, pair ->
+ 			def result = pair[1]
+ 			println("  ${name.padRight(26)} ${String.format('%6d', pair[0])}ms  " +
+-					"reused=${contains(result, 'Configuration cache entry reused')} " +
+-					"stored=${contains(result, 'Configuration cache entry stored')}")
++					"reused=${result.output.contains('Configuration cache entry reused')} " +
++					"stored=${result.output.contains('Configuration cache entry stored')}")
+ 		}
+ 
+ 		// 配置期是否仍在做环境供给：这是后续改造的核心验收点。

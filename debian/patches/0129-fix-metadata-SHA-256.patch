@@ -1,0 +1,711 @@
+From d4cd13ffeca6a7b3ff517257fddf98eb5016195d Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Wed, 11 Nov 2026 07:59:34 +0800
+Subject: [PATCH 129/147] =?UTF-8?q?fix(metadata):=20=E7=89=88=E6=9C=AC?=
+ =?UTF-8?q?=E6=B8=85=E5=8D=95=E6=B4=BE=E7=94=9F=E7=BC=93=E5=AD=98=E6=94=B9?=
+ =?UTF-8?q?=E6=8C=89=E5=86=85=E5=AE=B9=20SHA-256=20=E5=BB=BA=E9=94=AE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+版本清单的解析结果原本按 `SpecStore.inputIdentity(file)`（大小 + 修改时间）落盘，
+这在两个真实场景下会出错：
+
+- HTTP 304 会刷新清单文件的 mtime，但内容未变——产生一整代无意义的缓存条目
+  （每次配置、每个子项目重复）。
+- 并发替换清单文件时，旧 JSON 的解析结果可能被写到新一代文件的身份下，
+  这是**正确性问题**，不只是噪音。
+
+改为对**已经读取到内存的 JSON 字符串**算 SHA-256：身份与真正被解析的字节必然同代，
+不再重新 stat 文件。
+
+配置期输入隔离由新增的 `MinecraftMetadataValueSource` 承担：它把下载、派生缓存维护
+全部关在 `obtain()` 里，对外只返回目标版本的元数据语义值。参数只存路径、字符串与
+布尔快照，不持有 Project、不捕获项目回调。
+
+配套：`CompileConfiguration` 里该值已由 ValueSource 提供路径；`SpecStore` 的 javadoc
+相应改写（`inputIdentity` 保留，`ForgePrePatchJarReuse` 仍在用）。
+
+测试：MinecraftMetadataCacheTest 5 个用例，覆盖 304 改 mtime 仍复用、新增无关版本
+不失效、以及真实元数据变化必须失效。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: metadata-spec-content-key
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftMetadataProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftMetadataProvider.java
+index 7c7d89e97147d7434e8fbf18028d0ce770930fa9..c6b84957e6d816d14305b95701a42dd7828f3dd7 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftMetadataProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftMetadataProvider.java
+@@ -36,6 +36,7 @@ import java.util.function.Function;
+ 
+ import org.gradle.api.Project;
+ import org.gradle.api.provider.Property;
++import org.gradle.api.provider.Provider;
+ import org.jspecify.annotations.Nullable;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -47,6 +48,7 @@ import net.fabricmc.loom.configuration.DependencyInfo;
+ import net.fabricmc.loom.configuration.providers.minecraft.ManifestLocations.ManifestLocation;
+ import net.fabricmc.loom.configuration.providers.minecraft.VersionsManifest.Version;
+ import net.fabricmc.loom.spec.SpecStore;
++import net.fabricmc.loom.util.Checksum;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.download.DownloadBuilder;
+ 
+@@ -69,25 +71,31 @@ public final class MinecraftMetadataProvider {
+ 
+ 	private final Options options;
+ 	private final Function<String, DownloadBuilder> download;
++	private final @Nullable Provider<String> metadataSource;
+ 
+ 	private ManifestEntryLocation versionEntry;
+ 	private MinecraftVersionMeta versionMeta;
+ 
+-	private MinecraftMetadataProvider(Options options, Function<String, DownloadBuilder> download) {
++	// 原始解析器只由 ValueSource 内部与独立下载测试使用，不把派生缓存 I/O 暴露给配置输入跟踪。
++	MinecraftMetadataProvider(Options options, Function<String, DownloadBuilder> download) {
++		this(options, download, null);
++	}
++
++	private MinecraftMetadataProvider(Options options, Function<String, DownloadBuilder> download, @Nullable Provider<String> metadataSource) {
+ 		this.options = options;
+ 		this.download = download;
++		this.metadataSource = metadataSource;
+ 	}
+ 
+ 	public static MinecraftMetadataProvider create(ConfigContext configContext) {
+-		final String minecraftVersion = resolveMinecraftVersion(configContext.project());
+-
+-		return new MinecraftMetadataProvider(
+-				MinecraftMetadataProvider.Options.create(
+-						minecraftVersion,
+-						configContext.project()
+-				),
+-				configContext.extension()::download
++		final Project project = configContext.project();
++		final Options options = Options.create(resolveMinecraftVersion(project), project);
++		final Provider<String> metadataSource = MinecraftMetadataValueSource.create(
++				project.getProviders(), options,
++				project.getGradle().getStartParameter().isOffline(), configContext.extension().manualRefreshDeps()
+ 		);
++
++		return new MinecraftMetadataProvider(options, configContext.extension()::download, metadataSource);
+ 	}
+ 
+ 	private static String resolveMinecraftVersion(Project project) {
+@@ -100,6 +108,14 @@ public final class MinecraftMetadataProvider {
+ 	}
+ 
+ 	public MinecraftVersionMeta getVersionMeta() {
++		if (metadataSource != null) {
++			if (versionMeta == null) {
++				versionMeta = LoomGradlePlugin.GSON.fromJson(metadataSource.get(), MinecraftVersionMeta.class);
++			}
++
++			return versionMeta;
++		}
++
+ 		try {
+ 			if (versionEntry == null) {
+ 				versionEntry = getVersionEntry();
+@@ -229,46 +245,40 @@ public final class MinecraftMetadataProvider {
+ 	}
+ 
+ 	/**
+-	 * 从版本清单中取出目标版本，解析结果按清单文件的内容身份落盘.
+-	 *
+-	 * <p>版本清单是**全部** Minecraft 版本的清单（数百 KB ～ MB），而每次配置只需要其中一条。
+-	 * 逐次全文 GSON 解析是不必要的重复：清单内容一旦下载完成就不再变化，因此把「目标版本在这一代
+-	 * 清单中的条目」缓存下来，后续配置只解析这一条。
++	 * 从版本清单中取出目标版本，解析结果按实际读取内容的 SHA-256 身份落盘.
+ 	 *
+-	 * <p>缓存键含清单文件的内容身份（大小 + mtime），清单被刷新（含 {@code forceDownload}）后
+-	 * 身份变化、自然失效，不会读到过期条目。缓存只存派生数据，丢失仅意味着多解析一次。
++	 * <p>版本清单包含全部 Minecraft 版本，每次配置只需要其中一条。派生缓存以已经读取的 JSON
++	 * 内容为键，不再重新 stat 文件：HTTP 304 更新时间戳不会产生新条目，并发替换文件也不会把
++	 * 旧 JSON 的结果错误地写入新一代文件的身份下。配置输入隔离由外层 ValueSource 承担。
+ 	 *
+-	 * @param manifestJson 清单的原始 JSON（已确保为最新一代）
+-	 * @param manifestFile 清单的落盘位置，用于取内容身份
++	 * @param manifestJson 清单的原始 JSON
++	 * @param manifestFile 清单的落盘位置，用于损坏缓存的诊断
+ 	 * @return 目标版本条目；清单中不存在该版本时为空
+ 	 */
+ 	private @Nullable Version findVersion(String manifestJson, Path manifestFile) {
+ 		final SpecStore store = new SpecStore(options.userCache());
+-		final var identity = SpecStore.inputIdentity(manifestFile);
+-
+-		if (identity.isPresent()) {
+-			final var cached = store.load(NAMESPACE_VERSIONS_MANIFEST, identity.get(), options.minecraftVersion());
+-
+-			if (cached.isPresent()) {
+-				// 空内容表示「这一代清单里确实没有该版本」，是已解析过的结论，不是缓存缺失
+-				if (cached.get().isEmpty()) {
+-					return null;
+-				}
+-
+-				try {
+-					return LoomGradlePlugin.GSON.fromJson(cached.get(), Version.class);
+-				} catch (RuntimeException e) {
+-					// 缓存条目损坏：退回全文解析，本轮顺带把它覆盖成正确内容
+-					LOGGER.debug("Corrupt spec cache entry for manifest {}, re-parsing", manifestFile, e);
+-				}
++		final String identity = Checksum.of(manifestJson).sha256().hex();
++		final var cached = store.load(NAMESPACE_VERSIONS_MANIFEST, identity, options.minecraftVersion());
++
++		if (cached.isPresent()) {
++			// 空内容表示「这一代清单里确实没有该版本」，是已解析过的结论，不是缓存缺失
++			if (cached.get().isEmpty()) {
++				return null;
++			}
++
++			try {
++				return LoomGradlePlugin.GSON.fromJson(cached.get(), Version.class);
++			} catch (RuntimeException e) {
++				// 缓存条目损坏：退回全文解析，本轮顺带把它覆盖成正确内容
++				LOGGER.debug("Corrupt spec cache entry for manifest {}, re-parsing", manifestFile, e);
+ 			}
+ 		}
+ 
+ 		final VersionsManifest manifest = LoomGradlePlugin.GSON.fromJson(manifestJson, VersionsManifest.class);
+ 		final VersionsManifest.Version version = manifest.getVersion(options.minecraftVersion());
+ 
+-		identity.ifPresent(id -> store.store(NAMESPACE_VERSIONS_MANIFEST, id, options.minecraftVersion(),
+-				version != null ? LoomGradlePlugin.GSON.toJson(version) : ""));
++		store.store(NAMESPACE_VERSIONS_MANIFEST, identity, options.minecraftVersion(),
++				version != null ? LoomGradlePlugin.GSON.toJson(version) : "");
+ 
+ 		return version;
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftMetadataValueSource.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftMetadataValueSource.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d7f45ed46566388c0dc80d0f0616d8369dbcd032
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftMetadataValueSource.java
+@@ -0,0 +1,146 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.configuration.providers.minecraft;
++
++import java.net.URISyntaxException;
++import java.util.ArrayList;
++import java.util.Map;
++
++import com.google.gson.JsonArray;
++import com.google.gson.JsonElement;
++import com.google.gson.JsonObject;
++import org.gradle.api.file.DirectoryProperty;
++import org.gradle.api.provider.ListProperty;
++import org.gradle.api.provider.Property;
++import org.gradle.api.provider.Provider;
++import org.gradle.api.provider.ProviderFactory;
++import org.gradle.api.provider.ValueSource;
++import org.gradle.api.provider.ValueSourceParameters;
++
++import net.fabricmc.loom.LoomGradlePlugin;
++import net.fabricmc.loom.util.download.Download;
++import net.fabricmc.loom.util.download.DownloadBuilder;
++
++/**
++ * 以目标版本元数据的语义值作为配置输入，隔离下载与派生缓存的维护状态.
++ *
++ * <p>所有文件访问都在 obtain 内完成：派生文件从未命中到创建、304 更新时间戳以及其它版本
++ * 清单变化都不单独进入配置指纹。Gradle 在复用前重新求值，仅当返回的目标元数据变化才失效。
++ * 参数只保存路径、字符串与布尔值快照，不持有 Project、Loom 扩展或捕获项目的下载回调。
++ */
++public abstract class MinecraftMetadataValueSource implements ValueSource<String, MinecraftMetadataValueSource.Parameters> {
++	public static Provider<String> create(ProviderFactory providers, MinecraftMetadataProvider.Options options, boolean offline, boolean manualRefresh) {
++		final var names = new ArrayList<String>();
++		final var urls = new ArrayList<String>();
++
++		// 按原集合实际迭代顺序快照；不在本次修复中改变既有的多来源选择次序。
++		for (ManifestLocations.ManifestLocation location : options.versionsManifests()) {
++			names.add(location.name());
++			urls.add(location.url());
++		}
++
++		return providers.of(MinecraftMetadataValueSource.class, spec -> {
++			final Parameters parameters = spec.getParameters();
++			parameters.getMinecraftVersion().set(options.minecraftVersion());
++			parameters.getManifestNames().set(names);
++			parameters.getManifestUrls().set(urls);
++			parameters.getCustomManifestUrl().set(options.customManifestUrl());
++			parameters.getUserCache().set(options.userCache().toFile());
++			parameters.getWorkingDirectory().set(options.workingDir().toFile());
++			parameters.getOffline().set(offline);
++			parameters.getManualRefresh().set(manualRefresh);
++		});
++	}
++
++	@Override
++	public String obtain() {
++		final Parameters parameters = getParameters();
++		final var names = parameters.getManifestNames().get();
++		final var urls = parameters.getManifestUrls().get();
++		final var manifests = new ManifestLocations();
++
++		for (int i = 0; i < names.size(); i++) {
++			manifests.add(names.get(i), urls.get(i), i);
++		}
++
++		final var options = new MinecraftMetadataProvider.Options(
++				parameters.getMinecraftVersion().get(), manifests, parameters.getCustomManifestUrl().getOrNull(),
++				parameters.getUserCache().get().getAsFile().toPath(),
++				parameters.getWorkingDirectory().get().getAsFile().toPath()
++		);
++		final boolean offline = parameters.getOffline().get();
++		final boolean manualRefresh = parameters.getManualRefresh().get();
++		final var resolver = new MinecraftMetadataProvider(options, url -> download(url, offline, manualRefresh));
++		final MinecraftVersionMeta metadata = resolver.getVersionMeta();
++		return LoomGradlePlugin.GSON.toJson(canonicalize(LoomGradlePlugin.GSON.toJsonTree(metadata)));
++	}
++
++	private static DownloadBuilder download(String url, boolean offline, boolean manualRefresh) {
++		try {
++			final DownloadBuilder builder = Download.create(url);
++
++			if (offline) {
++				builder.offline();
++			}
++
++			if (manualRefresh) {
++				builder.forceDownload();
++			}
++
++			return builder;
++		} catch (URISyntaxException e) {
++			throw new IllegalArgumentException("无效的 Minecraft 元数据 URL：" + url, e);
++		}
++	}
++
++	// 对象键顺序与空白不属于元数据语义；数组次序（如参数、库列表）保持原样。
++	private static JsonElement canonicalize(JsonElement element) {
++		if (element.isJsonObject()) {
++			final var result = new JsonObject();
++			element.getAsJsonObject().entrySet().stream().sorted(Map.Entry.comparingByKey())
++					.forEach(entry -> result.add(entry.getKey(), canonicalize(entry.getValue())));
++			return result;
++		}
++
++		if (element.isJsonArray()) {
++			final var result = new JsonArray();
++			element.getAsJsonArray().forEach(value -> result.add(canonicalize(value)));
++			return result;
++		}
++
++		return element;
++	}
++
++	public interface Parameters extends ValueSourceParameters {
++		Property<String> getMinecraftVersion();
++		ListProperty<String> getManifestNames();
++		ListProperty<String> getManifestUrls();
++		Property<String> getCustomManifestUrl();
++		DirectoryProperty getUserCache();
++		DirectoryProperty getWorkingDirectory();
++		Property<Boolean> getOffline();
++		Property<Boolean> getManualRefresh();
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/spec/SpecStore.java b/src/main/java/net/fabricmc/loom/spec/SpecStore.java
+index 1d04a193dd7bba1fbe126994673cfa1d655124a5..1304e30f4cb82f4c8e58690bc83761e854a394eb 100644
+--- a/src/main/java/net/fabricmc/loom/spec/SpecStore.java
++++ b/src/main/java/net/fabricmc/loom/spec/SpecStore.java
+@@ -46,13 +46,13 @@ import net.fabricmc.loom.util.cache.AtomicFiles;
+  * （数百 KB ～ MB），而每次配置只需要其中一条；{@code minecraft_info.json} 每次配置都要
+  * 重新做一次全文 SHA1 校验。这些工作在每次配置、每个子项目上重复，且不随构建结果变化。
+  *
+- * <p>本类把「解析结果」与「已验证」这两类状态按输入文件的内容身份落盘，使它们跨 daemon、
+- * 跨工作树复用。键由 {@link #inputIdentity(Path)} 生成，取值来自文件的大小与最后修改时间——
+- * 下载器的落位是原子的，文件不会出现「大小与时间不变而内容改变」的情形。
++ * <p>本类保存「解析结果」与「已验证」等纯派生状态。输入身份由调用方选择：例如版本清单使用
++ * 已读取 JSON 的内容摘要；{@link #inputIdentity(Path)} 的大小与修改时间只适合作为统计代次提示，
++ * 不能代替严格的内容身份，也不能保证与调用方此前读取的字节属于同一代。
+  *
+- * <p>与 {@code ~/.gradle/caches} 下既有的手写就绪标记不同，本目录只存放**纯派生数据**：
+- * 任何条目都可安全删除，删除后只是重新解析一次，不影响正确性。因此它不需要参与
+- * 构建产物的有效性判定，也不会像产物标记那样在配置期形成「观察 → 填充 → 失效」的循环。
++ * <p>本类不自动隔离 Gradle 的文件输入跟踪。配置期调用方应把查询、重算与写回放进 ValueSource，
++ * 对外只返回语义值，避免把「观察未命中 → 填充派生文件」记录成下一轮配置失效的原因。
++ * 派生条目可安全删除，丢失只应引起重算，而不应改变配置结果。
+  */
+ public final class SpecStore {
+ 	private static final Logger LOGGER = LoggerFactory.getLogger(SpecStore.class);
+@@ -67,10 +67,10 @@ public final class SpecStore {
+ 	}
+ 
+ 	/**
+-	 * 生成输入文件的内容身份串.
++	 * 生成输入文件的统计代次提示.
+ 	 *
+-	 * <p>取大小与最后修改时间而非内容哈希：调用方关心的是「这个文件是不是上次那个」，
+-	 * 而计算内容哈希本身就是要省掉的成本。下载产物一律原子落位，故该组合足以区分代次。
++	 * <p>不读取内容，适合允许保守重算的缓存检查；相同大小与时间戳不等于内容相同。
++	 * 需要把解析结果绑定到已读取内容的调用方，应对实际字节或字符串计算内容摘要。
+ 	 *
+ 	 * @param file 输入文件
+ 	 * @return 形如 {@code size-mtime} 的身份串；文件不存在时返回空
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/MinecraftMetadataCacheTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/MinecraftMetadataCacheTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..93475eb6a3dfbe86f93905d9ded020f281786926
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/MinecraftMetadataCacheTest.groovy
+@@ -0,0 +1,335 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration
++
++import java.nio.charset.StandardCharsets
++import java.nio.file.Files
++import java.nio.file.Path
++import java.nio.file.attribute.FileTime
++import java.security.MessageDigest
++import java.time.Duration
++import java.time.Instant
++import java.util.concurrent.atomic.AtomicInteger
++
++import groovy.json.JsonOutput
++import groovy.json.JsonSlurper
++import io.javalin.Javalin
++import org.gradle.testkit.runner.BuildResult
++import org.gradle.testkit.runner.GradleRunner
++import spock.lang.Specification
++import spock.lang.TempDir
++
++/**
++ * 守护 Minecraft 元数据的配置缓存输入只包含目标版本的语义结果.
++ *
++ * <p>只应用仓库插件以取得真实插件 classpath，不运行 Minecraft 产物生产链；所有 HTTP 内容均由本地服务器提供.
++ */
++class MinecraftMetadataCacheTest extends Specification {
++	private static final String VERSION = "1.20.1"
++	private static final String CONFIGURED = "METADATA_CONFIGURED"
++	private static final String MAIN = "example.Main"
++
++	@TempDir
++	Path projectDir
++
++	private Javalin server
++	private String baseUrl
++	private volatile String manifestJson
++	private volatile String manifestEtag
++	private volatile String nextMetadataJson
++	private String metadataJson
++	private final AtomicInteger manifestRequests = new AtomicInteger()
++	private final AtomicInteger metadataRequests = new AtomicInteger()
++	private final AtomicInteger notModifiedResponses = new AtomicInteger()
++
++	def setup() {
++		metadataJson = metadata(MAIN)
++		nextMetadataJson = metadataJson
++		server = Javalin.create()
++		server.get("/manifest") { context ->
++			manifestRequests.incrementAndGet()
++			context.header("ETag", manifestEtag)
++
++			if (context.header("If-None-Match") == manifestEtag) {
++				notModifiedResponses.incrementAndGet()
++				context.status(304)
++				return
++			}
++
++			context.result(manifestJson)
++		}
++		server.get("/metadata") { context ->
++			metadataRequests.incrementAndGet()
++			context.result(metadataJson)
++		}
++		server.get("/metadata-next") { context ->
++			metadataRequests.incrementAndGet()
++			context.result(nextMetadataJson)
++		}
++		server.start(0)
++		baseUrl = "http://127.0.0.1:${server.port()}"
++		setManifest(manifest([
++			targetEntry("/metadata", metadataJson)
++		]))
++		writeProject()
++	}
++
++	def cleanup() {
++		server?.stop()
++	}
++
++	def "全新派生缓存写入后第二次构建立即复用配置缓存"() {
++		when:
++		def first = runBuild()
++
++		then:
++		first.output.contains("Configuration cache entry stored")
++		first.output.contains(CONFIGURED)
++		first.output.contains("METADATA_MAIN=${MAIN}")
++		first.output.count("Architectury Loom:") == 1
++		specEntries().size() == 1
++
++		when:
++		def second = runBuild()
++
++		then:
++		reused(second)
++		second.output.contains("METADATA_MAIN=${MAIN}")
++		manifestRequests.get() == 1
++		metadataRequests.get() == 1
++	}
++
++	def "删除或损坏派生缓存只触发重算而不使配置缓存失效"() {
++		given:
++		runBuild()
++		def entry = specEntries().first()
++
++		when: "命中配置缓存检查时重新填充缺失的派生文件"
++		Files.delete(entry)
++		def afterDeletion = runBuild()
++
++		then:
++		reused(afterDeletion)
++		Files.isRegularFile(entry)
++
++		when: "损坏的派生文件也不能成为配置输入"
++		Files.writeString(entry, "{broken")
++		def afterCorruption = runBuild()
++
++		then:
++		reused(afterCorruption)
++		new JsonSlurper().parseText(Files.readString(entry)).id == VERSION
++		manifestRequests.get() == 1
++		metadataRequests.get() == 1
++	}
++
++	def "清单过期后304更新mtime仍复用配置缓存"() {
++		given:
++		runBuild()
++		def oldTime = expireManifest()
++
++		when:
++		def refreshed = runBuild()
++
++		then:
++		reused(refreshed)
++		manifestRequests.get() == 2
++		notModifiedResponses.get() == 1
++		Files.getLastModifiedTime(manifestFile()).toMillis() > oldTime.toMillis()
++		metadataRequests.get() == 1
++
++		when: "304更新时间后不应立即再次请求"
++		def next = runBuild()
++
++		then:
++		reused(next)
++		manifestRequests.get() == 2
++	}
++
++	def "全版本清单新增无关版本改变顺序和排版均不使配置缓存失效"() {
++		given:
++		runBuild()
++		def target = targetEntry("/metadata", metadataJson)
++		def unrelated = [id: "99.0", url: "${baseUrl}/never-requested", sha1: "unused"]
++
++		when: "新增版本并把目标条目移到第二位，服务端返回新的200响应"
++		setManifest(manifest([unrelated, target]))
++		expireManifest()
++		def afterAddition = runBuild()
++
++		then:
++		reused(afterAddition)
++		manifestRequests.get() == 2
++		notModifiedResponses.get() == 0
++
++		when: "重新排序并改成带缩进的JSON，latest也不参与目标版本的语义"
++		setManifest(JsonOutput.prettyPrint(manifest([target, unrelated], "99.0")))
++		expireManifest()
++		def afterReordering = runBuild()
++
++		then:
++		reused(afterReordering)
++		manifestRequests.get() == 3
++		notModifiedResponses.get() == 0
++		metadataRequests.get() == 1
++		afterReordering.output.contains("METADATA_MAIN=${MAIN}")
++	}
++
++	def "相同metadata更换来源仍复用而真实metadata变化使配置缓存失效"() {
++		given:
++		runBuild()
++
++		when: "仅更换目标条目的URL，metadata内容保持一致"
++		setManifest(manifest([
++			targetEntry("/metadata-next", nextMetadataJson)
++		]))
++		expireManifest()
++		def afterUrlChange = runBuild()
++
++		then:
++		reused(afterUrlChange)
++		afterUrlChange.output.contains("METADATA_MAIN=${MAIN}")
++		manifestRequests.get() == 2
++
++		when: "新清单的sha1对应真实变化的metadata"
++		nextMetadataJson = metadata("example.Changed")
++		setManifest(manifest([
++			targetEntry("/metadata-next", nextMetadataJson)
++		]))
++		expireManifest()
++		def afterSemanticChange = runBuild()
++
++		then:
++		!afterSemanticChange.output.contains("Configuration cache entry reused")
++		afterSemanticChange.output.contains("configuration cache cannot be reused")
++		afterSemanticChange.output.contains(CONFIGURED)
++		afterSemanticChange.output.contains("METADATA_MAIN=example.Changed")
++		manifestRequests.get() == 3
++		metadataRequests.get() == 2
++
++		when:
++		def stable = runBuild()
++
++		then:
++		reused(stable)
++		stable.output.contains("METADATA_MAIN=example.Changed")
++	}
++
++	private void writeProject() {
++		Files.writeString(projectDir.resolve("settings.gradle"), "rootProject.name = 'metadata-cache-test'\n")
++		Files.writeString(projectDir.resolve("build.gradle"), """
++			plugins {
++				id 'top.wcpe.loom-repositories'
++			}
++
++			import groovy.json.JsonSlurper
++			import net.fabricmc.loom.configuration.providers.minecraft.ManifestLocations
++			import net.fabricmc.loom.configuration.providers.minecraft.MinecraftMetadataProvider
++			import net.fabricmc.loom.configuration.providers.minecraft.MinecraftMetadataValueSource
++			import net.fabricmc.loom.util.gradle.LoomVersionLogService
++
++			def previousLogFlag = System.getProperty('loom.printed.logged')
++			LoomVersionLogService.logVersion(project)
++			LoomVersionLogService.logVersion(project)
++			assert System.getProperty('loom.printed.logged') == previousLogFlag
++
++			def manifests = new ManifestLocations()
++			manifests.add('test', '${baseUrl}/manifest', 0)
++			def options = new MinecraftMetadataProvider.Options(
++				'${VERSION}', manifests, null, file('artifacts').toPath(), file('artifacts/minecraft').toPath())
++			def metadata = MinecraftMetadataValueSource.create(providers, options, false, false).get()
++			println '${CONFIGURED}'
++
++			abstract class MetadataProbe extends DefaultTask {
++				@Input
++				abstract Property<String> getMetadata()
++
++				@TaskAction
++				void probe() {
++					println 'METADATA_MAIN=' + new JsonSlurper().parseText(metadata.get()).mainClass
++				}
++			}
++
++			tasks.register('metadataProbe', MetadataProbe) {
++				getMetadata().set(metadata)
++			}
++			""".stripIndent())
++	}
++
++	private BuildResult runBuild() {
++		return GradleRunner.create()
++				.withProjectDir(projectDir.toFile())
++				.withPluginClasspath()
++				.withGradleVersion("9.5.0")
++				.withArguments("metadataProbe", "--configuration-cache", "--configuration-cache-problems=fail",
++				"--console=plain", "--stacktrace", "--gradle-user-home", projectDir.resolve("gradle-home").toString())
++				.build()
++	}
++
++	private Path manifestFile() {
++		return projectDir.resolve("artifacts/test_versions_manifest.json")
++	}
++
++	private List<Path> specEntries() {
++		def root = projectDir.resolve("artifacts/spec/versions-manifest")
++
++		return Files.walk(root).withCloseable { paths ->
++			paths.filter { Files.isRegularFile(it) && it.fileName.toString().endsWith(".json") }.toList()
++		}
++	}
++
++	private FileTime expireManifest() {
++		def oldTime = FileTime.from(Instant.now() - Duration.ofDays(2))
++		Files.setLastModifiedTime(manifestFile(), oldTime)
++		return oldTime
++	}
++
++	private void setManifest(String json) {
++		manifestJson = json
++		manifestEtag = '"' + sha1(json) + '"'
++	}
++
++	private Map<String, String> targetEntry(String path, String json) {
++		return [id: VERSION, url: "${baseUrl}${path}".toString(), sha1: sha1(json)]
++	}
++
++	private static String manifest(List<Map> entries, String latest = VERSION) {
++		return JsonOutput.toJson([latest: [release: latest], versions: entries])
++	}
++
++	private static String metadata(String mainClass) {
++		return JsonOutput.toJson([id: VERSION, mainClass: mainClass, downloads: [:], libraries: []])
++	}
++
++	private static String sha1(String value) {
++		return MessageDigest.getInstance("SHA-1").digest(value.getBytes(StandardCharsets.UTF_8)).encodeHex().toString()
++	}
++
++	private static boolean reused(BuildResult result) {
++		assert result.output.contains("Configuration cache entry reused")
++		assert !result.output.contains(CONFIGURED)
++		return true
++	}
++}

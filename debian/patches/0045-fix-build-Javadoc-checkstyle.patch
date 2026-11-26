@@ -1,0 +1,73 @@
+From 7fd466b40889b7187dafee6e2083079ea1fcc138 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:47 +0800
+Subject: [PATCH 045/147] =?UTF-8?q?fix(build):=20=E4=BF=AE=E6=AD=A3=20Java?=
+ =?UTF-8?q?doc=20=E9=A6=96=E5=8F=A5=E5=8F=A5=E5=8F=B7=E4=BB=A5=E9=80=9A?=
+ =?UTF-8?q?=E8=BF=87=20checkstyle?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+跨项目缓存相关改动新增的 5 处 Javadoc 以全角句号结尾，而 checkstyle 的
+JavadocStyle 要求首句以 ASCII 句号结束，导致 checkstyleMain 报 5 个错误、
+build 任务失败，进而使 CI 构建与正式版发布全部中断。
+
+仅将这几处行尾的全角句号改为 ASCII 句号，不改动任何语义或代码。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+index 291ba88a8d1c046320fb73fa303634d812f038a1..cdf23ef41b7237c2643054d3a1866dd5c03d7a5f 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+@@ -96,12 +96,12 @@ public class MappingConfiguration {
+ 	/**
+ 	 * 跨项目复用缓存：同构项目（同一套 mappings + 同一 MC 版本 + 同一平台）产出的
+ 	 * MappingConfiguration 语义等价，且暖路径下只读，无需每个项目都重开一次 mappings jar。
+-	 * 键取 mappingsIdentifier —— 它已编码 mappings 坐标、classifier、MC 版本与平台差异。
++	 * 键取 mappingsIdentifier —— 它已编码 mappings 坐标、classifier、MC 版本与平台差异.
+ 	 */
+ 	private static final Map<String, MappingConfiguration> SHARED_INSTANCES = new ConcurrentHashMap<>();
+ 
+ 	/**
+-	 * 早缓存索引：键仅由「声明信息」构成（不触发依赖解析），用于在解析 MAPPINGS 之前就命中已产出的实例。
++	 * 早缓存索引：键仅由「声明信息」构成（不触发依赖解析），用于在解析 MAPPINGS 之前就命中已产出的实例.
+ 	 */
+ 	private static final Map<String, MappingConfiguration> SHARED_EARLY = new ConcurrentHashMap<>();
+ 
+@@ -538,7 +538,7 @@ public class MappingConfiguration {
+ 
+ 	/**
+ 	 * 轻量预检：仅凭 zip 中央目录的条目名判断该 jar 是否带 extras，避免为「必然空跑」的
+-	 * extractExtras 打开 zipfs（打开会建索引，是暖路径上的主要成本）。
++	 * extractExtras 打开 zipfs（打开会建索引，是暖路径上的主要成本）.
+ 	 */
+ 	private static boolean jarContainsExtras(Path inputJar) throws IOException {
+ 		try (ZipFile zipFile = new ZipFile(inputJar.toFile())) {
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/tiny/TinyJarInfo.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/tiny/TinyJarInfo.java
+index 6bd5182643818081e7f965e509287f316b7be9d3..a59d2160607f42c2f581b423ede77819c18df577 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/tiny/TinyJarInfo.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/tiny/TinyJarInfo.java
+@@ -46,7 +46,7 @@ public record TinyJarInfo(boolean v2, Optional<String> minecraftVersionId) {
+ 
+ 	/**
+ 	 * 进程内缓存：TinyJarInfo 只由 jar 内容决定，而同构项目（共用同一套 mappings）会反复查询同一个 jar。
+-	 * 键取「路径 + 大小 + 修改时间」，足以识别内容变化；同一 daemon 内所有项目共享。
++	 * 键取「路径 + 大小 + 修改时间」，足以识别内容变化；同一 daemon 内所有项目共享.
+ 	 */
+ 	private static final Map<CacheKey, TinyJarInfo> CACHE = new ConcurrentHashMap<>();
+ 
+diff --git a/src/main/java/net/fabricmc/loom/util/fmj/FabricModJsonFactory.java b/src/main/java/net/fabricmc/loom/util/fmj/FabricModJsonFactory.java
+index 343f96e25fd92ce2429632823e5d601c0d1da08d..faf1808c802162c3e9e4e4c98606924d91a562e6 100644
+--- a/src/main/java/net/fabricmc/loom/util/fmj/FabricModJsonFactory.java
++++ b/src/main/java/net/fabricmc/loom/util/fmj/FabricModJsonFactory.java
+@@ -134,7 +134,7 @@ public final class FabricModJsonFactory {
+ 
+ 	/**
+ 	 * 跨项目缓存：读取 jar 内的 fabric.mod.json 是纯操作，而同构项目（共用同一批 mod jar）
+-	 * 会反复解析同一批文件。键取「路径 + 大小 + 修改时间」，足以识别内容变化。
++	 * 会反复解析同一批文件。键取「路径 + 大小 + 修改时间」，足以识别内容变化.
+ 	 */
+ 	private static final Map<ZipFmjKey, Optional<FabricModJson>> ZIP_FMJ_CACHE = new ConcurrentHashMap<>();
+ 

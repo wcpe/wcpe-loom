@@ -1,0 +1,173 @@
+From d5cc2f2fc36912537f82360d06762683f7abe0a2 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Wed, 25 Nov 2026 18:35:23 +0800
+Subject: [PATCH 144/147] =?UTF-8?q?fix(cache):=20=E6=A0=A1=E9=AA=8C?=
+ =?UTF-8?q?=E5=85=B1=E4=BA=AB=E4=BA=A7=E7=89=A9=E4=B8=8E=E8=BE=93=E5=85=A5?=
+ =?UTF-8?q?=E7=9A=84=E5=86=85=E5=AE=B9=E6=91=98=E8=A6=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+大小、时间戳与文件标识相同仍可能是不同内容。复用前校验记录的摘要，保留原指纹格式，并为输入和产物补上不依赖写入时序的回归。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: artifact-reuse-verify-content
+
+diff --git a/src/main/java/net/fabricmc/loom/util/cache/ArtifactReuse.java b/src/main/java/net/fabricmc/loom/util/cache/ArtifactReuse.java
+index d33c2b3b85d1927d49e46577bf2ffb4579618a8b..3b8063b081595d841d6258d6c5a4c33a7216dd64 100644
+--- a/src/main/java/net/fabricmc/loom/util/cache/ArtifactReuse.java
++++ b/src/main/java/net/fabricmc/loom/util/cache/ArtifactReuse.java
+@@ -60,25 +60,15 @@ import net.fabricmc.loom.util.FileSystemUtil;
+  *   <li><b>产出规则未换代</b>：{@code recipe} 是调用方给的产出规则身份（形如 {@code merge-jars/v1}）。
+  *       产出**实现**变了而输入没变也绝不能复用，这一层靠纪律而非校验守住：
+  *       <b>改了产出规则就必须递增自己那个 recipe 的版本号</b>。</li>
+- *   <li><b>输入与产物都没变</b>：见下面「两套身份，先廉价后精确」一层。</li>
++ *   <li><b>输入与产物都没变</b>：每个文件的名称、大小和内容摘要都必须与记录一致。</li>
+  * </ol>
+  *
+- * <h2>两套身份，先廉价后精确</h2>
+- * 一次构建的热路径不允许把输入 jar 整包读一遍（客户端 jar 20MB 级，实测 sha256 约 100ms），
+- * 而这条判据本身就发生在「本来要重算几秒到几十秒」之前。因此每一项都记两套身份：
+- * <ul>
+- *   <li>记录里存下 {@code (size, lastModified, fileKey)} 与内容 {@code sha256}；</li>
+- *   <li>判定时先比 stat 三元组。**全等就认定是同一份内容，不再算摘要**——暖路径因此只有几次 stat
+- *       与一次小属性读，不读任何 jar；</li>
+- *   <li>三元组有任一不等就真的比 {@code sha256}：内容仍相同（例如下载走了 304 刷新了 mtime、
+- *       或同一份内容被另一次原子落位重新发布）照旧可复用，内容不同则判为不可复用。</li>
+- * </ul>
+- * 三元组全等为何能等同于「同一份内容」：本判据服务的文件都位于共享缓存，它们的**每一次**内容换代都经
+- * {@link AtomicFiles}（或 {@code Download} 的 part 文件）原子落位——{@code rename(2)} 之后目标路径换成了
+- * 临时文件那个 inode（{@code fileKey} 必变）。也就是说，同一 inode 上的内容不会被就地改写换代。
+- * 反过来，若某处开始「就地重写这些 jar」，快速通道就会失效；那时唯一还能兜住的是慢通道的 sha256
+- * ——它虽然只在三元组不等时才跑，但就地重写必然改 mtime，所以仍然会真的比一次摘要。
+- * 两层合起来：「跳过摘要」只在不该变的文件确实没变时才发生。
++ * <h2>文件元数据只用于快速判定不匹配</h2>
++ * 大小不同可以直接拒绝复用。大小、修改时间和文件标识相同却不能证明内容相同：快速替换可能复用
++ * 同一个 inode 和时间戳，原位写入也可能保持原时间戳。因此只要大小相同，就核对输入和产物的
++ * {@code SHA-256}，不按时间戳或文件标识跳过。字节相同但只刷新过 mtime 的文件仍可复用。
++ * 记录保留原格式，已经记录的摘要可以继续验证。只有执行期任务实际开工并找到可复用候选时才走这条
++ * 判据，不影响 Gradle 直接判最新的路径。
+  *
+  * <h2>标记存在哪里</h2>
+  * 用 {@link AttributeHelper}（{@code LoomHash} / {@code ETag} / {@code loom-target} 的同一套载体）：
+@@ -243,10 +233,10 @@ public final class ArtifactReuse {
+ 		return filesMatch(recorded.outputs(), outputs) && filesMatch(recorded.inputs(), inputs);
+ 	}
+ 
+-	/** {@return 逐个比对「廉价身份」或（必要时）内容摘要是否一致}. */
+-	private static boolean filesMatch(List<RecordedFile> recorded, List<Path> files) {
++	/** {@return 逐个确认名称、大小和内容摘要与记录一致}. */
++	private static boolean filesMatch(List<RecordedFile> recorded, List<Path> files) throws IOException {
+ 		if (recorded.size() != files.size()) {
+-			// 集合本身变了（例如某条支线多了一个参考 jar）：记录描述的不是这一批
++			// 集合本身变了（例如某条支线多了一个参考 jar）：记录描述的不是这一批。
+ 			return false;
+ 		}
+ 
+@@ -254,27 +244,11 @@ public final class ArtifactReuse {
+ 			final Path file = files.get(i);
+ 			final RecordedFile entry = recorded.get(i);
+ 
+-			if (!nameOf(file).equals(entry.name())) {
+-				return false;
+-			}
+-
+-			final BasicFileAttributes attributes;
+-
+-			try {
+-				attributes = Files.readAttributes(file, BasicFileAttributes.class);
+-			} catch (IOException e) {
+-				// 读不到元数据：无法证明「还是那一份」，只能重算（生产侧会给出真正的失败原因）
++			if (!nameOf(file).equals(entry.name()) || Files.size(file) != entry.size()) {
+ 				return false;
+ 			}
+ 
+-			// 快速通道：stat 三元组全等即认为同一份内容，不读整包（见类注释「两套身份」）
+-			if (attributes.size() == entry.size()
+-					&& attributes.lastModifiedTime().toMillis() == entry.lastModified()
+-					&& fileKeyOf(attributes).equals(entry.fileKey())) {
+-				continue;
+-			}
+-
+-			// 慢通道：stat 变了不代表内容变了（下载走 304 会刷新 mtime），必须真的比一次摘要
++			// 同大小、mtime 和 inode 也可能是另一份字节，不能据此跳过摘要。
+ 			if (!Checksum.of(file).sha256().hex().equals(entry.sha256())) {
+ 				return false;
+ 			}
+@@ -371,7 +345,7 @@ public final class ArtifactReuse {
+ 		return name == null ? path.toString() : name.toString();
+ 	}
+ 
+-	/** {@return 文件系统给的 inode 标识；不提供时为 {@code ""}（此时快速通道退化为「大小 + mtime」）} */
++	/** {@return 与 v1 记录兼容的文件标识；文件系统不提供时为空字符串}. */
+ 	private static String fileKeyOf(BasicFileAttributes attributes) {
+ 		final Object fileKey = attributes.fileKey();
+ 		return fileKey == null ? "" : fileKey.toString();
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/cache/ArtifactReuseTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/cache/ArtifactReuseTest.groovy
+index 2af5019eb7b9ebf0110f93e70dca2634a884665f..5d2f11f027bf6b4d6c8b66be57d22de46bc11d97 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/cache/ArtifactReuseTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/cache/ArtifactReuseTest.groovy
+@@ -27,6 +27,7 @@ package net.fabricmc.loom.test.unit.cache
+ import java.nio.charset.StandardCharsets
+ import java.nio.file.Files
+ import java.nio.file.Path
++import java.nio.file.attribute.BasicFileAttributes
+ import java.nio.file.attribute.FileTime
+ import java.util.concurrent.TimeUnit
+ 
+@@ -120,19 +121,52 @@ class ArtifactReuseTest extends Specification {
+ 		!ArtifactReuse.isReusable(merged, RECIPE, [merged], [client])
+ 	}
+ 
+-	def "输入内容被换了（大小相同、仅 mtime 不同）也能识别出来"() {
+-		given: "两个不同内容但**恰好等长**的 client jar：只比大小会漏掉这种换代"
++	def "输入内容被等长替换且 mtime 变了时判为不可复用"() {
++		given:
+ 		def client = jar("client.jar", ["a.txt": "aaaa"])
+ 		def merged = jar("minecraft-merged.jar", ["a.txt": "a"])
++		def time = Files.getLastModifiedTime(client)
++		def size = Files.size(client)
+ 		ArtifactReuse.record(merged, RECIPE, [merged], [client])
+ 
+ 		when:
+ 		client = jar("client.jar", ["a.txt": "bbbb"])
++		Files.setLastModifiedTime(client, FileTime.fromMillis(time.toMillis() + TimeUnit.SECONDS.toMillis(2)))
+ 
+ 		then:
++		Files.size(client) == size
++		Files.getLastModifiedTime(client).toMillis() != time.toMillis()
+ 		!ArtifactReuse.isReusable(merged, RECIPE, [merged], [client])
+ 	}
+ 
++	def "文件三元组相同但 #fileKind 的内容已变时不复用"() {
++		given:
++		def client = jar("client.jar", ["a.txt": "aaaa"])
++		def merged = jar("minecraft-merged.jar", ["a.txt": "aaaa"])
++		def target = changeOutput ? merged : client
++		def replacement = jar("replacement.jar", ["a.txt": "bbbb"])
++		def originalBytes = Files.readAllBytes(target)
++		def original = Files.readAttributes(target, BasicFileAttributes.class)
++		ArtifactReuse.record(merged, RECIPE, [merged], [client])
++
++		when: "原位写入等长的有效 JAR 并恢复原时间戳，不依赖写入速度或 inode 循环"
++		Files.write(target, Files.readAllBytes(replacement))
++		Files.setLastModifiedTime(target, original.lastModifiedTime())
++		def current = Files.readAttributes(target, BasicFileAttributes.class)
++
++		then:
++		Files.readAllBytes(target) != originalBytes
++		current.size() == original.size()
++		current.lastModifiedTime() == original.lastModifiedTime()
++		current.fileKey() == original.fileKey()
++		!ArtifactReuse.isReusable(merged, RECIPE, [merged], [client])
++
++		where:
++		fileKind | changeOutput
++		"输入"     | false
++		"产物"     | true
++	}
++
+ 	def "输入只是 mtime 变了（内容相同）仍判为可复用"() {
+ 		given: "下载走 304 时 {@code Download} 会刷新 mtime，内容却还是同一份"
+ 		def client = jar("client.jar", ["a.txt": "a"])

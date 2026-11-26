@@ -1,0 +1,596 @@
+From 9423324fba411bca91c995f94198c032e5ce182c Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Sat, 31 Oct 2026 23:45:58 +0800
+Subject: [PATCH 110/147] =?UTF-8?q?fix(mods):=20=E6=94=AF=E6=8C=81?=
+ =?UTF-8?q?=E4=B8=80=E4=B8=AA=20mod=20=E5=A3=B0=E6=98=8E=E5=A4=9A=E4=B8=AA?=
+ =?UTF-8?q?=20class=20tweaker?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+schema v2 的 fabric.mod.json 允许 classTweakers 是「jar 内路径 → 生效环境」的映射，
+一个 mod 因此可以带多个规则文件。读取侧此前只接受一条，第二条直接抛
+UnsupportedOperationException（"TODO: support multiple class tweakers"），依赖这种 mod
+的工程在重映射阶段整体构建失败。
+
+具体的改动：
+
+- AccessWidenerUtils.readAccessWidenerData 改名为 readAccessWideners，返回
+  List<AccessWidenerData>，空列表（而不是 null）表示「这个 jar 不用处理」。
+  AccessWidenerData 加上 environment 组件：改造前用 keySet() 取值，环境信息被丢掉了。
+  结果按 jar 内路径排序——schema v2 的声明表是 HashMap，按迭代顺序处理会让输出在 JVM 间抖动。
+  读取逻辑另外拆成 readClassTweakers(FabricModJson)，单测可以不经真实 jar 直接覆盖它。
+- RemapModsTask / ModJarPostProcess：逐条重映射、逐条写回**各自的** jar 内路径
+  （replaceAccessWideners 收列表，单条形式保留为委托）。多条合成一份写回会让后写的
+  盖掉前一份，jar 里只剩一个规则文件。
+- AccessWidenerAnalyzeVisitorProvider：把各条声明都读进同一份分析器。分析阶段只回答
+  「哪些成员必须保持可访问」，与环境无关，多条覆盖同一成员是正常情况。
+- 环境语义收进 ModEnvironment#appliesTo(includeClient, includeServer)，
+  AccessWidenerJarProcessor 的按侧筛选改为调用它（行为不变，规则只留一份实现）。
+
+重映射阶段刻意**不**按环境筛选：产物是与项目无关、客户端与服务端开发环境共用、
+可能被其它项目直接复用的整体 jar，按单侧筛掉声明会让另一侧读不到规则。环境在
+「应用时」生效——Minecraft jar 的处理链与 loader 都按声明里的环境决定是否应用。
+
+单声明（绝大多数 mod）的行为与输出不变：路径、头、内容逐字相同，只是多带了一个
+environment 字段。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: class-tweakers
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/accesswidener/AccessWidenerJarProcessor.java b/src/main/java/net/fabricmc/loom/configuration/accesswidener/AccessWidenerJarProcessor.java
+index 703b50c5c89e1cc2f41af4fe39e51b9328b0b004..5f91046a6a65f49ed64318d1df84626534195911 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/accesswidener/AccessWidenerJarProcessor.java
++++ b/src/main/java/net/fabricmc/loom/configuration/accesswidener/AccessWidenerJarProcessor.java
+@@ -124,16 +124,9 @@ public class AccessWidenerJarProcessor implements MinecraftJarProcessor<AccessWi
+ 				return true;
+ 			}
+ 
+-			if (context.includesClient() && modEnvironment.isClient()) {
+-				return true;
+-			}
+-
+-			if (context.includesServer() && modEnvironment.isServer()) {
+-				return true;
+-			}
+-
+-			// Universal supports all jars
+-			return modEnvironment == ModEnvironment.UNIVERSAL;
++			// 环境语义只在 ModEnvironment#appliesTo 里实现一份：client / server 声明的取舍规则
++			// 与「合并 jar 全放行」是同一件事（合并 jar 两侧都在），别在这里再展开一遍。
++			return modEnvironment.appliesTo(context.includesClient(), context.includesServer());
+ 		}
+ 	}
+ 
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/AccessWidenerAnalyzeVisitorProvider.java b/src/main/java/net/fabricmc/loom/configuration/mods/AccessWidenerAnalyzeVisitorProvider.java
+index f8778c7a58854aab012a07a5f48f0df48c72a611..66946bf2a48975704de226f6edb3d312a9fcd4b8 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/AccessWidenerAnalyzeVisitorProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/AccessWidenerAnalyzeVisitorProvider.java
+@@ -51,14 +51,13 @@ public record AccessWidenerAnalyzeVisitorProvider(ClassTweaker accessWidener) im
+ 		accessWidener.visitHeader(namespace);
+ 
+ 		for (Path modJar : modJars) {
+-			final var accessWidenerData = AccessWidenerUtils.readAccessWidenerData(modJar, platform);
+-
+-			if (accessWidenerData == null) {
+-				continue;
++			// 一个 mod 可声明多条 class tweaker（schema v2），它们都要进同一份分析器：
++			// 分析阶段只回答「哪些成员必须保持可访问」，与环境无关，且允许多条声明覆盖同一成员。
++			// 每个文件各自建一个 reader：reader 只读一条流，读完即终止。
++			for (AccessWidenerUtils.AccessWidenerData accessWidenerData : AccessWidenerUtils.readAccessWideners(modJar, platform)) {
++				final var reader = ClassTweakerReader.create(new ClassTweakerRemapFilter(accessWidener));
++				reader.read(accessWidenerData.content());
+ 			}
+-
+-			final var reader = ClassTweakerReader.create(new ClassTweakerRemapFilter(accessWidener));
+-			reader.read(accessWidenerData.content());
+ 		}
+ 
+ 		return new AccessWidenerAnalyzeVisitorProvider(accessWidener);
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/AccessWidenerUtils.java b/src/main/java/net/fabricmc/loom/configuration/mods/AccessWidenerUtils.java
+index 22caeb8c23bb88a469ac7ee163774abdf96e539b..a2af2b6cb84d43a7a2421846deac8be79f6ed405 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/AccessWidenerUtils.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/AccessWidenerUtils.java
+@@ -26,7 +26,10 @@ package net.fabricmc.loom.configuration.mods;
+ 
+ import java.io.IOException;
+ import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.Comparator;
+ import java.util.List;
++import java.util.Map;
+ 
+ import org.objectweb.asm.commons.Remapper;
+ 
+@@ -36,6 +39,7 @@ import net.fabricmc.classtweaker.visitors.ClassTweakerRemapperVisitor;
+ import net.fabricmc.loom.util.ModPlatform;
+ import net.fabricmc.loom.util.fmj.FabricModJson;
+ import net.fabricmc.loom.util.fmj.FabricModJsonFactory;
++import net.fabricmc.loom.util.fmj.ModEnvironment;
+ import net.fabricmc.loom.util.fmj.ModMetadataFabricModJson;
+ 
+ public class AccessWidenerUtils {
+@@ -57,9 +61,25 @@ public class AccessWidenerUtils {
+ 		return writer.getOutput();
+ 	}
+ 
+-	public static AccessWidenerData readAccessWidenerData(Path inputJar, ModPlatform platform) throws IOException {
++	/**
++	 * 读取一个 mod jar 里声明的**全部** class tweaker（access widener）.
++	 *
++	 * <p>返回空列表表示「这个 jar 不需要处理」——不是 mod jar、Forge 系上不是 mods.toml 形态，
++	 * 或压根没有声明。调用方因此不必再区分 null 与空集合，只需判断是否为空。
++	 *
++	 * <p>为什么是列表而不是单条：schema v2 的 {@code classTweakers} 本来就是
++	 * 「jar 内路径 → 生效环境」的映射，一个 mod 声明多条是合法的（见
++	 * {@code FabricModJsonV2#getClassTweakers}）。把多条压成一条只有两种下场：要么丢掉后面的
++	 * 文件（它们的声音直接被忽略），要么把内容拼成一份（环境随之丢失，只在客户端生效的规则
++	 * 会跑到服务端去）。所以这里逐条返回，环境随条目一起带出。
++	 *
++	 * @param inputJar 待读取的 mod jar
++	 * @param platform 平台；决定「什么算 mod jar」以及是否接受 fabric.mod.json
++	 * @return 各条声明；有序（按 jar 内路径），无声明时为空列表
++	 */
++	public static List<AccessWidenerData> readAccessWideners(Path inputJar, ModPlatform platform) throws IOException {
+ 		if (!FabricModJsonFactory.isModJar(inputJar, platform)) {
+-			return null;
++			return List.of();
+ 		}
+ 
+ 		final FabricModJson fabricModJson = FabricModJsonFactory.createFromZip(inputJar);
+@@ -67,26 +87,57 @@ public class AccessWidenerUtils {
+ 		if (platform.isForgeLike() && !(fabricModJson instanceof ModMetadataFabricModJson)) {
+ 			// Ignore actual fabric.mod.json files on NeoForge and Forge.
+ 			// See https://github.com/architectury/architectury-loom/issues/165.
+-			return null;
++			return List.of();
+ 		}
+ 
+-		final List<String> classTweakers = List.copyOf(fabricModJson.getClassTweakers().keySet());
++		return readClassTweakers(fabricModJson);
++	}
++
++	/**
++	 * 把元数据里的 {@code classTweakers} 声明逐条展开成「路径 + 环境 + 头 + 内容」.
++	 *
++	 * <p>结果按 jar 内路径排序：schema v2 的声明表是 {@code HashMap}（见
++	 * {@code FabricModJsonV2#getConditionalConfigs}），按迭代顺序处理会让同一份元数据在不同
++	 * JVM 上得到不同顺序——写回 jar 的结果虽然等价，但任何按顺序展示或比较的输出都会抖动。
++	 *
++	 * <p>刻意保持 public：读取逻辑是本次改动的主体，单元测试要能在不落地真实 mod jar 的
++	 * 前提下直接覆盖它（与 {@code RemapModsTask#collectRemapClasspath} 同一种做法）。
++	 *
++	 * @param fabricModJson 已解析的元数据
++	 * @return 各条声明；有序（按 jar 内路径），无声明时为空列表
++	 */
++	public static List<AccessWidenerData> readClassTweakers(FabricModJson fabricModJson) throws IOException {
++		final Map<String, ModEnvironment> classTweakers = fabricModJson.getClassTweakers();
+ 
+ 		if (classTweakers.isEmpty()) {
+-			return null;
++			return List.of();
+ 		}
+ 
+-		if (classTweakers.size() != 1) {
+-			throw new UnsupportedOperationException("TODO: support multiple class tweakers");
+-		}
++		final List<AccessWidenerData> declarations = new ArrayList<>(classTweakers.size());
+ 
+-		final String accessWidenerPath = classTweakers.get(0);
+-		final byte[] accessWidener = fabricModJson.getSource().read(accessWidenerPath);
+-		final ClassTweakerReader.Header header = ClassTweakerReader.readHeader(accessWidener);
++		for (Map.Entry<String, ModEnvironment> classTweaker : classTweakers.entrySet()) {
++			final String path = classTweaker.getKey();
++			final byte[] content = fabricModJson.getSource().read(path);
++			final ClassTweakerReader.Header header = ClassTweakerReader.readHeader(content);
++			declarations.add(new AccessWidenerData(path, classTweaker.getValue(), header, content));
++		}
+ 
+-		return new AccessWidenerData(accessWidenerPath, header, accessWidener);
++		declarations.sort(Comparator.comparing(AccessWidenerData::path));
++		return List.copyOf(declarations);
+ 	}
+ 
+-	public record AccessWidenerData(String path, ClassTweakerReader.Header header, byte[] content) {
++	/**
++	 * 单个 class tweaker 声明.
++	 *
++	 * <p>{@code environment} 是元数据里给这条声明写的生效环境（只写路径时缺省为
++	 * {@link ModEnvironment#UNIVERSAL}）。它不参与重映射——规则文件只是名字改写，与环境无关
++	 * ——但它决定这条规则该在哪一侧生效，因此必须原样带出来，不能在读取时（{@code keySet()}）丢掉。
++	 *
++	 * @param path 规则文件在 jar 内的路径，也是写回 jar 时的落点
++	 * @param environment 该声明生效的环境
++	 * @param header 规则文件头（命名空间与版本）
++	 * @param content 规则文件内容
++	 */
++	public record AccessWidenerData(String path, ModEnvironment environment, ClassTweakerReader.Header header, byte[] content) {
+ 	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/core/ModJarPostProcess.java b/src/main/java/net/fabricmc/loom/core/ModJarPostProcess.java
+index 4518daa33ca5c28c964889fb416f2e8617506433..5a3c909bd19720342df355f901da10f19b0dea60 100644
+--- a/src/main/java/net/fabricmc/loom/core/ModJarPostProcess.java
++++ b/src/main/java/net/fabricmc/loom/core/ModJarPostProcess.java
+@@ -28,6 +28,7 @@ import java.io.ByteArrayInputStream;
+ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+ import java.nio.file.Path;
++import java.util.List;
+ import java.util.Map;
+ import java.util.jar.Manifest;
+ 
+@@ -58,16 +59,28 @@ public final class ModJarPostProcess {
+ 	}
+ 
+ 	/**
+-	 * 把重映射后的 access widener 写回 jar.
++	 * 把重映射后的 class tweaker 文件逐个写回 jar.
+ 	 *
+-	 * <p>{@code accessWidener} 为「已重映射的字节 + jar 内路径」；为空表示该 mod 不含 AW。
++	 * <p>{@code accessWideners} 是「已重映射的字节 + jar 内路径」的列表；为空（含 {@code null}）
++	 * 表示该 mod 不含声明。一个 mod 可以声明多个文件（schema v2 的 {@code classTweakers} 是映射），
++	 * 它们各有各的路径，所以必须一个条目写一次——把多条内容合成一份再写回，会让后写的那份盖掉
++	 * 前一份，jar 里只剩一个规则文件。
+ 	 */
+-	public static void replaceAccessWidener(Path jar, @Nullable Pair<byte[], String> accessWidener) throws IOException {
+-		if (accessWidener != null) {
++	public static void replaceAccessWideners(Path jar, @Nullable List<Pair<byte[], String>> accessWideners) throws IOException {
++		if (accessWideners == null) {
++			return;
++		}
++
++		for (Pair<byte[], String> accessWidener : accessWideners) {
+ 			ZipUtils.replace(jar, accessWidener.right(), accessWidener.left());
+ 		}
+ 	}
+ 
++	/** 单条声明的便捷形式：语义与 {@link #replaceAccessWideners} 完全相同，为既有调用方保留. */
++	public static void replaceAccessWidener(Path jar, @Nullable Pair<byte[], String> accessWidener) throws IOException {
++		replaceAccessWideners(jar, accessWidener == null ? List.of() : List.of(accessWidener));
++	}
++
+ 	/**
+ 	 * 去掉嵌套 jar 的元数据.
+ 	 *
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/RemapModsTask.java b/src/main/java/net/fabricmc/loom/pipeline/RemapModsTask.java
+index 57baaec629fe4ecceb775272f7ff7822d1a426d3..f52b3d114155fcd8cb7b44f10fa5d1ae169294f7 100644
+--- a/src/main/java/net/fabricmc/loom/pipeline/RemapModsTask.java
++++ b/src/main/java/net/fabricmc/loom/pipeline/RemapModsTask.java
+@@ -371,7 +371,8 @@ public abstract class RemapModsTask extends DefaultTask {
+ 		final Map<ModSpec, Path> outputs = new HashMap<>();
+ 		// 拆分依赖的另一半落位；只有 SPLIT 目标的 mod 在这张表里
+ 		final Map<ModSpec, Path> splitClients = new HashMap<>();
+-		final Map<ModSpec, Pair<byte[], String>> accessWideners = new HashMap<>();
++		// 一个 mod 可以声明多个 class tweaker（schema v2 的 classTweakers 是映射），因此是列表
++		final Map<ModSpec, List<Pair<byte[], String>>> accessWideners = new HashMap<>();
+ 
+ 		for (ModSpec mod : mods) {
+ 			outputs.put(mod, outputPath(mod));
+@@ -418,12 +419,24 @@ public abstract class RemapModsTask extends DefaultTask {
+ 				try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(output).build()) {
+ 					outputConsumer.addNonClassFiles(input, NonClassCopyMode.FIX_META_INF, remapper);
+ 
+-					final AccessWidenerUtils.AccessWidenerData awData = AccessWidenerUtils.readAccessWidenerData(input, getPlatform().get());
++					// 逐条重映射、逐条写回自己的路径：多条声明各有各的 jar 内路径，合成一份会把彼此覆盖。
++					//
++					// 这里**不**按环境筛选。产物是一份与项目无关、客户端与服务端开发环境共用的整体 jar
++					// （落在构建根共享的 remapped_mods 仓库，可能被其它项目直接复用），按单侧筛掉声明会让
++					// 另一侧读不到规则。环境的意义在「应用时」而不是「重映射时」：Minecraft jar 的处理链
++					// 与 loader 都按声明里的环境决定生效与否，规则文件本身只是名字改写。
++					final List<AccessWidenerUtils.AccessWidenerData> awData = AccessWidenerUtils.readAccessWideners(input, getPlatform().get());
+ 
+-					if (awData != null) {
+-						accessWideners.put(mod, new Pair<>(
+-								AccessWidenerUtils.remapAccessWidener(awData.content(), remapper.getEnvironment().getRemapper(), sourceNamespace, targetNamespace),
+-								awData.path()));
++					if (!awData.isEmpty()) {
++						final List<Pair<byte[], String>> remappedWideners = new ArrayList<>(awData.size());
++
++						for (AccessWidenerUtils.AccessWidenerData data : awData) {
++							remappedWideners.add(new Pair<>(
++									AccessWidenerUtils.remapAccessWidener(data.content(), remapper.getEnvironment().getRemapper(), sourceNamespace, targetNamespace),
++									data.path()));
++						}
++
++						accessWideners.put(mod, remappedWideners);
+ 					}
+ 
+ 					remapper.apply(outputConsumer, tags.get(mod));
+@@ -449,7 +462,7 @@ public abstract class RemapModsTask extends DefaultTask {
+ 			}
+ 
+ 			remappedMods++;
+-			ModJarPostProcess.replaceAccessWidener(output, accessWideners.get(mod));
++			ModJarPostProcess.replaceAccessWideners(output, accessWideners.get(mod));
+ 
+ 			final ModProcessorExtension.ModInfo modInfo = modInfos.get(mod);
+ 
+diff --git a/src/main/java/net/fabricmc/loom/util/fmj/ModEnvironment.java b/src/main/java/net/fabricmc/loom/util/fmj/ModEnvironment.java
+index aaa5316951acae21a74c5725ab77b4e95703f6b7..e8883e94b84cce57afe37f95fa01b809456f5538 100644
+--- a/src/main/java/net/fabricmc/loom/util/fmj/ModEnvironment.java
++++ b/src/main/java/net/fabricmc/loom/util/fmj/ModEnvironment.java
+@@ -49,6 +49,20 @@ public final class ModEnvironment {
+ 		return server;
+ 	}
+ 
++	/**
++	 * {@return 该环境在「包含客户端 / 包含服务端」这样的组合下是否生效}.
++	 *
++	 * <p>规则只有一条：上下文包含的那一侧出现在环境里，声明就生效。合并 jar（两侧都在）因此对
++	 * universal / client / server 全部生效；而 server-only 的上下文里 client 声明不生效——
++	 * 这正是 schema v2 允许每条 class tweaker 单独声明环境的意义。
++	 *
++	 * <p>集中在这里是为了让环境语义只有一份实现：{@code AccessWidenerJarProcessor} 的筛选与
++	 * 任何日后需要按侧筛选声明的地方都应当问同一个方法，而不是各写一遍。
++	 */
++	public boolean appliesTo(boolean includeClient, boolean includeServer) {
++		return (includeClient && client) || (includeServer && server);
++	}
++
+ 	@Override
+ 	public boolean equals(Object o) {
+ 		if (this == o) return true;
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/fmj/ModEnvironmentTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/fmj/ModEnvironmentTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..18c9365fd5c463b6c5483f3ced570b96a5849c12
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/fmj/ModEnvironmentTest.groovy
+@@ -0,0 +1,57 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.fmj
++
++import spock.lang.Specification
++
++import net.fabricmc.loom.util.fmj.ModEnvironment
++
++/**
++ * 声明环境与「当前上下文包含哪一侧」的匹配规则.
++ *
++ * <p>一个 mod 可以声明多个 class tweaker，每条各带环境；能声明多个之后，
++ * 「客户端声明不能在只有服务端的上下文里生效」就从约束变成了必须被验证的行为。
++ */
++class ModEnvironmentTest extends Specification {
++	def "环境匹配"(ModEnvironment environment, boolean client, boolean server) {
++		expect:
++		environment.appliesTo(client, server) == expected
++
++		where:
++		environment              | client | server || expected
++		// 合并 jar（两侧都在）——全部生效
++		ModEnvironment.UNIVERSAL | true   | true   || true
++		ModEnvironment.CLIENT    | true   | true   || true
++		ModEnvironment.SERVER    | true   | true   || true
++		// 只有客户端——服务端声明不得串过来
++		ModEnvironment.UNIVERSAL | true   | false  || true
++		ModEnvironment.CLIENT    | true   | false  || true
++		ModEnvironment.SERVER    | true   | false  || false
++		// 只有服务端——客户端声明不得串过来
++		ModEnvironment.UNIVERSAL | false  | true   || true
++		ModEnvironment.CLIENT    | false  | true   || false
++		ModEnvironment.SERVER    | false  | true   || true
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/mods/AccessWidenerUtilsTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/mods/AccessWidenerUtilsTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..244a5dd7844d77bc8cc2ae5122222e7bdd86b16f
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/mods/AccessWidenerUtilsTest.groovy
+@@ -0,0 +1,194 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.mods
++
++import java.nio.charset.StandardCharsets
++
++import spock.lang.Specification
++
++import net.fabricmc.loom.configuration.mods.AccessWidenerUtils
++import net.fabricmc.loom.core.ModJarPostProcess
++import net.fabricmc.loom.util.ModPlatform
++import net.fabricmc.loom.util.Pair
++import net.fabricmc.loom.util.ZipUtils
++import net.fabricmc.loom.util.fmj.FabricModJson
++import net.fabricmc.loom.util.fmj.FabricModJsonSource
++import net.fabricmc.loom.util.fmj.ModEnvironment
++
++/**
++ * 一个 mod 声明多个 class tweaker（schema v2 的 {@code classTweakers} 是「路径 → 环境」映射）.
++ *
++ * <p>改造前这条路径只接受单条，第二条直接抛 {@code UnsupportedOperationException}（构建崩掉）。
++ * 这里同时盯两件事：多的能被逐条读出来；单条的结果与改造前逐字段一致（回归底线）。
++ */
++class AccessWidenerUtilsTest extends Specification {
++	private static final String UNIVERSAL_AW = "accessWidener\tv2\tnamed\naccessible\tmethod\tnet/minecraft/class_1\t()V\n"
++	private static final String CLIENT_AW = "accessWidener\tv2\tnamed\naccessible\tfield\tnet/minecraft/client/class_2\tf\tI\n"
++	private static final String SERVER_AW = "accessWidener\tv2\tnamed\naccessible\tmethod\tnet/minecraft/server/class_3\tm\t()V\n"
++
++	def "单条声明：路径、环境、头、内容与改造前一致"() {
++		given:
++		def mod = mockMod(["test.accesswidener": ModEnvironment.UNIVERSAL], ["test.accesswidener": UNIVERSAL_AW])
++
++		when:
++		def declarations = AccessWidenerUtils.readClassTweakers(mod)
++
++		then:
++		declarations.size() == 1
++		with(declarations[0]) {
++			path() == "test.accesswidener"
++			environment() == ModEnvironment.UNIVERSAL
++			header().getNamespace() == "named"
++			new String(content(), StandardCharsets.UTF_8) == UNIVERSAL_AW
++		}
++	}
++
++	def "多条声明：逐条返回，环境不丢、顺序稳定"() {
++		given:
++		// 刻意乱序传入：schema v2 的声明表是 HashMap，按迭代顺序处理会让输出在 JVM 间抖动
++		def mod = mockMod([
++			"server.ct": ModEnvironment.SERVER,
++			"client.ct": ModEnvironment.CLIENT,
++			"universal.ct": ModEnvironment.UNIVERSAL
++		], [
++			"server.ct": SERVER_AW,
++			"client.ct": CLIENT_AW,
++			"universal.ct": UNIVERSAL_AW
++		])
++
++		when:
++		def declarations = AccessWidenerUtils.readClassTweakers(mod)
++
++		then: "三条都在，且按 jar 内路径排序"
++		declarations*.path() == [
++			"client.ct",
++			"server.ct",
++			"universal.ct"
++		]
++
++		and: "环境随条目带出（改造前被 keySet() 丢掉了）"
++		declarations*.environment() == [
++			ModEnvironment.CLIENT,
++			ModEnvironment.SERVER,
++			ModEnvironment.UNIVERSAL
++		]
++
++		and: "每条拿到的都是自己那份内容，没有串到别的文件"
++		new String(declarations.find { it.path() == "client.ct" }.content(), StandardCharsets.UTF_8) == CLIENT_AW
++		new String(declarations.find { it.path() == "server.ct" }.content(), StandardCharsets.UTF_8) == SERVER_AW
++	}
++
++	def "没有任何声明：空列表"() {
++		given:
++		def mod = Mock(FabricModJson.Mockable)
++		mod.getClassTweakers() >> [:]
++
++		expect:
++		AccessWidenerUtils.readClassTweakers(mod).isEmpty()
++	}
++
++	def "真实 jar：schema v2 的两条声明不再抛异常"() {
++		given: "一个真的 mod jar，classTweakers 里两条（客户端 + 通用）"
++		def jar = createModJar("""
++{
++	"schemaVersion": 2,
++	"id": "multi-tweaker-test",
++	"version": "1.0.0",
++	"classTweakers": [
++		{"config": "client.ct", "environment": "client"},
++		"universal.ct"
++	]
++}
++""", ["client.ct": CLIENT_AW, "universal.ct": UNIVERSAL_AW])
++
++		when:
++		def declarations = AccessWidenerUtils.readAccessWideners(jar.toPath(), ModPlatform.FABRIC)
++
++		then:
++		declarations*.path() == ["client.ct", "universal.ct"]
++		declarations*.environment() == [
++			ModEnvironment.CLIENT,
++			ModEnvironment.UNIVERSAL
++		]
++		new String(declarations[0].content(), StandardCharsets.UTF_8) == CLIENT_AW
++	}
++
++	def "非 mod jar：空列表"() {
++		given:
++		def dir = File.createTempDir()
++		new File(dir, "hello.txt").text = "not a mod"
++		def jar = File.createTempFile("loom-not-a-mod", ".jar")
++		ZipUtils.pack(dir.toPath(), jar.toPath())
++
++		expect:
++		AccessWidenerUtils.readAccessWideners(jar.toPath(), ModPlatform.FABRIC).isEmpty()
++	}
++
++	def "多个声明逐个写回 jar，互不覆盖"() {
++		given: "jar 里两份旧内容"
++		def dir = File.createTempDir()
++		new File(dir, "client.ct").text = "old client"
++		new File(dir, "server.ct").text = "old server"
++		def jar = File.createTempFile("loom-multi-tweaker-write", ".jar").toPath()
++		ZipUtils.pack(dir.toPath(), jar)
++
++		when:
++		ModJarPostProcess.replaceAccessWideners(jar, [
++			new Pair<>(CLIENT_AW.getBytes(StandardCharsets.UTF_8), "client.ct"),
++			new Pair<>(SERVER_AW.getBytes(StandardCharsets.UTF_8), "server.ct")
++		])
++
++		then: "两份各写各的路径，后者没有盖掉前者"
++		new String(ZipUtils.unpack(jar, "client.ct"), StandardCharsets.UTF_8) == CLIENT_AW
++		new String(ZipUtils.unpack(jar, "server.ct"), StandardCharsets.UTF_8) == SERVER_AW
++
++		when: "空列表（该 mod 不含声明）等同于不做任何事"
++		ModJarPostProcess.replaceAccessWideners(jar, null)
++
++		then:
++		new String(ZipUtils.unpack(jar, "client.ct"), StandardCharsets.UTF_8) == CLIENT_AW
++	}
++
++	private FabricModJson mockMod(Map<String, ModEnvironment> classTweakers, Map<String, String> contents) {
++		def mod = Mock(FabricModJson.Mockable)
++		mod.getClassTweakers() >> classTweakers
++		// 规则文件内容由读取方按路径去取，这里用一张按路径查表的来源代替真实 jar
++		mod.getSource() >> ({ String path -> contents[path].getBytes(StandardCharsets.UTF_8) } as FabricModJsonSource)
++		return mod
++	}
++
++	private File createModJar(String fabricModJson, Map<String, String> entries) {
++		def dir = File.createTempDir()
++		new File(dir, "fabric.mod.json").setText(fabricModJson, StandardCharsets.UTF_8.name())
++
++		entries.each { name, content ->
++			new File(dir, name).setText(content, StandardCharsets.UTF_8.name())
++		}
++
++		def jar = File.createTempFile("loom-multi-tweaker", ".jar")
++		ZipUtils.pack(dir.toPath(), jar.toPath())
++		return jar
++	}
++}

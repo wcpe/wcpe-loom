@@ -1,0 +1,81 @@
+From b212fdf57fe5dc16659e0133597d87ba47e86eab Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Wed, 25 Nov 2026 01:38:06 +0800
+Subject: [PATCH 135/147] =?UTF-8?q?fix(forge):=20=E5=90=8C=E6=97=B6?=
+ =?UTF-8?q?=E4=BF=9D=E7=95=99=E6=97=A7=E5=90=AF=E5=8A=A8=E5=99=A8=E4=B8=8E?=
+ =?UTF-8?q?=E8=87=AA=E5=AE=9A=E4=B9=89=E6=B7=B7=E5=85=A5=E6=98=A0=E5=B0=84?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+旧版启动器独立消费运行时映射；指定混入映射时不能用它替代前者，补集成用例校验两项属性。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: legacy-forge-dli-mixin-mappings
+
+diff --git a/src/main/java/net/fabricmc/loom/task/launch/GenerateDLIConfigTask.java b/src/main/java/net/fabricmc/loom/task/launch/GenerateDLIConfigTask.java
+index 4df7e4a7af7222e1f13c6146dad14a7232ac61f1..fe34d85e0839b2559e58e4d82270769ae41dac0f 100644
+--- a/src/main/java/net/fabricmc/loom/task/launch/GenerateDLIConfigTask.java
++++ b/src/main/java/net/fabricmc/loom/task/launch/GenerateDLIConfigTask.java
+@@ -291,11 +291,14 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
+ 
+ 				if (hasPlatformMappingFile) {
+ 					if (forgeInputs.useCustomMixin()) {
+-						// See mixin remapper service in forge-runtime
++						// Architectury 的 Mixin 重映射服务读取这两个属性。
+ 						launchConfig
+ 								.property("architectury.mixinRemapper.sourceNamespace", Objects.requireNonNull(intermediateNs))
+ 								.property("architectury.mixinRemapper.mappingsPath", Objects.requireNonNull(mappingsPath));
+-					} else {
++					}
++
++					// FG2 自身也读取该映射来查找开发环境中的类，与 Mixin 实现无关。
++					if (forgeInputs.legacyForge() || !forgeInputs.useCustomMixin()) {
+ 						launchConfig.property("net.minecraftforge.gradle.GradleStart.srg.srg-mcp", Objects.requireNonNull(forgeInputs.srgToNamedSrg()));
+ 					}
+ 				}
+@@ -401,6 +404,7 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
+ 			String legacyDataGenDir,
+ 			Set<String> mixinConfigs,
+ 			boolean useCustomMixin,
++			boolean legacyForge,
+ 			@Nullable String srgToNamedSrg
+ 	) implements Serializable {
+ 		public ForgeInputs(Project project, LoomGradleExtension extension) {
+@@ -409,6 +413,7 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
+ 					project.file("src/generated/resources").getAbsolutePath(),
+ 					extension.getForge().getMixinConfigs().get(),
+ 					extension.getForge().getUseCustomMixin().get(),
++					extension.isLegacyForge(),
+ 					!extension.disableObfuscation() ? extension.getMappingConfiguration().srgToNamedSrg.toAbsolutePath().toString() : null
+ 			);
+ 		}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/forge/legacy/LegacyForgeExternalModDependencyTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/forge/legacy/LegacyForgeExternalModDependencyTest.groovy
+index 9e3f9117a162ade13cc0968bcc5dd8822f01486b..d114d20a02e484a8849c4e79c85e3494454b52f8 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/forge/legacy/LegacyForgeExternalModDependencyTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/forge/legacy/LegacyForgeExternalModDependencyTest.groovy
+@@ -58,6 +58,23 @@ class LegacyForgeExternalModDependencyTest extends Specification implements Grad
+ 		version << STANDARD_TEST_VERSIONS
+ 	}
+ 
++	def "FG2 launcher keeps both Forge and custom Mixin mappings"() {
++		given:
++		def gradle = gradleProject(project: "forge/legacy/externalModDependency")
++
++		when:
++		def result = gradle.run(task: "generateDLIConfig")
++		def dliConfig = new File(gradle.projectDir.toString(), ".gradle/loom-cache/launch.cfg").text
++		def legacyMappingKey = "net.minecraftforge.gradle.GradleStart.srg.srg-mcp="
++		def legacyMapping = dliConfig.readLines().find { it.trim().startsWith(legacyMappingKey) }
++
++		then:
++		result.task(":generateDLIConfig").outcome == SUCCESS
++		dliConfig.contains("architectury.mixinRemapper.mappingsPath=")
++		legacyMapping != null
++		new File(legacyMapping.trim().substring(legacyMappingKey.length())).isFile()
++	}
++
+ 	/**
+ 	 * userdev3 的归一发生在配置期（依赖解析本身就在 afterEvaluate），
+ 	 * 因此配置缓存必须能完整复用，而不能在后续运行时重新解析或改写。

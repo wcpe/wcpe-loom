@@ -1,0 +1,45 @@
+From 9f28af8500ecb3e3629cf455826f8d6ae79ce8bb Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:31 +0800
+Subject: [PATCH 020/147] =?UTF-8?q?fix(build):=20=E8=A1=A5=E5=9B=9E=20chec?=
+ =?UTF-8?q?kstyle=20=E6=8A=91=E5=88=B6=E8=BF=87=E6=BB=A4=E5=99=A8=E5=B9=B6?=
+ =?UTF-8?q?=E4=BF=AE=E6=AD=A3=20javadoc=20=E6=A0=BC=E5=BC=8F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+checkstyle.xml 缺 SuppressionCommentFilter，导致源码里的 //CHECKSTYLE:OFF 全部失效。
+
+Origin: backport, essential dev/1.15
+Forwarded: not-needed
+
+diff --git a/checkstyle.xml b/checkstyle.xml
+index 3783b8f0f464873a00d4776b2893fc778aa9c558..3790c928a136d5706e8b9b5c4ee9157fabe05b85 100644
+--- a/checkstyle.xml
++++ b/checkstyle.xml
+@@ -61,6 +61,8 @@
+ 	</module>
+ 
+ 	<module name="TreeWalker">
++		<module name="SuppressionCommentFilter"/>
++
+ 		<!-- Ensure all imports are ship shape -->
+ 		<module name="AvoidStarImport"/>
+ 		<module name="IllegalImport"/>
+diff --git a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+index 6afa45e003f287c8eeb05fd5c080224cc9682a69..e9dfc3b9fa870547223b4a63e00d832610633f96 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+@@ -304,9 +304,9 @@ public abstract class CompileConfiguration implements Runnable {
+ 	}
+ 
+ 	/**
+-	 * 跨进程供给已映射的 Minecraft jar。
+-	 * <p>
+-	 * getGlobalLockObject 只覆盖 JVM 内（同一 daemon 的多个 classloader），多个 daemon 并发构建同一版本时
++	 * 跨进程供给已映射的 Minecraft jar.
++	 *
++	 * <p>getGlobalLockObject 只覆盖 JVM 内（同一 daemon 的多个 classloader），多个 daemon 并发构建同一版本时
+ 	 * 仍会同时生产共享缓存产物并互相踩踏；因此按 Minecraft 版本 + 映射标识叠加一把 per-key 跨进程文件锁，
+ 	 * 不同版本仍可并行。输出检查与重建必须同属一个事务，否则另一进程会在本项目读取 intermediary 时将它删除并重建。
+ 	 */

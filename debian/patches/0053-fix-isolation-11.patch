@@ -1,0 +1,1474 @@
+From e6eadf81ba779a7da4c2803c54ad1f1910d0e812 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:54 +0800
+Subject: [PATCH 053/147] =?UTF-8?q?fix(isolation):=20=E8=A1=A5=E9=BD=90?=
+ =?UTF-8?q?=E8=B7=A8=E9=A1=B9=E7=9B=AE=E6=95=B0=E6=8D=AE=E9=93=BE=E8=B7=AF?=
+ =?UTF-8?q?=E7=9A=84=E5=A4=B1=E6=95=88=E5=88=A4=E6=8D=AE=E4=B8=8E=E9=9D=99?=
+ =?UTF-8?q?=E9=BB=98=E9=99=8D=E7=BA=A7=20(#11)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+PR #9 新建的跨项目数据链路上失效判据缺失、静默降级与误导性文档并存，合起来可在特定时序下产生静默错误的跨项目产物。
+
+失效判据：ExportLoomProjectDataTask 原先标了 @CacheableTask 却只有 @OutputFile，共享缓存下可能把别的项目的 project-data.json 还原过来，改为补齐全部输入（项目路径、mod 元数据、mappingId、命名空间、mixin 映射路径）；ForgeSourcesService 配置期不再消费预解压目录（只可能是上次构建或其它 Forge 版本遗留）。
+
+静默降级：LoomProjectData 的 read/fromDependency 改为「没有」与「损坏」可区分（Optional + warn + 上抛），消费方不再把读取失败当成「这个依赖不是 Loom 项目」而静默丢弃依赖方的 mod 与 mixin 映射；TaskCompleter 新增失败容忍能力并逐点分类 9 个调用点（best-effort 汇总 warn，重映射器输入、stripped.jar、migrated-fields.json 保持致命）；DownloadSourcesHook 空 catch 与 MavenPublication 反射失败补诊断。
+
+语义修正：LoomProjectData 补按 projectPath 的 equals/hashCode（此前 distinct/contains 依赖对象同一性，走文件回退时交集变空）；fromMod 不再为非 FMJ 元数据伪造 schemaVersion；ExtractArchiveFilesTask 的 includeSuffixes 零参语义反转改为编译错误；ForgeRunTemplate 删掉重复注入的 programArguments（反编译 dev-launch-injector 确认其 Main 会合并两处来源）。
+
+验证：build -x test、LoomProjectDataTest 4/4、SpecContextTest 5/5、ForgeIsolatedProjectsTest 实跑 PASSED。CI 72 项通过 0 失败。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/dev/architectury/loom/forge/FieldMappingsMigrator.java b/src/main/java/dev/architectury/loom/forge/FieldMappingsMigrator.java
+index e3b3d7581851fdce103b38a15486864e09858548..f83cbd97a23ca08d24f27d0cc4e1034b7edf32ed 100644
+--- a/src/main/java/dev/architectury/loom/forge/FieldMappingsMigrator.java
++++ b/src/main/java/dev/architectury/loom/forge/FieldMappingsMigrator.java
+@@ -166,6 +166,9 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
+ 
+ 	private static Map<FieldMember, String> generateNewFieldMigration(Path patchedJar, String patchedJarNamespace, Path mappingsPath) throws IOException {
+ 		Map<FieldMember, String> fieldDescriptorMap = new ConcurrentHashMap<>();
++		// 这里刻意保持「失败即致命」：扫描结果会被写成 migrated-fields.json 并用于改写映射本身，
++		// 任何一个类读不出来都意味着它的字段描述符不会被迁移，而错误结果还会被缓存下来。
++		// 也就是说这类失败会让产物静默出错，而不是像源码包那样只少一个无关文件。
+ 		ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter();
+ 
+ 		class Visitor extends ClassVisitor {
+diff --git a/src/main/java/dev/architectury/loom/forge/ForgeSourcesService.java b/src/main/java/dev/architectury/loom/forge/ForgeSourcesService.java
+index 8f5da0473b8613e71747a6f27f3a2aad179fe78f..be3f51b0ffc3c4074ab63a3811900827343d9a6f 100644
+--- a/src/main/java/dev/architectury/loom/forge/ForgeSourcesService.java
++++ b/src/main/java/dev/architectury/loom/forge/ForgeSourcesService.java
+@@ -15,6 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.function.BiConsumer;
+ import java.util.function.Predicate;
++import java.util.stream.Stream;
+ 
+ import dev.architectury.loom.forge.tool.ForgeToolExecutor;
+ import dev.architectury.loom.util.DependencyDownloader;
+@@ -57,7 +58,12 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 
+ 	public interface Options extends Service.Options {
+ 		/**
+-		 * 仍以归档形态提供的 Forge 源码包，仅在未接入声明式解压任务时作为回退.
++		 * Forge 安装器源码包（归档形态）.
++		 *
++		 * <p>由 {@link #createOptions(Project)} 无条件声明，因此始终参与任务输入哈希，
++		 * 并不是「只有未接入声明式解压时才存在」的可选项。归档只在两种情况下真正被解压：
++		 * 没有可用的 {@link #getForgeSourceDirectories()}，或调用方明确要求走归档路径
++		 * （例如配置期，见 {@link #addForgeSourcesDuringProjectConfiguration(Project, ServiceFactory)}）。
+ 		 */
+ 		@Optional
+ 		@InputFiles
+@@ -65,11 +71,13 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 		ConfigurableFileCollection getForgeSourceJars();
+ 
+ 		/**
+-		 * 由声明式解压任务预先展开的 Forge 源码目录.
++		 * 由声明式解压任务（{@code extractForgeSources}）预先展开的 Forge 源码目录.
+ 		 *
+-		 * <p>含目录本身的构建依赖（{@code getBuiltBy()}），因此任务指纹会追踪生产者，
+-		 * 调用方无需额外声明 {@code dependsOn}。使用 {@link PathSensitivity#RELATIVE}
+-		 * 以“目录内容”语义参与输入哈希，避免缓存目录绝对路径变化引起无谓重跑。
++		 * <p>这里只是按构建目录约定声明出来的路径，<b>不含</b> {@code getBuiltBy()} 一类构建依赖：
++		 * 任务依赖由 {@code genSources} / {@code genForgePatchedSources} 自己声明，
++		 * 所以配置期调用方不能消费它（那时的目录只可能来自上一次构建），必须改走归档路径。
++		 * 使用 {@link PathSensitivity#RELATIVE} 以「目录内容」语义参与输入哈希，
++		 * 避免缓存目录绝对路径变化引起无谓重跑。
+ 		 */
+ 		@Optional
+ 		@InputFiles
+@@ -151,14 +159,40 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 
+ 		if (!Files.exists(sourcesJar)) {
+ 			final ForgeSourcesService service = serviceFactory.get(createOptions(project));
+-			service.addForgeSources(minecraftJar, sourcesJar);
++			// 配置期必须走归档路径：此时 extractForgeSources 还没有在本构建执行过（它是 genSources 的依赖），
++			// build/loom/forgeSources 里若有内容，只可能是上一次构建、甚至另一个 Forge 版本遗留的目录。
++			// 直接消费它会把旧版本的源码静默写进新生成的 *-sources.jar。
++			service.addForgeSources(minecraftJar, sourcesJar, false);
+ 		}
+ 	}
+ 
++	/**
++	 * 把 Forge 源码写入目标源码包，允许消费预解压目录.
++	 *
++	 * @param minecraftJar 用作类过滤依据的 Minecraft jar；为 {@code null} 时跳过「源码是否存在于输入 jar」的检查
++	 * @param sourcesJar 目标源码包
++	 * @throws IOException 读写源码包失败
++	 */
+ 	public void addForgeSources(@Nullable Path minecraftJar, Path sourcesJar) throws IOException {
++		addForgeSources(minecraftJar, sourcesJar, true);
++	}
++
++	/**
++	 * 把 Forge 源码写入目标源码包.
++	 *
++	 * @param minecraftJar 用作类过滤依据的 Minecraft jar；为 {@code null} 时跳过「源码是否存在于输入 jar」的检查
++	 * @param sourcesJar 目标源码包
++	 * @param usePreExtractedSources 是否允许消费 {@link Options#getForgeSourceDirectories()} 预解压目录。
++	 *         只有<b>同一次构建里</b>已经声明并执行了生产者任务（{@code extractForgeSources}）的调用方才能传
++	 *         {@code true}；配置期调用必须传 {@code false}，否则会读到上一次构建遗留的、属于旧 Forge 版本的源码。
++	 * @throws IOException 读写源码包失败
++	 */
++	public void addForgeSources(@Nullable Path minecraftJar, Path sourcesJar, boolean usePreExtractedSources) throws IOException {
+ 		try (FileSystemUtil.Delegate inputFs = minecraftJar == null ? null : FileSystemUtil.getJarFileSystem(minecraftJar, true);
+ 				FileSystemUtil.Delegate outputFs = FileSystemUtil.getJarFileSystem(sourcesJar, true)) {
+-			ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter();
++			// best-effort：目标是给 IDE 看的源码包，个别文件写不进去只会少一个源文件，
++			// 不应该让整个 genSources 失败（与下面 failedToRemap 的处理保持一致）。
++			ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter().tolerateFailures();
+ 
+ 			provideForgeSources(path -> {
+ 				Path inputPath = inputFs == null ? null : inputFs.get().getPath(path.replace(".java", ".class"));
+@@ -184,13 +218,21 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 					LOGGER.info("Added forge source file {}", path);
+ 					Files.write(fsPath, bytes, StandardOpenOption.CREATE);
+ 				});
+-			});
++			}, usePreExtractedSources);
+ 
+-			taskCompleter.complete();
++			taskCompleter.completeToleratingFailures("forge source files for " + sourcesJar);
+ 		}
+ 	}
+ 
+-	private void provideForgeSources(Predicate<String> classFilter, BiConsumer<String, byte[]> consumer) throws IOException {
++	/**
++	 * 产出 Forge 源码，逐个交给 {@code consumer}.
++	 *
++	 * @param classFilter 源码路径过滤器
++	 * @param consumer 消费源码的处理器
++	 * @param usePreExtractedSources 是否允许消费预解压目录。允许时由调用方保证生产者任务已在本构建执行过，
++	 *         否则目录可能是上一次构建的遗留物（本方法只检查目录是否存在，无法判断它属于哪个 Forge 版本）。
++	 */
++	private void provideForgeSources(Predicate<String> classFilter, BiConsumer<String, byte[]> consumer, boolean usePreExtractedSources) throws IOException {
+ 		List<Path> forgeInstallerSources = new ArrayList<>();
+ 
+ 		for (File file : getOptions().getForgeSourceJars()) {
+@@ -201,16 +243,24 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 		LOGGER.lifecycle(":found {} forge source jars", forgeInstallerSources.size());
+ 		Map<String, byte[]> forgeSources;
+ 
+-		final List<Path> extractedDirectories = getOptions().getForgeSourceDirectories().getFiles().stream()
+-				.map(File::toPath)
+-				.filter(Files::isDirectory)
+-				.toList();
++		final List<Path> extractedDirectories = usePreExtractedSources
++				? getOptions().getForgeSourceDirectories().getFiles().stream()
++						.map(File::toPath)
++						.filter(Files::isDirectory)
++						.toList()
++				: List.of();
+ 
+ 		if (!extractedDirectories.isEmpty()) {
+-			// 优先消费声明式解压任务的输出目录：归档解压已被 Gradle 缓存，这里只做目录遍历。
++			// 消费声明式解压任务的输出目录：归档解压已被 Gradle 缓存，这里只做目录遍历。
+ 			LOGGER.lifecycle(":using {} pre-extracted forge source directories", extractedDirectories.size());
+ 			forgeSources = readExtractedSources(extractedDirectories);
+ 		} else {
++			if (usePreExtractedSources) {
++				LOGGER.info("No pre-extracted forge source directory found, falling back to extracting the source jars");
++			} else {
++				LOGGER.info("Reading forge sources from the source jars instead of the pre-extracted directories");
++			}
++
+ 			forgeSources = extractSources(forgeInstallerSources);
+ 		}
+ 
+@@ -233,6 +283,7 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 		Files.delete(tmpOutput);
+ 
+ 		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(tmpInput, true)) {
++			// 这里必须致命：tmpInput 是重映射器的输入，少一个条目会让重映射结果整体不可信。
+ 			ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter();
+ 
+ 			for (Map.Entry<String, byte[]> entry : sources.entrySet()) {
+@@ -272,7 +323,9 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 		final AtomicInteger failedToRemap = new AtomicInteger();
+ 
+ 		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getReadOnlyJarFileSystem(tmpOutput)) {
+-			ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter();
++			// best-effort：「重映射后消失」与「读不回来」都属于个别源文件的问题，
++			// 少几个文件不影响整体源码包的有效性。
++			ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter().tolerateFailures();
+ 
+ 			for (Map.Entry<String, byte[]> entry : new HashSet<>(sources.entrySet())) {
+ 				taskCompleter.add(() -> {
+@@ -288,7 +341,7 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 				});
+ 			}
+ 
+-			taskCompleter.complete();
++			taskCompleter.completeToleratingFailures("remapped forge source files");
+ 		}
+ 
+ 		if (failedToRemap.get() > 0) {
+@@ -300,7 +353,9 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 
+ 	private static Map<String, byte[]> extractSources(List<Path> forgeInstallerSources) throws IOException {
+ 		Map<String, byte[]> sources = new ConcurrentHashMap<>();
+-		ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter();
++		// best-effort：逐个源文件读取，个别文件读不出来只应该少一个源文件。
++		// 注意 onComplete 中关闭 jar 文件系统的失败依然是致命的，见 completeToleratingFailures。
++		ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter().tolerateFailures();
+ 
+ 		for (Path path : forgeInstallerSources) {
+ 			FileSystemUtil.Delegate system = FileSystemUtil.getReadOnlyJarFileSystem(path);
+@@ -313,7 +368,7 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 			}
+ 		}
+ 
+-		taskCompleter.complete();
++		taskCompleter.completeToleratingFailures("forge source files in the source jars");
+ 		return sources;
+ 	}
+ 
+@@ -325,20 +380,24 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 	 */
+ 	static Map<String, byte[]> readExtractedSources(List<Path> extractedDirectories) throws IOException {
+ 		Map<String, byte[]> sources = new ConcurrentHashMap<>();
+-		ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter();
++		// best-effort：与 extractSources 同理，个别源文件读不出来不应该让整个 genSources 失败。
++		ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter().tolerateFailures();
+ 
+ 		for (Path directory : extractedDirectories) {
+-			for (Path filePath : (Iterable<? extends Path>) Files.walk(directory)::iterator) {
+-				if (!Files.isRegularFile(filePath) || !filePath.getFileName().toString().endsWith(".java")) {
+-					continue;
+-				}
++			// Files.walk 持有目录句柄，必须显式关闭（这里用 try-with-resources），否则每次调用都会泄漏一个句柄。
++			try (Stream<Path> stream = Files.walk(directory)) {
++				for (Path filePath : (Iterable<? extends Path>) stream::iterator) {
++					if (!Files.isRegularFile(filePath) || !filePath.getFileName().toString().endsWith(".java")) {
++						continue;
++					}
+ 
+-				final String key = "/" + directory.relativize(filePath).toString().replace(File.separatorChar, '/');
+-				taskCompleter.add(() -> sources.put(key, Files.readAllBytes(filePath)));
++					final String key = "/" + directory.relativize(filePath).toString().replace(File.separatorChar, '/');
++					taskCompleter.add(() -> sources.put(key, Files.readAllBytes(filePath)));
++				}
+ 			}
+ 		}
+ 
+-		taskCompleter.complete();
++		taskCompleter.completeToleratingFailures("pre-extracted forge source files");
+ 		return sources;
+ 	}
+ }
+diff --git a/src/main/java/dev/architectury/loom/forge/config/ForgeRunTemplate.java b/src/main/java/dev/architectury/loom/forge/config/ForgeRunTemplate.java
+index 4bc69297d6a53e557cc48501f32c9cce336d3a97..b8c1e7c5ddbf880eb90f46e092e3c27a1775f968 100644
+--- a/src/main/java/dev/architectury/loom/forge/config/ForgeRunTemplate.java
++++ b/src/main/java/dev/architectury/loom/forge/config/ForgeRunTemplate.java
+@@ -109,7 +109,10 @@ public record ForgeRunTemplate(
+ 
+ 	public void applyTo(RunConfiguration settings, ConfigValue.Resolver configValueResolver) {
+ 		settings.getMainClass().convention(main);
+-		settings.getProgramArguments().addAll(CollectionUtil.map(args, value -> value.resolve(configValueResolver)));
++		// 这里刻意不把 args 写进 programArguments：同一批 args 已经由 GenerateDLIConfigTask 写进
++		// dev-launcher-config.json 的 commonArgs/<env>Args，而 DLI（fabric.dli.main 的入口）在启动时会把
++		// 配置里的 args 插到命令行 args 之前一起传给真实主类——两处都写就会把同一组参数传两遍。
++		// 因此 Forge 运行参数只有 DLI 配置这一个来源，这里保持不动。
+ 		settings.getJvmArguments().addAll(CollectionUtil.map(jvmArgs, value -> value.resolve(configValueResolver)));
+ 
+ 		env.forEach((key, value) -> {
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
+index 2b4ffec245b4fb4380316b59d1ecfce6c0723670..e959e3933dc8a0000405b97dd79a0067a3c6b6e9 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
+@@ -361,7 +361,8 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 
+ 	private void modifyClasses(Path jarFile, Function<ClassVisitor, ClassVisitor> func) throws Exception {
+ 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jarFile, false)) {
+-			ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter();
++			// best-effort：逐类改写注解，单个类失败时保留该类原样即可，不应该让整个合并流程失败。
++			ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter().tolerateFailures();
+ 
+ 			for (Path file : (Iterable<? extends Path>) Files.walk(fs.getPath("/"))::iterator) {
+ 				if (!file.toString().endsWith(".class")) continue;
+@@ -381,7 +382,7 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 				});
+ 			}
+ 
+-			completer.complete();
++			completer.completeToleratingFailures("class modifications in " + jarFile.toAbsolutePath());
+ 		}
+ 	}
+ 
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+index a83d56924155f034aeb4dd5b9b8026452e2ebd2b..663cd8ab089800236b58d1fa1c8c0bab0c631675 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+@@ -639,7 +639,9 @@ public class MinecraftPatchedProvider {
+ 		Stopwatch stopwatch = Stopwatch.createStarted();
+ 
+ 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jarFile, false)) {
+-			ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter();
++			// best-effort：这里逐类修补注解，单个类解析/写入失败只应该让该类保持原样，
++			// 而不应该让整个 patched jar 流程在「已经改了一半」的状态下失败。
++			ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter().tolerateFailures();
+ 
+ 			for (Path file : (Iterable<? extends Path>) Files.walk(fs.getPath("/"))::iterator) {
+ 				if (!file.toString().endsWith(".class")) continue;
+@@ -662,7 +664,7 @@ public class MinecraftPatchedProvider {
+ 				});
+ 			}
+ 
+-			completer.complete();
++			completer.completeToleratingFailures("parameter annotation fixes in " + jarFile.toAbsolutePath());
+ 		}
+ 
+ 		logger.info(":fixed parameter annotations for " + jarFile.toAbsolutePath() + " in " + stopwatch.stop());
+@@ -673,7 +675,8 @@ public class MinecraftPatchedProvider {
+ 		Stopwatch stopwatch = Stopwatch.createStarted();
+ 
+ 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jarFile, false)) {
+-			ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter();
++			// best-effort：与 fixParameterAnnotation 同理，逐类改名，单类失败不应该让整个 jar 流程失败。
++			ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter().tolerateFailures();
+ 			Pattern vignetteParameters = Pattern.compile("p_[0-9a-zA-Z]+_(?:[0-9a-zA-Z]+_)?");
+ 
+ 			for (Path file : (Iterable<? extends Path>) Files.walk(fs.getPath("/"))::iterator) {
+@@ -716,7 +719,7 @@ public class MinecraftPatchedProvider {
+ 				});
+ 			}
+ 
+-			completer.complete();
++			completer.completeToleratingFailures("parameter name removals in " + jarFile.toAbsolutePath());
+ 		}
+ 
+ 		logger.info(":deleted parameter names for " + jarFile.toAbsolutePath() + " in " + stopwatch.stop());
+diff --git a/src/main/java/dev/architectury/loom/mcpconfig/steplogic/StripLogic.java b/src/main/java/dev/architectury/loom/mcpconfig/steplogic/StripLogic.java
+index 19af2d5b1e7eb57db787b6557195e7be958f02b6..61e13cc80ac1e8d9ad86139ced34f0fa7c1d8001 100644
+--- a/src/main/java/dev/architectury/loom/mcpconfig/steplogic/StripLogic.java
++++ b/src/main/java/dev/architectury/loom/mcpconfig/steplogic/StripLogic.java
+@@ -67,6 +67,8 @@ public final class StripLogic extends StepLogic<Service.Options> {
+ 
+ 		try (FileSystemUtil.Delegate output = FileSystemUtil.getJarFileSystem(context.setOutput("stripped.jar"), true)) {
+ 			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(input, false)) {
++				// 这里刻意保持「失败即致命」：stripped.jar 是本步骤的唯一产物，少一个类就是一个残缺的 jar，
++				// 后续编译会因此报出一堆与真实原因无关的错误，不如在源头失败。
+ 				ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter();
+ 
+ 				for (Path path : (Iterable<? extends Path>) Files.walk(fs.get().getPath("/"))::iterator) {
+diff --git a/src/main/java/dev/architectury/loom/metadata/ModMetadataFiles.java b/src/main/java/dev/architectury/loom/metadata/ModMetadataFiles.java
+index d19b372548d098ef38634ce49c456e0454aae113..fcad7f064dba7ed36541c501727ecabd00fe28e1 100644
+--- a/src/main/java/dev/architectury/loom/metadata/ModMetadataFiles.java
++++ b/src/main/java/dev/architectury/loom/metadata/ModMetadataFiles.java
+@@ -64,6 +64,18 @@ public final class ModMetadataFiles {
+ 		};
+ 	}
+ 
++	/**
++	 * 用内存中的原文重建模组元数据文件，供跨项目数据（{@code LoomProjectData}）在依赖方复原非 FMJ 形态.
++	 *
++	 * @param fileName {@link ModMetadataFile#getFileName()} 返回的文件名
++	 * @param bytes 元数据文件的原始内容
++	 * @return 重建的元数据文件；文件名不在已知范围内（例如带 {@code [erroring]} 后缀）时返回 {@code null}
++	 */
++	public static @Nullable ModMetadataFile fromBytes(String fileName, byte[] bytes) {
++		final Function<byte[], ModMetadataFile> factory = SINGLE_FILE_METADATA_TYPES.get(fileName);
++		return factory == null ? null : factory.apply(bytes);
++	}
++
+ 	/**
+ 	 * Reads the mod metadata file from a jar.
+ 	 *
+diff --git a/src/main/java/dev/architectury/loom/util/ThreadingUtils.java b/src/main/java/dev/architectury/loom/util/ThreadingUtils.java
+index e0e9fdd95ff948c3c6fbf2ed7f0f1a2ffa9eb486..d3719b83b6eaf5f5ef4b9dd5c6fe3a8018681316 100644
+--- a/src/main/java/dev/architectury/loom/util/ThreadingUtils.java
++++ b/src/main/java/dev/architectury/loom/util/ThreadingUtils.java
+@@ -27,6 +27,7 @@ package dev.architectury.loom.util;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
++import java.util.Collections;
+ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.concurrent.CompletableFuture;
+@@ -37,7 +38,12 @@ import java.util.concurrent.Future;
+ import java.util.function.Function;
+ import java.util.stream.Collectors;
+ 
++import org.gradle.api.logging.Logger;
++import org.gradle.api.logging.Logging;
++
+ public class ThreadingUtils {
++	private static final Logger LOGGER = Logging.getLogger(ThreadingUtils.class);
++
+ 	public static <T> void run(T[] values, UnsafeConsumer<T> action) {
+ 		run(Arrays.stream(values)
+ 				.<UnsafeRunnable>map(t -> () -> action.accept(t))
+@@ -138,6 +144,39 @@ public class ThreadingUtils {
+ 		List<CompletableFuture<?>> tasks = new ArrayList<>();
+ 		ExecutorService service = Executors.newFixedThreadPool(Math.max(1, Runtime.getRuntime().availableProcessors()));
+ 		List<UnsafeConsumer<Stopwatch>> completionListener = new ArrayList<>();
++		private final List<Throwable> failures = Collections.synchronizedList(new ArrayList<>());
++		private volatile boolean tolerateFailures;
++
++		/**
++		 * 把本 completer 切换为 best-effort 模式：单个任务失败只被收集，不再让 {@link #complete()} 上抛.
++		 *
++		 * <p>适用于「成千上万个互不依赖的条目、丢掉个别条目不影响产物整体有效性」的循环；
++		 * 必须在 {@link #add(UnsafeRunnable)} 之前调用。需要保证产物完整性的循环不要打开它。
++		 *
++		 * @return 本 completer
++		 */
++		public TaskCompleter tolerateFailures() {
++			this.tolerateFailures = true;
++			return this;
++		}
++
++		/**
++		 * 返回收集到的失败（best-effort 模式下才有内容）.
++		 *
++		 * @return 失败列表，顺序与完成顺序一致
++		 */
++		public List<Throwable> failures() {
++			return List.copyOf(failures);
++		}
++
++		/**
++		 * 返回失败的条目数量.
++		 *
++		 * @return 失败数量
++		 */
++		public int failureCount() {
++			return failures.size();
++		}
+ 
+ 		public TaskCompleter add(UnsafeRunnable job) {
+ 			if (!stopwatch.isRunning()) {
+@@ -148,6 +187,11 @@ public class ThreadingUtils {
+ 				try {
+ 					job.run();
+ 				} catch (Throwable throwable) {
++					if (tolerateFailures) {
++						failures.add(throwable);
++						return;
++					}
++
+ 					if (throwable instanceof RuntimeException runtimeException) {
+ 						throw runtimeException;
+ 					}
+@@ -168,6 +212,28 @@ public class ThreadingUtils {
+ 			return this;
+ 		}
+ 
++		/**
++		 * 以 best-effort 语义结束：先 {@link #complete()}，再把收集到的失败按 warn 级别汇总一次.
++		 *
++		 * <p>汇总使用默认可见的级别，避免「产物少了一些条目」这种事在默认控制台里完全看不见。
++		 * 注册在 {@link #onComplete(UnsafeConsumer)} 上的清理动作失败仍然会上抛：那属于资源释放失败，
++		 * 会直接影响产物完整性，不能降级。
++		 *
++		 * @param description 被处理对象的描述（例如「被打上注解的 jar」），用于日志
++		 * @return 收集到的失败数量
++		 */
++		public int completeToleratingFailures(String description) {
++			complete();
++			final List<Throwable> failures = failures();
++
++			if (failures.isEmpty()) {
++				return 0;
++			}
++
++			LOGGER.warn("{} of {} entries in {} failed and were skipped", failures.size(), tasks.size(), description, failures.getFirst());
++			return failures.size();
++		}
++
+ 		public void complete() {
+ 			Throwable failure = null;
+ 
+diff --git a/src/main/java/net/fabricmc/loom/api/processor/SpecContext.java b/src/main/java/net/fabricmc/loom/api/processor/SpecContext.java
+index 7b9707ee968c660a53d4265de64fcd0cc131ee74..93e4444584d48d23d09ad8c1c6d16a1f427e7619 100644
+--- a/src/main/java/net/fabricmc/loom/api/processor/SpecContext.java
++++ b/src/main/java/net/fabricmc/loom/api/processor/SpecContext.java
+@@ -60,6 +60,31 @@ public interface SpecContext {
+ 		return Stream.concat(modDependencies().stream(), localMods().stream()).toList();
+ 	}
+ 
++	/**
++	 * 返回 {@link SpecContext} 依赖的其它项目的 {@link Project}，现恒为空.
++	 *
++	 * <p>该方法与 {@link ProjectView#getLoomProjectDependencies(String)} 一样，是隔离模式之前
++	 * 直接访问跨项目模型的旧 SPI：现在没有任何实现会返回非空值，第三方 processor 调用它只会
++	 * 静默拿到空集合。需要依赖项目的信息请改用 {@link #getDependentProjectData(ProjectView)}。
++	 *
++	 * @param projectView 当前项目的视图
++	 * @return 恒为空流
++	 * @deprecated 已无生产实现，改用 {@link #getDependentProjectData(ProjectView)}
++	 */
++	@Deprecated
++	static Stream<Project> getDependentProjects(ProjectView projectView) {
++		return Stream.empty();
++	}
++
++	/**
++	 * 返回 runtime/compile classpath 上去重后的依赖项目数据.
++	 *
++	 * <p>去重依赖 {@link LoomProjectData#equals(Object)} 按项目路径判等：同一项目经内存共享表与
++	 * 导出文件两条路径可能得到两个实例，只有路径判等才能把它们视作同一个项目。
++	 *
++	 * @param projectView 当前项目的视图
++	 * @return 依赖项目的数据流
++	 */
+ 	static Stream<LoomProjectData> getDependentProjectData(ProjectView projectView) {
+ 		final Stream<LoomProjectData> runtimeProjects = projectView.getLoomProjectDataDependencies(JavaPlugin.RUNTIME_CLASSPATH_CONFIGURATION_NAME);
+ 		final Stream<LoomProjectData> compileProjects = projectView.getLoomProjectDataDependencies(JavaPlugin.COMPILE_CLASSPATH_CONFIGURATION_NAME);
+@@ -68,10 +93,6 @@ public interface SpecContext {
+ 				.distinct();
+ 	}
+ 
+-	static Stream<Project> getDependentProjects(ProjectView projectView) {
+-		return Stream.empty();
+-	}
+-
+ 	// Sort to ensure stable caching
+ 	static List<FabricModJson> distinctSorted(List<FabricModJson> mods) {
+ 		return mods.stream()
+diff --git a/src/main/java/net/fabricmc/loom/configuration/MavenPublication.java b/src/main/java/net/fabricmc/loom/configuration/MavenPublication.java
+index af84222bf6356bf2198c34b15842b136c4b1d868..34cae4f1d13c29a4dfca7f15bb6daf9c4b3f7a05 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/MavenPublication.java
++++ b/src/main/java/net/fabricmc/loom/configuration/MavenPublication.java
+@@ -41,6 +41,7 @@ import org.gradle.api.artifacts.Configuration;
+ import org.gradle.api.artifacts.Dependency;
+ import org.gradle.api.artifacts.ExcludeRule;
+ import org.gradle.api.artifacts.ModuleDependency;
++import org.gradle.api.logging.Logging;
+ import org.gradle.api.plugins.JavaPlugin;
+ import org.gradle.api.publish.Publication;
+ import org.gradle.api.publish.PublishingExtension;
+@@ -82,16 +83,31 @@ public abstract class MavenPublication implements Runnable {
+ 		});
+ 	}
+ 
+-	private static boolean hasSoftwareComponent(Publication publication) {
++	private static SoftwareComponentState softwareComponentState(Publication publication) {
+ 		try {
+ 			Method getComponent = publication.getClass().getMethod("getComponent");
+-			return getComponent.invoke(publication) != null;
++			return getComponent.invoke(publication) != null ? SoftwareComponentState.PRESENT : SoftwareComponentState.ABSENT;
+ 		} catch (ReflectiveOperationException e) {
+-			// our hacks have broken!
+-			return false;
++			// 以前这里静默返回 false，于是「确实没有 software component」和「Loom 的反射探测坏了」
++			// 两种完全不同的原因得到同一条弃用警告，用户看到的文案与真实原因无关。这里把真实原因记下来，
++			// 由调用方据此区分两条路径。
++			Logging.getLogger(MavenPublication.class).warn("Loom failed to inspect the software component of {} via reflection", publication.getClass().getName(), e);
++			return SoftwareComponentState.UNKNOWN;
+ 		}
+ 	}
+ 
++	/**
++	 * 发布项是否带有 software component 的探测结果.
++	 */
++	private enum SoftwareComponentState {
++		/** 有 component，无需手工注入依赖数据. */
++		PRESENT,
++		/** 确实没有 component，属于旧的、已弃用的发布配置方式. */
++		ABSENT,
++		/** 反射探测失败，说明 Loom 依赖的内部 API 变了，属于 Loom 自身的问题. */
++		UNKNOWN
++	}
++
+ 	private void processEntry(String scope, Configuration config, PublishingExtension mavenPublish, AtomicBoolean reportedDeprecation) {
+ 		mavenPublish.publications((publications) -> {
+ 			for (Publication publication : publications) {
+@@ -99,11 +115,17 @@ public abstract class MavenPublication implements Runnable {
+ 					continue;
+ 				}
+ 
+-				if (hasSoftwareComponent(publication) || EXCLUDED_PUBLICATIONS.contains(publication)) {
++				final SoftwareComponentState componentState = softwareComponentState(publication);
++
++				if (componentState == SoftwareComponentState.PRESENT || EXCLUDED_PUBLICATIONS.contains(publication)) {
+ 					continue;
+ 				} else if (!reportedDeprecation.get() && !LoomGradleExtension.get(getProject()).isForgeLike()) {
+ 					DeprecationHelper deprecationHelper = LoomGradleExtension.get(getProject()).getDeprecationHelper();
+-					deprecationHelper.warn("Loom is applying dependency data manually to publications instead of using a software component (from(components[\"java\"])). This is deprecated.");
++					// 两条路径的文案必须可区分：探测失败时不能把用户引向「你该改用 software component」，
++					// 因为问题出在 Loom 自己身上。
++					deprecationHelper.warn(componentState == SoftwareComponentState.UNKNOWN
++							? "Loom is applying dependency data manually to publications because it could not inspect their software component (see the warning above). This is a Loom bug."
++							: "Loom is applying dependency data manually to publications instead of using a software component (from(components[\"java\"])). This is deprecated.");
+ 					reportedDeprecation.set(true);
+ 				}
+ 
+diff --git a/src/main/java/net/fabricmc/loom/configuration/ide/idea/DownloadSourcesHook.java b/src/main/java/net/fabricmc/loom/configuration/ide/idea/DownloadSourcesHook.java
+index a2afb29924c00a126f5a7730c909f2ede8b4000f..199a8043d1db5e863e5dc84828a728e6ebcad0b6 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/ide/idea/DownloadSourcesHook.java
++++ b/src/main/java/net/fabricmc/loom/configuration/ide/idea/DownloadSourcesHook.java
+@@ -138,7 +138,9 @@ record DownloadSourcesHook(Project project, Task task) {
+ 
+ 				break;
+ 			} catch (IOException e) {
+-				// Ignore
++				// 这里失败会让 ijDownloadSources 任务照常成功却什么都不做（不会挂上任何 genSources 任务），
++				// 因此必须留下默认可见的日志，不能像以前那样静默吞掉。
++				LOGGER.warn("Failed to read IDEA init script {}, no genSources task will be hooked up", initScript, e);
+ 			}
+ 		}
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/ProjectView.java b/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/ProjectView.java
+index c7d77b1e285dd68aaa667bcd2edfb0d46864e75a..bf5ea824806b65bfc78a619ab99b636715062478 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/ProjectView.java
++++ b/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/ProjectView.java
+@@ -25,7 +25,6 @@
+ package net.fabricmc.loom.configuration.processors.speccontext;
+ 
+ import java.util.List;
+-import java.util.Objects;
+ import java.util.stream.Stream;
+ 
+ import org.gradle.api.Project;
+@@ -42,10 +41,26 @@ import net.fabricmc.loom.util.gradle.GradleUtils;
+ 
+ // Used to abstract out the Gradle API usage to ease unit testing.
+ public interface ProjectView {
+-	// 返回指定配置中的 Loom 项目数据
++	/**
++	 * 返回指定配置中依赖项目的跨项目数据.
++	 *
++	 * @param name 配置名（通常是 {@code runtimeClasspath} / {@code compileClasspath}）
++	 * @return 依赖项目的数据流；不是 Loom 项目的依赖不会出现在其中
++	 */
+ 	Stream<LoomProjectData> getLoomProjectDataDependencies(String name);
+ 
+-	// 保留旧接口以兼容测试替身，但隔离模式不再返回跨项目 Project 对象
++	/**
++	 * 旧的跨项目 {@link Project} 视图，现恒为空.
++	 *
++	 * <p>隔离模式不允许触碰其它项目的模型，这个方法已经没有任何实现会返回非空值；
++	 * 调用它只会静默拿到空集合。需要依赖项目的信息请改用
++	 * {@link #getLoomProjectDataDependencies(String)} 与 {@code LoomProjectData}。
++	 *
++	 * @param name 配置名
++	 * @return 恒为空流
++	 * @deprecated 已无生产实现，改用 {@link #getLoomProjectDataDependencies(String)}
++	 */
++	@Deprecated
+ 	default Stream<Project> getLoomProjectDependencies(String name) {
+ 		return Stream.empty();
+ 	}
+@@ -87,8 +102,9 @@ public interface ProjectView {
+ 			return configuration.getAllDependencies()
+ 					.withType(ProjectDependency.class)
+ 					.stream()
+-					.map(dependency -> LoomProjectData.fromDependency(project, dependency))
+-					.filter(Objects::nonNull);
++					// 不是 Loom 项目时 fromDependency 返回空；数据文件存在却读不出来时会抛异常，
++					// 不再像以前那样被 filter 静默丢掉（那会让依赖方的 mod/mixin 映射悄悄消失）。
++					.flatMap(dependency -> LoomProjectData.fromDependency(project, dependency).stream());
+ 		}
+ 
+ 		@Override
+diff --git a/src/main/java/net/fabricmc/loom/internal/LoomProjectData.java b/src/main/java/net/fabricmc/loom/internal/LoomProjectData.java
+index 292d9f66fa5821237b886a9143242d2edc161b95..b675ff9cbcbdb89b3fb03934363aaa1329dbd586 100644
+--- a/src/main/java/net/fabricmc/loom/internal/LoomProjectData.java
++++ b/src/main/java/net/fabricmc/loom/internal/LoomProjectData.java
+@@ -26,6 +26,7 @@ package net.fabricmc.loom.internal;
+ 
+ import java.io.IOException;
+ import java.io.Serializable;
++import java.io.UncheckedIOException;
+ import java.lang.reflect.Field;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+@@ -35,13 +36,19 @@ import java.util.LinkedHashMap;
+ import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Optional;
+ import java.util.Set;
+ 
+ import com.google.gson.JsonElement;
+ import com.google.gson.JsonObject;
++import com.google.gson.JsonSyntaxException;
++import dev.architectury.loom.metadata.ModMetadataFile;
++import dev.architectury.loom.metadata.ModMetadataFiles;
+ import org.gradle.api.Project;
+ import org.gradle.api.artifacts.Configuration;
+ import org.gradle.api.artifacts.ProjectDependency;
++import org.gradle.api.logging.Logger;
++import org.gradle.api.logging.Logging;
+ import org.gradle.api.plugins.JavaPlugin;
+ import org.gradle.api.tasks.SourceSet;
+ import org.jspecify.annotations.Nullable;
+@@ -49,25 +56,35 @@ import org.jspecify.annotations.Nullable;
+ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.LoomGradlePlugin;
+ import net.fabricmc.loom.build.mixin.AnnotationProcessorInvoker;
+-import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.fmj.FabricModJson;
+ import net.fabricmc.loom.util.fmj.FabricModJsonFactory;
+ import net.fabricmc.loom.util.fmj.FabricModJsonSource;
+ import net.fabricmc.loom.util.fmj.FabricModJsonHelpers;
++import net.fabricmc.loom.util.fmj.ModMetadataFabricModJson;
+ import net.fabricmc.loom.util.gradle.SourceSetHelper;
+ 
+ /**
+  * 跨项目传递的最小项目数据，只包含基础类型和可序列化集合.
++ *
++ * <p>相等性只由 {@link #projectPath()} 决定。同一次构建里，同一个项目的数据可能来自内存共享表
++ * （{@link LoomGradleSharedData} 中的既有实例）、直接读取依赖项目导出的 {@code project-data.json}
++ * （{@link #fromDependency}）或两者的组合，内容相同但实例不同。消费方用
++ * {@code distinct()} 与 {@code contains} 判断「是不是同一个依赖项目」，因此身份必须落在项目路径上；
++ * 否则文件回退路径会把同一个项目看成两个不同的项目，使交集为空（依赖项目的 mod 被静默丢弃）
++ * 或 {@code distinct()} 失效（同一个 mod 被处理两次）。
+  */
+ public final class LoomProjectData implements Serializable {
+ 	private static final long serialVersionUID = 1L;
+ 	public static final String DATA_ELEMENTS_CONFIGURATION = "loomProjectDataElements";
++	private static final Logger LOGGER = Logging.getLogger(LoomProjectData.class);
+ 
+ 	private final String projectPath;
+ 	private final List<ModData> mods;
+ 	private final String mappingId;
++	/** 生产命名空间；当前仓库内没有消费方，仅为保持跨项目数据形态稳定而保留，不要假定它已被使用. */
+ 	private final String productionNamespace;
++	/** 是否拆分环境源集；当前仓库内没有消费方，保留原因同 {@link #productionNamespace}. */
+ 	private final boolean splitEnvironmentSourceSets;
+ 	private final List<String> mixinMappingFiles;
+ 
+@@ -107,48 +124,122 @@ public final class LoomProjectData implements Serializable {
+ 		return mixinMappingFiles;
+ 	}
+ 
++	/**
++	 * 相等性只看 {@link #projectPath()}：该数据是项目自身状态的投影，一个项目在一次构建里只对应一份数据，
++	 * 不同来源（内存共享表、导出文件）得到的对象必须被视为同一个项目，见类注释.
++	 */
++	@Override
++	public boolean equals(@Nullable Object obj) {
++		return this == obj || obj instanceof LoomProjectData other && projectPath.equals(other.projectPath);
++	}
++
++	@Override
++	public int hashCode() {
++		return projectPath.hashCode();
++	}
++
++	@Override
++	public String toString() {
++		return "LoomProjectData[" + projectPath + "]";
++	}
++
+ 	public List<FabricModJson> createMods() {
+ 		return mods.stream().map(ModData::createMod).toList();
+ 	}
+ 
+ 	public static LoomProjectData fromProject(Project project) {
+-		LoomGradleExtension extension = LoomGradleExtension.get(project);
+-		String mappingId = null;
+-		String productionNamespace = null;
++		return new LoomProjectData(
++				project.getPath(),
++				FabricModJsonHelpers.getModsInProject(project).stream().map(ModData::fromMod).toList(),
++				readMappingId(project),
++				readProductionNamespace(project),
++				LoomGradleExtension.get(project).areEnvironmentSourceSetsSplit(),
++				readMixinMappingFiles(project)
++		);
++	}
++
++	/**
++	 * 读取生产命名空间，与 {@link #fromProject(Project)} 打包进 DTO 的值同源.
++	 *
++	 * <p>供 {@code exportLoomProjectData} 把它登记为任务输入；未配置时返回 {@code null}。
++	 *
++	 * @param project 目标项目
++	 * @return 生产命名空间名称，或 {@code null} 表示当前构建里还拿不到
++	 */
++	@Nullable
++	public static String readProductionNamespace(Project project) {
++		try {
++			return LoomGradleExtension.get(project).getProductionNamespaceEnum().get().toString();
++		} catch (RuntimeException e) {
++			// 忽略：生产命名空间未配置时退化为默认值
++			LOGGER.debug("Production namespace is not available in {}", project.getPath(), e);
++			return null;
++		}
++	}
++
++	/**
++	 * 读取项目内全部 mod 的元数据 JSON，与 {@link #fromProject(Project)} 写入 DTO 的 mod 列表同源.
++	 *
++	 * <p>供 {@code exportLoomProjectData} 登记输入指纹：mod 元数据是导出内容的一部分，
++	 * 它的变化必须让导出文件失效。
++	 *
++	 * @param project 目标项目
++	 * @return 每个 mod 一份元数据 JSON
++	 */
++	public static List<String> readModJson(Project project) {
++		return FabricModJsonHelpers.getModsInProject(project).stream()
++				.map(ModData::fromMod)
++				.map(ModData::json)
++				.toList();
++	}
++
++	/**
++	 * 读取当前项目的映射标识，与 {@link #fromProject(Project)} 打包进 DTO 的值同源.
++	 *
++	 * <p>供 {@code exportLoomProjectData} 把它登记为任务输入；映射尚未就绪或未启用混淆时返回
++	 * {@code null}（此时任务侧的输入属性为空），而不是抛异常。
++	 *
++	 * @param project 目标项目
++	 * @return 映射标识，或 {@code null} 表示当前构建里还拿不到
++	 */
++	@Nullable
++	public static String readMappingId(Project project) {
++		final LoomGradleExtension extension = LoomGradleExtension.get(project);
+ 
+ 		try {
+ 			if (!extension.disableObfuscation()) {
+-				MappingConfiguration mappingConfiguration = extension.getMappingConfiguration();
+-				mappingId = mappingConfiguration.mappingsIdentifier;
++				return extension.getMappingConfiguration().mappingsIdentifier;
+ 			}
+-		} catch (RuntimeException ignored) {
++		} catch (RuntimeException e) {
+ 			// 忽略：映射尚未就绪时退化为不带映射标识
++			LOGGER.debug("Mapping identifier is not available in {}", project.getPath(), e);
+ 		}
+ 
+-		try {
+-			productionNamespace = extension.getProductionNamespaceEnum().get().toString();
+-		} catch (RuntimeException ignored) {
+-			// 忽略：生产命名空间未配置时退化为默认值
+-		}
++		return null;
++	}
+ 
+-		List<String> mixinMappingFiles = new ArrayList<>();
++	/**
++	 * 读取项目内全部 Mixin AP 映射文件路径，与 {@link #fromProject(Project)} 打包进 DTO 的列表同源.
++	 *
++	 * <p>供 {@code exportLoomProjectData} 登记输入指纹。注意 DTO 里保存的是<b>路径</b>，
++	 * 消费方直接按路径读取生产者项目的文件，因此映射文件本身的内容不属于导出内容的一部分。
++	 *
++	 * @param project 目标项目
++	 * @return 映射文件的绝对路径，顺序与源集顺序一致
++	 */
++	public static List<String> readMixinMappingFiles(Project project) {
++		final List<String> files = new ArrayList<>();
+ 
+ 		for (SourceSet sourceSet : SourceSetHelper.getSourceSets(project)) {
+ 			try {
+-				mixinMappingFiles.add(AnnotationProcessorInvoker.getMixinMappingsForSourceSet(project, sourceSet).getAbsolutePath());
+-			} catch (RuntimeException ignored) {
++				files.add(AnnotationProcessorInvoker.getMixinMappingsForSourceSet(project, sourceSet).getAbsolutePath());
++			} catch (RuntimeException e) {
+ 				// 忽略：没有 Mixin AP 配置的源集不产出映射文件
++				LOGGER.debug("No mixin mappings for source set {} in {}", sourceSet.getName(), project.getPath(), e);
+ 			}
+ 		}
+ 
+-		return new LoomProjectData(
+-				project.getPath(),
+-				FabricModJsonHelpers.getModsInProject(project).stream().map(ModData::fromMod).toList(),
+-				mappingId,
+-				productionNamespace,
+-				extension.areEnvironmentSourceSetsSplit(),
+-				mixinMappingFiles
+-		);
++		return List.copyOf(files);
+ 	}
+ 
+ 	public static List<LoomProjectData> getDependencies(Project project) {
+@@ -162,26 +253,39 @@ public final class LoomProjectData implements Serializable {
+ 			}
+ 
+ 			for (ProjectDependency dependency : configuration.getAllDependencies().withType(ProjectDependency.class)) {
+-				LoomProjectData data = fromDependency(project, dependency);
+-
+-				if (data != null) {
+-					result.put(data.projectPath(), data);
+-				}
++				fromDependency(project, dependency).ifPresent(data -> result.put(data.projectPath(), data));
+ 			}
+ 		}
+ 
+ 		return List.copyOf(result.values());
+ 	}
+ 
+-	@Nullable
+-	public static LoomProjectData fromDependency(Project project, ProjectDependency dependency) {
++	/**
++	 * 读取依赖项目的跨项目数据，并让三种结果在 API 层面互不混淆.
++	 *
++	 * <ul>
++	 *     <li>返回非空：依赖项目是 Loom 项目，且数据可用；
++	 *     <li>返回 {@link Optional#empty()}：依赖项目没有暴露 {@link #DATA_ELEMENTS_CONFIGURATION}，
++	 *         即「本来就不是 Loom 项目」，只记 debug 日志，不产生噪音；
++	 *     <li>抛出异常：依赖项目确实暴露了数据文件，但文件读取或解析失败。这是「真失败」，
++	 *         必须上抛——若静默降级成空结果，调用方会把「跨项目数据损坏」当成「该依赖不是 Loom 项目」，
++	 *         进而静默丢掉依赖项目的 mod 与 mixin 映射，产出不完整的 remap 结果。
++	 * </ul>
++	 *
++	 * @param project 发起查询的项目
++	 * @param dependency 待查询的项目依赖
++	 * @return 依赖项目的跨项目数据；空表示该依赖不是 Loom 项目
++	 */
++	public static Optional<LoomProjectData> fromDependency(Project project, ProjectDependency dependency) {
+ 		LoomGradleSharedData sharedData = LoomGradleSharedData.get(project);
+ 		LoomProjectData data = sharedData.getProject(dependency.getPath());
+ 
+ 		if (data != null) {
+-			return data;
++			return Optional.of(data);
+ 		}
+ 
++		final Path path;
++
+ 		try {
+ 			Configuration configuration = project.getConfigurations().detachedConfiguration(
+ 					project.getDependencies().project(Map.of(
+@@ -189,23 +293,67 @@ public final class LoomProjectData implements Serializable {
+ 						"configuration", DATA_ELEMENTS_CONFIGURATION
+ 					)));
+ 			configuration.setTransitive(false);
+-			return read(configuration.getSingleFile().toPath());
+-		} catch (RuntimeException ignored) {
+-			return null;
++			path = configuration.getSingleFile().toPath();
++		} catch (RuntimeException e) {
++			// 「本来就没有」：依赖不是 Loom 项目、没有该可消费配置，或数据尚未登记。
++			// 这类情况在混用普通 jar 依赖的项目里很常见，因此只记 debug，不打断构建。
++			LOGGER.debug("Dependency {} does not expose Loom project data", dependency.getPath(), e);
++			return Optional.empty();
+ 		}
++
++		// 能解析出文件说明数据确实存在，之后任何失败都是真失败。
++		return Optional.of(read(path).orElseThrow(() -> new IllegalStateException(
++				"Loom project data file of dependency " + dependency.getPath() + " is missing: " + path)));
+ 	}
+ 
+-	@Nullable
+-	public static LoomProjectData read(Path path) {
++	/**
++	 * 读取跨项目数据文件.
++	 *
++	 * <p>空结果与失败被刻意区分开：文件不存在属于「该项目还没有产出数据」的常规情形，
++	 * 返回 {@link Optional#empty()} 且不写日志；文件存在却读不动或解析不了时，写一条
++	 * 默认可见（{@code warn}）的日志并抛出异常，避免把损坏的数据伪装成「没有数据」。
++	 *
++	 * @param path {@code exportLoomProjectData} 产出的 {@code project-data.json} 路径
++	 * @return 解析出的项目数据；文件不存在时为空
++	 * @throws UncheckedIOException 文件存在但读取失败
++	 * @throws JsonSyntaxException 文件存在但内容不是可用的项目数据
++	 */
++	public static Optional<LoomProjectData> read(Path path) {
++		if (!Files.isRegularFile(path)) {
++			return Optional.empty();
++		}
++
++		final String json;
++
+ 		try {
+-			if (!Files.isRegularFile(path)) {
+-				return null;
+-			}
++			json = Files.readString(path, StandardCharsets.UTF_8);
++		} catch (IOException e) {
++			LOGGER.warn("Failed to read Loom project data from {}", path, e);
++			throw new UncheckedIOException("无法读取跨项目数据: " + path, e);
++		}
+ 
+-			return LoomGradlePlugin.GSON.fromJson(Files.readString(path, StandardCharsets.UTF_8), LoomProjectData.class);
+-		} catch (IOException | RuntimeException e) {
+-			return null;
++		final LoomProjectData data;
++
++		try {
++			data = LoomGradlePlugin.GSON.fromJson(json, LoomProjectData.class);
++		} catch (RuntimeException e) {
++			LOGGER.warn("Failed to parse Loom project data from {}", path, e);
++			throw new JsonSyntaxException("跨项目数据无法解析: " + path, e);
++		}
++
++		if (data == null) {
++			// 文件为空（例如写入过程中被中断）时 Gson 直接返回 null。
++			LOGGER.warn("Loom project data at {} is empty", path);
++			throw new JsonSyntaxException("跨项目数据为空: " + path);
+ 		}
++
++		if (data.projectPath() == null || data.mods() == null || data.mixinMappingFiles() == null) {
++			// 字段缺失通常意味着文件由其它版本/其它项目写入：必须显式失败，不能带着 null 继续跑。
++			LOGGER.warn("Loom project data at {} is incomplete: {}", path, data);
++			throw new JsonSyntaxException("跨项目数据缺少必要字段: " + path);
++		}
++
++		return Optional.of(data);
+ 	}
+ 
+ 	public void write(Path path) throws IOException {
+@@ -213,7 +361,16 @@ public final class LoomProjectData implements Serializable {
+ 		Files.writeString(path, LoomGradlePlugin.GSON.toJson(this), StandardCharsets.UTF_8);
+ 	}
+ 
+-	public record ModData(String json, Map<String, byte[]> resources) implements Serializable {
++	/**
++	 * 单个模组的跨项目数据.
++	 *
++	 * @param json 模组元数据 JSON，保持源对象的原始键（不补 {@code schemaVersion}，仅在缺失时补 id/version 便于识别）
++	 * @param resources 需要在依赖方复现的资源（mixin 配置、AT/AW、javadoc 等）及其内容
++	 * @param metadataFileName 源对象的元数据文件名；仅当源对象来自
++	 *         {@link ModMetadataFabricModJson}（Forge/NeoForge 的 mods.toml、architectury.common.json 等
++	 *         非 FMJ 形态）时非空，用于在依赖方重建同类视图
++	 */
++	public record ModData(String json, Map<String, byte[]> resources, @Nullable String metadataFileName) implements Serializable {
+ 		private static final long serialVersionUID = 1L;
+ 
+ 		private static final Field JSON_OBJECT;
+@@ -227,26 +384,38 @@ public final class LoomProjectData implements Serializable {
+ 			}
+ 		}
+ 
++		/**
++		 * 供只关心元数据与资源的调用方（含既有测试）使用的便捷构造方法.
++		 */
++		public ModData(String json, Map<String, byte[]> resources) {
++			this(json, resources, null);
++		}
++
+ 		static ModData fromMod(FabricModJson mod) {
+ 			JsonObject jsonObject = null;
+ 
+ 			try {
+ 				jsonObject = ((JsonObject) JSON_OBJECT.get(mod)).deepCopy();
+-			} catch (IllegalAccessException ignored) {
++			} catch (IllegalAccessException e) {
+ 				// 忽略：无法读取内部 JSON 时退化为一个仅含默认字段的模组数据
++				LOGGER.debug("Failed to read the raw JSON of mod {}", safeId(mod), e);
+ 			}
+ 
+ 			if (jsonObject == null) {
+ 				jsonObject = new JsonObject();
+ 			}
+ 
+-			if (!jsonObject.has("schemaVersion")) {
+-				jsonObject.addProperty("schemaVersion", 1);
+-			}
+-
++			// 这里刻意不补 schemaVersion：补出来的 1 会让依赖方把非 FMJ 的模组（mods.toml 等）重建成
++			// FabricModJsonV1，类型与语义都变（getVersion() 从 -1 变成 1，getCustom()/mixin 列表改从
++			// FMJ 的键里读），于是同一个 mod 经「jar 元数据」和「DTO」两条路进来时身份不一致，
++			// 无法去重、javadoc/AT/AW 处理器会重复套用。缺失的 schemaVersion 本来就是 V0 的合法形态。
+ 			addStringIfAbsent(jsonObject, "id", safeId(mod));
+ 			addStringIfAbsent(jsonObject, "version", safeVersion(mod));
+ 
++			// 非 FMJ 形态无法靠 JSON 复原，必须记下原始元数据文件，依赖方才能重建同类视图。
++			final String metadataFileName = mod instanceof ModMetadataFabricModJson metadataBacked
++					? metadataBacked.getModMetadata().getFileName()
++					: null;
+ 			Set<String> resourcePaths = new LinkedHashSet<>();
+ 			resourcePaths.addAll(mod.getMixinConfigurations());
+ 			resourcePaths.addAll(mod.getClassTweakers().keySet());
+@@ -256,17 +425,22 @@ public final class LoomProjectData implements Serializable {
+ 				resourcePaths.add(javadoc.getAsString());
+ 			}
+ 
++			if (metadataFileName != null) {
++				resourcePaths.add(metadataFileName);
++			}
++
+ 			Map<String, byte[]> resources = new LinkedHashMap<>();
+ 
+ 			for (String resourcePath : resourcePaths) {
+ 				try {
+ 					resources.put(resourcePath, mod.getSource().read(resourcePath));
+-				} catch (IOException ignored) {
++				} catch (IOException e) {
+ 					// 忽略：缺失的可选资源不参与跨项目数据交换
++					LOGGER.debug("Optional resource {} of mod {} is missing from the project data", resourcePath, safeId(mod), e);
+ 				}
+ 			}
+ 
+-			return new ModData(LoomGradlePlugin.GSON.toJson(jsonObject), resources);
++			return new ModData(LoomGradlePlugin.GSON.toJson(jsonObject), resources, metadataFileName);
+ 		}
+ 
+ 		private static void addStringIfAbsent(JsonObject jsonObject, String key, @Nullable String value) {
+@@ -305,6 +479,24 @@ public final class LoomProjectData implements Serializable {
+ 
+ 				return bytes;
+ 			};
++
++			if (metadataFileName != null) {
++				// 非 FMJ 形态：按原始元数据文件重建同类视图，才能保持 getId()/getCustom()/mixin 列表语义，
++				// 也才能与依赖方从 jar 元数据读到的同名模组保持一致的 getVersion()（两者都用于 hashCode）。
++				final byte[] metadataBytes = copiedResources.get(metadataFileName);
++
++				if (metadataBytes != null) {
++					final ModMetadataFile metadataFile = ModMetadataFiles.fromBytes(metadataFileName, metadataBytes);
++
++					if (metadataFile != null) {
++						return FabricModJsonFactory.createFromModMetadata(metadataFile, source);
++					}
++				}
++
++				// 退化为 JSON 视图会丢掉元数据里的 mixin/AT 等信息，属于降级，必须默认可见。
++				LOGGER.warn("Cannot restore mod metadata {} from Loom project data, falling back to the raw JSON view", metadataFileName);
++			}
++
+ 			return FabricModJsonFactory.create(jsonObject, source);
+ 		}
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/task/ExportLoomProjectDataTask.java b/src/main/java/net/fabricmc/loom/task/ExportLoomProjectDataTask.java
+index a6b368bce644d493f14410bde59c80603d7579b4..ff5eb13ebf3e6e4005cf8433f0c274c2834028bb 100644
+--- a/src/main/java/net/fabricmc/loom/task/ExportLoomProjectDataTask.java
++++ b/src/main/java/net/fabricmc/loom/task/ExportLoomProjectDataTask.java
+@@ -28,18 +28,92 @@ import java.io.IOException;
+ 
+ import org.gradle.api.DefaultTask;
+ import org.gradle.api.file.RegularFileProperty;
++import org.gradle.api.provider.ListProperty;
++import org.gradle.api.provider.Property;
+ import org.gradle.api.tasks.CacheableTask;
++import org.gradle.api.tasks.Input;
++import org.gradle.api.tasks.Optional;
+ import org.gradle.api.tasks.OutputFile;
+ import org.gradle.api.tasks.TaskAction;
+ 
++import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.internal.LoomProjectData;
+ 
++/**
++ * 把当前项目的 {@link LoomProjectData} 导出为文件，供其它项目在内存共享表里查不到时回退读取.
++ *
++ * <p>输出通过 {@code loomProjectDataElements} 可消费配置暴露：消费方可以解析该配置（触发本任务），
++ * 也可以直接读文件，所以它必须随项目身份与内容一起失效。本类保留 {@link CacheableTask}，
++ * 同时把 {@link LoomProjectData#fromProject(org.gradle.api.Project)} 真正依赖的内容逐项声明为输入，
++ * 原因有两点：
++ *
++ * <ul>
++ *     <li>不声明输入时，Gradle 只按「输出是否存在」判定 UP-TO-DATE：改了 mod 元数据或映射标识之后文件不刷新，
++ *         日常被内存共享表掩盖，只在回退路径与外部消费方那里暴露成过期数据；
++ *     <li>构建缓存键里没有项目身份时，多个项目（甚至不同项目路径的工作副本）会算出同一个键，
++ *         共享缓存可能把别的项目的 {@code project-data.json} 还原到本项目。
++ * </ul>
++ *
++ * <p>所有输入都用 {@link org.gradle.api.provider.Provider} 惰性求值：配置期只登记「怎么取」，
++ * 读取映射配置、mod 元数据与 Mixin AP 输出都发生在执行期，不会在配置阶段强制求值。
++ */
+ @CacheableTask
+ public abstract class ExportLoomProjectDataTask extends DefaultTask {
+ 	public ExportLoomProjectDataTask() {
+ 		getOutputFile().convention(getProject().getLayout().getBuildDirectory().file("loom/project-data.json"));
++
++		getProjectPath().convention(getProject().getPath());
++		getMappingId().convention(getProject().provider(() -> LoomProjectData.readMappingId(getProject())));
++		getProductionNamespace().convention(getProject().provider(() -> LoomProjectData.readProductionNamespace(getProject())));
++		getSplitEnvironmentSourceSets().convention(getProject().provider(() -> LoomGradleExtension.get(getProject()).areEnvironmentSourceSetsSplit()));
++		getModJson().convention(getProject().provider(() -> LoomProjectData.readModJson(getProject())));
++		getMixinMappingFiles().convention(getProject().provider(() -> LoomProjectData.readMixinMappingFiles(getProject())));
+ 	}
+ 
++	/**
++	 * 项目路径，作为数据身份参与缓存键，避免共享缓存在不同项目之间复用同一份数据.
++	 */
++	@Input
++	public abstract Property<String> getProjectPath();
++
++	/**
++	 * 映射标识，与 {@link LoomProjectData#fromProject(org.gradle.api.Project)} 写入 DTO 的值同源.
++	 *
++	 * <p>映射尚未就绪或未启用混淆时该属性为空（用 {@code @Optional} 表达，而不是伪造一个占位值）。
++	 */
++	@Input
++	@Optional
++	public abstract Property<String> getMappingId();
++
++	/**
++	 * 生产命名空间，与 DTO 里写入的值同源；未配置时为空.
++	 */
++	@Input
++	@Optional
++	public abstract Property<String> getProductionNamespace();
++
++	/**
++	 * 是否拆分环境源集，与 DTO 里写入的值同源.
++	 */
++	@Input
++	public abstract Property<Boolean> getSplitEnvironmentSourceSets();
++
++	/**
++	 * 项目内全部 mod 的元数据 JSON，与 DTO 中的 mod 列表一一对应.
++	 */
++	@Input
++	public abstract ListProperty<String> getModJson();
++
++	/**
++	 * Mixin AP 映射文件的路径列表.
++	 *
++	 * <p>只登记路径而不是文件内容：DTO 里保存的也是路径，依赖方直接按路径读取生产者项目的文件，
++	 * 文件内容不属于导出内容。反过来，把它们声明成 {@code @InputFiles} 会让本任务输入命中
++	 * {@code compileJava} 的输出，从而引入未声明的隐式任务依赖（Gradle 会因此禁用执行优化）。
++	 */
++	@Input
++	public abstract ListProperty<String> getMixinMappingFiles();
++
+ 	@OutputFile
+ 	public abstract RegularFileProperty getOutputFile();
+ 
+diff --git a/src/main/java/net/fabricmc/loom/task/ExtractArchiveFilesTask.java b/src/main/java/net/fabricmc/loom/task/ExtractArchiveFilesTask.java
+index b3ded76b63b07da86d6bce09294608e053b520ab..ff3c11567de4ccf48171eba791ece81c985ee66e 100644
+--- a/src/main/java/net/fabricmc/loom/task/ExtractArchiveFilesTask.java
++++ b/src/main/java/net/fabricmc/loom/task/ExtractArchiveFilesTask.java
+@@ -85,7 +85,11 @@ public abstract class ExtractArchiveFilesTask extends DefaultTask {
+ 	protected abstract ConfigurableFileCollection getArchives();
+ 
+ 	/**
+-	 * 只保留这些后缀的条目；为空表示保留全部条目.
++	 * 只保留这些后缀的条目.
++	 *
++	 * <p>该属性必须显式赋值：空列表的语义是「保留全部条目」，与 {@link #includeSuffixes(String, String...)}
++	 * 的名称直觉相反，因此不提供默认值，未配置时任务会直接报错（见 {@link #run()}）；
++	 * 确实需要全部条目时请显式调用 {@link #includeAllSuffixes()}。
+ 	 */
+ 	@Input
+ 	protected abstract ListProperty<String> getIncludedSuffixes();
+@@ -97,10 +101,26 @@ public abstract class ExtractArchiveFilesTask extends DefaultTask {
+ 	protected abstract ListProperty<String> getEmptyMarkers();
+ 
+ 	/**
+-	 * 只解压这些后缀的条目；配合 {@link #getIncludedSuffixes()} 的约定（空列表表示全部）.
++	 * 只解压这些后缀的条目.
++	 *
++	 * <p>至少需要一个后缀：空列表表示「保留全部条目」，为避免误用，这里把它从参数层面排除，
++	 * 需要保留全部条目请调用 {@link #includeAllSuffixes()}。
++	 *
++	 * @param firstSuffix 第一个后缀
++	 * @param otherSuffixes 其余后缀
+ 	 */
+-	public void includeSuffixes(String... suffixes) {
+-		getIncludedSuffixes().set(java.util.List.of(suffixes));
++	public void includeSuffixes(String firstSuffix, String... otherSuffixes) {
++		final java.util.List<String> suffixes = new java.util.ArrayList<>();
++		suffixes.add(firstSuffix);
++		suffixes.addAll(java.util.List.of(otherSuffixes));
++		getIncludedSuffixes().set(suffixes);
++	}
++
++	/**
++	 * 显式声明保留全部条目（即不做后缀过滤），与 {@link #includeSuffixes(String, String...)} 互斥.
++	 */
++	public void includeAllSuffixes() {
++		getIncludedSuffixes().set(java.util.List.of());
+ 	}
+ 
+ 	public void emptyMarker(String marker) {
+@@ -123,12 +143,24 @@ public abstract class ExtractArchiveFilesTask extends DefaultTask {
+ 
+ 	@TaskAction
+ 	protected void run() throws IOException {
++		if (!getIncludedSuffixes().isPresent()) {
++			throw new IllegalStateException("必须显式声明过滤规则：调用 includeSuffixes(...) 或 includeAllSuffixes()");
++		}
++
++		if (!getEmptyMarkers().isPresent()) {
++			throw new IllegalStateException("必须显式声明空标记文件名：调用 emptyMarker(...)");
++		}
++
+ 		final Path outputDir = getOutputDirectory().get().getAsFile().toPath();
+ 		final java.util.List<String> suffixes = getIncludedSuffixes().get();
+ 		final Path emptyMarker = outputDir.resolve(getEmptyMarkers().get().getFirst());
+ 
+ 		Files.createDirectories(outputDir);
+ 
++		// 标记文件由本任务自己维护，不在 sync 的内容里：这里显式删除，而不是依赖 sync 把它当成
++		// 陈旧文件清理掉。这样标记的生命周期只由「本次执行是否解压出内容」决定，与 sync 的实现解耦。
++		Files.deleteIfExists(emptyMarker);
++
+ 		getFileSystemOperations().sync(spec -> {
+ 			spec.into(outputDir);
+ 
+@@ -143,18 +175,16 @@ public abstract class ExtractArchiveFilesTask extends DefaultTask {
+ 			}
+ 		});
+ 
+-		if (isEmptyDirectory(outputDir, emptyMarker)) {
++		if (isEmptyDirectory(outputDir)) {
+ 			Files.writeString(emptyMarker, "", StandardCharsets.UTF_8);
+-		} else {
+-			Files.deleteIfExists(emptyMarker);
+ 		}
+ 	}
+ 
+-	private static boolean isEmptyDirectory(Path outputDir, Path emptyMarker) throws IOException {
++	// 标记文件已在 sync 之前删除，因此这里不需要再把它排除在「是否为空」的判断之外。
++	private static boolean isEmptyDirectory(Path outputDir) throws IOException {
+ 		try (var stream = Files.walk(outputDir)) {
+ 			return stream
+ 					.filter(path -> !path.equals(outputDir))
+-					.filter(path -> !path.equals(emptyMarker))
+ 					.findAny()
+ 					.isEmpty();
+ 		}
+diff --git a/src/main/java/net/fabricmc/loom/task/service/MixinAPMappingService.java b/src/main/java/net/fabricmc/loom/task/service/MixinAPMappingService.java
+index 27c3e8eb655c015a867697bbf9a7fdeebe53e13e..50cdfa99b11bbe9f09730788dd647a022dcba511 100644
+--- a/src/main/java/net/fabricmc/loom/task/service/MixinAPMappingService.java
++++ b/src/main/java/net/fabricmc/loom/task/service/MixinAPMappingService.java
+@@ -76,6 +76,28 @@ public class MixinAPMappingService extends Service<MixinAPMappingService.Options
+ 		Property<String> getTo();
+ 	}
+ 
++	/**
++	 * 收集用于 Mixin AP 的映射来源.
++	 *
++	 * <p>两种模式覆盖的项目集合不同，这是隔离模式下的已知取舍（不是等价实现）：
++	 *
++	 * <ul>
++	 *     <li>非隔离模式用 {@link GradleUtils#allLoomProjects} 遍历<b>整个构建</b>中 mappingId 相同的
++	 *         Loom 项目。它需要读其它项目的扩展状态，在 Isolated Projects 下是不允许的；
++	 *     <li>隔离模式只覆盖<b>当前项目</b>与 {@link LoomProjectData#getDependencies(Project)} 得到的
++	 *         runtime/compileClasspath 上的<b>直接</b> {@code ProjectDependency}（同样按 mappingId 过滤）。
++	 *         DTO 里没有依赖图，不读别的项目就无法递归展开传递依赖。
++	 * </ul>
++	 *
++	 * <p>后果：若项目 A 通过 B 间接依赖 C，隔离模式下 C 的 mixin 映射不会被纳入，
++	 * A 重映射出的 refmap 可能与普通模式不同；直接依赖的场景不受影响。
++	 * 需要完整覆盖时请关闭 Isolated Projects，或把 C 也声明成直接依赖。
++	 *
++	 * @param thisProject 当前项目
++	 * @param from 源命名空间
++	 * @param to 目标命名空间
++	 * @return 每个（项目，源集）组合一份选项的惰性提供者
++	 */
+ 	public static Provider<List<Options>> createOptions(Project thisProject, Provider<String> from, Provider<String> to) {
+ 		final LoomGradleExtension thisExtension = LoomGradleExtension.get(thisProject);
+ 		String mappingId = thisExtension.getMappingConfiguration().mappingsIdentifier;
+@@ -106,12 +128,17 @@ public class MixinAPMappingService extends Service<MixinAPMappingService.Options
+ 		};
+ 
+ 		if (thisExtension.isProjectIsolationActive()) {
++			// 隔离模式：只允许读本项目与 DTO。这里刻意不遍历 gradle.allprojects——那会在别的项目
++			// 还没配置完时读取它们的扩展状态。覆盖范围差异见本方法 Javadoc。
+ 			processProject.accept(thisProject);
+ 
+ 			for (LoomProjectData projectData : LoomProjectData.getDependencies(thisProject)) {
+-				if (mappingId.equals(projectData.mappingId())) {
+-					processProjectData(thisProject, projectData, from, to, providers);
++				if (!mappingId.equals(projectData.mappingId())) {
++					LOGGER.debug("Skipping mixin mappings of {}: its mapping id {} differs from {}", projectData.projectPath(), projectData.mappingId(), mappingId);
++					continue;
+ 				}
++
++				processProjectData(thisProject, projectData, from, to, providers);
+ 			}
+ 		} else {
+ 			GradleUtils.allLoomProjects(thisProject.getGradle(), project -> {
+diff --git a/src/main/java/net/fabricmc/loom/util/fmj/FabricModJsonFactory.java b/src/main/java/net/fabricmc/loom/util/fmj/FabricModJsonFactory.java
+index faf1808c802162c3e9e4e4c98606924d91a562e6..539fbadd61f736e3689da243421ddc3d0b93b437 100644
+--- a/src/main/java/net/fabricmc/loom/util/fmj/FabricModJsonFactory.java
++++ b/src/main/java/net/fabricmc/loom/util/fmj/FabricModJsonFactory.java
+@@ -79,6 +79,21 @@ public final class FabricModJsonFactory {
+ 		};
+ 	}
+ 
++	/**
++	 * 用已解析的元数据文件重建模组视图（mods.toml / architectury.common.json / mcmod.info 等非 FMJ 形态）.
++	 *
++	 * <p>跨项目数据（{@code LoomProjectData}）不会给非 FMJ 元数据补 {@code schemaVersion}，
++	 * 消费端必须走这条路径，才能保持与源对象一致的 {@code getId()}/{@code getVersion()}/{@code getCustom()}
++	 * 与 mixin/AT 列表语义；否则会被重建成 {@link FabricModJsonV1}，静默丢掉元数据里的信息。
++	 *
++	 * @param modMetadata 元数据文件
++	 * @param source 资源读取来源
++	 * @return 与元数据文件对应的模组视图
++	 */
++	public static FabricModJson createFromModMetadata(ModMetadataFile modMetadata, FabricModJsonSource source) {
++		return new ModMetadataFabricModJson(modMetadata, source);
++	}
++
+ 	public static FabricModJson createFromZip(Path zipPath) {
+ 		try {
+ 			return create(ZipUtils.unpackGson(zipPath, FABRIC_MOD_JSON, JsonObject.class), new FabricModJsonSource.ZipSource(zipPath));
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/LoomProjectDataTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/LoomProjectDataTest.groovy
+index 0e2776b71584fd692654dac96852b3af519b0ded..33801581e55bec2aa4fc9f8204d7b65e9eedf752 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/LoomProjectDataTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/LoomProjectDataTest.groovy
+@@ -24,12 +24,20 @@
+ 
+ package net.fabricmc.loom.test.unit
+ 
++import java.nio.file.Files
++import java.nio.file.Path
++
++import com.google.gson.JsonSyntaxException
+ import spock.lang.Specification
++import spock.lang.TempDir
+ 
+ import net.fabricmc.loom.internal.LoomGradleSharedData
+ import net.fabricmc.loom.internal.LoomProjectData
+ 
+ class LoomProjectDataTest extends Specification {
++	@TempDir
++	Path tempDir
++
+ 	def "项目数据桥可通过 Java 序列化传递并还原模组元数据"() {
+ 		given:
+ 		def modData = new LoomProjectData.ModData(
+@@ -54,4 +62,57 @@ class LoomProjectDataTest extends Specification {
+ 		restoredData.createMods().first().id == 'example'
+ 		restoredData.createMods().first().getMixinConfigurations() == ['example.mixins.json']
+ 	}
++
++	def "同一项目的不同实例按项目路径判等"() {
++		given:
++		// 内存共享表与导出文件两条路径会给出内容等价但实例不同的对象，两者必须被当成同一个项目，
++		// 否则依赖项目求交会得到空集，distinct() 也会失效。
++		def modData = new LoomProjectData.ModData('{"schemaVersion":1,"id":"example","version":"1.0.0"}', [:])
++		def fromSharedTable = new LoomProjectData(':example', [modData], 'mappings', 'named', false, [])
++		def fromExportedFile = new LoomProjectData(':example', [], 'mappings', 'named', false, [])
++
++		expect:
++		fromSharedTable == fromExportedFile
++		fromSharedTable.hashCode() == fromExportedFile.hashCode()
++		[
++			fromSharedTable,
++			fromExportedFile
++		].toSet().size() == 1
++		[
++			fromSharedTable,
++			fromExportedFile
++		].stream().distinct().count() == 1
++
++		and:
++		fromSharedTable != new LoomProjectData(':other', [modData], 'mappings', 'named', false, [])
++	}
++
++	def "读取项目数据时区分「没有文件」与「文件损坏」"() {
++		given:
++		def missing = tempDir.resolve('missing.json')
++		def broken = tempDir.resolve('broken.json')
++		Files.writeString(broken, 'this is not json')
++
++		expect: '文件不存在属于常规情形，不产生异常'
++		LoomProjectData.read(missing).isEmpty()
++
++		when: '文件存在但内容损坏时必须显式失败，不能静默当成「没有数据」'
++		LoomProjectData.read(broken)
++
++		then:
++		thrown(JsonSyntaxException)
++	}
++
++	def "没有 schemaVersion 的模组元数据不会被伪造版本"() {
++		given:
++		def modData = new LoomProjectData.ModData('{"id":"example","version":"1.0.0"}', [:])
++
++		when:
++		def mod = modData.createMod()
++
++		then: '缺失 schemaVersion 是 V0 的正常形态；补一个 1 会把它变成语义不同的 V1'
++		mod.version == 0
++		mod.id == 'example'
++		mod.modVersion == '1.0.0'
++	}
+ }

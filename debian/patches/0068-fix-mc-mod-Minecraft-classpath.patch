@@ -1,0 +1,51 @@
+From 9412285efeeff53468fc7134aeff0611af6f1d83 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Fri, 2 Oct 2026 14:46:23 +0800
+Subject: [PATCH 068/147] =?UTF-8?q?fix(mc):=20=E8=A1=A5=E5=9B=9E=20mod=20?=
+ =?UTF-8?q?=E9=87=8D=E6=98=A0=E5=B0=84=E4=BB=BB=E5=8A=A1=E7=9A=84=20Minecr?=
+ =?UTF-8?q?aft=20classpath?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ModProcessor 迁到 RemapModsTask 时漏了一路 classpath：旧实现在配置期显式
+readClassPath(extension.getMinecraftJars(productionNamespace))，新任务只从各 remap
+配置的源文件收集，MC jar 不在其中。
+
+后果是重映射器解析不到 MC 类型层级，覆盖继承自 MC 类/接口的方法名不再被重命名。
+以 fabric-api 的 SimpleResourceReloadListener 为例，reload 保持为 method_25931：
+
+  e: RainstormClientAssets.kt:19:10 Object 'RainstormClientAssets' is not abstract
+     and does not implement abstract member: fun reload(...): CompletableFuture<Void!>!
+
+编译期报错只是表层；更危险的一类是覆写方法静默不被调用——产物能构建、行为却缺失，
+不报任何错。本次由消费方 AllinCore 的 :fabric-vfx:compileKotlin 暴露。
+
+改法沿用既有接线：getMinecraftJarsCollection(productionNamespace) 在产出方登记后携带
+任务依赖（未登记时回退为配置期文件），因此既恢复 classpath，又保证 MC 先产出。
+
+验证：
+- 重映射产物字节码核对：SimpleResourceReloadListener 的方法名由 method_25931 回到 reload
+- 消费方 AllinCore :fabric-vfx:compileKotlin 通过
+- loom 全量单元测试通过；compileJava + checkstyleMain 通过
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java b/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java
+index 25496814b7f817a5d7ed4e3a242561f16519ce3d..c8a7027da3656fa9b56404063545bd62903d1ced 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java
+@@ -321,6 +321,12 @@ public class ModConfigurationRemapper {
+ 
+ 						return RemapModsTask.collectRemapClasspath(remapConfigSourceFiles, inputsBeingRemapped);
+ 					}));
++					// MC jar 必须在重映射 classpath 上：覆写链的方法重命名靠它做类型层级解析。
++					// 旧 ModProcessor 在配置期显式 readClassPath(getMinecraftJars(productionNamespace))，
++					// 迁移到任务时漏了这一路，导致覆写传播的方法名（如 reload）保持源命名空间原名。
++					// 取源命名空间的集合：已登记任务产出时携带任务依赖（同时保证 MC 先产出），
++					// 未登记时回退为配置期文件，与旧语义一致。
++					task.getRemapClasspath().from(extension.getMinecraftJarsCollection(extension.getProductionNamespaceEnum().get()));
+ 					task.getMappingsServiceOptions().set(
+ 							mappingConfiguration.getMappingsServiceOptions(project, MappingOption.forPlatform(extension)));
+ 					task.getSourceNamespace().set(sourceNamespace);

@@ -1,0 +1,98 @@
+From d9f848e3c1df895a5149996b711556f61fc33511 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:24 +0800
+Subject: [PATCH 007/147] =?UTF-8?q?fix(download):=20=E5=86=85=E5=AE=B9?=
+ =?UTF-8?q?=E5=AF=BB=E5=9D=80=E4=B8=8B=E8=BD=BD=E8=B7=B3=E8=BF=87=E6=97=A0?=
+ =?UTF-8?q?=E8=B0=93=E7=9A=84=E5=BC=BA=E5=88=B6=E9=87=8D=E4=B8=8B?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+产物按内容寻址，已存在且校验通过时不再强制重新下载。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/src/main/java/net/fabricmc/loom/util/download/Download.java b/src/main/java/net/fabricmc/loom/util/download/Download.java
+index 21d8bd0fb20bdae1db37592a61b9bdb0b6d7830f..65b5922f1631896322e413edae73a85441d62dc6 100644
+--- a/src/main/java/net/fabricmc/loom/util/download/Download.java
++++ b/src/main/java/net/fabricmc/loom/util/download/Download.java
+@@ -310,6 +310,15 @@ public final class Download {
+ 		final boolean locked = getAndResetLock(output);
+ 
+ 		if (forceDownload || !exists(output)) {
++			// 内容寻址下载的快路径：带期望 hash 的文件（如 vanilla jar）内容永不改变，
++			// 本地 hash 匹配 = 重下结果必然一字节不差。即使 --refresh-dependencies 强制刷新，
++			// 也直接复用本地完好文件，避免重复下载几十 MB 的不变产物；
++			// 损坏文件 hash 必不匹配，仍会照常重下，语义安全。
++			if (forceDownload && expectedHash != null && exists(output) && isHashValid(output)) {
++				LOGGER.info("跳过强制重新下载：本地文件 hash 与期望一致（{}）", output);
++				return false;
++			}
++
+ 			// File does not exist, or we are forced to download again.
+ 			return true;
+ 		}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/download/DownloadFileTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/download/DownloadFileTest.groovy
+index 1cea69b6f05ba701e370450ff8702295f696bdeb..9f332488cc213e202acbad96cd9c1160322f385d 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/download/DownloadFileTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/download/DownloadFileTest.groovy
+@@ -132,6 +132,58 @@ class DownloadFileTest extends DownloadTest {
+ 		!results[1].didDownload()
+ 	}
+ 
++	def "Force: 本地 hash 匹配时跳过强制重下"() {
++		setup:
++		int requestCount = 0
++
++		server.get("/forceSha1Skip.txt") {
++			it.result("Hello World")
++			requestCount ++
++		}
++
++		def output = new File(File.createTempDir(), "file.txt").toPath()
++
++		when:
++		// 第一次正常下载；第二次 forceDownload（模拟 --refresh-dependencies），本地 hash 匹配应直接复用、不发请求
++		def first = Download.create("$PATH/forceSha1Skip.txt")
++				.sha1("0a4d55a8d778e5022fab701977c5d840bbc486d0")
++				.downloadPath(output)
++		def second = Download.create("$PATH/forceSha1Skip.txt")
++				.sha1("0a4d55a8d778e5022fab701977c5d840bbc486d0")
++				.forceDownload()
++				.downloadPath(output)
++
++		then:
++		requestCount == 1
++		first.didDownload()
++		!second.didDownload()
++	}
++
++	def "Force: 本地 hash 不匹配时仍强制重下"() {
++		setup:
++		int requestCount = 0
++
++		server.get("/forceSha1Redownload.txt") {
++			it.result("Hello World")
++			requestCount ++
++		}
++
++		def output = new File(File.createTempDir(), "file.txt").toPath()
++		// 预置一个内容不符（hash 必不匹配）的本地文件，模拟损坏缓存
++		Files.writeString(output, "corrupted content")
++
++		when:
++		def result = Download.create("$PATH/forceSha1Redownload.txt")
++				.sha1("0a4d55a8d778e5022fab701977c5d840bbc486d0")
++				.forceDownload()
++				.downloadPath(output)
++
++		then:
++		requestCount == 1
++		result.didDownload()
++		Files.readString(output) == "Hello World"
++	}
++
+ 	def "Invalid Sha1"() {
+ 		setup:
+ 		server.get("/sha1.invalid") {

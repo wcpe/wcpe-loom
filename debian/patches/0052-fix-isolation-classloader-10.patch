@@ -1,0 +1,803 @@
+From 6f98bdbc94d122095fb5ab44669edaa9e3f00383 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:53 +0800
+Subject: [PATCH 052/147] =?UTF-8?q?fix(isolation):=20=E4=BF=AE=E5=AE=8C?=
+ =?UTF-8?q?=E8=B7=A8=20classloader=20=E6=89=A9=E5=B1=95=E6=B3=A8=E5=86=8C?=
+ =?UTF-8?q?=E8=BF=99=E4=B8=80=E7=B1=BB=E9=97=AE=E9=A2=98=20(#10)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Loom 可能被两个 classloader 各加载一份（settings 与 project classpath 各一份、buildSrc 一份 + plugins{} 一份、复合构建）。此时同名类不是同一 Class 对象，任何基于类型身份的判据都会失效；而 Gradle 9.5 的 ExtensionsStorage 内部是无同步的 LinkedHashMap，「查名 → 注册」不互斥时并行配置会竞态。
+
+核心修复（LoomGradleSharedData）：幂等判据按名判断；查→注册→复查整体加锁；add 被抢名按名复查后跳过而非崩溃（两把静态锁各 classloader 一份，本就无法跨 loader 串行化）；名被外来对象占用时退回本 classloader 兜底实例；兜底表弱引用键 + 锁内 get/put；兜底日志由 info 提到 warn 并打出占用者类型及其 classloader。
+
+同一类的其它位点一并修完：IdeaDownloadSourcesRegistry（同形且无锁）、LoomRepositoryPlugin 与 InstallerData（hasPlugin(Class) 类型身份判据导致 marker 静默失效、重复声明整套仓库）、LoomGradleExtension.get（裸 CCE 改为带成因的 GradleException）、MavenPublication（静态弱集合补同步）。
+
+验证：build -x test 与 checkstyle/codenarc/javadoc 全通过；新增测试用真实第二份 classloader 复现旧判据失效并验证修复生效；IdeaDownloadSourcesHookTest 实跑 PASSED。CI 72 项通过 0 失败。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/LoomGradleExtension.java b/src/main/java/net/fabricmc/loom/LoomGradleExtension.java
+index 9380ab5f86d2f1493d94b1f3ecb77edf606173ad..40a0b1d37d2e309d8fa72788f51e8b5c4af3a1ec 100644
+--- a/src/main/java/net/fabricmc/loom/LoomGradleExtension.java
++++ b/src/main/java/net/fabricmc/loom/LoomGradleExtension.java
+@@ -66,8 +66,34 @@ import net.fabricmc.loom.util.download.DownloadBuilder;
+ 
+ @ApiStatus.Internal
+ public interface LoomGradleExtension extends LoomGradleExtensionAPI {
++	/**
++	 * 取项目上的 Loom 扩展.
++	 *
++	 * <p>判据只做 {@code instanceof} 而不直接强转：当 Loom 被两个 classloader 各加载一份时（settings 与
++	 * project classpath 各一份、buildSrc/约定插件与 plugins 块各一份、复合构建），「loom」这个名字查得到，
++	 * 但对象是由另一份 Loom 创建的，裸强转会抛不带任何业务信息的 ClassCastException。
++	 * 跨 classloader 复用对方实例在语言层面不可能（同名类不是同一个 Class），因此退化为可诊断的失败，
++	 * 明确指出占用者实际类型与其 classloader，并给出可能成因。
++	 *
++	 * @param project 目标项目
++	 * @return 该项目上的 Loom 扩展
++	 * @throws org.gradle.api.UnknownDomainObjectException 项目上没有名为「loom」的扩展（项目未应用 Loom）
++	 * @throws GradleException 扩展存在但由另一份 classloader 的 Loom 创建
++	 */
+ 	static LoomGradleExtension get(Project project) {
+-		return (LoomGradleExtension) project.getExtensions().getByName("loom");
++		final Object extension = project.getExtensions().getByName("loom");
++
++		if (extension instanceof LoomGradleExtension loomExtension) {
++			return loomExtension;
++		}
++
++		throw new GradleException(String.format(
++				"项目 %s 上的「loom」扩展由另一份 classloader 的 Loom 创建：扩展实际类型为 %s（由 classloader %s 加载），"
++						+ "当前 Loom 期望 %s。跨 classloader 无法复用对方实例，常见成因是 Loom 被两个 classloader 各加载了一份"
++						+ "（settings 与项目 classpath 各一份、buildSrc/约定插件与 plugins 块各一份、复合构建），"
++						+ "请把 Loom 统一到单一来源，或改用不遍历其它项目的隔离模式路径。",
++				project.getPath(), extension.getClass().getName(), extension.getClass().getClassLoader(),
++				LoomGradleExtension.class.getName()));
+ 	}
+ 
+ 	LoomFiles getFiles();
+diff --git a/src/main/java/net/fabricmc/loom/LoomRepositoryPlugin.java b/src/main/java/net/fabricmc/loom/LoomRepositoryPlugin.java
+index 984199a2451cd6d7c1982b3fb9bf3df9ead93a90..d4d7189f10044cb09b77769e73c79d0a38c6e7bb 100644
+--- a/src/main/java/net/fabricmc/loom/LoomRepositoryPlugin.java
++++ b/src/main/java/net/fabricmc/loom/LoomRepositoryPlugin.java
+@@ -36,6 +36,7 @@ import org.gradle.api.initialization.Settings;
+ import org.gradle.api.invocation.Gradle;
+ import org.gradle.api.plugins.ExtensionAware;
+ import org.gradle.api.plugins.PluginAware;
++import org.gradle.api.plugins.PluginContainer;
+ 
+ import net.fabricmc.loom.configuration.providers.minecraft.library.processors.LWJGL2UpgradeLibraryProcessor;
+ import net.fabricmc.loom.extension.LoomFiles;
+@@ -43,6 +44,10 @@ import net.fabricmc.loom.internal.LoomGradleSharedData;
+ import net.fabricmc.loom.util.MirrorUtil;
+ 
+ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
++	/** 本 fork 的插件 id. */
++	public static final String NAME = "top.wcpe.loom-repositories";
++	/** 上一层分叉（architectury）的插件 id，作为兼容别名保留. */
++	public static final String LEGACY_NAME = "dev.architectury.loom-repositories";
+ 	private static final List<String> FORGE_GROUPS = List.of(
+ 			"net.minecraftforge",
+ 			"cpw.mods",
+@@ -51,6 +56,24 @@ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
+ 			"org.mcmodlauncher"
+ 	);
+ 
++	/**
++	 * 构建是否已由 settings 侧声明过仓库.
++	 *
++	 * <p>判据必须与 classloader 无关：当 Loom 被两个 classloader 各加载一份时
++	 * （settings 与 project classpath 各一份、buildSrc/约定插件与 plugins 块各一份、复合构建），
++	 * {@code hasPlugin(LoomRepositoryPlugin.class)} 走的是类型身份比较，对本 classloader 而言恒判 false，
++	 * marker 静默失效，项目侧会重复声明整套仓库并二次重排（不报错，只是静默地做了两遍）。
++	 * 插件 id 是字符串，Gradle 在注册表内部按「注册者那一侧的 class」比对，天然跨 classloader 一致，
++	 * 与 {@link LoomGradlePlugin#isApplied(PluginAware)} 同理。
++	 *
++	 * @param gradle 目标构建
++	 * @return 构建上是否已有 Loom 的仓库声明 marker
++	 */
++	public static boolean isRepositoriesDeclared(Gradle gradle) {
++		PluginContainer plugins = gradle.getPlugins();
++		return plugins.hasPlugin(NAME) || plugins.hasPlugin(LEGACY_NAME);
++	}
++
+ 	@Override
+ 	public void apply(PluginAware target) {
+ 		if (target instanceof Settings settings) {
+@@ -61,13 +84,12 @@ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
+ 			settings.getGradle().getPluginManager().apply(LoomRepositoryPlugin.class);
+ 		} else if (target instanceof Project project) {
+ 			LoomGradleSharedData.beforeProject(project.getGradle());
++			LoomGradleSharedData.beforeProject(project, LoomGradleSharedData.get(project));
+ 
+-			if (project.getGradle().getPlugins().hasPlugin(LoomRepositoryPlugin.class)) {
+-				LoomGradleSharedData.beforeProject(project, LoomGradleSharedData.get(project));
++			if (isRepositoriesDeclared(project.getGradle())) {
+ 				return;
+ 			}
+ 
+-			LoomGradleSharedData.beforeProject(project, LoomGradleSharedData.get(project));
+ 			declareRepositories(project.getRepositories(), LoomFiles.create(project), project);
+ 		} else if (target instanceof Gradle) {
+ 			return;
+diff --git a/src/main/java/net/fabricmc/loom/configuration/InstallerData.java b/src/main/java/net/fabricmc/loom/configuration/InstallerData.java
+index 639e7b3081ff00f7c71f9ae37392ed0b33fbc35f..73b9fe840a2c4f688afccdf9652f2b63e374ed75 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/InstallerData.java
++++ b/src/main/java/net/fabricmc/loom/configuration/InstallerData.java
+@@ -92,7 +92,9 @@ public record InstallerData(String version, JsonObject installerJson) {
+ 
+ 			// If user choose to use dependencyResolutionManagement, then they should declare
+ 			// these repositories manually in the settings file.
+-			if (project.getGradle().getPlugins().hasPlugin(LoomRepositoryPlugin.class)) {
++			// 判据必须与 classloader 无关：按 Class 判定在 settings 与项目 classpath 各有一份 Loom 时恒为 false，
++			// 会静默绕过 settings 侧的声明重复添加仓库。
++			if (LoomRepositoryPlugin.isRepositoriesDeclared(project.getGradle())) {
+ 				continue;
+ 			}
+ 
+diff --git a/src/main/java/net/fabricmc/loom/configuration/MavenPublication.java b/src/main/java/net/fabricmc/loom/configuration/MavenPublication.java
+index ffa95da84846319d175a47522cef6b5a677ce2f7..af84222bf6356bf2198c34b15842b136c4b1d868 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/MavenPublication.java
++++ b/src/main/java/net/fabricmc/loom/configuration/MavenPublication.java
+@@ -57,7 +57,9 @@ public abstract class MavenPublication implements Runnable {
+ 			JavaPlugin.API_ELEMENTS_CONFIGURATION_NAME, "compile",
+ 			JavaPlugin.RUNTIME_ELEMENTS_CONFIGURATION_NAME, "runtime"
+ 	);
+-	private static final Set<Publication> EXCLUDED_PUBLICATIONS = Collections.newSetFromMap(new WeakHashMap<>());
++	// 静态集合会在「每个项目的 setup job（contains）」与「用户调用 excludePublication（add）」之间跨项目并发访问，
++	// 而 WeakHashMap 本身无同步，故加同步；弱引用语义保留 —— 构建结束后条目可回收，daemon 复用不会钉住 publication.
++	private static final Set<Publication> EXCLUDED_PUBLICATIONS = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
+ 
+ 	@Inject
+ 	protected abstract Project getProject();
+diff --git a/src/main/java/net/fabricmc/loom/configuration/ide/idea/IdeaDownloadSourcesRegistry.java b/src/main/java/net/fabricmc/loom/configuration/ide/idea/IdeaDownloadSourcesRegistry.java
+index de630f3549823412e5e88a4f229481999e3b2b16..9352f7b85977a6782e84ab7c8a4f908263e44a91 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/ide/idea/IdeaDownloadSourcesRegistry.java
++++ b/src/main/java/net/fabricmc/loom/configuration/ide/idea/IdeaDownloadSourcesRegistry.java
+@@ -29,6 +29,7 @@ import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.WeakHashMap;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
+ import org.gradle.api.Project;
+@@ -46,18 +47,109 @@ import org.gradle.api.plugins.ExtensionContainer;
+ public final class IdeaDownloadSourcesRegistry {
+ 	private static final String EXTENSION_NAME = "loomIdeaDownloadSources";
+ 
++	/**
++	 * 构建级扩展容器的访问互斥：Gradle 的扩展容器内部是普通 LinkedHashMap，
++	 * 「查名 → 注册」若不互斥，并行配置（各项目的 afterEvaluate）会各自通过查名而后双双注册，
++	 * 慢的一方吃到抢名异常，登记表还可能分裂成两份.
++	 */
++	private static final Object REGISTRATION_LOCK = new Object();
++
++	/**
++	 * 跨 classloader 场景下的兜底登记表：构建级扩展已由另一份 Loom（settings 与 project classpath
++	 * 各一份，或多构建复合）注册时，本 classloader 自用一份，保证本 classloader 内登记与读取仍然一致.
++	 *
++	 * <p>键用弱引用：构建存续期间经由 {@code Project#getGradle()} 始终有强引用，身份稳定；
++	 * 构建结束后条目可回收，不会在复用的 daemon 中钉住整个构建对象图。
++	 */
++	private static final Map<Gradle, IdeaDownloadSourcesRegistry> FALLBACK = new WeakHashMap<>();
++
+ 	private final Map<String, Set<String>> taskPathsByNotation = new ConcurrentHashMap<>();
+ 
+ 	public static IdeaDownloadSourcesRegistry get(Project project) {
+ 		final Gradle gradle = project.getGradle();
+ 		final ExtensionContainer extensions = ((ExtensionAware) gradle).getExtensions();
+ 
+-		if (extensions.findByName(EXTENSION_NAME) instanceof IdeaDownloadSourcesRegistry registry) {
++		synchronized (REGISTRATION_LOCK) {
++			final Object existing = extensions.findByName(EXTENSION_NAME);
++
++			// 幂等判据只按「名」判断，不能依赖 instanceof：另一份 Loom 由另一个 classloader 加载时，
++			// 同名类并非同一类型，instanceof 会判 false 并重复注册，Gradle 随即抛
++			// "Cannot add extension with name 'loomIdeaDownloadSources'"。
++			if (existing == null) {
++				return register(project, extensions);
++			}
++
++			if (existing instanceof IdeaDownloadSourcesRegistry registry) {
++				return registry;
++			}
++
++			// 名字已被另一份 classloader 的登记表占用：既不能复用对方实例（类型不同），也不能重复注册。
++			return fallback(project, existing);
++		}
++	}
++
++	/**
++	 * 注册本 classloader 的登记表，并把「名被另一份 classloader 抢占」从崩溃降级为兜底.
++	 *
++	 * <p>{@link ExtensionContainer#add} 只在「查名」与「注册」之间没有其他写入者时才安全。同一 classloader
++	 * 内由 {@link #REGISTRATION_LOCK} 保证；另一个 classloader 的 Loom 有它自己的（静态字段）锁，管不到这里，
++	 * 因此仍可能恰好抢在两步之间完成注册，此时 {@code add} 抛 {@link IllegalArgumentException}。
++	 *
++	 * @param project 目标项目，用于取构建与日志器
++	 * @param extensions 构建级扩展容器
++	 * @return 本 classloader 可用的登记表
++	 */
++	private static IdeaDownloadSourcesRegistry register(Project project, ExtensionContainer extensions) {
++		try {
++			final IdeaDownloadSourcesRegistry registry = new IdeaDownloadSourcesRegistry();
++			extensions.add(IdeaDownloadSourcesRegistry.class, EXTENSION_NAME, registry);
+ 			return registry;
++		} catch (IllegalArgumentException e) {
++			final Object winner = extensions.findByName(EXTENSION_NAME);
++
++			if (winner == null) {
++				// 名并未被占用，异常来自入参非法，原样抛出以免掩盖真实错误
++				throw e;
++			}
++
++			if (winner instanceof IdeaDownloadSourcesRegistry registry) {
++				return registry;
++			}
++
++			return fallback(project, winner);
++		}
++	}
++
++	/**
++	 * 取本 classloader 在给定构建下的兜底登记表，不存在则创建并缓存.
++	 *
++	 * @param project 目标项目，用于取构建（兜底缓存的键）与日志器
++	 * @param occupant 当前占用构建级扩展名的对象，仅用于诊断输出
++	 * @return 本 classloader 的兜底登记表
++	 */
++	private static IdeaDownloadSourcesRegistry fallback(Project project, Object occupant) {
++		final Gradle gradle = project.getGradle();
++		IdeaDownloadSourcesRegistry registry;
++
++		synchronized (FALLBACK) {
++			registry = FALLBACK.get(gradle);
++
++			if (registry != null) {
++				return registry;
++			}
++
++			registry = new IdeaDownloadSourcesRegistry();
++			FALLBACK.put(gradle, registry);
+ 		}
+ 
+-		final IdeaDownloadSourcesRegistry registry = new IdeaDownloadSourcesRegistry();
+-		extensions.add(IdeaDownloadSourcesRegistry.class, EXTENSION_NAME, registry);
++		// 每个 (classloader, 构建) 只记一次：跨 classloader 时登记表本就不互通，降级必须可诊断，
++		// 故用默认控制台（LIFECYCLE）可见的 warn，而不是默认看不到的 info。
++		// 注意消息正文里不能再出现 {}，否则会被日志器当成参数占位符。
++		project.getLogger().warn("构建级扩展 {} 已被其他 classloader 的对象占用：{}。本 classloader 改用私有的登记表，"
++				+ "跨 classloader 的登记不互通；常见成因是 Loom 被两个 classloader 各加载了一份"
++				+ "（settings 与项目 classpath、buildSrc/约定插件与 plugins 块、复合构建），"
++				+ "如 IDE 的下载源码钩子缺少其它项目登记的任务路径，请统一 Loom 的加载来源。",
++				EXTENSION_NAME, occupant.getClass().getName() + "（classloader: " + occupant.getClass().getClassLoader() + "）");
+ 		return registry;
+ 	}
+ 
+diff --git a/src/main/java/net/fabricmc/loom/internal/LoomGradleSharedData.java b/src/main/java/net/fabricmc/loom/internal/LoomGradleSharedData.java
+index b9f40800a39afe45f7807505e31914fb19d6464f..24b2e6bcf0d4c19a8d4f192e2497e20f0b5db989 100644
+--- a/src/main/java/net/fabricmc/loom/internal/LoomGradleSharedData.java
++++ b/src/main/java/net/fabricmc/loom/internal/LoomGradleSharedData.java
+@@ -27,11 +27,13 @@ package net.fabricmc.loom.internal;
+ import java.io.Serializable;
+ import java.util.LinkedHashMap;
+ import java.util.Map;
++import java.util.WeakHashMap;
+ 
+ import org.gradle.api.Project;
+ import org.gradle.api.invocation.Gradle;
+-import org.gradle.api.plugins.ExtensionAware;
++import org.gradle.api.logging.Logger;
+ import org.gradle.api.plugins.ExtensionContainer;
++import org.jspecify.annotations.Nullable;
+ 
+ /**
+  * 在项目隔离模式下传递只包含可序列化值的共享数据.
+@@ -40,6 +42,21 @@ public final class LoomGradleSharedData implements Serializable {
+ 	private static final long serialVersionUID = 1L;
+ 	public static final String EXTENSION_NAME = "loomSharedData";
+ 
++	/**
++	 * 构建级扩展容器的访问互斥：Gradle 的扩展容器内部是普通 LinkedHashMap，
++	 * 「查名 → 注册」若不互斥，同一构建的并行配置会各自通过查名而撞上抢名异常，甚至同时写入损坏容器.
++	 */
++	private static final Object REGISTRATION_LOCK = new Object();
++
++	/**
++	 * 跨 classloader 场景下的兜底实例：构建级扩展已由另一份 Loom（settings 与 project classpath
++	 * 各一份，或多构建复合）注册时，本 classloader 自用一份，保证数据桥在各自 classloader 内自洽.
++	 *
++	 * <p>键用弱引用：构建存续期间经由 {@code Project#getGradle()} 始终有强引用，身份稳定；构建结束后
++	 * 条目可回收，不会在复用的 daemon 中钉住整个构建对象图。
++	 */
++	private static final Map<Gradle, LoomGradleSharedData> FALLBACK = new WeakHashMap<>();
++
+ 	private final String pluginVersion;
+ 	private final Map<String, LoomProjectData> projects = new LinkedHashMap<>();
+ 
+@@ -60,38 +77,151 @@ public final class LoomGradleSharedData implements Serializable {
+ 	}
+ 
+ 	public static void beforeProject(Gradle gradle) {
+-		ExtensionContainer extensions = ((ExtensionAware) gradle).getExtensions();
++		registerSharedData(gradle.getExtensions());
++	}
+ 
+-		if (extensions.findByName(EXTENSION_NAME) instanceof LoomGradleSharedData) {
+-			return;
+-		}
++	/**
++	 * 在项目级扩展容器中登记共享数据，幂等.
++	 *
++	 * <p>项目级容器同样会被并行配置的多线程访问（同一构建的多个项目、或同一项目的多个配置线程），
++	 * 故判据与注册整体加锁，与 {@link #get(Project)} 使用同一把锁。
++	 *
++	 * @param project 目标项目
++	 * @param data 本 classloader 的共享数据实例
++	 */
++	public static void beforeProject(Project project, LoomGradleSharedData data) {
++		ExtensionContainer extensions = project.getExtensions();
++
++		synchronized (REGISTRATION_LOCK) {
++			// 幂等判据只按「名」判断，不能依赖 instanceof：当另一份 Loom 由另一个 classloader 加载时，
++			// 同名类并非同一类型，instanceof 会判 false 并重复注册，Gradle 随即抛
++			// "Cannot add extension with name 'loomSharedData'"。
++			if (extensions.findByName(EXTENSION_NAME) != null) {
++				return;
++			}
+ 
+-		LoomGradleSharedData data = new LoomGradleSharedData(net.fabricmc.loom.LoomGradlePlugin.LOOM_VERSION);
+-		extensions.add(LoomGradleSharedData.class, EXTENSION_NAME, data);
++			addSharedData(extensions, data);
++		}
+ 	}
+ 
+-	public static void beforeProject(Project project, LoomGradleSharedData data) {
+-		if (project.getExtensions().findByName(EXTENSION_NAME) == null) {
+-			project.getExtensions().add(LoomGradleSharedData.class, EXTENSION_NAME, data);
++	/**
++	 * 在构建级扩展容器中登记本 classloader 的共享数据，幂等.
++	 *
++	 * <p>只按「名」判断是否已注册，理由同 {@link #beforeProject(Project, LoomGradleSharedData)}；
++	 * 名已被占用时静默跳过——容器里已有同名扩展本就是期望的终态，本 classloader 真正需要数据时
++	 * 会在 {@link #get(Project)} 中降级并输出可诊断的日志。
++	 *
++	 * @param extensions 目标扩展容器，通常是 {@link Gradle#getExtensions()}
++	 */
++	static void registerSharedData(ExtensionContainer extensions) {
++		synchronized (REGISTRATION_LOCK) {
++			if (extensions.findByName(EXTENSION_NAME) != null) {
++				return;
++			}
++
++			addSharedData(extensions, createSharedData());
+ 		}
+ 	}
+ 
+ 	public static LoomGradleSharedData get(Project project) {
++		ExtensionContainer extensions = project.getGradle().getExtensions();
+ 		LoomGradleSharedData data = project.getExtensions().findByType(LoomGradleSharedData.class);
+ 
+ 		if (data != null) {
+ 			return data;
+ 		}
+ 
+-		ExtensionContainer extensions = ((ExtensionAware) project.getGradle()).getExtensions();
+-		data = extensions.findByType(LoomGradleSharedData.class);
++		// 构建级容器会被同一构建的多个项目（并行配置时即多个线程）同时访问，故整段原子化：
++		// 查名 → 注册 → 复查 之间不允许插入其他 Loom 线程，否则会各拿一份实例或撞上抢名异常。
++		synchronized (REGISTRATION_LOCK) {
++			data = extensions.findByType(LoomGradleSharedData.class);
++
++			if (data == null) {
++				beforeProject(project.getGradle());
++				data = extensions.findByType(LoomGradleSharedData.class);
++			}
++		}
+ 
+ 		if (data == null) {
+-			beforeProject(project.getGradle());
+-			data = extensions.getByType(LoomGradleSharedData.class);
++			// 按名取到了但类型不符 —— 构建级扩展属于另一个 classloader，既不能复用对方实例，
++			// 也不能重复注册；退回本 classloader 的兜底实例（原先 getByType 在此会直接抛错）。
++			data = fallback(project.getGradle(), extensions.findByName(EXTENSION_NAME), project.getLogger());
+ 		}
+ 
+ 		beforeProject(project, data);
+ 		return data;
+ 	}
++
++	/**
++	 * 注册共享数据，并把「名被另一份 classloader 抢占」从崩溃降级为跳过.
++	 *
++	 * <p>{@link ExtensionContainer#add} 只在「查名」与「注册」之间没有其他写入者时才安全。同一 classloader
++	 * 内由 {@link #REGISTRATION_LOCK} 保证；另一个 classloader 的 Loom 有它自己的（静态字段）锁，管不到这里，
++	 * 因此仍可能恰好抢在两步之间完成注册，此时 {@code add} 抛 {@link IllegalArgumentException}。
++	 * 按名复查可以把「被抢名」与「入参非法」区分开：被抢名时跳过注册即可（容器里已有别人的同名扩展），
++	 * 调用方随后会走兜底路径并给出可诊断的日志；入参非法则原样抛出，避免掩盖真实错误。
++	 *
++	 * @param extensions 目标扩展容器
++	 * @param data 待注册的共享数据
++	 * @return 本次调用是否完成了注册
++	 */
++	private static boolean addSharedData(ExtensionContainer extensions, LoomGradleSharedData data) {
++		try {
++			extensions.add(LoomGradleSharedData.class, EXTENSION_NAME, data);
++			return true;
++		} catch (IllegalArgumentException e) {
++			if (extensions.findByName(EXTENSION_NAME) == null) {
++				throw e;
++			}
++
++			return false;
++		}
++	}
++
++	/**
++	 * 取本 classloader 在给定构建下的兜底实例，不存在则创建并缓存.
++	 *
++	 * @param gradle 目标构建，用作兜底实例的缓存键（弱引用，构建结束后即可回收）
++	 * @param occupant 当前占用构建级扩展名的对象，仅用于诊断输出，可能为 {@code null}
++	 * @param logger 用于输出降级诊断的日志器
++	 * @return 本 classloader 的兜底实例
++	 */
++	private static LoomGradleSharedData fallback(Gradle gradle, @Nullable Object occupant, Logger logger) {
++		LoomGradleSharedData data;
++
++		synchronized (FALLBACK) {
++			data = FALLBACK.get(gradle);
++
++			if (data != null) {
++				return data;
++			}
++
++			data = createSharedData();
++			FALLBACK.put(gradle, data);
++		}
++
++		// 每个 (classloader, 构建) 只记一次：跨 classloader 时数据桥本就不互通，降级必须可诊断，
++		// 故用默认控制台（LIFECYCLE）可见的 warn，而不是默认看不到的 info。
++		// 注意消息正文里不能再出现 {}，否则会被日志器当成参数占位符。
++		logger.warn("构建级扩展 {} 已被其他 classloader 的对象占用：{}。本 classloader 改用私有的共享数据实例，"
++				+ "跨 classloader 的数据桥不互通；常见成因是 Loom 被两个 classloader 各加载了一份"
++				+ "（settings 与项目 classpath、buildSrc/约定插件与 plugins 块、复合构建），"
++				+ "如出现数据缺失请统一 Loom 的加载来源。", EXTENSION_NAME, describe(occupant));
++		return data;
++	}
++
++	/**
++	 * 描述占用构建级扩展名的对象，用于诊断输出.
++	 */
++	private static String describe(@Nullable Object occupant) {
++		if (occupant == null) {
++			return "<未知>";
++		}
++
++		return occupant.getClass().getName() + "（classloader: " + occupant.getClass().getClassLoader() + "）";
++	}
++
++	private static LoomGradleSharedData createSharedData() {
++		return new LoomGradleSharedData(net.fabricmc.loom.LoomGradlePlugin.LOOM_VERSION);
++	}
+ }
+diff --git a/src/test/groovy/net/fabricmc/loom/LoomRepositoryPluginTest.groovy b/src/test/groovy/net/fabricmc/loom/LoomRepositoryPluginTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..d01fa622510ea9888ceec138cda7593a52c30fe1
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/LoomRepositoryPluginTest.groovy
+@@ -0,0 +1,112 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom
++
++import org.gradle.testfixtures.ProjectBuilder
++import spock.lang.Specification
++
++/**
++ * 覆盖「settings 侧已声明过仓库」这一 marker 的判据。
++ *
++ * <p>marker 打在 Gradle 对象上，项目侧据此跳过整套仓库的重复声明。若判据用
++ * {@code hasPlugin(LoomRepositoryPlugin.class)}，走的就是类型身份比较：cross classloader 时恒判 false，
++ * marker 静默失效，项目侧会把整套仓库再声明一遍并二次重排（不报错，只是行为静默变差）。
++ * 这里用「第二份 Loom」的类加载器真实复现该场景，验证字符串插件 id 判据仍然成立。
++ */
++class LoomRepositoryPluginTest extends Specification {
++	private static final String PLUGIN_CLASS = "net.fabricmc.loom.LoomRepositoryPlugin"
++
++	def "按 Class 应用 marker 后，项目侧能按插件 id 判出已声明"() {
++		given:
++		def project = ProjectBuilder.builder().withName("root").build()
++
++		expect:
++		!LoomRepositoryPlugin.isRepositoriesDeclared(project.getGradle())
++
++		when: "settings 侧应用 marker，写法与 apply(Settings) 中一致（按 Class 应用）"
++		project.getGradle().getPluginManager().apply(LoomRepositoryPlugin.class)
++
++		then:
++		LoomRepositoryPlugin.isRepositoriesDeclared(project.getGradle())
++	}
++
++	def "另一份 classloader 的 Loom 留下的 marker 仍能按插件 id 判出"() {
++		given: "第二份 Loom：同名类不是同一个 Class，模拟 settings 与项目 classpath 各加载一份"
++		def project = ProjectBuilder.builder().withName("root").build()
++		def foreignLoader = new ForeignLoomClassLoader(getClass().getClassLoader(), PLUGIN_CLASS)
++		def foreignPluginClass = foreignLoader.loadClass(PLUGIN_CLASS)
++
++		when: "settings 侧那份 Loom 把 marker 打在构建上"
++		project.getGradle().getPluginManager().apply(foreignPluginClass)
++
++		then: "旧判据（类型身份比较）已经判不出来 —— 这正是 marker 静默失效的原因"
++		foreignPluginClass != LoomRepositoryPlugin.class
++		!project.getGradle().getPlugins().hasPlugin(LoomRepositoryPlugin.class)
++
++		and: "按插件 id 的判据与 classloader 无关，仍然成立"
++		LoomRepositoryPlugin.isRepositoriesDeclared(project.getGradle())
++	}
++
++	/**
++	 * 「第二份 Loom」的类加载器：只自行定义指定类，形成与父加载器不同的类身份；
++	 * 其余类（Gradle API、Spock、Loom 的其它类与资源）一律委托父加载器，
++	 * 保证两边共享同一批 Gradle 类型与同一份插件描述符。
++	 */
++	private static class ForeignLoomClassLoader extends ClassLoader {
++		private final Set<String> ownedClasses
++
++		ForeignLoomClassLoader(ClassLoader parent, String... ownedClasses) {
++			super(parent)
++			this.ownedClasses = Set.of(ownedClasses)
++		}
++
++		@Override
++		protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
++			synchronized (getClassLoadingLock(name)) {
++				Class<?> loaded = findLoadedClass(name)
++
++				if (loaded == null && ownedClasses.contains(name)) {
++					loaded = findClass(name)
++				}
++
++				return loaded == null ? super.loadClass(name, resolve) : loaded
++			}
++		}
++
++		@Override
++		protected Class<?> findClass(String name) throws ClassNotFoundException {
++			def resource = getParent().getResourceAsStream(name.replace('.', '/') + '.class')
++
++			if (resource == null) {
++				throw new ClassNotFoundException(name)
++			}
++
++			resource.withCloseable { input ->
++				byte[] bytes = input.bytes
++				return defineClass(name, bytes, 0, bytes.length)
++			}
++		}
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/configuration/ide/idea/IdeaDownloadSourcesRegistryTest.groovy b/src/test/groovy/net/fabricmc/loom/configuration/ide/idea/IdeaDownloadSourcesRegistryTest.groovy
+index 0ef50c2a376493ee56dd392f22266a7e135232b1..48a141ff6db4e165e9125b2621813084339657d6 100644
+--- a/src/test/groovy/net/fabricmc/loom/configuration/ide/idea/IdeaDownloadSourcesRegistryTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/configuration/ide/idea/IdeaDownloadSourcesRegistryTest.groovy
+@@ -117,4 +117,29 @@ class IdeaDownloadSourcesRegistryTest extends Specification {
+ 		firstRegistry.register(MERGED_SOURCES, ":genSources")
+ 		secondRegistry.taskPathsFor(MERGED_SOURCES).isEmpty()
+ 	}
++
++	def "构建级名字被外来对象占用时不抛异常，且同一构建内实例唯一"() {
++		given: "构建级扩展名已被另一个 classloader 的对象占用"
++		def rootProject = ProjectBuilder.builder().withName("root").build()
++		def subProject = ProjectBuilder.builder().withName("sub").withParent(rootProject).build()
++		def foreign = new Object()
++		rootProject.getGradle().getExtensions().add("loomIdeaDownloadSources", foreign)
++
++		when: "本 classloader 取登记表（原先会在 add 处抛 Cannot add extension with name 'loomIdeaDownloadSources'）"
++		def fromRoot = IdeaDownloadSourcesRegistry.get(rootProject)
++		def fromSub = IdeaDownloadSourcesRegistry.get(subProject)
++		def again = IdeaDownloadSourcesRegistry.get(rootProject)
++
++		then: "不抛异常，且同一构建内始终是同一份兜底登记表"
++		fromRoot != null
++		fromSub.is(fromRoot)
++		again.is(fromRoot)
++
++		and: "外来对象仍然占着构建级名字，本登记表没有被塞进构建级容器"
++		rootProject.getGradle().getExtensions().getByName("loomIdeaDownloadSources").is(foreign)
++
++		and: "兜底登记表在本 classloader 内仍然可用"
++		fromSub.register(MERGED_SOURCES, ":sub:genSources")
++		fromRoot.taskPathsFor(MERGED_SOURCES) == [":sub:genSources"]
++	}
+ }
+diff --git a/src/test/groovy/net/fabricmc/loom/internal/LoomGradleSharedDataTest.groovy b/src/test/groovy/net/fabricmc/loom/internal/LoomGradleSharedDataTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..1eacfd38ae7fe3a596cb9764e6ef5c511e1e5a35
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/internal/LoomGradleSharedDataTest.groovy
+@@ -0,0 +1,159 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.internal
++
++import java.util.concurrent.Callable
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++
++import org.gradle.api.plugins.ExtensionContainer
++import org.gradle.testfixtures.ProjectBuilder
++import spock.lang.Specification
++
++/**
++ * 覆盖「构建级共享数据」在跨 classloader 与并行配置下的注册语义。
++ *
++ * <p>跨 classloader 无法在单测里真的造出第二份 Loom，因此用两类等价手段：
++ * 一是往构建级容器里塞一个同名外来对象（对类型身份判据而言与「另一份 Loom 的实例」完全等价，
++ * {@code findByType} 一样会判 null）；二是用一个假扩展容器模拟「另一份 classloader 恰好抢在
++ * 查名与注册之间完成注册」这一无法稳定复现的竞态窗口。
++ */
++class LoomGradleSharedDataTest extends Specification {
++	def "构建级名字被外来对象占用时不抛异常，且多次调用返回同一实例"() {
++		given: "构建级扩展名已被另一个 classloader 的对象占用"
++		def project = ProjectBuilder.builder().withName("root").build()
++		def foreign = new Object()
++		project.getGradle().getExtensions().add(LoomGradleSharedData.EXTENSION_NAME, foreign)
++
++		when: "本 classloader 取共享数据（原先会在 add 处抛 Cannot add extension with name 'loomSharedData'）"
++		def first = LoomGradleSharedData.get(project)
++		def second = LoomGradleSharedData.get(project)
++
++		then: "不抛异常，且多次调用拿到同一份实例"
++		first != null
++		second.is(first)
++
++		and: "外来对象仍然占着构建级名字，本实例没有被塞进构建级容器"
++		project.getGradle().getExtensions().getByName(LoomGradleSharedData.EXTENSION_NAME).is(foreign)
++
++		and: "本 classloader 的实例挂在项目级扩展上，项目内取到的就是同一份"
++		project.getExtensions().getByName(LoomGradleSharedData.EXTENSION_NAME).is(first)
++	}
++
++	def "不同项目共享同一份构建级实例"() {
++		given:
++		def rootProject = ProjectBuilder.builder().withName("root").build()
++		def subProject = ProjectBuilder.builder().withName("sub").withParent(rootProject).build()
++
++		when:
++		def fromRoot = LoomGradleSharedData.get(rootProject)
++		def fromSub = LoomGradleSharedData.get(subProject)
++
++		then:
++		fromRoot.is(fromSub)
++	}
++
++	def "并行首次取只产生一个实例"() {
++		given: "同一构建下的多个项目，模拟并行配置"
++		def rootProject = ProjectBuilder.builder().withName("root").build()
++		def projects = (0..<8).collect { index -> ProjectBuilder.builder().withName("sub" + index).withParent(rootProject).build() }
++		// 预热：真实构建里 Gradle 对象的扩展容器在 settings 求值阶段（单线程）就已创建，而 ProjectBuilder
++		// 下它是「首次访问时惰性创建」且创建过程未同步 —— 多线程同时首次访问会各自造出一个不同的空容器
++		// （实测 8 线程拿到 8 个不同实例）。那是 Gradle 自身的惰性初始化竞态，不在被测范围内，
++		// 故先在主线程创建一次，让并发阶段只考察被测类的互斥与幂等。
++		def buildExtensions = rootProject.getGradle().getExtensions()
++		def start = new CountDownLatch(1)
++		def pool = Executors.newFixedThreadPool(projects.size())
++
++		when:
++		def futures = projects.collect { project ->
++			pool.submit({
++				start.await()
++				return LoomGradleSharedData.get(project)
++			} as Callable)
++		}
++		start.countDown()
++		def results = futures.collect { it.get(60, TimeUnit.SECONDS) }
++		pool.shutdown()
++
++		then: "所有线程拿到同一份构建级实例，也没有人吃到抢名异常"
++		results.every { result -> result.is(results[0]) }
++		rootProject.getGradle().getExtensions().getByType(LoomGradleSharedData).is(results[0])
++
++		and: "预热时拿到的容器就是后续所有访问看到的容器（前提不成立时这里会先失败）"
++		buildExtensions.is(rootProject.getGradle().getExtensions())
++	}
++
++	def "项目级扩展只登记一次，重复登记不会覆盖已有实例"() {
++		given:
++		def project = ProjectBuilder.builder().withName("root").build()
++		def registered = LoomGradleSharedData.get(project)
++
++		when: "另一份数据试图重复登记"
++		LoomGradleSharedData.beforeProject(project, new LoomGradleSharedData("9.9.9"))
++
++		then:
++		project.getExtensions().getByName(LoomGradleSharedData.EXTENSION_NAME).is(registered)
++	}
++
++	def "另一份 classloader 抢在查名与注册之间完成注册时降级为跳过"() {
++		given: "查名时名还没被占，add 时已经被另一份 classloader 抢走"
++		def winner = new Object()
++		def stolen = false
++		def extensions = [
++			findByName: { String name -> stolen ? winner : null },
++			add: { Class type, String name, Object extension ->
++				// 争用窗口只存在于「查名」与「注册」之间，这里让 add 撞上已完成的抢名
++				stolen = true
++				throw new IllegalArgumentException("Cannot add extension with name '" + name + "'")
++			}
++		] as ExtensionContainer
++
++		when:
++		LoomGradleSharedData.registerSharedData(extensions)
++
++		then: "降级为跳过注册，而不是把异常炸到配置阶段"
++		noExceptionThrown()
++		extensions.findByName(LoomGradleSharedData.EXTENSION_NAME).is(winner)
++	}
++
++	def "名并未被占用时的注册失败仍原样抛出"() {
++		given: "add 抛出的不是抢名，而是入参非法"
++		def extensions = [
++			findByName: { String name -> null },
++			add: { Class type, String name, Object extension ->
++				throw new IllegalArgumentException("入参非法（模拟）")
++			}
++		] as ExtensionContainer
++
++		when:
++		LoomGradleSharedData.registerSharedData(extensions)
++
++		then: "按名复查确认不是抢名后必须原样抛出，避免掩盖真实错误"
++		IllegalArgumentException e = thrown()
++		e.message == "入参非法（模拟）"
++	}
++}

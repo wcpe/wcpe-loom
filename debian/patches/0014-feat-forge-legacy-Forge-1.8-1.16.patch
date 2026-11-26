@@ -1,0 +1,2137 @@
+From eaeb5cb4f25512546d07d7b577f291abc71cd681 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:27 +0800
+Subject: [PATCH 014/147] =?UTF-8?q?feat(forge):=20=E6=81=A2=E5=A4=8D=20leg?=
+ =?UTF-8?q?acy=20Forge=EF=BC=881.8-1.16=EF=BC=89=E6=94=AF=E6=8C=81?=
+ =?UTF-8?q?=E9=93=BE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+1.17 上游已移除 legacy Forge 链路，按 essential dev/1.15 重新接回：FG2 支持、
+pack200 与 binpatches、MinecraftLegacyPatchedProvider 及其 patched provider 分派、
+legacy access transform 的输入输出路径等。
+
+Origin: backport, essential dev/1.15
+Forwarded: no
+
+diff --git a/build.gradle b/build.gradle
+index 8c3f27f03a50fea3c1619fe04313f2c9cf3d5338..c749d52aca7824338d84ea57af18734accaf4a3f 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -159,6 +159,9 @@ dependencies {
+ 	implementation libs.datafixerupper
+ 	implementation libs.at
+ 
++	// LZMA 解压：legacy Forge 的 binpatches.pack.lzma 需要
++	implementation libs.lzma
++
+ 	// Forge mods.toml parsing
+ 	implementation libs.night.config.toml
+ 
+@@ -181,6 +184,8 @@ dependencies {
+ 	testImplementation testLibs.bcutil
+ 	testImplementation testLibs.bcpkix
+ 	testImplementation testLibs.fabric.loader
++	// pack200 解包：legacy Forge 夹具注入的 pack200Provider 在运行时需要
++	runtimeOnly testLibs.pack200
+ 
+ 	compileOnly runtimeLibs.jetbrains.annotations
+ 	testCompileOnly runtimeLibs.jetbrains.annotations
+@@ -521,8 +526,16 @@ abstract class WriteActionsTestMatrix extends DefaultTask {
+ 					testMatrix.add("net.fabricmc.loom.test.integration.${it.name}.*")
+ 				} else if (directSubdirs.contains(it.name)) {
+ 					it.eachFile { child ->
+-						def className = child.name.replace(".groovy", "")
+-						testMatrix.add("net.fabricmc.loom.test.integration.${it.name}.${className}")
++						if (child.isDirectory()) {
++							// 二级目录中的测试同样逐个成组
++							child.eachFile { nested ->
++								def nestedName = nested.name.replace(".groovy", "")
++								testMatrix.add("net.fabricmc.loom.test.integration.${it.name}.${child.name}.${nestedName}")
++							}
++						} else {
++							def className = child.name.replace(".groovy", "")
++							testMatrix.add("net.fabricmc.loom.test.integration.${it.name}.${className}")
++						}
+ 					}
+ 				}
+ 			}
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 50d05af9d965b4f2ecb77ba47dfb680accb5dd91..ac3e41db302c3e45cf7aff77d3fac8d76cdc8d86 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -28,6 +28,7 @@ night-config = "3.6.6"
+ datafixerupper = "6.0.8"
+ at = "1.0.1"
+ jankson = "1.2.3"
++lzma = "1.3"
+ 
+ [libraries]
+ # Loom compile libraries
+@@ -63,6 +64,7 @@ night-config-toml = { module = "com.electronwill.night-config:toml", version.ref
+ datafixerupper = { module = "com.mojang:datafixerupper", version.ref = "datafixerupper" }
+ at = { module = "dev.architectury:at", version.ref = "at" }
+ jankson = { module = "blue.endless:jankson", version.ref = "jankson" }
++lzma = { module = "com.github.jponge:lzma-java", version.ref = "lzma" }
+ 
+ [plugins]
+ kotlin = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+diff --git a/gradle/test.libs.versions.toml b/gradle/test.libs.versions.toml
+index abfff1caab97b3acc8e44bca231c3015913223c7..63e851954d5635cce4952b0c2b61e1d2a7d78780 100644
+--- a/gradle/test.libs.versions.toml
++++ b/gradle/test.libs.versions.toml
+@@ -9,6 +9,7 @@ bouncycastle = "1.84"
+ 
+ gradle-nightly = "9.7.0-20260602012325+0000"
+ fabric-loader = "0.19.2"
++pack200 = "0.1.3"
+ 
+ [libraries]
+ spock = { module = "org.spockframework:spock-core", version.ref = "spock" }
+@@ -20,6 +21,7 @@ java-debug = { module = "com.microsoft.java:com.microsoft.java.debug.core", vers
+ mixin = { module = "net.fabricmc:sponge-mixin", version.ref = "mixin" }
+ gradle-nightly = { module = "org.gradle:dummy", version.ref = "gradle-nightly" }
+ fabric-loader = { module = "net.fabricmc:fabric-loader", version.ref = "fabric-loader" }
++pack200 = { module = "dev.architectury.architectury-pack200:dev.architectury.architectury-pack200.gradle.plugin", version.ref = "pack200" }
+ bcprov = { module = "org.bouncycastle:bcprov-jdk18on", version.ref = "bouncycastle" }
+ bcpkix = { module = "org.bouncycastle:bcpkix-jdk18on", version.ref = "bouncycastle" }
+ bcutil = { module = "org.bouncycastle:bcutil-jdk18on", version.ref = "bouncycastle" }
+\ No newline at end of file
+diff --git a/src/main/java/dev/architectury/loom/forge/AccessTransformSetMapper.java b/src/main/java/dev/architectury/loom/forge/AccessTransformSetMapper.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9ba5dcef1cb8e94cdc32a39dcff7a85ca2fb34a
+--- /dev/null
++++ b/src/main/java/dev/architectury/loom/forge/AccessTransformSetMapper.java
+@@ -0,0 +1,70 @@
++/*
++ * The MIT License (MIT)
++ *
++ * Copyright (c) 2018 Minecrell (https://github.com/Minecrell)
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++
++package dev.architectury.loom.forge;
++
++import java.util.Objects;
++import java.util.Optional;
++
++import org.cadixdev.at.AccessTransformSet;
++import org.cadixdev.bombe.type.signature.MethodSignature;
++import org.cadixdev.lorenz.MappingSet;
++import org.cadixdev.lorenz.model.ClassMapping;
++import org.cadixdev.lorenz.model.FieldMapping;
++import org.cadixdev.lorenz.model.Mapping;
++import org.cadixdev.lorenz.model.MethodMapping;
++
++// TODO from https://github.com/CadixDev/at/blob/c2b92fc26cf26e64d3ca3b35abf3364d4b95e6c3/src/main/java/org/cadixdev/at/impl/AccessTransformSetMapper.java
++//      remove once https://github.com/CadixDev/at/issues/7 is fixed
++public final class AccessTransformSetMapper {
++	private AccessTransformSetMapper() {
++	}
++
++	public static AccessTransformSet remap(AccessTransformSet set, MappingSet mappings) {
++		Objects.requireNonNull(set, "set");
++		Objects.requireNonNull(mappings, "mappings");
++
++		AccessTransformSet remapped = AccessTransformSet.create();
++		set.getClasses().forEach((className, classSet) -> {
++			Optional<? extends ClassMapping<?, ?>> mapping = mappings.getClassMapping(className);
++			remap(mappings, mapping, classSet, remapped.getOrCreateClass(mapping.map(Mapping::getFullDeobfuscatedName).orElse(className)));
++		});
++		return remapped;
++	}
++
++	private static void remap(MappingSet mappings, Optional<? extends ClassMapping<?, ?>> mapping, AccessTransformSet.Class set, AccessTransformSet.Class remapped) {
++		remapped.merge(set.get());
++		remapped.mergeAllFields(set.allFields());
++		remapped.mergeAllMethods(set.allMethods());
++
++		set.getFields().forEach((name, transform) ->
++				remapped.mergeField(mapping.flatMap(m -> m.getFieldMapping(name))
++						.map(FieldMapping::getDeobfuscatedName).orElse(name), transform));
++
++		set.getMethods().forEach((signature, transform) ->
++				remapped.mergeMethod(mapping.flatMap(m -> m.getMethodMapping(signature))
++						.map(MethodMapping::getDeobfuscatedSignature)
++						.orElseGet(() -> new MethodSignature(signature.getName(), mappings.deobfuscate(signature.getDescriptor()))), transform));
++	}
++}
+diff --git a/src/main/java/dev/architectury/loom/forge/CoreModManagerTransformer.java b/src/main/java/dev/architectury/loom/forge/CoreModManagerTransformer.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b9bb6417b6d5c7e1d436d2c149629023d804083
+--- /dev/null
++++ b/src/main/java/dev/architectury/loom/forge/CoreModManagerTransformer.java
+@@ -0,0 +1,238 @@
++package dev.architectury.loom.forge;
++
++import static org.objectweb.asm.Opcodes.ACC_PRIVATE;
++import static org.objectweb.asm.Opcodes.ACC_STATIC;
++import static org.objectweb.asm.Opcodes.ALOAD;
++import static org.objectweb.asm.Opcodes.ASTORE;
++import static org.objectweb.asm.Opcodes.BIPUSH;
++import static org.objectweb.asm.Opcodes.CHECKCAST;
++import static org.objectweb.asm.Opcodes.DUP;
++import static org.objectweb.asm.Opcodes.GOTO;
++import static org.objectweb.asm.Opcodes.ICONST_0;
++import static org.objectweb.asm.Opcodes.IFEQ;
++import static org.objectweb.asm.Opcodes.IFNONNULL;
++import static org.objectweb.asm.Opcodes.INVOKEINTERFACE;
++import static org.objectweb.asm.Opcodes.INVOKESPECIAL;
++import static org.objectweb.asm.Opcodes.INVOKESTATIC;
++import static org.objectweb.asm.Opcodes.INVOKEVIRTUAL;
++import static org.objectweb.asm.Opcodes.NEW;
++import static org.objectweb.asm.Opcodes.POP;
++import static org.objectweb.asm.Opcodes.RETURN;
++
++import org.objectweb.asm.ClassVisitor;
++import org.objectweb.asm.Label;
++import org.objectweb.asm.MethodVisitor;
++import org.objectweb.asm.Opcodes;
++
++/**
++ * Transforms Forge's CoreModManager class to search the classpath for coremods.
++ * For motivation, see comments at usage site.
++ */
++public class CoreModManagerTransformer extends ClassVisitor {
++	private static final String CLASS = "net/minecraftforge/fml/relauncher/CoreModManager";
++	public static final String FILE = CLASS + ".class";
++
++	private static final String TARGET_METHOD = "discoverCoreMods";
++	private static final String OUR_METHOD_NAME = "loom$injectCoremodsFromClasspath";
++	private static final String OUR_METHOD_DESCRIPTOR = "(Lnet/minecraft/launchwrapper/LaunchClassLoader;)V";
++
++	public CoreModManagerTransformer(ClassVisitor classVisitor) {
++		super(Opcodes.ASM9, classVisitor);
++	}
++
++	@Override
++	public MethodVisitor visitMethod(int access, String name, String descriptor, String signature, String[] exceptions) {
++		MethodVisitor methodVisitor = super.visitMethod(access, name, descriptor, signature, exceptions);
++
++		// We inject a call to our method, which will discover and load coremods from the classpath, at the very start of the
++		// regular discovery method.
++		if (name.equals(TARGET_METHOD)) {
++			methodVisitor = new InjectCallAtHead(methodVisitor);
++		}
++
++		return methodVisitor;
++	}
++
++	@Override
++	public void visitEnd() {
++		// We add the following method, which will find all coremods on the classpath, and load them.
++		//
++		//     private static void loom$injectCoremodsFromClasspath(LaunchClassLoader classLoader) throws Exception {
++		//         Enumeration<URL> urls = classLoader.getResources("META-INF/MANIFEST.MF");
++		//         while (urls.hasMoreElements()) {
++		//             URL url = urls.nextElement();
++		//             InputStream stream = url.openStream();
++		//             Manifest manifest = new Manifest(stream);
++		//             stream.close();
++		//             String coreModClass = manifest.getMainAttributes().getValue("FMLCorePlugin");
++		//             if (coreModClass == null) continue;
++		//             File file;
++		//             if ("jar".equals(url.getProtocol())) {
++		//                 file = new File(new URL(url.getPath()).toURI());
++		//             } else if ("file".equals(url.getProtocol())) {
++		//                 file = new File(url.toURI()).getParentFile().getParentFile();
++		//             } else {
++		//                 continue;
++		//             }
++		//             loadCoreMod(classLoader, coreModClass, file);
++		//         }
++		//     }
++		//
++		// Converted to ASM via the "ASM Bytecode Viewer" IntelliJ plugin:
++		{
++			MethodVisitor methodVisitor = super.visitMethod(ACC_PRIVATE | ACC_STATIC, OUR_METHOD_NAME, OUR_METHOD_DESCRIPTOR, null, null);
++			methodVisitor.visitCode();
++			Label label0 = new Label();
++			methodVisitor.visitLabel(label0);
++			methodVisitor.visitLineNumber(25, label0);
++			methodVisitor.visitVarInsn(ALOAD, 0);
++			methodVisitor.visitLdcInsn("META-INF/MANIFEST.MF");
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "net/minecraft/launchwrapper/LaunchClassLoader", "getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;", false);
++			methodVisitor.visitVarInsn(ASTORE, 1);
++			Label label1 = new Label();
++			methodVisitor.visitLabel(label1);
++			methodVisitor.visitLineNumber(26, label1);
++			methodVisitor.visitFrame(Opcodes.F_APPEND, 1, new Object[]{"java/util/Enumeration"}, 0, null);
++			methodVisitor.visitVarInsn(ALOAD, 1);
++			methodVisitor.visitMethodInsn(INVOKEINTERFACE, "java/util/Enumeration", "hasMoreElements", "()Z", true);
++			Label label2 = new Label();
++			methodVisitor.visitJumpInsn(IFEQ, label2);
++			Label label3 = new Label();
++			methodVisitor.visitLabel(label3);
++			methodVisitor.visitLineNumber(27, label3);
++			methodVisitor.visitVarInsn(ALOAD, 1);
++			methodVisitor.visitMethodInsn(INVOKEINTERFACE, "java/util/Enumeration", "nextElement", "()Ljava/lang/Object;", true);
++			methodVisitor.visitTypeInsn(CHECKCAST, "java/net/URL");
++			methodVisitor.visitVarInsn(ASTORE, 2);
++			Label label4 = new Label();
++			methodVisitor.visitLabel(label4);
++			methodVisitor.visitLineNumber(28, label4);
++			methodVisitor.visitVarInsn(ALOAD, 2);
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "java/net/URL", "openStream", "()Ljava/io/InputStream;", false);
++			methodVisitor.visitVarInsn(ASTORE, 3);
++			Label label5 = new Label();
++			methodVisitor.visitLabel(label5);
++			methodVisitor.visitLineNumber(29, label5);
++			methodVisitor.visitTypeInsn(NEW, "java/util/jar/Manifest");
++			methodVisitor.visitInsn(DUP);
++			methodVisitor.visitVarInsn(ALOAD, 3);
++			methodVisitor.visitMethodInsn(INVOKESPECIAL, "java/util/jar/Manifest", "<init>", "(Ljava/io/InputStream;)V", false);
++			methodVisitor.visitVarInsn(ASTORE, 4);
++			Label label6 = new Label();
++			methodVisitor.visitLabel(label6);
++			methodVisitor.visitLineNumber(30, label6);
++			methodVisitor.visitVarInsn(ALOAD, 3);
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "java/io/InputStream", "close", "()V", false);
++			Label label7 = new Label();
++			methodVisitor.visitLabel(label7);
++			methodVisitor.visitLineNumber(31, label7);
++			methodVisitor.visitVarInsn(ALOAD, 4);
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "java/util/jar/Manifest", "getMainAttributes", "()Ljava/util/jar/Attributes;", false);
++			methodVisitor.visitLdcInsn("FMLCorePlugin");
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "java/util/jar/Attributes", "getValue", "(Ljava/lang/String;)Ljava/lang/String;", false);
++			methodVisitor.visitVarInsn(ASTORE, 5);
++			Label label8 = new Label();
++			methodVisitor.visitLabel(label8);
++			methodVisitor.visitLineNumber(32, label8);
++			methodVisitor.visitVarInsn(ALOAD, 5);
++			Label label9 = new Label();
++			methodVisitor.visitJumpInsn(IFNONNULL, label9);
++			methodVisitor.visitJumpInsn(GOTO, label1);
++			methodVisitor.visitLabel(label9);
++			methodVisitor.visitLineNumber(34, label9);
++			methodVisitor.visitFrame(Opcodes.F_FULL, 6, new Object[]{"net/minecraft/launchwrapper/LaunchClassLoader", "java/util/Enumeration", "java/net/URL", "java/io/InputStream", "java/util/jar/Manifest", "java/lang/String"}, 0, new Object[]{});
++			methodVisitor.visitLdcInsn("jar");
++			methodVisitor.visitVarInsn(ALOAD, 2);
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "java/net/URL", "getProtocol", "()Ljava/lang/String;", false);
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "java/lang/String", "equals", "(Ljava/lang/Object;)Z", false);
++			Label label10 = new Label();
++			methodVisitor.visitJumpInsn(IFEQ, label10);
++			Label label11 = new Label();
++			methodVisitor.visitLabel(label11);
++			methodVisitor.visitLineNumber(35, label11);
++			methodVisitor.visitTypeInsn(NEW, "java/io/File");
++			methodVisitor.visitInsn(DUP);
++			methodVisitor.visitTypeInsn(NEW, "java/net/URL");
++			methodVisitor.visitInsn(DUP);
++			methodVisitor.visitVarInsn(ALOAD, 2);
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "java/net/URL", "getPath", "()Ljava/lang/String;", false);
++			methodVisitor.visitInsn(ICONST_0);
++			methodVisitor.visitVarInsn(ALOAD, 2);
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "java/net/URL", "getPath", "()Ljava/lang/String;", false);
++			methodVisitor.visitIntInsn(BIPUSH, 33);
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "java/lang/String", "lastIndexOf", "(I)I", false);
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "java/lang/String", "substring", "(II)Ljava/lang/String;", false);
++			methodVisitor.visitMethodInsn(INVOKESPECIAL, "java/net/URL", "<init>", "(Ljava/lang/String;)V", false);
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "java/net/URL", "toURI", "()Ljava/net/URI;", false);
++			methodVisitor.visitMethodInsn(INVOKESPECIAL, "java/io/File", "<init>", "(Ljava/net/URI;)V", false);
++			methodVisitor.visitVarInsn(ASTORE, 6);
++			Label label12 = new Label();
++			methodVisitor.visitLabel(label12);
++			Label label13 = new Label();
++			methodVisitor.visitJumpInsn(GOTO, label13);
++			methodVisitor.visitLabel(label10);
++			methodVisitor.visitLineNumber(36, label10);
++			methodVisitor.visitFrame(Opcodes.F_SAME, 0, null, 0, null);
++			methodVisitor.visitLdcInsn("file");
++			methodVisitor.visitVarInsn(ALOAD, 2);
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "java/net/URL", "getProtocol", "()Ljava/lang/String;", false);
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "java/lang/String", "equals", "(Ljava/lang/Object;)Z", false);
++			methodVisitor.visitJumpInsn(IFEQ, label1);
++			Label label14 = new Label();
++			methodVisitor.visitLabel(label14);
++			methodVisitor.visitLineNumber(37, label14);
++			methodVisitor.visitTypeInsn(NEW, "java/io/File");
++			methodVisitor.visitInsn(DUP);
++			methodVisitor.visitVarInsn(ALOAD, 2);
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "java/net/URL", "toURI", "()Ljava/net/URI;", false);
++			methodVisitor.visitMethodInsn(INVOKESPECIAL, "java/io/File", "<init>", "(Ljava/net/URI;)V", false);
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "java/io/File", "getParentFile", "()Ljava/io/File;", false);
++			methodVisitor.visitMethodInsn(INVOKEVIRTUAL, "java/io/File", "getParentFile", "()Ljava/io/File;", false);
++			methodVisitor.visitVarInsn(ASTORE, 6);
++			methodVisitor.visitLabel(label13);
++			methodVisitor.visitLineNumber(41, label13);
++			methodVisitor.visitFrame(Opcodes.F_APPEND, 1, new Object[]{"java/io/File"}, 0, null);
++			methodVisitor.visitVarInsn(ALOAD, 0);
++			methodVisitor.visitVarInsn(ALOAD, 5);
++			methodVisitor.visitVarInsn(ALOAD, 6);
++			methodVisitor.visitMethodInsn(INVOKESTATIC, "net/minecraftforge/fml/relauncher/CoreModManager", "loadCoreMod", "(Lnet/minecraft/launchwrapper/LaunchClassLoader;Ljava/lang/String;Ljava/io/File;)Lnet/minecraftforge/fml/relauncher/CoreModManager$FMLPluginWrapper;", false);
++			methodVisitor.visitInsn(POP);
++			Label label15 = new Label();
++			methodVisitor.visitLabel(label15);
++			methodVisitor.visitLineNumber(42, label15);
++			methodVisitor.visitJumpInsn(GOTO, label1);
++			methodVisitor.visitLabel(label2);
++			methodVisitor.visitLineNumber(43, label2);
++			methodVisitor.visitFrame(Opcodes.F_FULL, 2, new Object[]{"net/minecraft/launchwrapper/LaunchClassLoader", "java/util/Enumeration"}, 0, new Object[]{});
++			methodVisitor.visitInsn(RETURN);
++			Label label16 = new Label();
++			methodVisitor.visitLabel(label16);
++			methodVisitor.visitLocalVariable("file", "Ljava/io/File;", null, label12, label10, 6);
++			methodVisitor.visitLocalVariable("url", "Ljava/net/URL;", null, label4, label15, 2);
++			methodVisitor.visitLocalVariable("stream", "Ljava/io/InputStream;", null, label5, label15, 3);
++			methodVisitor.visitLocalVariable("manifest", "Ljava/util/jar/Manifest;", null, label6, label15, 4);
++			methodVisitor.visitLocalVariable("coreModClass", "Ljava/lang/String;", null, label8, label15, 5);
++			methodVisitor.visitLocalVariable("file", "Ljava/io/File;", null, label13, label15, 6);
++			methodVisitor.visitLocalVariable("classLoader", "Lnet/minecraft/launchwrapper/LaunchClassLoader;", null, label0, label16, 0);
++			methodVisitor.visitLocalVariable("urls", "Ljava/util/Enumeration;", "Ljava/util/Enumeration<Ljava/net/URL;>;", label1, label16, 1);
++			methodVisitor.visitMaxs(8, 7);
++			methodVisitor.visitEnd();
++		}
++
++		super.visitEnd();
++	}
++
++	private static class InjectCallAtHead extends MethodVisitor {
++		private InjectCallAtHead(MethodVisitor methodVisitor) {
++			super(Opcodes.ASM9, methodVisitor);
++		}
++
++		@Override
++		public void visitCode() {
++			super.visitCode();
++
++			super.visitVarInsn(Opcodes.ALOAD, 1);
++			super.visitMethodInsn(Opcodes.INVOKESTATIC, CLASS, OUR_METHOD_NAME, OUR_METHOD_DESCRIPTOR, false);
++		}
++	}
++}
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java
+index 9bfbf183f1158767e0a6c778dbd400edd0d87f13..74105d97f032cd2f8115de437fb3b449a62f1939 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java
+@@ -25,19 +25,27 @@
+ package dev.architectury.loom.forge.dependency;
+ 
+ import java.io.File;
++import java.io.IOException;
+ import java.io.Reader;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.nio.file.NoSuchFileException;
++import java.util.List;
+ import java.nio.file.StandardCopyOption;
+ 
+ import com.google.gson.Gson;
++import com.google.gson.JsonArray;
++import com.google.gson.JsonElement;
+ import com.google.gson.JsonObject;
+ import com.mojang.serialization.JsonOps;
+ import dev.architectury.loom.forge.config.UserdevConfig;
+ import org.gradle.api.Project;
++import org.gradle.api.artifacts.repositories.IvyArtifactRepository;
+ 
+ import net.fabricmc.loom.configuration.DependencyInfo;
++import net.fabricmc.loom.configuration.mods.dependency.LocalMavenHelper;
+ import net.fabricmc.loom.util.Constants;
++import net.fabricmc.loom.util.FileSystemUtil;
+ import net.fabricmc.loom.util.ZipUtils;
+ 
+ public class ForgeUserdevProvider extends DependencyProvider {
+@@ -45,6 +53,7 @@ public class ForgeUserdevProvider extends DependencyProvider {
+ 	private JsonObject json;
+ 	private UserdevConfig config;
+ 	private Path joinedPatches;
++	private Boolean isLegacyForge;
+ 
+ 	public ForgeUserdevProvider(Project project) {
+ 		super(project);
+@@ -59,11 +68,31 @@ public class ForgeUserdevProvider extends DependencyProvider {
+ 		if (!userdevJar.exists() || Files.notExists(configJson) || refreshDeps()) {
+ 			File resolved = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve Forge userdev"));
+ 			Files.copy(resolved.toPath(), userdevJar.toPath(), StandardCopyOption.REPLACE_EXISTING);
+-			Files.write(configJson, ZipUtils.unpack(resolved.toPath(), "config.json"));
++			byte[] bytes;
++
++			try {
++				bytes = ZipUtils.unpack(resolved.toPath(), "config.json");
++			} catch (NoSuchFileException e) {
++				// If we cannot find a modern config json, try the legacy/FG2-era one
++				try {
++					bytes = ZipUtils.unpack(resolved.toPath(), "dev.json");
++				} catch (NoSuchFileException e1) {
++					e.addSuppressed(e1);
++					throw e;
++				}
++			}
++
++			Files.write(configJson, bytes);
+ 		}
+ 
+ 		try (Reader reader = Files.newBufferedReader(configJson)) {
+ 			json = new Gson().fromJson(reader, JsonObject.class);
++			isLegacyForge = !json.has("mcp");
++
++			if (isLegacyForge) {
++				json = createManifestFromForgeGradle2(dependency, json);
++			}
++
+ 			config = UserdevConfig.CODEC.parse(JsonOps.INSTANCE, json)
+ 					.getOrThrow(false, msg -> getProject().getLogger().error("Couldn't read userdev config, {}", msg));
+ 		}
+@@ -76,11 +105,125 @@ public class ForgeUserdevProvider extends DependencyProvider {
+ 
+ 		addDependency(config.universal(), Constants.Configurations.FORGE_UNIVERSAL);
+ 
+-		if (Files.notExists(joinedPatches)) {
++		if (!isLegacyForge && Files.notExists(joinedPatches)) {
+ 			Files.write(joinedPatches, ZipUtils.unpack(userdevJar.toPath(), config.binpatches()));
+ 		}
+ 	}
+ 
++	private JsonObject createManifestFromForgeGradle2(DependencyInfo dependency, JsonObject fg2Json) throws IOException {
++		JsonObject json = new JsonObject();
++
++		addLegacyMCPRepo();
++		String mcVersion = fg2Json.get("inheritsFrom").getAsString();
++		json.addProperty("mcp", "de.oceanlabs.mcp:mcp:" + mcVersion + ":srg@zip");
++
++		json.addProperty("universal", dependency.getDepString() + ":universal");
++		json.addProperty("sources", createLegacySources(dependency));
++		json.addProperty("patches", "");
++		json.addProperty("binpatches", "");
++		json.add("binpatcher", createLegacyBinpatcher());
++		json.add("libraries", createLegacyLibs(fg2Json));
++		json.add("runs", createLegacyRuns());
++		json.add("ats", createLegacyAts());
++
++		return json;
++	}
++
++	private static JsonObject createLegacyBinpatcher() {
++		JsonObject binpatcher = new JsonObject();
++		binpatcher.addProperty("version", "net.minecraftforge:binarypatcher:1.1.1:fatjar");
++		JsonArray args = new JsonArray();
++		List.of("--clean", "{clean}", "--output", "{output}", "--apply", "{patch}").forEach(args::add);
++		binpatcher.add("args", args);
++		return binpatcher;
++	}
++
++	private static JsonArray createLegacyLibs(JsonObject json) {
++		JsonArray array = new JsonArray();
++
++		for (JsonElement lib : json.getAsJsonArray("libraries")) {
++			array.add(lib.getAsJsonObject().get("name"));
++		}
++
++		return array;
++	}
++
++	private static JsonObject createLegacyRuns() {
++		JsonObject clientRun = new JsonObject();
++		JsonObject serverRun = new JsonObject();
++		clientRun.addProperty("name", "client");
++		serverRun.addProperty("name", "server");
++		clientRun.addProperty("main", Constants.LegacyForge.LAUNCH_WRAPPER);
++		serverRun.addProperty("main", Constants.LegacyForge.LAUNCH_WRAPPER);
++		JsonArray clientArgs = new JsonArray();
++		JsonArray serverArgs = new JsonArray();
++		clientArgs.add("--tweakClass");
++		serverArgs.add("--tweakClass");
++		clientArgs.add(Constants.LegacyForge.FML_TWEAKER);
++		serverArgs.add(Constants.LegacyForge.FML_SERVER_TWEAKER);
++		clientArgs.add("--accessToken");
++		serverArgs.add("--accessToken");
++		clientArgs.add("undefined");
++		serverArgs.add("undefined");
++		clientRun.add("args", clientArgs);
++		serverRun.add("args", serverArgs);
++		JsonObject runs = new JsonObject();
++		runs.add("client", clientRun);
++		runs.add("server", serverRun);
++		return runs;
++	}
++
++	private static JsonArray createLegacyAts() {
++		JsonArray array = new JsonArray();
++		array.add("merged_at.cfg");
++		return array;
++	}
++
++	private String createLegacySources(DependencyInfo dependency) throws IOException {
++		Path sourceRepo = getExtension().getForgeProvider().getGlobalCache().toPath().resolve("source-repo");
++		String group = dependency.getDependency().getGroup();
++		String name = dependency.getDependency().getName() + "_sources";
++		String version = dependency.getResolvedVersion();
++		LocalMavenHelper sourcesMaven = new LocalMavenHelper(group, name, version, "sources", sourceRepo);
++		getProject().getRepositories().maven(repo -> {
++			repo.setName("LoomFG2Source");
++			repo.setUrl(sourceRepo);
++		});
++
++		if (!sourcesMaven.exists(null)) {
++			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(userdevJar.toPath(), false)) {
++				sourcesMaven.copyToMaven(fs.getPath("sources.zip"), null);
++			}
++		}
++
++		return sourcesMaven.getNotation();
++	}
++
++	private void addLegacyMCPRepo() {
++		getProject().getRepositories().ivy(repo -> {
++			// Old MCP data does not have POMs
++			repo.setName("LegacyMCP");
++			repo.setUrl("https://maven.minecraftforge.net/");
++			repo.patternLayout(layout -> {
++				layout.artifact("[orgPath]/[artifact]/[revision]/[artifact]-[revision](-[classifier])(.[ext])");
++				// also check the zip so people do not have to explicitly specify the extension for older versions
++				layout.artifact("[orgPath]/[artifact]/[revision]/[artifact]-[revision](-[classifier]).zip");
++			});
++			repo.content(descriptor -> {
++				descriptor.includeGroup("de.oceanlabs.mcp");
++			});
++			repo.metadataSources(IvyArtifactRepository.MetadataSources::artifact);
++		});
++	}
++
++	public boolean isLegacyForge() {
++		if (isLegacyForge == null) {
++			throw new IllegalArgumentException("Not yet resolved.");
++		}
++
++		return isLegacyForge;
++	}
++
+ 	public File getUserdevJar() {
+ 		return userdevJar;
+ 	}
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java
+index b3f33b6c1a5771d51270b77305e67d9e559bc06c..c977a5a2e367cbd272c9475dee41861eebc880a5 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java
+@@ -24,16 +24,34 @@
+ 
+ package dev.architectury.loom.forge.dependency;
+ 
++import static java.nio.file.StandardOpenOption.CREATE;
++import static java.nio.file.StandardOpenOption.TRUNCATE_EXISTING;
++
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
+ import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
+ import java.io.UncheckedIOException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.StandardCopyOption;
+-
++import java.util.jar.JarEntry;
++import java.util.jar.JarInputStream;
++import java.util.jar.JarOutputStream;
++import java.util.zip.ZipEntry;
++
++import lzma.sdk.lzma.Decoder;
++import lzma.sdk.lzma.Encoder;
++import lzma.streams.LzmaInputStream;
++import lzma.streams.LzmaOutputStream;
+ import org.gradle.api.Project;
+ import org.jspecify.annotations.Nullable;
+ 
+ import net.fabricmc.loom.configuration.DependencyInfo;
++import net.fabricmc.loom.configuration.providers.forge.fg2.Pack200Provider;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.FileSystemUtil;
+ 
+@@ -50,7 +68,16 @@ public class PatchProvider extends DependencyProvider {
+ 	@Override
+ 	public void provide(DependencyInfo dependency) throws Exception {
+ 		init();
+-		installerJar = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve Forge installer")).toPath();
++		// legacy Forge（1.8-1.16）没有独立的 installer，补丁位于 universal jar 内
++		installerJar = getExtension().isModernForgeLike()
++				? dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve Forge installer")).toPath()
++				: getExtension().getForgeUniversalProvider().getForge().toPath();
++
++		if (getExtension().isLegacyForge()) {
++			clientPatches = projectCacheFolder.resolve("patches-client.lzma");
++			serverPatches = projectCacheFolder.resolve("patches-server.lzma");
++			extractLegacyPatches(clientPatches, serverPatches);
++		}
+ 	}
+ 
+ 	public Path extractClientPatches() {
+@@ -94,6 +121,84 @@ public class PatchProvider extends DependencyProvider {
+ 		}
+ 	}
+ 
++	private void extractLegacyPatches(Path clientPatches, Path serverPatches) throws IOException {
++		if (Files.exists(clientPatches) && Files.exists(serverPatches) && !refreshDeps()) {
++			// No need to extract
++			return;
++		}
++
++		byte[] unpackedBytes;
++
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(installerJar, false)) {
++			unpackedBytes = unpack200Lzma(fs.getPath("binpatches.pack.lzma"));
++		}
++
++		try (JarInputStream in = new JarInputStream(new ByteArrayInputStream(unpackedBytes));
++				OutputStream clientFileOut = Files.newOutputStream(clientPatches, CREATE, TRUNCATE_EXISTING);
++				LzmaOutputStream clientLzmaOut = new LzmaOutputStream(clientFileOut, new Encoder());
++				JarOutputStream clientJarOut = new JarOutputStream(clientLzmaOut);
++				OutputStream serverFileOut = Files.newOutputStream(serverPatches, CREATE, TRUNCATE_EXISTING);
++				LzmaOutputStream serverLzmaOut = new LzmaOutputStream(serverFileOut, new Encoder());
++				JarOutputStream serverJarOut = new JarOutputStream(serverLzmaOut);
++		) {
++			for (JarEntry entry; (entry = in.getNextJarEntry()) != null;) {
++				String name = entry.getName();
++
++				JarOutputStream out;
++
++				if (name.startsWith("binpatch/client/")) {
++					out = clientJarOut;
++				} else if (name.startsWith("binpatch/server/")) {
++					out = serverJarOut;
++				} else {
++					getProject().getLogger().warn("Unexpected file in Forge binpatches archive: " + name);
++					continue;
++				}
++
++				out.putNextEntry(new ZipEntry(name));
++
++				// Converting from legacy format to modern (v1) format
++				DataInputStream dataIn = new DataInputStream(in);
++				DataOutputStream dataOut = new DataOutputStream(out);
++				dataOut.writeByte(1); // version
++				dataIn.readUTF(); // unused patch name (presumably always the same as the obf class name)
++				dataOut.writeUTF(dataIn.readUTF().replace('.', '/')); // obf class name
++				dataOut.writeUTF(dataIn.readUTF().replace('.', '/')); // srg class name
++				in.transferTo(out); // remainder is unchanged
++
++				out.closeEntry();
++			}
++		}
++	}
++
++	private byte[] unpack200(InputStream in) throws IOException {
++		ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++
++		try (JarOutputStream jarOut = new JarOutputStream(bytes)) {
++			Pack200Provider provider = getExtension().getForge().getPack200Provider().getOrNull();
++
++			if (provider == null) {
++				throw new IllegalStateException("No provider for Pack200 has been found. Did you declare a provider?");
++			}
++
++			provider.unpack(in, jarOut);
++		}
++
++		return bytes.toByteArray();
++	}
++
++	private byte[] unpack200Lzma(InputStream in) throws IOException {
++		try (LzmaInputStream lzmaIn = new LzmaInputStream(in, new Decoder())) {
++			return unpack200(lzmaIn);
++		}
++	}
++
++	private byte[] unpack200Lzma(Path path) throws IOException {
++		try (InputStream in = Files.newInputStream(path)) {
++			return unpack200Lzma(in);
++		}
++	}
++
+ 	@Override
+ 	public String getTargetConfig() {
+ 		return Constants.Configurations.FORGE_INSTALLER;
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MergedForgeMinecraftProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MergedForgeMinecraftProvider.java
+index eda36c6c18d3ba094553848de0fb1e24dd19bf5e..6df3451f647e1c4062ecb2c065ec28bd8cb521a4 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MergedForgeMinecraftProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MergedForgeMinecraftProvider.java
+@@ -28,16 +28,16 @@ import java.io.IOException;
+ import java.nio.file.Path;
+ import java.util.List;
+ 
++import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.configuration.ConfigContext;
+ import net.fabricmc.loom.configuration.providers.minecraft.MergedMinecraftProvider;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftMetadataProvider;
+ 
+ public final class MergedForgeMinecraftProvider extends MergedMinecraftProvider implements ForgeMinecraftProvider {
+-	private final MinecraftPatchedProvider patchedProvider;
++	private MinecraftPatchedProvider patchedProvider;
+ 
+ 	public MergedForgeMinecraftProvider(MinecraftMetadataProvider metadataProvider, ConfigContext configContext) {
+ 		super(metadataProvider, configContext);
+-		this.patchedProvider = new MinecraftPatchedProvider(configContext.project(), this, MinecraftPatchedProvider.Type.MERGED);
+ 	}
+ 
+ 	@Override
+@@ -51,16 +51,27 @@ public final class MergedForgeMinecraftProvider extends MergedMinecraftProvider
+ 
+ 	@Override
+ 	public Path getMergedJar() {
+-		return patchedProvider.getMinecraftPatchedJar();
++		return getPatchedProvider().getMinecraftPatchedJar();
+ 	}
+ 
+ 	@Override
+ 	public List<Path> getMinecraftJars() {
+-		return List.of(patchedProvider.getMinecraftPatchedJar());
++		return List.of(getPatchedProvider().getMinecraftPatchedJar());
+ 	}
+ 
+ 	@Override
+ 	public MinecraftPatchedProvider getPatchedProvider() {
++		if (this.patchedProvider == null) {
++			// legacy Forge（1.8-1.16）走 FG2 的 patching 流程，需要专门的实现。
++			// 判定依赖已解析的 userdev 配置（ForgeUserdevProvider.isLegacyForge 未解析时会抛异常），
++			// 故延迟到这里而非构造函数。
++			if (LoomGradleExtension.get(getProject()).isModernForgeLike()) {
++				this.patchedProvider = new MinecraftPatchedProvider(getProject(), this, MinecraftPatchedProvider.Type.MERGED);
++			} else {
++				this.patchedProvider = new MinecraftLegacyPatchedProvider(getProject(), this, MinecraftPatchedProvider.Type.MERGED);
++			}
++		}
++
+ 		return patchedProvider;
+ 	}
+ }
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..fa0394d6120b4873189bb4a7e771ab2e9f7f1c35
+--- /dev/null
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
+@@ -0,0 +1,465 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2021 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package dev.architectury.loom.forge.minecraft;
++
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.nio.file.FileVisitResult;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.SimpleFileVisitor;
++import java.nio.file.StandardCopyOption;
++import java.nio.file.StandardOpenOption;
++import java.nio.file.attribute.BasicFileAttributes;
++import java.util.Arrays;
++import java.util.Iterator;
++import java.util.function.Function;
++import java.util.function.Predicate;
++import java.util.jar.Attributes;
++import java.util.jar.Manifest;
++import java.util.stream.Stream;
++
++import dev.architectury.loom.forge.CoreModManagerTransformer;
++import dev.architectury.loom.forge.dependency.ForgeProvider;
++import dev.architectury.loom.forge.dependency.PatchProvider;
++import dev.architectury.loom.util.Stopwatch;
++import dev.architectury.loom.util.ThreadingUtils;
++import org.gradle.api.Project;
++import org.objectweb.asm.AnnotationVisitor;
++import org.objectweb.asm.ClassReader;
++import org.objectweb.asm.ClassVisitor;
++import org.objectweb.asm.ClassWriter;
++import org.objectweb.asm.FieldVisitor;
++import org.objectweb.asm.MethodVisitor;
++import org.objectweb.asm.Opcodes;
++
++import net.fabricmc.loom.LoomGradleExtension;
++import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
++import net.fabricmc.loom.util.Constants;
++import net.fabricmc.loom.util.FileSystemUtil;
++import net.fabricmc.loom.util.Pair;
++import net.fabricmc.loom.util.ZipUtils;
++import net.fabricmc.loom.util.service.ServiceFactory;
++import net.fabricmc.stitch.merge.JarMerger;
++
++public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
++	// Step 1: Binary Patch
++	private Path minecraftClientPatchedJar;
++	private Path minecraftServerPatchedJar;
++	// Step 2: Merge (global)
++	private Path minecraftMergedPatchedJar;
++	// Step 4: Access Transform (global or project)
++	private Path minecraftPatchedAtJar;
++
++	private Path forgeJar;
++
++	private boolean dirty;
++
++	public MinecraftLegacyPatchedProvider(Project project, MinecraftProvider minecraftProvider, Type type) {
++		super(project, minecraftProvider, type);
++	}
++
++	private LoomGradleExtension getExtension() {
++		return LoomGradleExtension.get(project);
++	}
++
++	@Override
++	public void provide() throws Exception {
++		String forgeVersion = getExtension().getForgeProvider().getVersion().getCombined();
++		Path forgeWorkingDir = ForgeProvider.getForgeCache(project);
++		String patchId = "forge-" + forgeVersion + "-";
++
++		minecraftProvider.setJarPrefix(patchId);
++
++		minecraftClientPatchedJar = forgeWorkingDir.resolve("client-patched.jar");
++		minecraftServerPatchedJar = forgeWorkingDir.resolve("server-patched.jar");
++		minecraftMergedPatchedJar = forgeWorkingDir.resolve("merged-patched.jar");
++		minecraftPatchedAtJar = forgeWorkingDir.resolve(type.id + "-at-patched.jar");
++		forgeJar = forgeWorkingDir.resolve("forge.jar");
++
++		checkCache();
++
++		dirty = false;
++	}
++
++	protected void cleanAllCache() throws IOException {
++		for (Path path : getGlobalCaches()) {
++			Files.deleteIfExists(path);
++		}
++	}
++
++	protected Path[] getGlobalCaches() {
++		return new Path[] {
++				minecraftClientPatchedJar,
++				minecraftServerPatchedJar,
++				minecraftMergedPatchedJar,
++				minecraftPatchedAtJar,
++				forgeJar,
++		};
++	}
++
++	protected void checkCache() throws IOException {
++		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(Files::notExists)
++				|| !isPatchedJarUpToDate(minecraftPatchedAtJar) || !isPatchedJarUpToDate(forgeJar)) {
++			cleanAllCache();
++		}
++	}
++
++	@Override
++	public void remapJar(ServiceFactory serviceFactory) throws Exception {
++		if (Files.notExists(forgeJar)) {
++			dirty = true;
++			patchForge();
++			applyLoomPatchVersion(forgeJar);
++		}
++
++		if (Files.notExists(minecraftClientPatchedJar) || Files.notExists(minecraftServerPatchedJar)) {
++			dirty = true;
++			patchJars();
++		}
++
++		if (type == Type.MERGED && (dirty || Files.notExists(minecraftMergedPatchedJar))) {
++			dirty = true;
++			mergeJars();
++		}
++
++		if (dirty || Files.notExists(minecraftPatchedAtJar)) {
++			dirty = true;
++			Path minecraftPatchedJar = switch (type) {
++			case CLIENT_ONLY -> minecraftClientPatchedJar;
++			case SERVER_ONLY -> minecraftServerPatchedJar;
++			case MERGED -> minecraftMergedPatchedJar;
++			};
++			accessTransform(minecraftPatchedJar, minecraftPatchedAtJar);
++			walkFileSystems(forgeJar, minecraftPatchedAtJar, (path) -> true, this::copyReplacing);
++			applyLoomPatchVersion(minecraftPatchedAtJar);
++		}
++	}
++
++	private void patchForge() throws Exception {
++		Stopwatch stopwatch = Stopwatch.createStarted();
++		logger.lifecycle(":patching forge");
++
++		Files.copy(getExtension().getForgeUniversalProvider().getForge().toPath(), forgeJar, StandardCopyOption.REPLACE_EXISTING);
++
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(forgeJar, false)) {
++			// For the development environment, we need to remove the binpatches, otherwise forge will try to re-apply them
++			Files.delete(fs.get().getPath("binpatches.pack.lzma"));
++
++			// We also need to remove Forge's jar signature data
++			// Based off https://github.com/FabricMC/tiny-remapper/blob/7f341dcbf1bae754ba992f0b0f127566f347f37f/src/main/java/net/fabricmc/tinyremapper/MetaInfFixer.java
++			Files.walkFileTree(fs.get().getPath("META-INF"), new SimpleFileVisitor<>() {
++				@Override
++				public FileVisitResult visitFile(Path path, BasicFileAttributes attributes) throws IOException {
++					String fileName = path.getFileName().toString();
++
++					if (fileName.endsWith(".SF") || fileName.endsWith(".DSA") || fileName.endsWith(".RSA") || fileName.endsWith(".EC") || fileName.startsWith("SIG-")) {
++						Files.delete(path);
++					} else if (path.getNameCount() == 2 && fileName.equals("MANIFEST.MF")) {
++						Manifest manifest = new Manifest();
++
++						try (InputStream is = Files.newInputStream(path)) {
++							manifest.read(is);
++						}
++
++						for (Iterator<Attributes> it = manifest.getEntries().values().iterator(); it.hasNext(); ) {
++							Attributes attrs = it.next();
++
++							for (Iterator<Object> it2 = attrs.keySet().iterator(); it2.hasNext(); ) {
++								Attributes.Name attrName = (Attributes.Name) it2.next();
++								String name = attrName.toString();
++
++								if (name.endsWith("-Digest") || name.contains("-Digest-") || name.equals("Magic")) {
++									it2.remove();
++								}
++							}
++
++							if (attrs.isEmpty()) it.remove();
++						}
++
++						try (OutputStream os = Files.newOutputStream(path)) {
++							manifest.write(os);
++						}
++					}
++
++					return FileVisitResult.CONTINUE;
++				}
++			});
++		}
++
++		// Older versions of Forge rely on utility classes from log4j-core 2.0-beta9 but we'll upgrade the runtime to a
++		// release version (so we can use the LoggerNamePatternSelector from fabric-log4j-util) where some of those
++		// classes have been moved from a `helpers` to a `utils` package.
++		// To allow Forge to work regardless, we'll re-package those helper classes into the forge jar.
++		Path log4jBeta9 = project.getConfigurations().getByName(Constants.Configurations.MINECRAFT_COMPILE_LIBRARIES)
++				.getFiles()
++				.stream()
++				.map(File::toPath)
++				.filter(it -> it.getFileName().toString().equals("log4j-core-2.0-beta9.jar"))
++				.findAny()
++				.orElse(null);
++		if (log4jBeta9 != null) {
++			Predicate<Path> isHelper = path -> path.startsWith("/org/apache/logging/log4j/core/helpers");
++			walkFileSystems(log4jBeta9, forgeJar, isHelper, this::copyReplacing);
++		}
++
++		// While Forge will discover mods on the classpath, it won't do the same for ATs, coremods or tweakers.
++		// ForgeGradle "solves" this problem using a huge, gross hack (GradleForgeHacks and related classes), and only
++		// for ATs and coremods, not tweakers.
++		// No clue why FG went the hack route when it's the same project and they could have just added first-party
++		// support for loading both from the classpath right into Forge (it's even really simply to do).
++		// We'll have none of those hacks and instead patch first-party support into Forge.
++		ZipUtils.transform(forgeJar, Stream.of(new Pair<>(CoreModManagerTransformer.FILE, original -> {
++			ClassReader reader = new ClassReader(original);
++			ClassWriter writer = new ClassWriter(reader, 0);
++			reader.accept(new CoreModManagerTransformer(writer), 0);
++			return writer.toByteArray();
++		})));
++
++		logger.lifecycle(":patched forge in " + stopwatch.stop());
++	}
++
++	private void patchJars() throws Exception {
++		Stopwatch stopwatch = Stopwatch.createStarted();
++		logger.lifecycle(":patching jars");
++
++		MinecraftProvider minecraftProvider = getExtension().getMinecraftProvider();
++		PatchProvider patchProvider = getExtension().getPatchProvider();
++		patchJars(minecraftProvider.getMinecraftServerJar().toPath(), minecraftServerPatchedJar, patchProvider.extractServerPatches());
++		patchJars(minecraftProvider.getMinecraftClientJar().toPath(), minecraftClientPatchedJar, patchProvider.extractClientPatches());
++
++		logger.lifecycle(":patched jars in " + stopwatch.stop());
++	}
++
++	@Override
++	protected void patchJars(Path clean, Path output, Path patches) throws Exception {
++		super.patchJars(clean, output, patches);
++
++		// Patching only preserves affected classes, everything else we need to copy manually
++		copyMissingClasses(clean, output);
++		walkFileSystems(clean, output, file -> !file.toString().endsWith(".class"), this::copyReplacing);
++
++		// Workaround Forge patches apparently violating the JVM spec (see ParameterAnnotationsFixer for details)
++		modifyClasses(output, ParameterAnnotationsFixer::new);
++	}
++
++	private void mergeJars() throws Exception {
++		logger.info(":merging jars");
++		Stopwatch stopwatch = Stopwatch.createStarted();
++
++		try (JarMerger jarMerger = new JarMerger(minecraftClientPatchedJar.toFile(), minecraftServerPatchedJar.toFile(), minecraftMergedPatchedJar.toFile())) {
++			jarMerger.enableSyntheticParamsOffset();
++			jarMerger.merge();
++		}
++
++		// The JarMerger adds Sided annotations but so do the Forge patches. The latter doesn't require extra
++		// dependencies beyond Forge, so we'll keep those and convert any non-redundant Fabric ones.
++		modifyClasses(minecraftMergedPatchedJar, SideAnnotationMerger::new);
++
++		logger.info(":merged jars in " + stopwatch);
++	}
++
++	private void modifyClasses(Path jarFile, Function<ClassVisitor, ClassVisitor> func) throws Exception {
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jarFile, false)) {
++			ThreadingUtils.TaskCompleter completer = ThreadingUtils.taskCompleter();
++
++			for (Path file : (Iterable<? extends Path>) Files.walk(fs.getPath("/"))::iterator) {
++				if (!file.toString().endsWith(".class")) continue;
++
++				completer.add(() -> {
++					byte[] original = Files.readAllBytes(file);
++
++					ClassReader reader = new ClassReader(original);
++					ClassWriter writer = new ClassWriter(reader, 0);
++					reader.accept(func.apply(writer), 0);
++
++					byte[] modified = writer.toByteArray();
++
++					if (!Arrays.equals(original, modified)) {
++						Files.write(file, modified, StandardOpenOption.TRUNCATE_EXISTING);
++					}
++				});
++			}
++
++			completer.complete();
++		}
++	}
++
++	@Override
++	public Path getMinecraftIntermediateJar() {
++		throw new UnsupportedOperationException();
++	}
++
++	@Override
++	public Path getMinecraftPatchedIntermediateJar() {
++		return forgeJar; // TODO current used only for ATs
++	}
++
++	@Override
++	public Path getMinecraftPatchedJar() {
++		return minecraftPatchedAtJar;
++	}
++
++	/**
++	 * It seems that Forge patches produce class files which are in violation of the JVM spec. Specifically, the value
++	 * of Runtime[In]VisibleParameterAnnotation.num_parameters is by SE8 spec required to match the number of formal
++	 * parameters of the method (and may be ignored in favor of directly looking at the method arguments, which is
++	 * indeed what the OpenJDK 8 compiler does). Using a smaller value (possible if e.g. the last parameter has no
++	 * annotations) will cause the compiler to read past the end of the table, throwing an exception and therefore being
++	 * unable to read the class file.
++	 * <br>
++	 * This class visitor fixes that by ignoring the original num_parameters value, letting the MethodVisitor compute a
++	 * new value based on its signature. This will at first produce an invalid count when there are synthetic parameters
++	 * but later, during mergeJars, those will be properly offset (enableSyntheticParamsOffset).
++	 * <br>
++	 * SE8 JVM spec: https://docs.oracle.com/javase/specs/jvms/se8/html/jvms-4.html#jvms-4.7.18
++	 * Example method affected: RenderGlobal.ContainerLocalRenderInformation(RenderChunk, EnumFacing, int)
++	 */
++	private static class ParameterAnnotationsFixer extends ClassVisitor {
++		private ParameterAnnotationsFixer(ClassVisitor classVisitor) {
++			super(Opcodes.ASM9, classVisitor);
++		}
++
++		@Override
++		public MethodVisitor visitMethod(int access, String name, String descriptor, String signature, String[] exceptions) {
++			MethodVisitor methodVisitor = super.visitMethod(access, name, descriptor, signature, exceptions);
++
++			// This issue has so far only been observed with constructors, so we can skip everything else
++			if (name.equals("<init>")) {
++				methodVisitor = new MethodFixer(methodVisitor);
++			}
++
++			return methodVisitor;
++		}
++
++		private static class MethodFixer extends MethodVisitor {
++			private MethodFixer(MethodVisitor methodVisitor) {
++				super(Opcodes.ASM9, methodVisitor);
++			}
++
++			@Override
++			public void visitAnnotableParameterCount(int parameterCount, boolean visible) {
++				// Not calling visitAnnotableParameterCount will cause it to compute its value from the method signature
++			}
++		}
++	}
++
++	private static class SideAnnotationMerger extends ClassVisitor {
++		private static final String FABRIC_ANNOTATION_DESCRIPTOR = "Lnet/fabricmc/api/Environment;";
++		private static final String FORGE_ANNOTATION_DESCRIPTOR = "Lnet/minecraftforge/fml/relauncher/SideOnly;";
++		private static final String FORGE_SIDE_DESCRIPTOR = "Lnet/minecraftforge/fml/relauncher/Side;";
++
++		private static boolean isSideAnnotation(String descriptor) {
++			return FABRIC_ANNOTATION_DESCRIPTOR.equals(descriptor) || FORGE_ANNOTATION_DESCRIPTOR.equals(descriptor);
++		}
++
++		private boolean visitedAnnotation;
++
++		private SideAnnotationMerger(ClassVisitor classVisitor) {
++			super(Opcodes.ASM9, classVisitor);
++		}
++
++		@Override
++		public AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
++			if (isSideAnnotation(descriptor)) {
++				if (visitedAnnotation) {
++					return null;
++				}
++
++				visitedAnnotation = true;
++				return new FabricToForgeConverter(super.visitAnnotation(FORGE_ANNOTATION_DESCRIPTOR, true));
++			}
++
++			return super.visitAnnotation(descriptor, visible);
++		}
++
++		@Override
++		public FieldVisitor visitField(int access, String name, String descriptor, String signature, Object value) {
++			return new FieldSideAnnotationMerger(super.visitField(access, name, descriptor, signature, value));
++		}
++
++		@Override
++		public MethodVisitor visitMethod(int access, String name, String descriptor, String signature, String[] exceptions) {
++			return new MethodSideAnnotationMerger(super.visitMethod(access, name, descriptor, signature, exceptions));
++		}
++
++		private static class FieldSideAnnotationMerger extends FieldVisitor {
++			private boolean visitedAnnotation;
++
++			private FieldSideAnnotationMerger(FieldVisitor fieldVisitor) {
++				super(Opcodes.ASM9, fieldVisitor);
++			}
++
++			@Override
++			public AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
++				if (isSideAnnotation(descriptor)) {
++					if (visitedAnnotation) {
++						return null;
++					}
++
++					visitedAnnotation = true;
++					return new FabricToForgeConverter(super.visitAnnotation(FORGE_ANNOTATION_DESCRIPTOR, true));
++				}
++
++				return super.visitAnnotation(descriptor, visible);
++			}
++		}
++
++		private static class MethodSideAnnotationMerger extends MethodVisitor {
++			private boolean visitedAnnotation;
++
++			private MethodSideAnnotationMerger(MethodVisitor methodVisitor) {
++				super(Opcodes.ASM9, methodVisitor);
++			}
++
++			@Override
++			public AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
++				if (isSideAnnotation(descriptor)) {
++					if (visitedAnnotation) {
++						return null;
++					}
++
++					visitedAnnotation = true;
++					return new FabricToForgeConverter(super.visitAnnotation(FORGE_ANNOTATION_DESCRIPTOR, true));
++				}
++
++				return super.visitAnnotation(descriptor, visible);
++			}
++		}
++
++		private static class FabricToForgeConverter extends AnnotationVisitor {
++			private FabricToForgeConverter(AnnotationVisitor annotationVisitor) {
++				super(Opcodes.ASM9, annotationVisitor);
++			}
++
++			@Override
++			public void visitEnum(String name, String descriptor, String value) {
++				super.visitEnum(name, FORGE_SIDE_DESCRIPTOR, value);
++			}
++		}
++	}
++}
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+index e63000c6acefa79b0545c96297e6438bc9d8cd9c..3a66d9a1e2485619a4af684f6397b3360f781b77 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+@@ -110,10 +110,11 @@ public class MinecraftPatchedProvider {
+ 	// The version where the bug was fixed.
+ 	private static final String MAX_NEOFORGE_MANUAL_CLEAN_JAR_CREATION_VERSION = "21.10.64";
+ 
+-	private final Project project;
+-	private final Logger logger;
+-	private final MinecraftProvider minecraftProvider;
+-	private final Type type;
++	// 对子类开放：legacy Forge（1.8-1.16）支持的 MinecraftLegacyPatchedProvider 需要访问这些成员
++	protected final Project project;
++	protected final Logger logger;
++	protected final MinecraftProvider minecraftProvider;
++	protected final Type type;
+ 
+ 	// Step 1: Remap Minecraft to intermediate mappings, merge if needed
+ 	private Path minecraftIntermediateJar;
+@@ -167,13 +168,13 @@ public class MinecraftPatchedProvider {
+ 		minecraftClientExtra = forgeWorkingDir.resolve("client-extra.jar");
+ 	}
+ 
+-	private void cleanAllCache() throws IOException {
++	protected void cleanAllCache() throws IOException {
+ 		for (Path path : getGlobalCaches()) {
+ 			Files.deleteIfExists(path);
+ 		}
+ 	}
+ 
+-	private Path[] getGlobalCaches() {
++	protected Path[] getGlobalCaches() {
+ 		Path[] files = {
+ 				minecraftIntermediateJar,
+ 				minecraftPatchedIntermediateJar,
+@@ -185,7 +186,7 @@ public class MinecraftPatchedProvider {
+ 		return files;
+ 	}
+ 
+-	private void checkCache() throws IOException {
++	protected void checkCache() throws IOException {
+ 		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(Files::notExists)
+ 				|| !isPatchedJarUpToDate(minecraftPatchedJar)) {
+ 			cleanAllCache();
+@@ -502,7 +503,7 @@ public class MinecraftPatchedProvider {
+ 		return getExtension().getForgeUserdevProvider().getUserdevJar();
+ 	}
+ 
+-	private boolean isPatchedJarUpToDate(Path jar) throws IOException {
++	protected boolean isPatchedJarUpToDate(Path jar) throws IOException {
+ 		if (Files.notExists(jar)) return false;
+ 
+ 		byte[] manifestBytes = ZipUtils.unpackNullable(jar, "META-INF/MANIFEST.MF");
+@@ -523,9 +524,18 @@ public class MinecraftPatchedProvider {
+ 		}
+ 	}
+ 
+-	private void accessTransformForge() throws IOException {
+-		Path input = minecraftPatchedIntermediateJar;
+-		Path target = minecraftPatchedIntermediateAtJar;
++	protected void accessTransformForge() throws IOException {
++		accessTransform(minecraftPatchedIntermediateJar, minecraftPatchedIntermediateAtJar);
++	}
++
++	/**
++	 * 对给定 jar 执行 Forge 的 access transform.
++	 *
++	 * <p>现代 Forge 走 {@link #accessTransformForge()}（中间产物路径）；legacy Forge 的补丁
++	 * 流程在 FG2 自己的工作目录下产出 jar（client/server/merged-patched.jar），必须显式指定
++	 * 输入输出，否则会写错产物，令后续的 walkFileSystems / applyLoomPatchVersion 拿到陈旧文件。
++	 */
++	protected void accessTransform(Path input, Path target) throws IOException {
+ 		Stopwatch stopwatch = Stopwatch.createStarted();
+ 		logger.lifecycle(":access transforming minecraft");
+ 
+@@ -592,7 +602,7 @@ public class MinecraftPatchedProvider {
+ 		logger.lifecycle(":patched jars in " + stopwatch.stop());
+ 	}
+ 
+-	private void patchJars(Path clean, Path output, Path patches) {
++	protected void patchJars(Path clean, Path output, Path patches) throws Exception {
+ 		ForgeToolValueSource.exec(project, spec -> {
+ 			UserdevConfig.BinaryPatcherConfig config = getExtension().getForgeUserdevProvider().getConfig().binpatcher();
+ 			final FileCollection download = DependencyDownloader.download(project, config.dependency());
+@@ -675,11 +685,11 @@ public class MinecraftPatchedProvider {
+ 		}
+ 	}
+ 
+-	private void walkFileSystems(Path source, Path target, Predicate<Path> filter, FsPathConsumer action) throws IOException {
++	protected void walkFileSystems(Path source, Path target, Predicate<Path> filter, FsPathConsumer action) throws IOException {
+ 		walkFileSystems(source, target, filter, FileSystem::getRootDirectories, action);
+ 	}
+ 
+-	private void copyMissingClasses(Path source, Path target) throws IOException {
++	protected void copyMissingClasses(Path source, Path target) throws IOException {
+ 		walkFileSystems(source, target, it -> it.toString().endsWith(".class"), (sourceFs, targetFs, sourcePath, targetPath) -> {
+ 			if (Files.exists(targetPath)) return;
+ 			Path parent = targetPath.getParent();
+@@ -701,7 +711,7 @@ public class MinecraftPatchedProvider {
+ 		walkFileSystems(source, target, filter, this::copyReplacing);
+ 	}
+ 
+-	private void copyReplacing(FileSystem sourceFs, FileSystem targetFs, Path sourcePath, Path targetPath) throws IOException {
++	protected void copyReplacing(FileSystem sourceFs, FileSystem targetFs, Path sourcePath, Path targetPath) throws IOException {
+ 		Path parent = targetPath.getParent();
+ 
+ 		if (parent != null) {
+@@ -793,9 +803,10 @@ public class MinecraftPatchedProvider {
+ 		SERVER_ONLY("server", "server", (patch, userdev) -> patch.extractServerPatches()),
+ 		MERGED("merged", "joined", (patch, userdev) -> userdev.getJoinedPatches());
+ 
+-		private final String id;
+-		private final String mcpId;
+-		private final BiFunction<PatchProvider, ForgeUserdevProvider, Path> patches;
++		// 对子类开放：legacy 实现需要按 type 区分产物命名
++		protected final String id;
++		protected final String mcpId;
++		protected final BiFunction<PatchProvider, ForgeUserdevProvider, Path> patches;
+ 
+ 		Type(String id, String mcpId, BiFunction<PatchProvider, ForgeUserdevProvider, Path> patches) {
+ 			this.id = id;
+diff --git a/src/main/java/dev/architectury/loom/metadata/McmodInfo.java b/src/main/java/dev/architectury/loom/metadata/McmodInfo.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..79b4326d072e844bde5b742db197dbde83e501b3
+--- /dev/null
++++ b/src/main/java/dev/architectury/loom/metadata/McmodInfo.java
+@@ -0,0 +1,84 @@
++package dev.architectury.loom.metadata;
++
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Objects;
++import java.util.Set;
++
++import com.google.gson.JsonArray;
++import com.google.gson.JsonElement;
++import org.jspecify.annotations.Nullable;
++
++import net.fabricmc.loom.LoomGradlePlugin;
++import net.fabricmc.loom.configuration.ifaceinject.InterfaceInjectionProcessor;
++import net.fabricmc.loom.util.ModPlatform;
++
++public class McmodInfo implements ModMetadataFile {
++	public static final String FILE_PATH = "mcmod.info";
++
++	private final JsonArray modsArray;
++
++	private McmodInfo(JsonArray modsArray) {
++		this.modsArray = Objects.requireNonNull(modsArray, "modsArray");
++	}
++
++	public static McmodInfo of(byte[] utf8) {
++		return of(new String(utf8, StandardCharsets.UTF_8));
++	}
++
++	public static McmodInfo of(String text) {
++		return of(LoomGradlePlugin.GSON.fromJson(text, JsonArray.class));
++	}
++
++	public static McmodInfo of(JsonArray jsonArray) {
++		return new McmodInfo(jsonArray);
++	}
++
++	@Override
++	public Set<String> getIds() {
++		final List<String> modIds = new ArrayList<>();
++
++		for (final JsonElement mod : modsArray) {
++			final String modId = mod.getAsJsonObject().get("modid").getAsString();
++			modIds.add(modId);
++		}
++
++		return Set.copyOf(modIds);
++	}
++
++	@Override
++	public Set<String> getAccessWideners() {
++		return Set.of();
++	}
++
++	@Override
++	public Set<String> getAccessTransformers(ModPlatform platform) {
++		return Set.of();
++	}
++
++	@Override
++	public List<InterfaceInjectionProcessor.InjectedInterface> getInjectedInterfaces(@Nullable String modId) {
++		return List.of();
++	}
++
++	@Override
++	public String getFileName() {
++		return FILE_PATH;
++	}
++
++	@Override
++	public List<String> getMixinConfigs() {
++		return List.of();
++	}
++
++	@Override
++	public boolean equals(Object obj) {
++		return obj == this || obj instanceof McmodInfo mcmodInfo && mcmodInfo.modsArray.equals(modsArray);
++	}
++
++	@Override
++	public int hashCode() {
++		return modsArray.hashCode();
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/LoomGradleExtension.java b/src/main/java/net/fabricmc/loom/LoomGradleExtension.java
+index f9527ca126b2761375afc5e48f4720f700e73837..6a8c3b116e42745b0ce5e83788f1368af3890591 100644
+--- a/src/main/java/net/fabricmc/loom/LoomGradleExtension.java
++++ b/src/main/java/net/fabricmc/loom/LoomGradleExtension.java
+@@ -212,6 +212,23 @@ public interface LoomGradleExtension extends LoomGradleExtensionAPI {
+ 		return getDependencyProviders().getProvider(ForgeUserdevProvider.class);
+ 	}
+ 
++	/**
++	 * 是否为 legacy Forge（1.8-1.16，ForgeGradle 2 时代）.
++	 *
++	 * <p>判定依据是 userdev 配置里有没有 {@code mcp} 段，因此必须在 userdev 解析完成后调用；
++	 * 未解析时 {@link ForgeUserdevProvider#isLegacyForge()} 会抛异常。
++	 */
++	default boolean isLegacyForge() {
++		return isForge() && getForgeUserdevProvider().isLegacyForge();
++	}
++
++	/**
++	 * 是否为 Forge 系（含 NeoForge）中的现代版本，即非 legacy Forge.
++	 */
++	default boolean isModernForgeLike() {
++		return isForgeLike() && !isLegacyForge();
++	}
++
+ 	default ForgeProvider getForgeProvider() {
+ 		return getDependencyProviders().getProvider(ForgeProvider.class);
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/api/ForgeExtensionAPI.java b/src/main/java/net/fabricmc/loom/api/ForgeExtensionAPI.java
+index 20ca4efeabeccc5282decacd809c2cf672edfeca..1e5518bbe425ba3567929387c4d2c10839ae84f8 100644
+--- a/src/main/java/net/fabricmc/loom/api/ForgeExtensionAPI.java
++++ b/src/main/java/net/fabricmc/loom/api/ForgeExtensionAPI.java
+@@ -35,6 +35,7 @@ import org.gradle.jvm.tasks.Jar;
+ import org.jetbrains.annotations.ApiStatus;
+ 
+ import net.fabricmc.loom.api.aw2at.Aw2AtSettings;
++import net.fabricmc.loom.configuration.providers.forge.fg2.Pack200Provider;
+ import net.fabricmc.loom.util.Check;
+ 
+ /**
+@@ -176,6 +177,14 @@ public interface ForgeExtensionAPI {
+ 	@Deprecated(forRemoval = true)
+ 	Property<Boolean> getUseForgeLoggerConfig();
+ 
++	/**
++	 * pack200 解包器，仅供 legacy Forge（1.8-1.16）使用.
++	 *
++	 * <p>legacy 的 binpatches 以 pack200 压缩，而 JDK 自 14 起不再自带解包实现，
++	 * 需要调用方注入（例如 architectury-pack200）。
++	 */
++	Property<Pack200Provider> getPack200Provider();
++
+ 	/**
+ 	 * A list of mod IDs for mods applied for data generation.
+ 	 * The returned list is unmodifiable but not immutable - it will reflect changes done with
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/forge/fg2/Pack200Provider.java b/src/main/java/net/fabricmc/loom/configuration/providers/forge/fg2/Pack200Provider.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c40ca48c2464317900657d23f58f60ca184c545f
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/forge/fg2/Pack200Provider.java
+@@ -0,0 +1,38 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.configuration.providers.forge.fg2;
++
++import java.io.InputStream;
++import java.util.jar.JarOutputStream;
++
++/**
++ * pack200 解包器.
++ *
++ * <p>legacy Forge（1.8-1.16）的 binpatches 以 pack200 压缩，JDK 自 14 起移除了内置实现，
++ * 因此由调用方注入（通常是 architectury-pack200）。
++ */
++public interface Pack200Provider {
++	void unpack(InputStream inputStream, JarOutputStream outputStream);
++}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/forge/fg2/package-info.java b/src/main/java/net/fabricmc/loom/configuration/providers/forge/fg2/package-info.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..0810034782c1724abd635649493ba222f57db805
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/forge/fg2/package-info.java
+@@ -0,0 +1,31 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++/**
++ * ForgeGradle 2（legacy Forge 1.8-1.16）时代的支持代码.
++ */
++@NullMarked
++package net.fabricmc.loom.configuration.providers.forge.fg2;
++
++import org.jspecify.annotations.NullMarked;
+diff --git a/src/main/java/net/fabricmc/loom/extension/ForgeExtensionImpl.java b/src/main/java/net/fabricmc/loom/extension/ForgeExtensionImpl.java
+index 7b34054535601f3acdc1f5349a82f8363722126b..8bc6f233425bb44a601e627fff40266e74c67861 100644
+--- a/src/main/java/net/fabricmc/loom/extension/ForgeExtensionImpl.java
++++ b/src/main/java/net/fabricmc/loom/extension/ForgeExtensionImpl.java
+@@ -41,6 +41,7 @@ import org.gradle.api.tasks.TaskProvider;
+ import org.gradle.jvm.tasks.Jar;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
++import net.fabricmc.loom.configuration.providers.forge.fg2.Pack200Provider;
+ import net.fabricmc.loom.api.ForgeExtensionAPI;
+ import net.fabricmc.loom.api.aw2at.Aw2AtSettings;
+ import net.fabricmc.loom.configuration.ide.RunConfigSettings;
+@@ -55,6 +56,7 @@ public class ForgeExtensionImpl implements ForgeExtensionAPI {
+ 	private final Property<Boolean> useCustomMixin;
+ 	private final Property<Boolean> useForgeLoggerConfig;
+ 	private final List<String> dataGenMods = new ArrayList<>(); // not a property because it has custom adding logic
++	private final Property<Pack200Provider> pack200Provider;
+ 
+ 	@Inject
+ 	public ForgeExtensionImpl(Project project, LoomGradleExtension extension) {
+@@ -66,6 +68,7 @@ public class ForgeExtensionImpl implements ForgeExtensionAPI {
+ 		mixinConfigs = project.getObjects().setProperty(String.class).empty();
+ 		useCustomMixin = project.getObjects().property(Boolean.class).convention(true);
+ 		useForgeLoggerConfig = project.getObjects().property(Boolean.class).convention(false);
++		pack200Provider = project.getObjects().property(Pack200Provider.class);
+ 	}
+ 
+ 	@Override
+@@ -133,4 +136,9 @@ public class ForgeExtensionImpl implements ForgeExtensionAPI {
+ 			}
+ 		});
+ 	}
++
++	@Override
++	public Property<Pack200Provider> getPack200Provider() {
++		return pack200Provider;
++	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/util/Constants.java b/src/main/java/net/fabricmc/loom/util/Constants.java
+index acf81e6bec3d4b755559c7eda90e6ecf92ad5263..940d8183d5b4d4f1886db77d6dd018ce8eef3c5d 100644
+--- a/src/main/java/net/fabricmc/loom/util/Constants.java
++++ b/src/main/java/net/fabricmc/loom/util/Constants.java
+@@ -255,4 +255,16 @@ public class Constants {
+ 		private Forge() {
+ 		}
+ 	}
++
++	/**
++	 * legacy Forge（1.8-1.16，ForgeGradle 2 时代）的启动入口常量.
++	 */
++	public static final class LegacyForge {
++		public static final String LAUNCH_WRAPPER = "net.minecraft.launchwrapper.Launch";
++		public static final String FML_TWEAKER = "net.minecraftforge.fml.common.launcher.FMLTweaker";
++		public static final String FML_SERVER_TWEAKER = "net.minecraftforge.fml.common.launcher.FMLServerTweaker";
++
++		private LegacyForge() {
++		}
++	}
+ }
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/MultiProjectDirectPluginTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/MultiProjectDirectPluginTest.groovy
+index 630cec858f8aea204a6d44a5652a781a574dc1cf..42d1ce1b008a9fb9b7d6bfc802a489ee36ef7f01 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/MultiProjectDirectPluginTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/MultiProjectDirectPluginTest.groovy
+@@ -1,7 +1,7 @@
+ /*
+  * This file is part of fabric-loom, licensed under the MIT License (MIT).
+  *
+- * Copyright (c) 2026 WCPE
++ * Copyright (c) 2026 FabricMC
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a copy
+  * of this software and associated documentation files (the "Software"), to deal
+@@ -33,21 +33,30 @@ import static org.gradle.testkit.runner.TaskOutcome.UP_TO_DATE
+ 
+ class MultiProjectDirectPluginTest extends Specification implements GradleProjectTestTrait {
+ 	def "multiple subprojects can apply Loom directly in one Gradle root"() {
+-	setup:
++		setup:
+ 		def gradle = gradleProject(project: "multiProjectDirectLoom", version: "9.5.0")
+ 		gradle.buildSrc("loomClasspath")
+ 
+ 		when:
+ 		def result = gradle.run(
+-				tasks: [":one:configureClientLaunch", ":two:configureClientLaunch"],
++				tasks: [
++					":one:configureClientLaunch",
++					":two:configureClientLaunch"
++				],
+ 				isloatedProjects: true)
+ 		// 首次执行会创建运行配置输出，isolated-projects 会因此使下一次重新存储；
+ 		// 输出稳定后第三次必须真正复用同一配置缓存条目。
+ 		def warm = gradle.run(
+-				tasks: [":one:configureClientLaunch", ":two:configureClientLaunch"],
++				tasks: [
++					":one:configureClientLaunch",
++					":two:configureClientLaunch"
++				],
+ 				isloatedProjects: true)
+ 		def reused = gradle.run(
+-				tasks: [":one:configureClientLaunch", ":two:configureClientLaunch"],
++				tasks: [
++					":one:configureClientLaunch",
++					":two:configureClientLaunch"
++				],
+ 				isloatedProjects: true)
+ 
+ 		then:
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/RemapTaskCacheTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/RemapTaskCacheTest.groovy
+index e4e8914749790017daaba9c7a7a0f1f6d8d38112..0887f0eae2e9ccf649ca797e8ee77de11681c46d 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/RemapTaskCacheTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/RemapTaskCacheTest.groovy
+@@ -1,7 +1,7 @@
+ /*
+  * This file is part of fabric-loom, licensed under the MIT License (MIT).
+  *
+- * Copyright (c) 2026 WCPE
++ * Copyright (c) 2026 FabricMC
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a copy
+  * of this software and associated documentation files (the "Software"), to deal
+@@ -112,7 +112,10 @@ class RemapTaskCacheTest extends Specification implements GradleProjectTestTrait
+ 		outputJars(gradle).every { manifestValue(it, "Fabric-Minecraft-Version") == "manifest-one" }
+ 
+ 		when:
+-		def changed = gradle.run(tasks: tasks, args: ["--build-cache", "-PcacheTestManifestVersion=manifest-two"])
++		def changed = gradle.run(tasks: tasks, args: [
++			"--build-cache",
++			"-PcacheTestManifestVersion=manifest-two"
++		])
+ 
+ 		then:
+ 		tasks.every { changed.task(":$it").outcome == SUCCESS }
+@@ -121,7 +124,11 @@ class RemapTaskCacheTest extends Specification implements GradleProjectTestTrait
+ 		manifestValue(gradle.getOutputFile("fabric-example-mod-1.0.0.jar"), "Fabric-Mixin-Group") == "custom-group"
+ 
+ 		when:
+-		def reproducible = gradle.run(tasks: tasks, args: ["--build-cache", "-PcacheTestManifestVersion=manifest-two", "-Dloom.test.reproducible=true"])
++		def reproducible = gradle.run(tasks: tasks, args: [
++			"--build-cache",
++			"-PcacheTestManifestVersion=manifest-two",
++			"-Dloom.test.reproducible=true"
++		])
+ 
+ 		then:
+ 		tasks.every { reproducible.task(":$it").outcome == SUCCESS }
+@@ -139,7 +146,10 @@ class RemapTaskCacheTest extends Specification implements GradleProjectTestTrait
+ 		gradle.run(task: "remapJar", args: ["--build-cache"])
+ 
+ 		when:
+-		def failed = gradle.run(task: "remapJar", args: ["--build-cache", "-PcacheTestNamespace=missing"], expectFailure: true)
++		def failed = gradle.run(task: "remapJar", args: [
++			"--build-cache",
++			"-PcacheTestNamespace=missing"
++		], expectFailure: true)
+ 
+ 		then:
+ 		failed.task(":remapJar").outcome == FAILED
+@@ -177,12 +187,20 @@ class RemapTaskCacheTest extends Specification implements GradleProjectTestTrait
+ 	}
+ 
+ 	private static List<File> outputJars(GradleProject gradle) {
+-		return [gradle.getOutputFile("fabric-example-mod-1.0.0.jar"), gradle.getOutputFile("fabric-example-mod-1.0.0-sources.jar")]
++		return [
++			gradle.getOutputFile("fabric-example-mod-1.0.0.jar"),
++			gradle.getOutputFile("fabric-example-mod-1.0.0-sources.jar")
++		]
+ 	}
+ 
++	/** 读取 Manifest 属性（try/finally 形式规避 groovy formatter 缺陷） */
+ 	private static String manifestValue(File file, String name) {
+-		try (def jar = new JarFile(file)) {
++		def jar = new JarFile(file)
++
++		try {
+ 			return jar.manifest.mainAttributes.getValue(name)
++		} finally {
++			jar.close()
+ 		}
+ 	}
+ }
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/buildSrc/loomClasspath/ForeignCacheService.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/buildSrc/loomClasspath/ForeignCacheService.groovy
+index 065acfc4e19def10da4b1ed98f4acca2d1b66176..6988e7fb425ccf2700bfb9e5f8aae000e7a066be 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/buildSrc/loomClasspath/ForeignCacheService.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/buildSrc/loomClasspath/ForeignCacheService.groovy
+@@ -1,3 +1,27 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
+ package net.fabricmc.loom.test.integration.buildSrc.loomClasspath
+ 
+ import org.gradle.api.services.BuildService
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/buildSrc/loomClasspath/TestPlugin.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/buildSrc/loomClasspath/TestPlugin.groovy
+index 628d867338a274c168d7e26136399181dce99312..886c1afaa1b3ba852da6b533b46bea8ac9e29e1c 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/buildSrc/loomClasspath/TestPlugin.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/buildSrc/loomClasspath/TestPlugin.groovy
+@@ -1,3 +1,27 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
+ package net.fabricmc.loom.test.integration.buildSrc.loomClasspath
+ 
+ import org.gradle.api.Plugin
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/forge/legacy/LegacyForgeExternalModDependencyTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/forge/legacy/LegacyForgeExternalModDependencyTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..a112f224c0aab66478f4d49233a063f435ac9927
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/forge/legacy/LegacyForgeExternalModDependencyTest.groovy
+@@ -0,0 +1,56 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration.forge.legacy
++
++import spock.lang.Specification
++import spock.lang.Unroll
++
++import net.fabricmc.loom.test.util.GradleProjectTestTrait
++
++import static net.fabricmc.loom.test.LoomTestConstants.STANDARD_TEST_VERSIONS
++import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
++
++/**
++ * legacy Forge（FG2 时代，MC 1.12.2）的端到端构建验证。
++ *
++ * <p>覆盖 MinecraftLegacyPatchedProvider 的完整链路：FG2 manifest 生成、
++ * pack200/binpatches 解包、access transform 与最终产物。
++ */
++class LegacyForgeExternalModDependencyTest extends Specification implements GradleProjectTestTrait {
++	@Unroll
++	def "build (gradle #version)"() {
++		setup:
++		def gradle = gradleProject(project: "forge/legacy/externalModDependency")
++
++		when:
++		def result = gradle.run(task: "build")
++
++		then:
++		result.task(":build").outcome == SUCCESS
++
++		where:
++		version << STANDARD_TEST_VERSIONS
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/RuntimeLibrariesTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/RuntimeLibrariesTest.groovy
+index 7ef53818e0f2172c1ec0f42660406cb0018ee5bc..95495319009a92da5d05f84e32014dd3a64905d8 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/RuntimeLibrariesTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/RuntimeLibrariesTest.groovy
+@@ -1,7 +1,7 @@
+ /*
+  * This file is part of fabric-loom, licensed under the MIT License (MIT).
+  *
+- * Copyright (c) 2026 WCPE
++ * Copyright (c) 2026 FabricMC
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a copy
+  * of this software and associated documentation files (the "Software"), to deal
+@@ -24,12 +24,15 @@
+ 
+ package net.fabricmc.loom.test.unit
+ 
++import org.gradle.api.provider.Property
+ import spock.lang.Specification
+ 
+ import net.fabricmc.loom.LoomGradleExtension
+-import net.fabricmc.loom.configuration.ide.RunConfig
++import net.fabricmc.loom.api.RunConfiguration
++import net.fabricmc.loom.configuration.ide.RuntimeLibraries
+ import net.fabricmc.loom.test.util.GradleTestUtil
+ 
++import static org.mockito.Mockito.mock
+ import static org.mockito.Mockito.when
+ 
+ class RuntimeLibrariesTest extends Specification {
+@@ -38,9 +41,15 @@ class RuntimeLibrariesTest extends Specification {
+ 		def project = GradleTestUtil.mockProject()
+ 		def extension = LoomGradleExtension.get(project)
+ 		when(extension.disableObfuscation()).thenReturn(true)
+-		def runConfig = new RunConfig(environment: "server")
++
++		Property<String> runtimeEnvironment = project.objects.property(String)
++		runtimeEnvironment.set("server")
++
++		def runConfiguration = mock(RunConfiguration)
++		when(runConfiguration.getRuntimeEnvironment()).thenReturn(runtimeEnvironment)
+ 
+ 		expect:
+-		runConfig.getExcludedLibraryPaths(project).empty
++		// 无混淆时不排除 client-only 库，保证 ForgeBootstrap 的 JPMS 模块图完整
++		RuntimeLibraries.getExcludedLibraryPaths(project, runConfiguration).isEmpty()
+ 	}
+ }
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/cache/AtomicFilesTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/cache/AtomicFilesTest.groovy
+index a40746f488a54e22900b2316676b777dd99dbbfb..3fc571cb2acb35522a2dbdc8a4f2046b993e7434 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/cache/AtomicFilesTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/cache/AtomicFilesTest.groovy
+@@ -206,10 +206,14 @@ class AtomicFilesTest extends Specification {
+ 		}
+ 	}
+ 
+-	/** publish 消费者：把临时文件当作新 zip 创建并写入内容（方法引用形式规避 groovy formatter 缺陷） */
++	/** publish 消费者：把临时文件当作新 zip 创建并写入内容（try/finally 形式规避 groovy formatter 缺陷） */
+ 	private static void writeHelloJar(Path tmp) {
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(tmp, true)) {
++		def fs = FileSystemUtil.getJarFileSystem(tmp, true)
++
++		try {
+ 			Files.writeString(fs.getRoot().resolve("hello.txt"), "hi", StandardCharsets.UTF_8)
++		} finally {
++			fs.close()
+ 		}
+ 	}
+ }
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/cache/LoomCacheServiceTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/cache/LoomCacheServiceTest.groovy
+index 0a00015ff8b941466a62dd7d2e60fee1322b5072..e3e525efad543e9ca0997e6bca3b6dde2c3372a3 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/cache/LoomCacheServiceTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/cache/LoomCacheServiceTest.groovy
+@@ -47,10 +47,9 @@ class LoomCacheServiceTest extends Specification {
+ 	// BuildService 是 abstract 类，无法直接 new，使用匿名子类绕过 Gradle 实例化；
+ 	// runExclusive 不会用到 getParameters，故返回 None 占位即可
+ 	LoomCacheService service = new LoomCacheService() {
+-		@Override
+-		BuildServiceParameters.None getParameters() {
+-			return null
+-		}
++		// 以 Groovy 属性形式声明：自动生成的 getParameters() 满足 BuildService 抽象方法，
++		// 同时避开 codenarc GetterMethodCouldBeProperty
++		final BuildServiceParameters.None parameters = null
+ 	}
+ 
+ 	def setup() {
+diff --git a/src/test/resources/projects/forge/legacy/externalModDependency/build.gradle b/src/test/resources/projects/forge/legacy/externalModDependency/build.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..e526d3e28d7cf5a876b9681cc088471f42e697ab
+--- /dev/null
++++ b/src/test/resources/projects/forge/legacy/externalModDependency/build.gradle
+@@ -0,0 +1,88 @@
++plugins {
++	id 'dev.architectury.loom'
++	id 'maven-publish'
++}
++
++java {
++	sourceCompatibility = JavaVersion.VERSION_1_8
++	targetCompatibility = JavaVersion.VERSION_1_8
++}
++
++base {
++	archivesName = project.archives_base_name
++}
++
++version = project.mod_version
++group = project.maven_group
++
++loom {
++	forge {
++		pack200Provider = new dev.architectury.pack200.java.Pack200Adapter()
++	}
++}
++
++repositories {
++	// Add repositories to retrieve artifacts from in here.
++	// You should only use this when depending on other mods because
++	// Loom adds the essential maven repositories to download Minecraft and libraries from automatically.
++	// See https://docs.gradle.org/current/userguide/declaring_repositories.html
++	// for more information about repositories.
++	maven {
++		url = 'https://dvs1.progwml6.com/files/maven/'
++	}
++}
++
++dependencies {
++	minecraft "com.mojang:minecraft:1.12.2"
++	mappings "de.oceanlabs.mcp:mcp_stable:39-1.12"
++	forge "net.minecraftforge:forge:1.12.2-14.23.5.2847"
++
++	// Example mod dep
++	modLocalRuntime "mezz.jei:jei_1.12.2:4.16.1.302"
++}
++
++tasks.withType(JavaCompile).configureEach {
++	// ensure that the encoding is set to UTF-8, no matter what the system default is
++	// this fixes some edge cases with special characters not displaying correctly
++	// see http://yodaconditions.net/blog/fix-for-a-java-file-encoding-problem.html
++	// If Javadoc is generated, this must be specified in that task too.
++	it.options.encoding = "UTF-8"
++
++	it.options.release = 8
++}
++
++java {
++	// Loom will automatically attach sourcesJar to a RemapSourcesJar task and to the "build" task
++	// if it is present.
++	// If you remove this line, sources will not be generated.
++	withSourcesJar()
++}
++
++jar {
++	from("LICENSE") {
++		rename { "${it}_${project.archivesBaseName}"}
++	}
++}
++
++// configure the maven publication
++publishing {
++	publications {
++		mavenJava(MavenPublication) {
++			// add all the jars that should be included when publishing to maven
++			artifact(remapJar) {
++				builtBy remapJar
++			}
++			artifact(sourcesJar) {
++				builtBy remapSourcesJar
++			}
++		}
++	}
++
++	// See https://docs.gradle.org/current/userguide/publishing_maven.html for information on how to set up publishing.
++	repositories {
++		// Add repositories to publish to here.
++		// Notice: This block does NOT have the same function as the block in the top level.
++		// The repositories here will be used for publishing your artifact, not for
++		// retrieving dependencies.
++	}
++}
+diff --git a/src/test/resources/projects/forge/legacy/externalModDependency/gradle.properties b/src/test/resources/projects/forge/legacy/externalModDependency/gradle.properties
+new file mode 100644
+index 0000000000000000000000000000000000000000..ee6c7d1d89143771141df2bfdc5046e7d2088d1f
+--- /dev/null
++++ b/src/test/resources/projects/forge/legacy/externalModDependency/gradle.properties
+@@ -0,0 +1,9 @@
++# Done to increase the memory available to gradle.
++org.gradle.jvmargs=-Xmx1G
++
++# Mod Properties
++mod_version = 1.0.0
++maven_group = com.example
++archives_base_name = fabric-example-mod
++
++loom.platform=forge

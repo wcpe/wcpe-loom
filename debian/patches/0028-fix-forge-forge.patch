@@ -1,0 +1,701 @@
+From fd45c885192f804ad4c713abe14a6bcb82212452 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:35 +0800
+Subject: [PATCH 028/147] =?UTF-8?q?fix(forge):=20forge=20=E7=B3=BB?=
+ =?UTF-8?q?=E5=85=B1=E4=BA=AB=E7=BC=93=E5=AD=98=E7=9A=84=E7=94=9F=E4=BA=A7?=
+ =?UTF-8?q?=E4=B8=8E=E5=88=A0=E9=99=A4=E8=A1=A5=E9=BD=90=E8=B7=A8=E8=BF=9B?=
+ =?UTF-8?q?=E7=A8=8B=E9=94=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+问题：forge 系的共享缓存产物位于 userCache/<mc>/<platform>/<forge>/（不按项目隔离），
+但多数写入点是无锁裸写。多 daemon 并发构建同一 Forge 版本时（典型场景：多个 mod 项目
+或多个 AI agent 并行开发），会出现两类失败：写入侧互相覆盖导致读方拿到半截 jar；以及
+一个进程删除缓存时另一个进程正持有该文件句柄——Windows 强制文件锁下直接报
+「另一个程序正在使用此文件」使构建失败（集成测试 SingleJarTest 的 1.19.4 用例即可复现）。
+
+改动：
+
+- ForgeUserdevProvider：userdev jar 与 config.json 的生产包进 CacheEntryLock（锁内二次
+  确认，等锁期间其它进程完成生产则直接复用）；patches-joined.lzma 改为原子发布。
+- PatchProvider：patches 提取包锁并原子落位；legacy 双产物（client/server）先写唯一临时
+  文件再原子 move，避免读方看到半截内容。
+- ForgeUniversalProvider：forge-universal.jar 生产包锁并原子复制。
+- SrgProvider：srg.tsrg 与 merged mojmap 产物生产包锁，srg.tsrg 改为原子发布（含 FG2-era
+  格式转换分支）；新增无锁快路径判定，legacy 形态下 merged 产物缺失属正常、不误进锁。
+- MinecraftPatchedProvider 及其 legacy 子类：provide 与 remapJar 的整段生产包锁。锁 key
+  不含 Type，因 client-extra.jar 在 CLIENT_ONLY/SERVER_ONLY/MERGED 实例间共享同一路径，
+  同版本所有 Type 必须互斥。
+
+锁 key 统一为 <类别>:<mc>:<forge>，与既有的 mojmap-tsrg2 锁同模式：无锁快路径、锁内
+二次确认、产物原子落位。锁顺序单向（forge-* → mojmap-tsrg2 / mappings），无死锁。
+
+验证：compileJava、checkstyleMain 通过；全量单元测试 742 项全绿；forge 集成测试 13 个
+测试类 44 项全绿（含此前因文件占用失败的 SingleJarTest 6 项、legacy 管线的
+LegacyForgeExternalModDependencyTest）。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/ForgeUniversalProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/ForgeUniversalProvider.java
+index 0e5cba218f43bbb56bbbc09ca099576181a8529f..ac2e86577a78e5967023f5748c47d93ec830284f 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/ForgeUniversalProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/ForgeUniversalProvider.java
+@@ -25,13 +25,17 @@
+ package dev.architectury.loom.forge.dependency;
+ 
+ import java.io.File;
+-import java.nio.file.Files;
+-import java.nio.file.StandardCopyOption;
++import java.io.IOException;
++import java.io.UncheckedIOException;
++import java.nio.file.Path;
+ 
+ import org.gradle.api.Project;
+ 
+ import net.fabricmc.loom.configuration.DependencyInfo;
+ import net.fabricmc.loom.util.Constants;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.cache.CacheEntryLock;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ 
+ public class ForgeUniversalProvider extends DependencyProvider {
+ 	private File forge;
+@@ -44,9 +48,38 @@ public class ForgeUniversalProvider extends DependencyProvider {
+ 	public void provide(DependencyInfo dependency) throws Exception {
+ 		forge = new File(getExtension().getForgeProvider().getGlobalCache(), "forge-universal.jar");
+ 
++		// 无锁快路径：缓存就绪且未要求刷新时不取锁
+ 		if (!forge.exists() || refreshDeps()) {
+-			File dep = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve Forge"));
+-			Files.copy(dep.toPath(), forge.toPath(), StandardCopyOption.REPLACE_EXISTING);
++			produceWithLock(dependency);
++		}
++	}
++
++	/**
++	 * 在跨进程锁保护下生产 forge-universal.jar.
++	 *
++	 * <p>缓存位于 {@code userCache}（不按项目隔离），同一 MC+Forge 版本的多个 daemon 会指向同一路径；
++	 * 由首个取得锁的进程写入，其余进程等待后直接复用。锁内二次确认 + 原子落位。
++	 */
++	private void produceWithLock(DependencyInfo dependency) {
++		final String lockKey = "forge-universal:" + getExtension().getMinecraftProvider().minecraftVersion()
++				+ ":" + getExtension().getForgeProvider().getVersion().getCombined();
++		final Path lockRoot = getExtension().getForgeProvider().getGlobalCache().toPath().resolve(Constants.Cache.LOCKS_DIR);
++
++		try {
++			CacheEntryLock.withLock(lockRoot, lockKey, LoomCacheService.defaultTimeout(), () -> {
++				// 锁内二次确认：等锁期间可能已被其它进程完成生产
++				if (forge.exists() && !refreshDeps()) {
++					return null;
++				}
++
++				final File dep = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve Forge"));
++				AtomicFiles.copy(dep.toPath(), forge.toPath());
++				return null;
++			});
++		} catch (IOException e) {
++			throw new UncheckedIOException(e);
++		} catch (Exception e) {
++			throw new RuntimeException("Could not produce Forge universal jar", e);
+ 		}
+ 	}
+ 
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java
+index df7ce18b08bcb032d94b6c61eada103f5b584802..5cacdffe0ac6bdc8425ebbdd975f09f63872eb20 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java
+@@ -26,6 +26,7 @@ package dev.architectury.loom.forge.dependency;
+ 
+ import java.io.File;
+ import java.io.IOException;
++import java.io.UncheckedIOException;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.AtomicMoveNotSupportedException;
+ import java.nio.file.Files;
+@@ -50,6 +51,9 @@ import net.fabricmc.loom.configuration.mods.dependency.LocalMavenHelper;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.FileSystemUtil;
+ import net.fabricmc.loom.util.ZipUtils;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.cache.CacheEntryLock;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ 
+ public class ForgeUserdevProvider extends DependencyProvider {
+ 	/** FG2 形态 userdev jar 内的 AT 文件名，与 {@link #createLegacyAts()} 的条目保持一致. */
+@@ -94,27 +98,14 @@ public class ForgeUserdevProvider extends DependencyProvider {
+ 		// 缓存内保留 forge 发布的原始配置（userdev3 也原样保留），形态判定与 manifest 派生都以它为准
+ 		byte[] configBytes = Files.notExists(configJson) ? null : Files.readAllBytes(configJson);
+ 		UserdevForm form = configBytes == null ? null : UserdevForm.of(parse(configBytes));
+-		JsonObject rawJson;
+ 
+ 		if (needsUserdevRework(form)) {
+-			File resolved = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve Forge userdev"));
+-			configBytes = readUserdevConfig(resolved.toPath());
+-			rawJson = parse(configBytes);
+-			form = UserdevForm.of(rawJson);
+-			Files.write(configJson, configBytes);
+-
+-			if (form == UserdevForm.USERDEV3) {
+-				// userdev3 与 legacy 分支期待的 FG2 形态不兼容，必须在配置期归一——依赖解析本身就发生在
+-				// 配置期（afterEvaluate），任务级 dependsOn 一律晚于该时点
+-				json = createNormalizedUserdev3Jar(dependency, resolved.toPath(), rawJson);
+-			} else {
+-				Files.copy(resolved.toPath(), userdevJar.toPath(), StandardCopyOption.REPLACE_EXISTING);
+-				json = createManifest(dependency, rawJson, form, userdevJar.toPath());
+-			}
++			// 需要生产：userdev jar / config.json 位于跨 daemon 共享的 userCache（不按项目隔离），
++			// 同一 MC+Forge 版本的多个并发构建会写同一路径，必须串行化（锁内二次确认）。
++			form = produceWithLock(dependency, configJson);
+ 		} else {
+ 			// 命中缓存：manifest 由缓存的原始配置重新派生（legacy 形态的 sources 落位是幂等的）
+-			rawJson = parse(configBytes);
+-			json = createManifest(dependency, rawJson, form, userdevJar.toPath());
++			json = createManifest(dependency, parse(configBytes), form, userdevJar.toPath());
+ 		}
+ 
+ 		isLegacyForge = form.isLegacy();
+@@ -131,7 +122,58 @@ public class ForgeUserdevProvider extends DependencyProvider {
+ 		addDependency(config.universal(), Constants.Configurations.FORGE_UNIVERSAL);
+ 
+ 		if (!isLegacyForge && Files.notExists(joinedPatches)) {
+-			Files.write(joinedPatches, ZipUtils.unpack(userdevJar.toPath(), config.binpatches()));
++			// 原子发布：写临时文件后原子落位，跨 daemon 读方不会看到半截内容
++			AtomicFiles.publish(joinedPatches, tmp -> Files.write(tmp, ZipUtils.unpack(userdevJar.toPath(), config.binpatches())));
++		}
++	}
++
++	/**
++	 * 在跨进程锁保护下生产 userdev 缓存（userdev jar 与 config.json）.
++	 *
++	 * <p>缓存位于 {@code userCache}（不按项目隔离），同一 MC+Forge 版本的多个 daemon 会指向同一路径；
++	 * 生产结果只取决于目标版本，故由首个取得锁的进程写入，其余进程等待后直接复用。锁内二次确认，
++	 * 等锁期间可能已被其它进程完成生产。
++	 *
++	 * @return 生产（或复用）后的 userdev 形态
++	 */
++	private UserdevForm produceWithLock(DependencyInfo dependency, Path configJson) throws IOException {
++		final String lockKey = "forge-userdev:" + getExtension().getMinecraftProvider().minecraftVersion()
++				+ ":" + getExtension().getForgeProvider().getVersion().getCombined();
++		final Path lockRoot = getExtension().getForgeProvider().getGlobalCache().toPath().resolve(Constants.Cache.LOCKS_DIR);
++
++		try {
++			return CacheEntryLock.withLock(lockRoot, lockKey, LoomCacheService.defaultTimeout(), () -> {
++				// 锁内二次确认：等锁期间可能已被其它进程完成生产
++				final byte[] cached = Files.notExists(configJson) ? null : Files.readAllBytes(configJson);
++				final UserdevForm cachedForm = cached == null ? null : UserdevForm.of(parse(cached));
++
++				if (needsUserdevRework(cachedForm)) {
++					final File resolved = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve Forge userdev"));
++					final byte[] config = readUserdevConfig(resolved.toPath());
++					final JsonObject raw = parse(config);
++					final UserdevForm form = UserdevForm.of(raw);
++					Files.write(configJson, config);
++
++					if (form == UserdevForm.USERDEV3) {
++						// userdev3 与 legacy 分支期待的 FG2 形态不兼容，必须在配置期归一——依赖解析本身就发生在
++						// 配置期（afterEvaluate），任务级 dependsOn 一律晚于该时点
++						json = createNormalizedUserdev3Jar(dependency, resolved.toPath(), raw);
++					} else {
++						Files.copy(resolved.toPath(), userdevJar.toPath(), StandardCopyOption.REPLACE_EXISTING);
++						json = createManifest(dependency, raw, form, userdevJar.toPath());
++					}
++
++					return form;
++				}
++
++				// 其它进程已生产：manifest 由缓存的原始配置重新派生（legacy 形态的 sources 落位是幂等的）
++				json = createManifest(dependency, parse(cached), cachedForm, userdevJar.toPath());
++				return cachedForm;
++			});
++		} catch (IOException e) {
++			throw new UncheckedIOException(e);
++		} catch (Exception e) {
++			throw new RuntimeException("Could not produce Forge userdev cache", e);
+ 		}
+ 	}
+ 
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java
+index b7d7311799163991baf6d18ae3df9f6499a65a92..6d48f0797777661df16293800d1bd5fa23ddb7de 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java
+@@ -37,7 +37,7 @@ import java.io.OutputStream;
+ import java.io.UncheckedIOException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+-import java.nio.file.StandardCopyOption;
++import java.util.concurrent.Callable;
+ import java.util.jar.JarEntry;
+ import java.util.jar.JarInputStream;
+ import java.util.jar.JarOutputStream;
+@@ -54,6 +54,9 @@ import net.fabricmc.loom.configuration.DependencyInfo;
+ import net.fabricmc.loom.configuration.providers.forge.fg2.Pack200Provider;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.FileSystemUtil;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.cache.CacheEntryLock;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ 
+ public class PatchProvider extends DependencyProvider {
+ 	private Path projectCacheFolder;
+@@ -104,10 +107,40 @@ public class PatchProvider extends DependencyProvider {
+ 			return;
+ 		}
+ 
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(installerJar)) {
+-			Files.copy(fs.getPath("data", name), targetPath, StandardCopyOption.REPLACE_EXISTING);
++		withPatchLock(() -> {
++			// 锁内二次确认：等锁期间可能已被其它进程提取完成
++			if (Files.exists(targetPath) && !refreshDeps()) {
++				return null;
++			}
++
++			try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(installerJar)) {
++				final byte[] data = fs.readAllBytes("data/" + name);
++				AtomicFiles.publish(targetPath, tmp -> Files.write(tmp, data));
++			} catch (IOException e) {
++				throw new UncheckedIOException(e);
++			}
++
++			return null;
++		});
++	}
++
++	/**
++	 * 在跨进程锁保护下提取补丁文件.
++	 *
++	 * <p>补丁位于跨 daemon 共享的 forge 缓存目录（不按项目隔离），同一 MC+Forge 版本的多个并发构建
++	 * 会写同一路径；由首个取得锁的进程写入，其余进程等待后直接复用。锁内二次确认。
++	 */
++	private void withPatchLock(Callable<Void> action) {
++		final String lockKey = "forge-patches:" + getExtension().getMinecraftProvider().minecraftVersion()
++				+ ":" + getExtension().getForgeProvider().getVersion().getCombined();
++		final Path lockRoot = projectCacheFolder.resolve(Constants.Cache.LOCKS_DIR);
++
++		try {
++			CacheEntryLock.withLock(lockRoot, lockKey, LoomCacheService.defaultTimeout(), action);
+ 		} catch (IOException e) {
+ 			throw new UncheckedIOException(e);
++		} catch (Exception e) {
++			throw new RuntimeException("Could not extract Forge patches", e);
+ 		}
+ 	}
+ 
+@@ -127,12 +160,36 @@ public class PatchProvider extends DependencyProvider {
+ 			return;
+ 		}
+ 
+-		byte[] unpackedBytes;
++		withPatchLock(() -> {
++			// 锁内二次确认：等锁期间可能已被其它进程提取完成
++			if (Files.exists(clientPatches) && Files.exists(serverPatches) && !refreshDeps()) {
++				return null;
++			}
+ 
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(installerJar)) {
+-			unpackedBytes = unpack200Lzma(fs.getPath("binpatches.pack.lzma"));
+-		}
++			byte[] unpackedBytes;
++
++			try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(installerJar)) {
++				unpackedBytes = unpack200Lzma(fs.getPath("binpatches.pack.lzma"));
++			}
++
++			// 两个产物都先写「同目录唯一临时文件」再原子 move，避免读方看到半截内容
++			final Path clientTmp = AtomicFiles.tempSibling(clientPatches);
++			final Path serverTmp = AtomicFiles.tempSibling(serverPatches);
++
++			try {
++				writeLegacyPatches(unpackedBytes, clientTmp, serverTmp);
++				AtomicFiles.move(clientTmp, clientPatches);
++				AtomicFiles.move(serverTmp, serverPatches);
++			} finally {
++				Files.deleteIfExists(clientTmp);
++				Files.deleteIfExists(serverTmp);
++			}
++
++			return null;
++		});
++	}
+ 
++	private void writeLegacyPatches(byte[] unpackedBytes, Path clientPatches, Path serverPatches) throws IOException {
+ 		try (JarInputStream in = new JarInputStream(new ByteArrayInputStream(unpackedBytes));
+ 				OutputStream clientFileOut = Files.newOutputStream(clientPatches, CREATE, TRUNCATE_EXISTING);
+ 				LzmaOutputStream clientLzmaOut = new LzmaOutputStream(clientFileOut, new Encoder());
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/SrgProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/SrgProvider.java
+index 996b63602f76d476c15fad33d3409fd9c30d4967..02dffc2c02cc6eea3bc6c06ebe57d64091b21079 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/SrgProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/SrgProvider.java
+@@ -58,6 +58,7 @@ import net.fabricmc.loom.configuration.providers.mappings.mojmap.MojangMappingsS
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.LoomVersions;
+ import net.fabricmc.loom.util.ZipUtils;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.loom.util.cache.CacheEntryLock;
+ import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.mappingio.MappingReader;
+@@ -86,64 +87,134 @@ public class SrgProvider extends DependencyProvider {
+ 	public void provide(DependencyInfo dependency) throws Exception {
+ 		init(dependency.getDependency().getVersion());
+ 
+-		if (!Files.exists(srg) || refreshDeps()) {
+-			Path srgZip = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve srg")).toPath();
++		// srg.tsrg 与 merged mojmap 产物位于跨 daemon 共享的 userCache（不按项目隔离），
++		// 同一 MC 版本的多个并发构建会写同一路径；需要生产时取锁串行化（锁内二次确认）。
++		if (needsSrgProduction()) {
++			produceSrgWithLock(dependency);
++		}
++
++		try (BufferedReader reader = Files.newBufferedReader(srg)) {
++			isTsrgV2 = reader.readLine().startsWith("tsrg2");
++		}
++	}
++
++	/**
++	 * {@return 是否需要生产 srg 相关产物}.
++	 *
++	 * <p>无锁快路径：srg.tsrg 缺失或要求刷新时直接判定需要；否则读 srg.tsrg 首行判断形态，
++	 * 仅 tsrgV2（现代 MC）才存在 merged mojmap 产物，legacy 形态下其缺失属正常，无需生产。
++	 */
++	private boolean needsSrgProduction() throws IOException {
++		if (Files.notExists(srg) || refreshDeps()) {
++			return true;
++		}
++
++		try (BufferedReader reader = Files.newBufferedReader(srg)) {
++			if (!reader.readLine().startsWith("tsrg2")) {
++				return false;
++			}
++		}
++
++		return Files.notExists(mergedMojangRaw) || Files.notExists(mergedMojangTrimmed);
++	}
++
++	/**
++	 * 在跨进程锁保护下生产 srg.tsrg 与 merged mojmap 产物.
++	 *
++	 * <p>缓存位于 {@code userCache}（不按项目隔离），同一 MC 版本的多个 daemon 会指向同一路径；
++	 * 由首个取得锁的进程写入，其余进程等待后直接复用。锁内二次确认；srg.tsrg 原子落位，
++	 * 保证「文件存在 ⟺ 内容完整」，锁外读方不会看到半截内容。
++	 */
++	private void produceSrgWithLock(DependencyInfo dependency) {
++		final String lockKey = "forge-srg:" + getExtension().getMinecraftProvider().minecraftVersion();
++		final Path lockRoot = srg.getParent().resolve(Constants.Cache.LOCKS_DIR);
+ 
++		try {
++			CacheEntryLock.withLock(lockRoot, lockKey, LoomCacheService.defaultTimeout(), () -> {
++				// 锁内二次确认：等锁期间可能已被其它进程完成生产
++				produceSrg(dependency);
++				produceMergedMojang(dependency);
++				return null;
++			});
++		} catch (IOException e) {
++			throw new UncheckedIOException(e);
++		} catch (Exception e) {
++			throw new RuntimeException("Could not produce SRG mappings", e);
++		}
++	}
++
++	private void produceSrg(DependencyInfo dependency) throws IOException {
++		if (Files.exists(srg) && !refreshDeps()) {
++			return;
++		}
++
++		Path srgZip = dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve srg")).toPath();
++
++		try {
++			final byte[] tsrgBytes = ZipUtils.unpack(srgZip, "config/joined.tsrg");
++			AtomicFiles.publish(srg, tmp -> Files.write(tmp, tsrgBytes));
++		} catch (NoSuchFileException e) {
+ 			try {
+-				Files.write(srg, ZipUtils.unpack(srgZip, "config/joined.tsrg"));
+-			} catch (NoSuchFileException e) {
+-				try {
+-					// FG2-era MCP uses the older SRG format, convert it on the fly
+-					byte[] srgBytes = ZipUtils.unpack(srgZip, "joined.srg");
++				// FG2-era MCP uses the older SRG format, convert it on the fly
++				byte[] srgBytes = ZipUtils.unpack(srgZip, "joined.srg");
+ 
+-					try (Reader reader = new InputStreamReader(new ByteArrayInputStream(srgBytes)); Writer writer = Files.newBufferedWriter(srg)) {
++				AtomicFiles.publish(srg, tmp -> {
++					try (Reader reader = new InputStreamReader(new ByteArrayInputStream(srgBytes)); Writer writer = Files.newBufferedWriter(tmp)) {
+ 						new TSrgWriter(writer).write(new SrgReader(reader).read());
+ 					}
+-				} catch (NoSuchFileException e1) {
+-					e.addSuppressed(e1);
+-					throw e;
+-				}
++				});
++			} catch (NoSuchFileException e1) {
++				e.addSuppressed(e1);
++				throw e;
+ 			}
+ 		}
++	}
++
++	private void produceMergedMojang(DependencyInfo dependency) throws IOException {
++		boolean tsrgV2;
+ 
+ 		try (BufferedReader reader = Files.newBufferedReader(srg)) {
+-			isTsrgV2 = reader.readLine().startsWith("tsrg2");
++			tsrgV2 = reader.readLine().startsWith("tsrg2");
+ 		}
+ 
+-		if (isTsrgV2) {
+-			if (!Files.exists(mergedMojangRaw) || !Files.exists(mergedMojangTrimmed) || refreshDeps()) {
+-				Stopwatch stopwatch = Stopwatch.createStarted();
+-				getProject().getLogger().lifecycle(":merging mappings (InstallerTools, srg + mojmap)");
+-
+-				Files.deleteIfExists(mergedMojangRaw);
+-				Path mojmapTsrg2 = getMojmapTsrg2(getProject(), getExtension());
+-				ForgeToolValueSource.exec(getProject(), settings -> {
+-					settings.classpath(DependencyDownloader.download(getProject(), LoomVersions.FORGE_INSTALLER_TOOLS.mavenNotation()));
+-					settings.getMainClass().set(INSTALLER_TOOLS_MAIN_CLASS);
+-					settings.args(
+-							"--task",
+-							"MERGE_MAPPING",
+-							"--left",
+-							getSrg().toAbsolutePath().toString(),
+-							"--right",
+-							mojmapTsrg2.toAbsolutePath().toString(),
+-							"--classes",
+-							"--output",
+-							mergedMojangRaw.toAbsolutePath().toString()
+-					);
+-				});
+-
+-				MemoryMappingTree tree = new MemoryMappingTree();
+-				MappingVisitor visitor = new ArgDroppingVisitor(new FieldDescWrappingVisitor(tree));
+-				MappingReader.read(mergedMojangRaw, visitor);
++		if (!tsrgV2) {
++			return;
++		}
+ 
+-				try (MappingWriter writer = MappingWriter.create(mergedMojangTrimmed, MappingFormat.TSRG_2_FILE)) {
+-					tree.accept(writer);
+-				}
++		if (Files.exists(mergedMojangRaw) && Files.exists(mergedMojangTrimmed) && !refreshDeps()) {
++			return;
++		}
+ 
+-				getProject().getLogger().lifecycle(":merged mappings (InstallerTools, srg + mojmap) in " + stopwatch.stop());
+-			}
++		Stopwatch stopwatch = Stopwatch.createStarted();
++		getProject().getLogger().lifecycle(":merging mappings (InstallerTools, srg + mojmap)");
++
++		Files.deleteIfExists(mergedMojangRaw);
++		Path mojmapTsrg2 = getMojmapTsrg2(getProject(), getExtension());
++		ForgeToolValueSource.exec(getProject(), settings -> {
++			settings.classpath(DependencyDownloader.download(getProject(), LoomVersions.FORGE_INSTALLER_TOOLS.mavenNotation()));
++			settings.getMainClass().set(INSTALLER_TOOLS_MAIN_CLASS);
++			settings.args(
++					"--task",
++					"MERGE_MAPPING",
++					"--left",
++					getSrg().toAbsolutePath().toString(),
++					"--right",
++					mojmapTsrg2.toAbsolutePath().toString(),
++					"--classes",
++					"--output",
++					mergedMojangRaw.toAbsolutePath().toString()
++			);
++		});
++
++		MemoryMappingTree tree = new MemoryMappingTree();
++		MappingVisitor visitor = new ArgDroppingVisitor(new FieldDescWrappingVisitor(tree));
++		MappingReader.read(mergedMojangRaw, visitor);
++
++		try (MappingWriter writer = MappingWriter.create(mergedMojangTrimmed, MappingFormat.TSRG_2_FILE)) {
++			tree.accept(writer);
+ 		}
++
++		getProject().getLogger().lifecycle(":merged mappings (InstallerTools, srg + mojmap) in " + stopwatch.stop());
+ 	}
+ 
+ 	// A visitor that drop all method args from srg
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
+index fa0394d6120b4873189bb4a7e771ab2e9f7f1c35..ba4106dd2a6f88a419aca5ea6ef5590b8ba4b1f4 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
+@@ -89,21 +89,25 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 
+ 	@Override
+ 	public void provide() throws Exception {
+-		String forgeVersion = getExtension().getForgeProvider().getVersion().getCombined();
+-		Path forgeWorkingDir = ForgeProvider.getForgeCache(project);
+-		String patchId = "forge-" + forgeVersion + "-";
++		withPatchedLock(() -> {
++			String forgeVersion = getExtension().getForgeProvider().getVersion().getCombined();
++			Path forgeWorkingDir = ForgeProvider.getForgeCache(project);
++			String patchId = "forge-" + forgeVersion + "-";
+ 
+-		minecraftProvider.setJarPrefix(patchId);
++			minecraftProvider.setJarPrefix(patchId);
+ 
+-		minecraftClientPatchedJar = forgeWorkingDir.resolve("client-patched.jar");
+-		minecraftServerPatchedJar = forgeWorkingDir.resolve("server-patched.jar");
+-		minecraftMergedPatchedJar = forgeWorkingDir.resolve("merged-patched.jar");
+-		minecraftPatchedAtJar = forgeWorkingDir.resolve(type.id + "-at-patched.jar");
+-		forgeJar = forgeWorkingDir.resolve("forge.jar");
++			minecraftClientPatchedJar = forgeWorkingDir.resolve("client-patched.jar");
++			minecraftServerPatchedJar = forgeWorkingDir.resolve("server-patched.jar");
++			minecraftMergedPatchedJar = forgeWorkingDir.resolve("merged-patched.jar");
++			minecraftPatchedAtJar = forgeWorkingDir.resolve(type.id + "-at-patched.jar");
++			forgeJar = forgeWorkingDir.resolve("forge.jar");
+ 
+-		checkCache();
++			// 锁内判定：等锁期间其它进程可能已完成生产，checkCache 的 notExists 判定即为二次确认
++			checkCache();
+ 
+-		dirty = false;
++			dirty = false;
++			return null;
++		});
+ 	}
+ 
+ 	protected void cleanAllCache() throws IOException {
+@@ -131,33 +135,38 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 
+ 	@Override
+ 	public void remapJar(ServiceFactory serviceFactory) throws Exception {
+-		if (Files.notExists(forgeJar)) {
+-			dirty = true;
+-			patchForge();
+-			applyLoomPatchVersion(forgeJar);
+-		}
++		// 锁内判定：等锁期间其它进程可能已完成生产，notExists 判定即为二次确认
++		withPatchedLock(() -> {
++			if (Files.notExists(forgeJar)) {
++				dirty = true;
++				patchForge();
++				applyLoomPatchVersion(forgeJar);
++			}
+ 
+-		if (Files.notExists(minecraftClientPatchedJar) || Files.notExists(minecraftServerPatchedJar)) {
+-			dirty = true;
+-			patchJars();
+-		}
++			if (Files.notExists(minecraftClientPatchedJar) || Files.notExists(minecraftServerPatchedJar)) {
++				dirty = true;
++				patchJars();
++			}
+ 
+-		if (type == Type.MERGED && (dirty || Files.notExists(minecraftMergedPatchedJar))) {
+-			dirty = true;
+-			mergeJars();
+-		}
++			if (type == Type.MERGED && (dirty || Files.notExists(minecraftMergedPatchedJar))) {
++				dirty = true;
++				mergeJars();
++			}
+ 
+-		if (dirty || Files.notExists(minecraftPatchedAtJar)) {
+-			dirty = true;
+-			Path minecraftPatchedJar = switch (type) {
+-			case CLIENT_ONLY -> minecraftClientPatchedJar;
+-			case SERVER_ONLY -> minecraftServerPatchedJar;
+-			case MERGED -> minecraftMergedPatchedJar;
+-			};
+-			accessTransform(minecraftPatchedJar, minecraftPatchedAtJar);
+-			walkFileSystems(forgeJar, minecraftPatchedAtJar, (path) -> true, this::copyReplacing);
+-			applyLoomPatchVersion(minecraftPatchedAtJar);
+-		}
++			if (dirty || Files.notExists(minecraftPatchedAtJar)) {
++				dirty = true;
++				Path minecraftPatchedJar = switch (type) {
++				case CLIENT_ONLY -> minecraftClientPatchedJar;
++				case SERVER_ONLY -> minecraftServerPatchedJar;
++				case MERGED -> minecraftMergedPatchedJar;
++				};
++				accessTransform(minecraftPatchedJar, minecraftPatchedAtJar);
++				walkFileSystems(forgeJar, minecraftPatchedAtJar, (path) -> true, this::copyReplacing);
++				applyLoomPatchVersion(minecraftPatchedAtJar);
++			}
++
++			return null;
++		});
+ 	}
+ 
+ 	private void patchForge() throws Exception {
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+index 05dc28a79d78a298a92d96a4c179d095ae5152e4..d2f2222d9f6ebe45c7fd469e0d2d142537e70456 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+@@ -40,6 +40,7 @@ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Objects;
++import java.util.concurrent.Callable;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.function.BiFunction;
+ import java.util.function.Function;
+@@ -91,6 +92,8 @@ import net.fabricmc.loom.util.FileSystemUtil;
+ import net.fabricmc.loom.util.LoomVersions;
+ import net.fabricmc.loom.util.TinyRemapperHelper;
+ import net.fabricmc.loom.util.ZipUtils;
++import net.fabricmc.loom.util.cache.CacheEntryLock;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.loom.util.service.ScopedServiceFactory;
+ import net.fabricmc.loom.util.service.ServiceFactory;
+ import net.fabricmc.mappingio.tree.MappingTree;
+@@ -213,6 +216,11 @@ public class MinecraftPatchedProvider {
+ 
+ 	public void provide() throws Exception {
+ 		initPatchedFiles();
++		withPatchedLock(this::providePatched);
++	}
++
++	private Void providePatched() throws Exception {
++		// 锁内判定：等锁期间其它进程可能已完成生产，checkCache 与 notExists 均为幂等二次确认
+ 		checkCache();
+ 
+ 		this.dirty = false;
+@@ -231,9 +239,16 @@ public class MinecraftPatchedProvider {
+ 			this.dirty = true;
+ 			accessTransformForge();
+ 		}
++
++		return null;
+ 	}
+ 
+ 	public void remapJar(ServiceFactory serviceFactory) throws Exception {
++		withPatchedLock(() -> remapPatchedJarWithDirty(serviceFactory));
++	}
++
++	private Void remapPatchedJarWithDirty(ServiceFactory serviceFactory) throws Exception {
++		// 锁内判定：等锁期间其它进程可能已完成生产，dirty/notExists 判定即为二次确认
+ 		if (dirty) {
+ 			if (getExtension().isUnobfuscatedForge()) {
+ 				mergeUnobfuscatedPatchedJar();
+@@ -253,6 +268,29 @@ public class MinecraftPatchedProvider {
+ 		if (providesClientJar()) {
+ 			DependencyProvider.addDependency(project, minecraftClientExtra, Constants.Configurations.FORGE_EXTRA);
+ 		}
++
++		return null;
++	}
++
++	/**
++	 * 在跨进程锁保护下执行 patched jar 生产.
++	 *
++	 * <p>产物位于跨 daemon 共享的 forge 缓存目录（不按项目隔离），且 {@code client-extra.jar} 在
++	 * 各 Type 实例间共享同一路径；同一 MC+Forge 版本的多个并发构建会互相读写/删除同一批文件，
++	 * 必须整段生产串行化。锁内判定均为幂等二次确认，等锁期间其它进程完成生产后直接复用。
++	 */
++	protected void withPatchedLock(Callable<Void> action) {
++		final String lockKey = "forge-patched:" + getExtension().getMinecraftProvider().minecraftVersion()
++				+ ":" + getExtension().getForgeProvider().getVersion().getCombined();
++		final Path lockRoot = ForgeProvider.getForgeCache(project).resolve(Constants.Cache.LOCKS_DIR);
++
++		try {
++			CacheEntryLock.withLock(lockRoot, lockKey, LoomCacheService.defaultTimeout(), action);
++		} catch (IOException e) {
++			throw new UncheckedIOException(e);
++		} catch (Exception e) {
++			throw new RuntimeException("Could not produce patched Minecraft jars", e);
++		}
+ 	}
+ 
+ 	/**

@@ -1,0 +1,23 @@
+From d7a3a79c59274809932179f022ec00e74bab122d Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:42 +0800
+Subject: [PATCH 038/147] =?UTF-8?q?fix(ci):=20release.yml=20=E7=A7=BB?=
+ =?UTF-8?q?=E9=99=A4=E7=A9=BA=20labels=20=E5=88=86=E7=BB=84=E9=81=BF?=
+ =?UTF-8?q?=E5=85=8D=E5=90=9E=E6=8E=89=E6=97=A0=E6=A0=87=E7=AD=BE=20PR=20?=
+ =?UTF-8?q?=E7=9A=84=E5=8F=98=E6=9B=B4=E6=9D=A1=E7=9B=AE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/.github/release.yml b/.github/release.yml
+index 013869aecf07527492a823a04862efea36e02a25..586adcc57d0080f80537e75866fe1be7d46d0328 100644
+--- a/.github/release.yml
++++ b/.github/release.yml
+@@ -41,4 +41,3 @@ changelog:
+         - test
+         - tests
+     - title: 其他变更
+-      labels: []

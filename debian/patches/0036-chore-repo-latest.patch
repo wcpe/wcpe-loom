@@ -1,0 +1,163 @@
+From 784c4cac87c709db3cccb2699907c0d3dc59d33f Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:41 +0800
+Subject: [PATCH 036/147] =?UTF-8?q?chore(repo):=20=E5=8F=91=E5=B8=83?=
+ =?UTF-8?q?=E4=BD=93=E7=B3=BB=E5=88=86=E7=A6=BB=E5=BC=80=E5=8F=91/?=
+ =?UTF-8?q?=E6=AD=A3=E5=BC=8F=E5=91=BD=E5=90=8D=E7=A9=BA=E9=97=B4=E5=B9=B6?=
+ =?UTF-8?q?=E5=AE=9E=E7=8E=B0=20latest=20=E6=8C=87=E9=92=88?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+问题：分支构建与正式版共用 1.17.x 命名空间，自动构建的 1.17.<运行号> 会盖过
+正式版号（现已出现 1.17.84），maven 元数据的 release 字段也指向自动构建。
+
+改动：
+- 分支构建改发 1.17-dev.<运行号>；正式版仍为 1.17.<N>（仅 wcpe-v* tag 发布），
+  两套号不再冲突。
+- 实现此前空转的 latest 指针：build.gradle 读取 PUBLISH_LATEST，正式版发布时更新
+  1.17-latest、分支构建时更新 1.17-dev-latest；指针的插件标记 POM 指向该次发布的
+  具体版本，使用者写指针版本即可，不必关心运行号。
+- 顺带移除 workflow 中从未被消费的 latest-version 输出。
+
+本地验证：publishToMavenLocal 三种用例（1.17-dev.85+dev / 1.17.2+stable /
+无 RELEASE_VERSION→1.17-dev.9999），指针标记 POM 的依赖分别正确指向
+1.17-dev.85 与 1.17.2。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/.github/workflows/publish.yml b/.github/workflows/publish.yml
+index ce60b4153c09f01925f92ea943ea5b12b86fdb8a..0c4eb0b0c3698d56ab285b56ea3269a2829e9240 100644
+--- a/.github/workflows/publish.yml
++++ b/.github/workflows/publish.yml
+@@ -1,9 +1,10 @@
+ name: CI
+ 
+ # 触发规则：
+-# 1. 推送到 dev/1.17-wcpe（仅代码变更）→ 构建 + 发布补丁版本（版本号 1.17.<运行号>）
+-# 2. 打 wcpe-v 开头的 tag → 发布该 tag 指定的正式版（如 wcpe-v1.17.1 → 1.17.1）
+-#    并创建 GitHub Release。
++# 1. 推送到 dev/1.17-wcpe（仅代码变更）→ 构建 + 发布开发版（版本号 1.17-dev.<运行号>），
++#    并更新开发线指针 1.17-dev-latest
++# 2. 打 wcpe-v 开头的 tag → 发布该 tag 指定的正式版（如 wcpe-v1.17.1 → 1.17.1），
++#    更新稳定线指针 1.17-latest，并创建 GitHub Release。
+ #    说明：这里不用 v* 前缀，因为上游 fabric-loom 已占用大量 v1.17.* 的 release tag，
+ #    同名 tag 在本仓库内不可复用。
+ # 3. 纯文档修改（README/CHANGELOG/docs/**）不触发任何构建
+@@ -52,14 +53,13 @@ jobs:
+             VERSION="${GITHUB_REF#refs/tags/wcpe-v}"
+             echo "is-release=true" >> "$GITHUB_OUTPUT"
+             echo "release-version=$VERSION" >> "$GITHUB_OUTPUT"
+-            echo "latest-version=1.17-latest" >> "$GITHUB_OUTPUT"
+             echo "is-prerelease=false" >> "$GITHUB_OUTPUT"
+           else
+-            # 代码推送：发布补丁版本 1.17.<运行号>；运行号单调递增，天然满足产物不可覆盖的要求
+-            VERSION="1.17.${GITHUB_RUN_NUMBER}"
++            # 代码推送：发布开发版 1.17-dev.<运行号>，与正式版 1.17.<N> 分属不同命名空间；
++            # 运行号单调递增，天然满足产物不可覆盖的要求
++            VERSION="1.17-dev.${GITHUB_RUN_NUMBER}"
+             echo "is-release=false" >> "$GITHUB_OUTPUT"
+             echo "release-version=$VERSION" >> "$GITHUB_OUTPUT"
+-            echo "latest-version=1.17-dev-latest" >> "$GITHUB_OUTPUT"
+             echo "is-prerelease=true" >> "$GITHUB_OUTPUT"
+           fi
+ 
+diff --git a/build.gradle b/build.gradle
+index db68680debb1db53fc26cb686883d6f35ad83cee..90487ab1fbbe3ac7a97f8f1979f90c7fa3779d1b 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -34,7 +34,8 @@ if (ENV.RELEASE_VERSION) {
+ 	// 发布流程可显式指定版本号（如从 tag 推导的 1.17.3），优先于按运行号推导
+ 	version = ENV.RELEASE_VERSION
+ } else if (!isSnapshot) {
+-	version = baseVersion + "." + runNumber
++	// 分支构建与正式版分属不同命名空间：正式版为 1.17.<N>（仅 tag 发布），分支构建为 1.17-dev.<运行号>
++	version = baseVersion + "-dev." + runNumber
+ } else {
+ 	version = baseVersion + "-PR." + ENV.PR_NUM + "." + runNumber
+ }
+@@ -372,41 +373,55 @@ publishing {
+ 		}
+ 	}
+ 
+-	publications {
++	publications { pubs ->
+ 		if (!isSnapshot && !ENV.EXPERIMENTAL) {
+-			// Also publish a snapshot so people can use the latest version if they wish
+-			snapshot(MavenPublication) { publication ->
+-				groupId = project.group
+-				artifactId = project.base.archivesName.get()
+-				version = baseVersion + '-SNAPSHOT'
+-
+-				from components.java
++			// 除具体版本外，额外发布一组固定版本（随每次发布覆盖）：
++			//   1.17-SNAPSHOT    —— 始终指向最近一次发布（不论正式版还是分支构建）
++			//   1.17-latest      —— 稳定线指针，仅正式版发布时更新
++			//   1.17-dev-latest  —— 开发线指针，仅分支构建时更新
++			// 使用者写指针版本即可，无需关心单调递增的运行号。
++			def extraVersions = [(baseVersion + '-SNAPSHOT'): 'snapshot']
++
++			if (ENV.PUBLISH_LATEST == 'stable') {
++				extraVersions[baseVersion + '-latest'] = 'latest'
++			} else if (ENV.PUBLISH_LATEST == 'dev') {
++				extraVersions[baseVersion + '-dev-latest'] = 'devLatest'
+ 			}
+ 
+ 			def projectGroup = project.group
+ 			def projectArtifactId = project.base.archivesName.get()
+ 			def markerDependencyVersion = project.version.toString()
+ 
+-			gradlePlugin.plugins.forEach { plugin ->
+-				// Manually crate the plugin marker for snapshot versions
+-				it.create(plugin.id + "SnapshotMarker", MavenPublication) { publication ->
+-					groupId = plugin.id
+-					artifactId = plugin.id + '.gradle.plugin'
+-					version = baseVersion + '-SNAPSHOT'
+-
+-					pom.withXml({
+-						// Based off org.gradle.plugin.devel.plugins.MavenPluginPublishPlugin
+-						Element root = asElement()
+-						Document document = root.getOwnerDocument()
+-						Node dependencies = root.appendChild(document.createElement('dependencies'))
+-						Node dependency = dependencies.appendChild(document.createElement('dependency'))
+-						Node groupId = dependency.appendChild(document.createElement('groupId'))
+-						groupId.setTextContent(projectGroup)
+-						Node artifactId = dependency.appendChild(document.createElement('artifactId'))
+-						artifactId.setTextContent(projectArtifactId)
+-						Node version = dependency.appendChild(document.createElement('version'))
+-						version.setTextContent(markerDependencyVersion)
+-					})
++			extraVersions.each { extraVersion, name ->
++				pubs.create(name, MavenPublication) { publication ->
++					groupId = projectGroup
++					artifactId = projectArtifactId
++					version = extraVersion
++
++					from components.java
++				}
++
++				gradlePlugin.plugins.forEach { plugin ->
++					// Manually crate the plugin marker for the extra versions
++					pubs.create(plugin.id + name.capitalize() + 'Marker', MavenPublication) { publication ->
++						groupId = plugin.id
++						artifactId = plugin.id + '.gradle.plugin'
++						version = extraVersion
++
++						pom.withXml({
++							// Based off org.gradle.plugin.devel.plugins.MavenPluginPublishPlugin
++							Element root = asElement()
++							Document document = root.getOwnerDocument()
++							Node dependencies = root.appendChild(document.createElement('dependencies'))
++							Node dependency = dependencies.appendChild(document.createElement('dependency'))
++							Node groupId = dependency.appendChild(document.createElement('groupId'))
++							groupId.setTextContent(projectGroup)
++							Node artifactId = dependency.appendChild(document.createElement('artifactId'))
++							artifactId.setTextContent(projectArtifactId)
++							Node version = dependency.appendChild(document.createElement('version'))
++							version.setTextContent(markerDependencyVersion)
++						})
++					}
+ 				}
+ 			}
+ 		}

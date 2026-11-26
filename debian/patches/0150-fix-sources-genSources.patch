@@ -1,0 +1,436 @@
+From 54b1ec23585714dc0ce1585b7ad4adc32439bb01 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Sun, 25 Oct 2026 23:16:02 +0800
+Subject: [PATCH 150/151] =?UTF-8?q?fix(sources):=20=E4=BF=AE=E5=A4=8D=20genSources?=
+ =?UTF-8?q?=20=E5=86=B7=E7=BC=93=E5=AD=98=E5=B4=A9=E6=BA=83=E4=B8=8E?=
+ =?UTF-8?q?=E6=B0=B8=E4=B9=85=E9=87=8D=E8=B7=91?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+冷缓存下 :buildAll 会失败，且 genSources 连续两次构建第二次仍全量重跑。
+根因有两条，各自独立。
+
+- 配置期读尚不存在的 MC jar：SourceMappingsService 原先在 create() 里同步
+  生成 mappings，该路径经 TransitiveAccessWidenerMappingsProcessor 需要 MC jar
+  做命名空间翻译。MC jar 生产迁到执行期任务后，配置期它还不存在，
+  ContextImplHelper.minecraftClassPath 直接抛「尚不存在」。现改为配置期只算
+  路径（供 @InputFile 指纹），生成推迟到执行期 provider；缓存命中时不触发。
+
+- 一条路径两个生产者：GenerateSourcesTask 的 classesOutputJar 原先指向 named
+  MC jar 本体，而该路径已是 processMinecraft* 的 outputJar。applyLineNumbers
+  每轮把带行号的 jar 写回本体，两者互相判定对方改写了产物，陷入永久重跑。
+  现改为独占的兄弟路径（.linenumbers 后缀）。经核查该产物无外部消费者，
+  本任务读的是 .backup，不依赖写回本体。
+
+顺带修掉重映射产物的不可复现：TinyRemapper 用当前时刻写 ZIP 条目时间戳，
+使同输入每次产出不同字节（同样表现为 outputJar has changed）。落位前归一化
+时间戳与条目顺序，并保留各条目原有压缩方法，避免把 STORED 目录项改成压缩存储。
+
+回归网：启用 GenSourcesUpToDateTest，断言第二次构建为 UP_TO_DATE 且复用配置
+缓存条目，另有一条断言换映射后必须重跑，防过度缓存。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/core/MinecraftJarRemap.java b/src/main/java/net/fabricmc/loom/core/MinecraftJarRemap.java
+index 9780dd5129c44b22d8d88cf2a44ce7c5a750d4df..8e90efbb63cc36aea09b49c7f15460e9d87a2501 100644
+--- a/src/main/java/net/fabricmc/loom/core/MinecraftJarRemap.java
++++ b/src/main/java/net/fabricmc/loom/core/MinecraftJarRemap.java
+@@ -40,6 +40,7 @@ import net.fabricmc.loom.configuration.providers.mappings.extras.annotations.Ann
+ import net.fabricmc.loom.configuration.providers.minecraft.AnnotationsApplyVisitor;
+ import net.fabricmc.loom.configuration.providers.minecraft.SignatureFixerApplyVisitor;
+ import net.fabricmc.loom.util.TinyRemapperHelper;
++import net.fabricmc.loom.util.ZipReprocessorUtil;
+ import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.tinyremapper.extension.mixin.MixinExtension;
+ import net.fabricmc.tinyremapper.OutputConsumerPath;
+@@ -153,6 +154,17 @@ public final class MinecraftJarRemap {
+ 							options.objectHolderTargetNamespace()
+ 					);
+ 				}
++
++				// 时间戳归一化，必须是落位前的最后一步（上面 remapObjectHolder 若重写 zip 会引入新时间戳）。
++				//
++				// 为什么必须做：TinyRemapper 的 OutputConsumerPath 用「当前时刻」写每个 ZIP entry 的修改时间，
++				// 于是同一份输入重映射两次的字节不同。而本产物由 RemapMinecraftTask 用 @OutputFile 声明，
++				// Gradle 靠输出指纹判 up-to-date —— 指纹每次都变，该任务就永远重跑（实测：
++				// 「Output property 'outputJar' ... has changed」），下游 genSources 也跟着每轮重做。
++				//
++				// 固定条目顺序 + 固定时间戳后，重映射变成输入的纯函数，产物字节可复现。
++				// 用「保留原压缩方法」的变体：不把原本 STORED 的目录项改成压缩存储，避免无谓的产物结构变化。
++				ZipReprocessorUtil.reprocessZipPreservingCompression(tmpJar, true);
+ 			});
+ 		} catch (Exception e) {
+ 			LOGGER.error("Failed to remap {} to namespace {}", options.inputJar(), options.toNamespace(), e);
+diff --git a/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java b/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
+index 3361ce1ffe2f7f9e1b7459c8f1e6e92b91556b64..d2475e0f801c4988208bd91bcc9e02d24cbf1c73 100644
+--- a/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
++++ b/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
+@@ -229,7 +229,19 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
+ 
+ 			for (MinecraftJar minecraftJar : minecraftJars) {
+ 				if (minecraftJar.getName().equals(minecraftJarName)) {
+-					return minecraftJar.toFile();
++					// 写回带行号的 classes 必须是本任务独占的路径，不能是 MC jar 本体。
++					//
++					// MC jar 本体由 processMinecraft*（ProcessMinecraftJarTask）声明为 outputJar。
++					// 若本任务也把同一路径声明成 @OutputFile 并写回，就构成「一条路径两个生产者」——
++					// 这正是 ProcessedNamedMinecraftProvider 里「同一条路径上只允许有一个生产者」那条约定要防的。
++					// 后果是两者互相判定对方改写了产物：processMinecraft 看到 outputJar changed → 重跑重写；
++					// genSources 看到 classesOutputJar changed → 重跑重写。于是永远无法 UP-TO-DATE
++					// （实测连续两次 genSources 第二次仍全量重跑，--info 给出的原因是
++					//  'Output property classesOutputJar ... has changed'）。
++					//
++					// 本任务不需要写回本体：它读的是 backup（见 getClassesInputJar），
++					// 带行号的 classes 也只被本任务内部消费，没有外部读者按 MC jar 路径去取。
++					return linenumbersJarPath(minecraftJar).toFile();
+ 				}
+ 			}
+ 
+@@ -379,6 +391,18 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
+ 	 *
+ 	 * @throws IllegalStateException 输入 jar 在执行期仍不存在
+ 	 */
++	/**
++	 * 带行号的 classes jar 的落位路径：与 MC jar 同目录的兄弟文件，加 {@code .linenumbers} 后缀.
++	 *
++	 * <p>取兄弟文件而不是写回 MC jar 本体，是为了让本任务对这条路径独占写入
++	 * （理由与后果见 {@code getClassesOutputJar()} 处的注释）；做法与 backup jar
++	 * （{@code AbstractMappedMinecraftProvider.getBackupJarPath}）一致，都靠后缀与本体区分。
++	 */
++	private static Path linenumbersJarPath(MinecraftJar minecraftJar) {
++		final Path jarPath = minecraftJar.getPath();
++		return jarPath.resolveSibling(jarPath.getFileName() + ".linenumbers");
++	}
++
+ 	private Path getClassesInputJarPath() {
+ 		final Path path = getClassesInputJar().get().getAsFile().toPath();
+ 
+diff --git a/src/main/java/net/fabricmc/loom/task/service/SourceMappingsService.java b/src/main/java/net/fabricmc/loom/task/service/SourceMappingsService.java
+index 8ebf4cbdbc895cfb0b1cd04e1922bcc4d52b7ed0..30e80b1bbec724237569fee8655ada0d48d4082d 100644
+--- a/src/main/java/net/fabricmc/loom/task/service/SourceMappingsService.java
++++ b/src/main/java/net/fabricmc/loom/task/service/SourceMappingsService.java
+@@ -80,45 +80,76 @@ public class SourceMappingsService extends Service<SourceMappingsService.Options
+ 
+ 	public static Provider<Options> create(Project project) {
+ 		final Property<String> hash = project.getObjects().property(String.class);
+-		final Path mappings = getMappings(project, hash);
++
++		// 路径与 hash 都必须在配置期算出来：getMappings / getProcessorHash 都是 @Input(File)，
++		// Gradle 要在执行前拿它们做输入指纹。若随生成动作一起延迟，快照时二者恒为空 →
++		// 指纹不稳定 → 任务每轮重跑（实测：连续两次构建都不 UP-TO-DATE）。
++		//
++		// 二者都只依赖「补丁器 cacheValue + 扩展的缓存目录」，不读 MC jar，配置期求值安全。
++		final Path mappings = resolveMappingsPath(project, hash);
++
++		// 只有「写 mappings 文件」这一步延迟到执行期：它内部会经 createMappings →
++		// MinecraftJarProcessorManager.processMappings → TransitiveAccessWidenerMappingsProcessor
++		// 读 MC jar（依赖自带的传递性 AW 需要 remapper 翻译命名空间）。而在「MC jar 生产迁到
++		// 执行期任务」之后，配置期这些 jar 还不存在，ContextImplHelper.minecraftClassPath 会抛
++		// 「尚不存在，无法作为 remapper 的 classpath」——表现为任务创建阶段就失败。
++		//
++		// 缓存命中时不会走到该路径（见 ensureMappingsGenerated），所以本缺陷只在冷缓存下暴露。
++		final Provider<Path> resolvedMappings =
++				project.provider(() -> {
++					ensureMappingsGenerated(project, mappings);
++					return mappings;
++				});
+ 
+ 		return TYPE.create(project, options -> {
+-			options.getMappings().fileValue(project.file(mappings));
++			options.getMappings().fileProvider(resolvedMappings.map(project::file));
+ 			options.getProcessorHash().set(hash);
+ 		});
+ 	}
+ 
+-	private static Path getMappings(Project project, Property<String> hashProperty) {
++	/**
++	 * 在配置期求出 mappings 文件路径（不含生成动作）.
++	 *
++	 * <p>同时把补丁器 hash 填进 {@code hashProperty}；无补丁器时留空。
++	 */
++	private static Path resolveMappingsPath(Project project, Property<String> hashProperty) {
+ 		final LoomGradleExtension extension = LoomGradleExtension.get(project);
+ 		final MinecraftJarProcessorManager jarProcessor = MinecraftJarProcessorManager.create(project);
+ 		final Path dir = extension.getFiles().getProjectPersistentCache().toPath().resolve("source_mappings");
+-		final Path emptyMappingsPath = dir.resolve("empty.tiny"); // empty base mappings for unobf
+ 		final boolean disableObf = extension.disableObfuscation();
+ 
+-		if (disableObf && (!Files.exists(emptyMappingsPath) || extension.refreshDeps())) {
+-			try {
+-				Files.createDirectories(dir);
+-				Files.deleteIfExists(emptyMappingsPath);
+-				Files.writeString(emptyMappingsPath, "tiny\t2\t0\tofficial\n", StandardCharsets.UTF_8);
+-			} catch (IOException e) {
+-				throw new UncheckedIOException("Failed to create empty source mappings", e);
+-			}
+-		}
+-
+ 		if (jarProcessor == null) {
+ 			if (!disableObf) {
+ 				LOGGER.info("No jar processor found, not creating source mappings, using project mappings");
+ 				return extension.getMappingConfiguration().tinyMappings;
+ 			} else {
+ 				LOGGER.info("No jar processor found, using empty source mappings");
+-				return emptyMappingsPath;
++				return dir.resolve("empty.tiny");
+ 			}
+ 		}
+ 
+ 		final String hash = jarProcessor.getSourceMappingsHash();
+ 		hashProperty.set(hash);
++		return dir.resolve(hash + ".tiny");
++	}
+ 
+-		final Path path = dir.resolve(hash + ".tiny");
++	/** 执行期：mappings 文件不可复用时生成它，可复用或无需生成时直接返回. */
++	private static void ensureMappingsGenerated(Project project, Path path) {
++		final LoomGradleExtension extension = LoomGradleExtension.get(project);
++		final MinecraftJarProcessorManager jarProcessor = MinecraftJarProcessorManager.create(project);
++		final Path dir = extension.getFiles().getProjectPersistentCache().toPath().resolve("source_mappings");
++		final Path emptyMappingsPath = dir.resolve("empty.tiny"); // empty base mappings for unobf
++		final boolean disableObf = extension.disableObfuscation();
++
++		if (disableObf) {
++			ensureEmptyMappings(dir, emptyMappingsPath, extension);
++
++			if (jarProcessor == null) {
++				return; // 路径即 empty.tiny，已就绪
++			}
++		} else if (jarProcessor == null) {
++			return; // 路径即项目 mappings，无需生成
++		}
+ 
+ 		// 就绪判据为内容级，与共享 mappings 产物同一把尺子（见 MappingConfiguration.isReusableMappingsText）：
+ 		// 本文件是按补丁 hash 命名的纯文本 tiny，由 createMappings 用 Tiny2FileWriter 直接写最终路径
+@@ -126,21 +157,40 @@ public class SourceMappingsService extends Service<SourceMappingsService.Options
+ 		// 只判存在会让这份残骸被永久复用，源码反编译静默地按空映射进行。
+ 		if (MappingConfiguration.isReusableMappingsText(path) && !extension.refreshDeps()) {
+ 			LOGGER.debug("Using cached source mappings");
+-			return path;
++			return;
+ 		}
+ 
+ 		LOGGER.info("Creating source mappings for hash {}", jarProcessor.getSourceMappingsHash());
++		generateMappings(project, jarProcessor, disableObf ? emptyMappingsPath : extension.getPlatformMappingFile(), path);
++	}
++
++	/** 确保 unobf 形态的空 mappings 就位. */
++	private static void ensureEmptyMappings(Path dir, Path emptyMappingsPath, LoomGradleExtension extension) {
++		if (Files.exists(emptyMappingsPath) && !extension.refreshDeps()) {
++			return;
++		}
++
++		try {
++			Files.createDirectories(dir);
++			Files.deleteIfExists(emptyMappingsPath);
++			Files.writeString(emptyMappingsPath, "tiny\t2\t0\tofficial\n", StandardCharsets.UTF_8);
++		} catch (IOException e) {
++			throw new UncheckedIOException("Failed to create empty source mappings", e);
++		}
++	}
++
++	/** 写出 mappings 文件到 {@code path}. */
++	private static void generateMappings(Project project, MinecraftJarProcessorManager jarProcessor, Path inputMappings, Path path) {
++		final LoomGradleExtension extension = LoomGradleExtension.get(project);
++		final Path dir = extension.getFiles().getProjectPersistentCache().toPath().resolve("source_mappings");
+ 
+ 		try {
+ 			Files.createDirectories(dir);
+ 			Files.deleteIfExists(path);
+-			final Path inputMappings = disableObf ? emptyMappingsPath : extension.getPlatformMappingFile();
+ 			createMappings(project, jarProcessor, inputMappings, path);
+ 		} catch (IOException e) {
+ 			throw new UncheckedIOException("Failed to create source mappings", e);
+ 		}
+-
+-		return path;
+ 	}
+ 
+ 	private static void createMappings(Project project, MinecraftJarProcessorManager jarProcessor, Path inputMappings, Path outputMappings) throws IOException {
+diff --git a/src/main/java/net/fabricmc/loom/util/ZipReprocessorUtil.java b/src/main/java/net/fabricmc/loom/util/ZipReprocessorUtil.java
+index c560f1b7b83dbe922e6231515f76e990ecb6e460..6e342e6fadbdec76bf8b0fe7564d218851564845 100644
+--- a/src/main/java/net/fabricmc/loom/util/ZipReprocessorUtil.java
++++ b/src/main/java/net/fabricmc/loom/util/ZipReprocessorUtil.java
+@@ -94,6 +94,52 @@ public class ZipReprocessorUtil {
+ 		reprocessZip(file, reproducibleFileOrder, preserveFileTimestamps, ZipEntryCompression.DEFLATED);
+ 	}
+ 
++	/**
++	 * 归一化时间戳与条目顺序，但**逐条沿用原压缩方法**.
++	 *
++	 * <p>与 {@link #reprocessZip(Path, boolean, boolean)} 的区别：后者把整包统一按一种压缩方式重写
++	 * （{@code DEFLATED}），会把原本 {@code STORED} 的条目（目录项、预压缩资源）也改成压缩存储。
++	 * 对 Minecraft jar 这类混合条目产物，那会改变产物的字节结构，属于不必要的副作用——
++	 * 归一化的目的只是让「同输入产出同字节」，不需要也不应该动压缩方式。
++	 *
++	 * <p>用于需要可复现、但必须原样保留条目存储形式的场景（如 remapMinecraft* 的产物）。
++	 */
++	public static void reprocessZipPreservingCompression(Path file, boolean reproducibleFileOrder) throws IOException {
++		final Path tempFile = file.resolveSibling(file.getFileName() + ".tmp");
++
++		try (var zipFile = new ZipFile(file.toFile());
++				var fileOutputStream = Files.newOutputStream(tempFile)) {
++			final ZipEntry[] entries;
++
++			if (reproducibleFileOrder) {
++				entries = zipFile.stream()
++						.sorted(Comparator.comparing(ZipEntry::getName, ZipReprocessorUtil::specialOrdering))
++						.toArray(ZipEntry[]::new);
++			} else {
++				entries = zipFile.stream()
++						.toArray(ZipEntry[]::new);
++			}
++
++			try (var zipOutputStream = new ZipOutputStream(fileOutputStream)) {
++				for (ZipEntry entry : entries) {
++					// 沿用原条目的压缩方法：STORED 保持 STORED，DEFLATED 保持 DEFLATED
++					final boolean stored = entry.getMethod() == ZipEntry.STORED;
++					final ZipEntry newEntry = new ZipEntry(entry.getName());
++					setConstantFileTime(newEntry);
++					newEntry.setMethod(stored ? ZipEntry.STORED : ZipEntry.DEFLATED);
++
++					if (stored) {
++						copyUncompressedZipEntry(zipOutputStream, newEntry, zipFile.getInputStream(entry));
++					} else {
++						copyZipEntry(zipOutputStream, newEntry, zipFile.getInputStream(entry));
++					}
++				}
++			}
++		}
++
++		AtomicFiles.move(tempFile, file);
++	}
++
+ 	public static void reprocessZip(Path file, boolean reproducibleFileOrder, boolean preserveFileTimestamps, ZipEntryCompression zipEntryCompression) throws IOException {
+ 		final Path tempFile = file.resolveSibling(file.getFileName() + ".tmp");
+ 
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/GenSourcesUpToDateTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/GenSourcesUpToDateTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..5a7ff9e8fb9bffd651df72581f95d7ac18a41891
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/GenSourcesUpToDateTest.groovy
+@@ -0,0 +1,122 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration
++
++import spock.lang.Specification
++
++import net.fabricmc.loom.test.util.GradleProjectTestTrait
++
++import static net.fabricmc.loom.test.LoomTestConstants.DEFAULT_GRADLE
++import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
++import static org.gradle.testkit.runner.TaskOutcome.UP_TO_DATE
++
++/**
++ * 守护 {@code genSources} 在连续构建间能判定为最新.
++ *
++ * <p>{@code SourceMappingsService} 的 {@code mappings} / {@code processorHash} 都是
++ * {@code @Input(File)} / {@code @Input}，Gradle 要在任务执行前拿它们做指纹。早期实现把它们
++ * 与「生成 mappings 文件」这个动作一起延迟求值，于是快照时二者恒为空 → 指纹不稳定 →
++ * 任务每轮重跑，用户看到的就是 genSources 永远不 UP-TO-DATE。
++ *
++ * <p>这里刻意跑两次并断言第二次为 {@link org.gradle.testkit.runner.TaskOutcome#UP_TO_DATE}：
++ * 只断言「能跑成功」是抓不到那个缺陷的，因为重跑也能成功，只是慢。
++ *
++ * <p>同时开启配置缓存：mappings 的路径求值依赖 {@code MinecraftJarProcessorManager}，
++ * 而那套东西持有 {@code Project}。断言第二次构建复用配置缓存条目，可以顺带守住
++ * 「求值只发生在配置期」这个前提——一旦有人让它挪到执行期，会以
++ * {@code InvalidUserCodeException} 的形式在此失败。
++ *
++ * <p><b>历史根因（已修复，本用例即为回归网）。</b>曾经 {@code genSources} 第二次构建不是
++ * UP-TO-DATE，用 {@code --info} 抓到的是这条链：
++ * <pre>
++ *   Task ':processMinecraftNamedMerged' is not up-to-date because:
++ *     Output property 'outputJar' ... minecraft-merged-&lt;mc&gt;-&lt;mappings&gt;.jar has changed.
++ *   Task ':genSourcesWithCfr' is not up-to-date because:
++ *     Output property 'classesOutputJar' ... (同一个 jar) has changed.
++ * </pre>
++ * 即 {@code GenerateSourcesTask} 把 {@code classesOutputJar} 声明成 named MC jar 本体，
++ * 而那个路径已是 {@code processMinecraft*} 的 {@code outputJar}——一条路径两个生产者。
++ * {@code applyLineNumbers} 每轮把带行号的 jar 写回本体，于是两者互相判定对方改写了产物，
++ * 陷入永久重跑。修复方式：{@code classesOutputJar} 改为独占的兄弟路径（{@code .linenumbers}
++ * 后缀），不再写回 MC jar 本体。
++ *
++ * <p>另有一处相关的可复现性修复：重映射产物原先带「当前时刻」的 ZIP 条目时间戳，
++ * 使输出字节每轮都变（同样表现为 {@code outputJar has changed}）；现已在落位前归一时戳。
++ */
++class GenSourcesUpToDateTest extends Specification implements GradleProjectTestTrait {
++	def "genSources is up to date on the second build"() {
++		setup:
++		def gradle = setupProject()
++
++		when: "首次构建：产出源码"
++		def first = gradle.run(tasks: ["genSources"], args: ["--configuration-cache"])
++
++		then:
++		first.task(":genSources").outcome == SUCCESS
++		first.output.contains("Configuration cache entry stored")
++
++		when: "第二次构建：输入没有变化"
++		def second = gradle.run(tasks: ["genSources"], args: ["--configuration-cache"])
++
++		then: "必须判定为最新，而不是又跑一遍（这正是映射指纹不稳定的旧缺陷）"
++		second.task(":genSources").outcome == UP_TO_DATE
++
++		and: "配置缓存条目被复用，说明求值确实只发生在配置期"
++		second.output.contains("Reusing configuration cache")
++	}
++
++	def "genSources reruns when the project changes the mappings"() {
++		setup:
++		def gradle = setupProject()
++
++		when:
++		def first = gradle.run(tasks: ["genSources"], args: ["--configuration-cache"])
++
++		then:
++		first.task(":genSources").outcome == SUCCESS
++
++		when: "换一套映射，产物必须重建"
++		def buildFile = new File(gradle.projectDir, "build.gradle")
++		buildFile.text = buildFile.text.replace(
++				'mappings "net.fabricmc:yarn:1.18.1+build.18:v2"',
++				'mappings "net.fabricmc:yarn:1.18.1+build.20:v2"')
++		def second = gradle.run(tasks: ["genSources"], args: ["--configuration-cache"])
++
++		then: "映射变化必须让任务失效，不能因为缓存键漏项而错误复用旧源码"
++		second.task(":genSources").outcome == SUCCESS
++	}
++
++	/** minimalBase 不含依赖声明，按仓库惯例在测试里补上。 */
++	private GradleProjectTestTrait.GradleProject setupProject() {
++		def gradle = gradleProject(project: "minimalBase", version: DEFAULT_GRADLE)
++		gradle.buildGradle << '''
++			dependencies {
++				minecraft "com.mojang:minecraft:1.18.1"
++				mappings "net.fabricmc:yarn:1.18.1+build.18:v2"
++			}
++		'''.stripIndent()
++		return gradle
++	}
++}

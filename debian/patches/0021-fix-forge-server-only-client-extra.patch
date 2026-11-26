@@ -1,0 +1,71 @@
+From 50f8f97fd8f383ef1baf4deda365de3afaa74026 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:31 +0800
+Subject: [PATCH 021/147] =?UTF-8?q?fix(forge):=20server-only=20=E4=B8=8B?=
+ =?UTF-8?q?=E4=B8=8D=E5=86=8D=E7=94=9F=E6=88=90=E4=B8=8E=E6=B3=A8=E5=86=8C?=
+ =?UTF-8?q?=20client-extra?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+remapJar 无守卫地调用 fillClientExtraJar，server-only 配置下必然抛
+"Not configured to provide client jar"；该调用链在基底上同样无守卫，属上游缺陷。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+index 3a66d9a1e2485619a4af684f6397b3360f781b77..901382a52762170b7117bf7246ce33da69a101b2 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+@@ -83,6 +83,7 @@ import org.objectweb.asm.tree.ClassNode;
+ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.build.IntermediaryNamespaces;
+ import net.fabricmc.loom.configuration.providers.mappings.TinyMappingsService;
++import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+ import net.fabricmc.loom.util.Check;
+ import net.fabricmc.loom.util.Constants;
+@@ -240,14 +241,27 @@ public class MinecraftPatchedProvider {
+ 				remapPatchedJar(serviceFactory);
+ 			}
+ 
+-			fillClientExtraJar(serviceFactory);
++			if (providesClientJar()) {
++				fillClientExtraJar(serviceFactory);
++			}
+ 		}
+ 
+ 		if (getExtension().isUnobfuscatedForge()) {
+ 			DependencyProvider.addDependency(project, getForgeJar(), Constants.Configurations.FORGE_EXTRA);
+ 		}
+ 
+-		DependencyProvider.addDependency(project, minecraftClientExtra, Constants.Configurations.FORGE_EXTRA);
++		if (providesClientJar()) {
++			DependencyProvider.addDependency(project, minecraftClientExtra, Constants.Configurations.FORGE_EXTRA);
++		}
++	}
++
++	/**
++	 * server-only 的 jar 配置不提供 client jar，client-extra 既不生成也不加入 classpath.
++	 *
++	 * <p>否则 getMinecraftClientJar 会抛 "Not configured to provide client jar"。
++	 */
++	private boolean providesClientJar() {
++		return getExtension().getMinecraftJarConfiguration().get() != MinecraftJarConfiguration.SERVER_ONLY;
+ 	}
+ 
+ 	private void mergeUnobfuscatedPatchedJar() throws IOException {
+diff --git a/src/test/resources/projects/forge/simple/gradle.properties b/src/test/resources/projects/forge/simple/gradle.properties
+index f3b2ac323b5ba9817dfd6eda33e9a0e191e7ced9..cc56c4774e96c7ceaa01dccb98f3984b9b9808b9 100644
+--- a/src/test/resources/projects/forge/simple/gradle.properties
++++ b/src/test/resources/projects/forge/simple/gradle.properties
+@@ -1,5 +1,7 @@
+ # Done to increase the memory available to gradle.
+-org.gradle.jvmargs=-Xmx1G
++# PatchedDecompileTest 会用本夹具对 Forge 1.19.2 源码做 Mercury 重映射（进程内跑 JDT，
++# 1G 会 OutOfMemoryError），故较其它夹具再放宽。
++org.gradle.jvmargs=-Xmx2G
+ 
+ # Fabric Properties
+ # check these on https://fabricmc.net/use

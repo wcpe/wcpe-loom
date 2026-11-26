@@ -1,0 +1,401 @@
+From 94308751671cda579284ed5804abc9050c4fb14b Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:37 +0800
+Subject: [PATCH 030/147] =?UTF-8?q?docs:=20=E8=A1=A5=20add-patch=20?=
+ =?UTF-8?q?=E6=B5=81=E7=A8=8B=E5=B9=B6=E5=86=99=E5=85=A8=E8=A1=A5=E4=B8=81?=
+ =?UTF-8?q?=E9=98=9F=E5=88=97=E6=93=8D=E4=BD=9C=E6=89=8B=E5=86=8C?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+原先只有规范与清单，缺「新补丁怎么加」的操作入口，容易把补丁当普通提交丢在
+队列末端之后（同步上游时会被静默丢掉）。
+
+- scripts/sync-upstream.sh 新增 add-patch：<补丁名> 建工作分支（起点=队列末端），
+  add-patch finish 校验溯源块齐备、把元数据提交重放到新队列末端之后、打印校对命令
+  与人工步骤（不自动前移 tag、不自动改默认分支、不自动推送）
+- .upstream/README.md 改写为完整操作手册：两段结构与判定规则、与 Debian/1.15 的对照、
+  加补丁/改文档/校验/同步上游的步骤、四类会静默丢失改动的错误做法、改写队列的三步
+  强推流程与空 diff 硬门槛、命令速查
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/.upstream/README.md b/.upstream/README.md
+index 81e17d4893acfd42e1fcd0f08a4988e0e5a4b209..7853ceebe9550e55ff75fb96f8a30167f6b3b181 100644
+--- a/.upstream/README.md
++++ b/.upstream/README.md
+@@ -1,34 +1,144 @@
+-# `.upstream/` 目录说明
++# 补丁队列使用指南
+ 
+-本目录保存**队列与谱系元数据**，属于仓库元数据而非补丁（不参与补丁队列）。
++本文件是 `dev/1.17-wcpe` 这条线的**维护手册**：说明队列怎么组织、什么算补丁什么算元数据、
++日常怎么加补丁、怎么同步上游、以及哪些操作会把改动**静默丢掉**。
++
++配套文件：
+ 
+ | 文件 | 作用 |
+ |---|---|
+-| `PATCH-QUEUE.md` | **队列规范**：结构、补丁判定标准、DEP-3 溯源标注、校验与维护纪律 |
+-| `migration-1.17.md` | **1.17 主线谱系清单**：基底、25 个补丁与来源的对照、例外说明、同步上游的方法、审计方法与已知遗留 |
+-| `essential-base` | （继承自 1.15 线）essential 基底快照的说明 |
++| `PATCH-QUEUE.md` | 队列**规范**（结构、补丁判定标准、DEP-3 溯源标注、维护纪律） |
++| `migration-1.17.md` | **谱系清单**（基底、22 个补丁与来源对照、例外说明、审计方法、已知遗留） |
++| `README.md` | 本文件：**操作手册** |
++| `../scripts/sync-upstream.sh` | 维护脚本：`status` / `verify` / `add-patch` / `rebase` |
++
++## 一、两段结构（最重要的概念）
++
++```
++base/architectury-1.17-026ce830        ← 基底（不可变 tag）
++  ↓  22 个代码补丁，每个带 Origin: / Forwarded: 溯源块
++patch-queue/1.17                       ← 队列末端标记（tag）
++  ↓  1 个元数据提交
++HEAD = dev/1.17-wcpe（默认分支）
++```
++
++- **补丁段**：会被**重放到新上游基底**的内容 —— 代码、构建配置、测试。
++- **元数据段**：描述**本仓库自身**、重放时没有意义的内容 —— CI、README、队列规范、脚本、CHANGELOG。
++
++**判定规则一句话**：*换上游后这行还需要吗？* 需要 → 补丁；不需要 → 元数据。
++
++> 这与 Debian 的划分同构：`debian/patches/*.patch` + `series` 是补丁段；
++> `debian/control`、`changelog`、`rules` 是元数据段（可直接提交）。
++
++## 二、与 Debian / 1.15 线的对应
++
++| Debian（gbp / quilt） | 本线 | 1.15 线 |
++|---|---|---|
++| `debian/patches/` + `series` | `patch-queue/1.17` 之前的 22 个补丁 | 12 个补丁提交 |
++| 打包元数据 | 队列末端之后的元数据提交 | 1 个元数据提交 |
++| `gbp pq rebase` | `scripts/sync-upstream.sh rebase` | `sync-upstream.sh essential-rebase` |
++| `gbp pq start` / `export` | `sync-upstream.sh add-patch` / `add-patch finish` | `sync-upstream.sh pick` |
++| 改动未进系列 → 打包失败 | 改动丢在队列末端之后 → **下次同步上游时静默丢失** | 同 |
++
++## 三、日常操作
++
++### 1. 加一个新补丁
++
++```bash
++scripts/sync-upstream.sh add-patch my-fix     # 1) 建工作分支（起点=队列末端）
++#     …改代码…
++git commit                                    # 2) 一个逻辑变更一个提交，带溯源块
++scripts/sync-upstream.sh add-patch finish     # 3) 校验溯源块 + 元数据重放到新队列之后
++```
++
++`finish` 会：校验新提交是否都带 `Origin:`（缺了直接拒绝）→ 生成候选分支并把元数据提交重放到
++新队列末端之后 → 打印校对命令与后续人工步骤。它**不会**代你前移 tag、切换分支或推送。
++
++**溯源块写法**（提交信息末尾）：
++
++```
++fix(forge): 修掉 xxx
++
++正文说明为什么改、改动要点。
++
++Origin: vendor, wcpe-loom
++Forwarded: no
++```
++
++| 字段 | 取值 |
++|---|---|
++| `Origin` | `vendor, wcpe-loom`（本项目自研）· `backport, <上游版本>`（从别的代系移植）· `upstream, <提交URL>`（取自上游） |
++| `Forwarded` | `no`（该反馈上游但还没）· `not-needed`（本仓库专属）· `<URL>`（已反馈） |
++| `Applied-Upstream` | 可选；上游已收录 → 换基底时**直接删掉该补丁** |
+ 
+-对应的维护脚本：`scripts/sync-upstream.sh`（`status` / `verify` / `rebase`，默认只读）。
++### 2. 改文档 / CI / 脚本（元数据）
+ 
+-## 与 1.15 线的关系
++直接在默认分支上提交、正常 `git push` 即可。**不用强推**，分支保护不受影响，也不需要跑 `verify`。
+ 
+-1.15 线的队列元数据在其分支 `1.15-wcpe` 上：`.upstream/wcpe-patches.txt`（12 个补丁的清单）、
+-`.upstream/PATCH-QUEUE.md`（同一套规范）、`scripts/sync-upstream.sh`（quilt 式逐补丁采集）。
+-本线沿用同一套规范与纪律，但**队列模型不同**：
++碎提交完全合规；嫌乱时可在**发版前**压缩一次（见第五节）。
+ 
+-- 1.15 线：基底 + 12 个可逐个增删的补丁，同步上游时逐补丁 rebase
+-- **1.17 线（本线）**：基底 + 一条由 1.15 线改动整体重放后合并而成的**固定序列**（25 个补丁），
+-  同步上游时对**整条序列** `rebase --onto`
++### 3. 校验
+ 
+-具体差异与理由见 `PATCH-QUEUE.md` 开头的对照表。
++```bash
++scripts/sync-upstream.sh verify    # 只读：线性无 merge、补丁数、溯源块齐备、分支基于队列末端
++scripts/sync-upstream.sh status    # 只读：基底/队列/元数据/远端状态一览
++```
+ 
+-## 快速上手
++### 4. 同步上游
+ 
+ ```bash
+-scripts/sync-upstream.sh status                 # 看当前基底/队列状态
+-scripts/sync-upstream.sh verify                 # 校验队列是否符合规范
+ git fetch architectury
+ scripts/sync-upstream.sh rebase <新基底sha> base/architectury-1.17-<新sha>
+ ```
+ 
+-第三条会在**临时分支**上重放整条队列，不会改动默认分支，也不会推送；冲突解决与切换分支都需人工完成。
++在**临时分支**上重放整条队列；冲突逐补丁解决（每个补丁单一逻辑，归因容易）。完成后还要把
++**元数据**重放到新队列之后（脚本会打印命令），再更新 `migration-1.17.md` 的基底与溯源归类。
++
++## 四、绝不要做的事（会把改动静默丢掉）
++
++| 错误做法 | 后果 |
++|---|---|
++| 把代码改动当普通提交**丢在队列末端之后** | 下次 `rebase` 只重放 `base..patch-queue/1.17` → **你的补丁不会跟上新上游** |
++| **amend 队列内的补丁**（`patch-queue/1.17` 之前的提交） | 队列被改写 → 必须前移 tag 并重新证明内容等价；若队列已被 rebase 或他人引用，牵连一片 |
++| 已发布版本之后**改写该发布点之前的历史** | 已发布的 `wcpe-v*` tag 会被留在分支历史之外（GitHub 显示"不在默认分支上"）；产物本身仍有效，但溯源混乱 |
++| 用 `merge` 把上游合进队列 | 规范禁止队列出现 merge 提交（`verify` 会报错），且队列无法线性 rebase |
++
++## 五、改写队列 / 压缩元数据的正确姿势
++
++改写历史（插补丁、压缩元数据、换基底）必然要强推，而默认分支开着
++`allow_force_pushes=false`，因此固定三步：
++
++```bash
++# 0) 先备份
++git tag -a backup/<说明> HEAD -m "改写前备份"
++
++# 1) 临时放开强推（保护配置的其余字段保持不变）
++gh api -X PUT "repos/wcpe/wcpe-loom/branches/dev%2F1.17-wcpe/protection" \
++  --input .tmp/prot-relax.json      # {"allow_force_pushes":true, ...}
++
++# 2) 强推（务必先捕获退出码再判断，别用管道吃掉它）
++git push --force origin dev/1.17-wcpe
++
++# 3) 立即还原保护
++gh api -X PUT "repos/wcpe/wcpe-loom/branches/dev%2F1.17-wcpe/protection" \
++  --input .tmp/prot-normal.json     # {"allow_force_pushes":false, ...}
++```
++
++**硬门槛**：改写后必须 `git diff <改写前> <改写后>` **为空**（或差异仅限你刻意修改的那几个文件）。
++空 diff 是客观证据，说明重组无损 —— 达到它可以不重跑测试（内容零变化，行为不可能变）。
++
++**时机建议**：插补丁与压缩元数据都**尽量放在发版前**做；发版之后就尽量只用普通提交，
++直到下一次发版前再一并整理。
++
++## 六、命令速查
++
++```bash
++scripts/sync-upstream.sh status                    # 状态一览（只读）
++scripts/sync-upstream.sh verify                    # 规范自检（只读）
++scripts/sync-upstream.sh add-patch <名>            # 开补丁工作分支
++scripts/sync-upstream.sh add-patch finish          # 校验 + 元数据重放 + 打印后续步骤
++scripts/sync-upstream.sh rebase <新基底sha> [tag]  # 整条队列重放到新基底（临时分支）
++```
++
++环境变量可覆盖默认边界（换基底/测试用）：`WCPE_BASE_TAG`、`WCPE_QUEUE_TAG`、
++`WCPE_DEFAULT_BRANCH`、`WCPE_UPSTREAM_REMOTE`。
+diff --git a/scripts/sync-upstream.sh b/scripts/sync-upstream.sh
+index b1e8cdf0591b7f5bdb15ae6f684601913cac208a..bcb0e29d554648cf4e4f350129e51fcffa4621db 100644
+--- a/scripts/sync-upstream.sh
++++ b/scripts/sync-upstream.sh
+@@ -2,17 +2,18 @@
+ # WCPE Loom 1.17 补丁队列维护脚本
+ #
+ # 用法：
+-#   scripts/sync-upstream.sh status          # 查看基底/队列末端/提交数（只读）
+-#   scripts/sync-upstream.sh verify          # 校验队列是否符合 .upstream/PATCH-QUEUE.md 规范（只读，默认）
+-#   scripts/sync-upstream.sh rebase <新基底sha> [新基底tag名]
+-#                                            # 把整条队列重放到新基底（在临时分支上执行，不碰默认分支）
++#   scripts/sync-upstream.sh status                     # 查看基底/队列末端/提交数（只读）
++#   scripts/sync-upstream.sh verify                     # 校验队列是否符合规范（只读，默认）
++#   scripts/sync-upstream.sh add-patch <补丁名>          # 开一个补丁工作分支（起点=队列末端）
++#   scripts/sync-upstream.sh add-patch finish           # 校验溯源块 + 把元数据重放到新队列之后
++#   scripts/sync-upstream.sh rebase <新基底sha> [tag名]  # 把整条队列重放到新基底（临时分支上）
+ #
+ # 原则（与 1.15 线一致）：
+-#   - 默认只读；任何改写都在临时分支上进行，**不自动改默认分支、不自动打发布 tag**
+-#   - 改写后必须人工确认内容等价，再自行切换分支
++#   - 默认只读；任何改写都在临时/候选分支上进行
++#   - **不自动改默认分支、不自动前移 tag、不自动推送**；改写后由人工确认内容等价再切换
+ #
+-# 与 1.15 线的差异：本线是「整条序列 rebase」模型，故无 pick/candidates 之类的逐补丁采集命令；
+-# 同步上游用 rebase。
++# 与 1.15 线的差异：本线是「整条序列 rebase」模型，故无逐补丁采集命令；
++# 加补丁用 add-patch，同步上游用 rebase。
+ 
+ set -euo pipefail
+ 
+@@ -20,37 +21,40 @@ cd "$(git rev-parse --show-toplevel)"
+ 
+ BASE_TAG="${WCPE_BASE_TAG:-base/architectury-1.17-026ce830}"
+ QUEUE_TAG="${WCPE_QUEUE_TAG:-patch-queue/1.17}"
++DEFAULT_BRANCH="${WCPE_DEFAULT_BRANCH:-dev/1.17-wcpe}"
+ UPSTREAM_REMOTE="${WCPE_UPSTREAM_REMOTE:-architectury}"
+ 
+ die() { echo "错误: $*" >&2; exit 1; }
+ 
+-base_commit() {
+-	git rev-parse -q --verify "refs/tags/${BASE_TAG}^{commit}" 2>/dev/null \
+-		|| die "找不到基底 tag ${BASE_TAG}"
+-}
++base_commit() { git rev-parse -q --verify "refs/tags/${BASE_TAG}^{commit}" 2>/dev/null || die "找不到基底 tag ${BASE_TAG}"; }
++queue_commit() { git rev-parse -q --verify "refs/tags/${QUEUE_TAG}^{commit}" 2>/dev/null || echo ""; }
+ 
+-queue_commit() {
+-	git rev-parse -q --verify "refs/tags/${QUEUE_TAG}^{commit}" 2>/dev/null || echo ""
++# 检查某范围内的提交是否都带溯源块，输出缺失项
++missing_origin() {
++	local from="$1" to="$2"
++	git log --format='%H' "${from}..${to}" | while read -r sha; do
++		git log -1 --format=%B "${sha}" | grep -q '^Origin:' || echo "$(git log -1 --format='%h %s' "${sha}")"
++	done
+ }
+ 
+ cmd_status() {
+ 	local base queue
+-	base="$(base_commit)"
+-	queue="$(queue_commit)"
++	base="$(base_commit)"; queue="$(queue_commit)"
+ 	echo "基底 tag    : ${BASE_TAG} -> ${base:0:8}"
+ 	echo "队列末端 tag: ${QUEUE_TAG} -> ${queue:0:8}"
+ 	echo "当前 HEAD   : $(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD))"
+ 	if [ -n "${queue}" ]; then
+-		echo "队列提交数  : $(git rev-list --count "${base}..${queue}")"
++		echo "查询队列提交数: $(git rev-list --count "${base}..${queue}")"
+ 		echo "队列是否含 merge: $(git rev-list --merges --count "${base}..${queue}") 个"
++		echo "队列末端之后的元数据提交: $(git rev-list --count "${queue}..HEAD") 个"
+ 	fi
++	echo "默认分支    : ${DEFAULT_BRANCH} -> $(git rev-parse --short "${DEFAULT_BRANCH}" 2>/dev/null || echo '(本地无此分支)')"
+ 	echo "上游远端    : ${UPSTREAM_REMOTE} -> $(git rev-parse --short "${UPSTREAM_REMOTE}" 2>/dev/null || echo '(未 fetch)')"
+ }
+ 
+ cmd_verify() {
+ 	local base queue rc=0
+-	base="$(base_commit)"
+-	queue="$(queue_commit)"
++	base="$(base_commit)"; queue="$(queue_commit)"
+ 	[ -n "${queue}" ] || die "找不到队列末端 tag ${QUEUE_TAG}"
+ 
+ 	local merges
+@@ -63,19 +67,15 @@ cmd_verify() {
+ 
+ 	echo "· 队列提交数: $(git rev-list --count "${base}..${queue}")"
+ 
+-	# 溯源块：序列中的提交均应含 Origin: 字段
+ 	local missing
+-	missing="$(git log --format='%H %s' "${base}..${queue}" | while read -r sha _; do
+-		git log -1 --format=%B "${sha}" | grep -q '^Origin:' || echo "${sha:0:8}"
+-	done)"
++	missing="$(missing_origin "${base}" "${queue}")"
+ 	if [ -n "${missing}" ]; then
+-		echo "✗ 缺少溯源块（Origin:）的提交:"; echo "${missing}" | sed 's/^/    /'; rc=1
++		echo "✗ 缺少溯源块（Origin:）的补丁:"; echo "${missing}" | sed 's/^/    /'; rc=1
+ 	else
+ 		echo "✓ 所有补丁均含溯源块"
+ 	fi
+ 
+-	# 工作树当前分支是否就是队列末端
+-	if [ "$(git rev-parse HEAD)" = "${queue}" ] || git merge-base --is-ancestor "${queue}" HEAD 2>/dev/null; then
++	if git merge-base --is-ancestor "${queue}" HEAD 2>/dev/null; then
+ 		echo "✓ 当前分支基于队列末端"
+ 	else
+ 		echo "· 当前分支与队列末端无祖先关系（改写进行中？）"
+@@ -85,6 +85,82 @@ cmd_verify() {
+ 	return "${rc}"
+ }
+ 
++cmd_add_patch() {
++	local arg="${1:-}"
++	[ -n "${arg}" ] || die "用法: scripts/sync-upstream.sh add-patch <补丁名> | add-patch finish"
++	if [ "${arg}" = "finish" ]; then cmd_add_patch_finish; return; fi
++
++	local queue branch
++	queue="$(queue_commit)"
++	[ -n "${queue}" ] || die "找不到队列末端 tag ${QUEUE_TAG}"
++	[ -z "$(git status --porcelain)" ] || die "工作区不干净，请先提交或清理"
++
++	branch="add-patch/${arg}"
++	git branch -f "${branch}" "${queue}"
++	git checkout -q "${branch}"
++	cat <<EOF
++已切到补丁工作分支 ${branch}（起点 = 队列末端 ${queue:0:8}）。
++
++接下来：
++  1) 修改代码
++  2) 提交（一个逻辑变更 = 一个提交），提交信息末尾必须带溯源块，例如：
++
++       fix(forge): 修掉 xxx
++
++       正文说明为什么改。
++
++       Origin: vendor, wcpe-loom
++       Forwarded: no
++
++     Origin 取值： vendor, wcpe-loom | backport, <上游版本> | upstream, <URL>
++     Forwarded 取值： no | not-needed | <URL>
++
++  3) 完成后执行： scripts/sync-upstream.sh add-patch finish
++EOF
++}
++
++cmd_add_patch_finish() {
++	local branch queue oldtip cand
++	branch="$(git rev-parse --abbrev-ref HEAD)"
++	case "${branch}" in add-patch/*) ;; *) die "当前不在 add-patch/* 分支上（现在：${branch}）";; esac
++	queue="$(queue_commit)"
++	[ -n "${queue}" ] || die "找不到队列末端 tag ${QUEUE_TAG}"
++
++	local n
++	n="$(git rev-list --count "${queue}..HEAD")"
++	[ "${n}" != "0" ] || die "本分支尚无新提交，先改代码并提交"
++
++	local missing
++	missing="$(missing_origin "${queue}" HEAD)"
++	if [ -n "${missing}" ]; then
++		echo "✗ 以下新提交缺少溯源块（Origin:），请先补齐："
++		echo "${missing}" | sed 's/^/    /'
++		echo "  补法： git commit --amend（本分支未推送，可安全改写）"
++		return 1
++	fi
++	echo "✓ 新增补丁 ${n} 个，溯源块齐备（${queue:0:8} → $(git rev-parse --short HEAD)）"
++
++	oldtip="$(git rev-parse "${DEFAULT_BRANCH}")"
++	cand="candidate/$(date +%Y%m%d-%H%M%S)"
++	git branch -f "${cand}" "${DEFAULT_BRANCH}"
++	git checkout -q "${cand}"
++	if git rebase --onto "${branch}" "${queue}" "${cand}" >/dev/null 2>&1; then
++		echo "✓ 元数据提交已重放到新队列末端之后（候选分支 ${cand}）"
++	else
++		echo "重放元数据时出现冲突，请解决后执行 git rebase --continue（当前在 ${cand}）"
++		return 1
++	fi
++
++	echo
++	echo "校对：以下差异应当恰好等于你新写的补丁（不应有其它变化）"
++	echo "    git diff ${oldtip:0:8} HEAD"
++	echo
++	echo "确认无误后的人工步骤（脚本不代劳）："
++	echo "    1) 前移队列标记： git tag -f -a ${QUEUE_TAG} $(git rev-parse --short "${branch}")"
++	echo "    2) 切换默认分支： 需临时放开分支保护后强推，三步见 .upstream/README.md「改写队列」一节"
++	echo "    3) 自检：         scripts/sync-upstream.sh verify"
++}
++
+ cmd_rebase() {
+ 	local new_base="${1:-}" new_tag="${2:-}"
+ 	[ -n "${new_base}" ] || die "用法: scripts/sync-upstream.sh rebase <新基底sha> [新基底tag名]"
+@@ -105,9 +181,9 @@ cmd_rebase() {
+ 	if git rebase --onto "${new_base}" "${base}"; then
+ 		echo
+ 		echo "重放完成。请人工完成以下步骤："
+-		echo "  1) 复核冲突解决是否符合预期： git log --oneline ${new_base}..HEAD"
+-		echo "  2) 对比内容：                      git diff <改写前备份> HEAD"
+-		echo "  3) 确认无误后再自行切换默认分支，并前移 tag ${QUEUE_TAG}"
++		echo "  1) 复核冲突解决： git log --oneline ${new_base}..HEAD"
++		echo "  2) 元数据也要重放： git rebase --onto ${branch} ${QUEUE_TAG} ${DEFAULT_BRANCH}"
++		echo "  3) 确认无误后再切换默认分支，并前移 tag ${QUEUE_TAG}"
+ 		echo "  4) 更新 .upstream/migration-1.17.md 的基底与溯源归类"
+ 	else
+ 		echo "重放出现冲突，解决后执行 git rebase --continue（当前在 ${branch}）"
+@@ -118,6 +194,7 @@ cmd_rebase() {
+ case "${1:-verify}" in
+ 	status) cmd_status ;;
+ 	verify) cmd_verify ;;
++	add-patch) shift; cmd_add_patch "$@" ;;
+ 	rebase) shift; cmd_rebase "$@" ;;
+-	*) echo "用法: scripts/sync-upstream.sh {status|verify|rebase <新基底sha> [新基底tag名]}"; exit 2 ;;
++	*) echo "用法: scripts/sync-upstream.sh {status|verify|add-patch <名>|add-patch finish|rebase <新基底sha> [tag名]}"; exit 2 ;;
+ esac

@@ -1,0 +1,142 @@
+From 2e496ed42e7303800da261ea76eb41434d6923b8 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Wed, 25 Nov 2026 01:38:06 +0800
+Subject: [PATCH 134/147] =?UTF-8?q?fix(forge):=20=E6=81=A2=E5=A4=8D?=
+ =?UTF-8?q?=E6=97=A7=E7=89=88=E5=BC=80=E5=8F=91=E5=8C=85=E7=9A=84=E4=B8=A4?=
+ =?UTF-8?q?=E9=A1=B9=E8=BF=90=E8=A1=8C=E5=BA=93?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+只在归一化一一二二版开发包时恢复服务端控制台与客户端模型所需的库，不引入旧启动器整套依赖。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: legacy-forge-userdev3-runtime-libs
+
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java
+index 6984db9a25451bf8bb1e3fad818ec9cb4308781d..31557319cdb7cd99d79d6720ced8b2ec1e0bdd2f 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java
+@@ -61,12 +61,10 @@ public class ForgeUserdevProvider extends DependencyProvider {
+ 	private static final String LEGACY_SOURCES_FILE = "sources.zip";
+ 
+ 	/**
+-	 * userdev3 归一后使用的 libraries 清单.
++	 * userdev3 归一后的基础运行库.
+ 	 *
+-	 * <p>取消费方实测可用的 7 条精简集合（构建与校验所需的公共库），而非 userdev3 自带的 22 条：
+-	 * 后者含 scala/akka 与 {@code net.minecraftforge:legacydev} 等只在 Gradle 启动器里用到的库，
+-	 * 其中 scala 系的 {@code *_mc} 版本已从 mavenCentral 下架，只有 forge 仓库的 artifact-only
+-	 * 形态才能解析。锁定这份固定清单可让产物字节不随上游 libraries 列表漂移。
++	 * <p>不继承整份上游 libraries：其中含 Scala、Akka 和 {@code net.minecraftforge:legacydev} 等
++	 * 只在原 Gradle 启动器中使用的依赖。旧版运行时直接需要的额外库在对应版本单独恢复。
+ 	 */
+ 	private static final List<String> LEGACY_LIBRARIES = List.of(
+ 			"net.minecraft:launchwrapper:1.12",
+@@ -291,7 +289,7 @@ public class ForgeUserdevProvider extends DependencyProvider {
+ 	 * 只替换 userdev3 特有的差异：
+ 	 * <ul>
+ 	 *     <li>配置里没有 {@code inheritsFrom}，MC 版本改由 Forge 版本推导</li>
+-	 *     <li>{@code libraries} 是纯字符串数组，且改用 {@link #LEGACY_LIBRARIES} 精简清单</li>
++	 *     <li>{@code libraries} 用精简清单保留游戏直接需要的库，不引入原 Gradle 启动器</li>
+ 	 * </ul>
+ 	 *
+ 	 * @param userdevJarPath 已归一的 FG2 形态 jar（sources.zip 由 {@link #createNormalizedUserdev3Jar} 放进去）
+@@ -310,6 +308,13 @@ public class ForgeUserdevProvider extends DependencyProvider {
+ 		json.add("binpatcher", createLegacyBinpatcher());
+ 		JsonArray libraries = new JsonArray();
+ 		LEGACY_LIBRARIES.forEach(libraries::add);
++
++		if ("1.12.2".equals(mcVersion)) {
++			// 恢复 1.12.2 原始 userdev3 声明：服务端控制台使用 JLine，客户端模型加载使用 vecmath。
++			libraries.add("org.jline:jline:3.5.1");
++			libraries.add("java3d:vecmath:1.5.2");
++		}
++
+ 		json.add("libraries", libraries);
+ 		json.add("runs", createLegacyRuns());
+ 		json.add("ats", createLegacyAts());
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeUserdevProviderTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeUserdevProviderTest.groovy
+index d57e37ec5f835186e9ddcf567e887b8282415aa9..7e050d72e3caed84fee19f8a4b2da3240d8ee45f 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeUserdevProviderTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeUserdevProviderTest.groovy
+@@ -32,10 +32,17 @@ import java.util.zip.ZipOutputStream
+ 
+ import com.google.gson.JsonArray
+ import com.google.gson.JsonObject
++import dev.architectury.loom.forge.dependency.ForgeProvider
+ import dev.architectury.loom.forge.dependency.ForgeUserdevProvider
++import groovy.json.JsonOutput
++import org.gradle.testfixtures.ProjectBuilder
+ import spock.lang.Specification
+ import spock.lang.TempDir
+ 
++import net.fabricmc.loom.LoomGradleExtension
++import net.fabricmc.loom.configuration.DependencyInfo
++import net.fabricmc.loom.util.Constants
++
+ class ForgeUserdevProviderTest extends Specification {
+ 	@TempDir
+ 	Path temp
+@@ -62,6 +69,60 @@ class ForgeUserdevProviderTest extends Specification {
+ 		new String(result, StandardCharsets.UTF_8) == 'public-f net.minecraft.First one\nprotected net.minecraft.Second two\n'
+ 	}
+ 
++	def '从缓存的 #shape 清单派生默认运行库'() {
++		given:
++		def project = ProjectBuilder.builder().withProjectDir(temp.toFile()).build()
++		def forge = Stub(ForgeProvider) {
++			getGlobalCache() >> temp.toFile()
++		}
++		project.extensions.add('loom', Stub(LoomGradleExtension) {
++			getForgeProvider() >> forge
++		})
++		[Constants.Configurations.MCP_CONFIG, Constants.Configurations.SRG, Constants.Configurations.FORGE_UNIVERSAL].each {
++			project.configurations.create(it)
++		}
++		def notation = "net.minecraftforge:forge:${version}".toString()
++		def forgeDependency = project.dependencies.create(notation)
++		def dependency = Stub(DependencyInfo) {
++			getDependency() >> forgeDependency
++			getResolvedVersion() >> version
++			getDepString() >> notation
++			resolveFile() >> { throw new AssertionError('已归一的 userdev 不应重新解析') }
++		}
++		def original = userdev3 ? [spec: 2, notchObf: true, libraries: [
++			'org.jline:jline:3.5.1', 'java3d:vecmath:1.5.2', 'net.minecraftforge:legacydev:0.2.3.+:fatjar'
++		]] : [inheritsFrom: '1.12.2', libraries: [[name: 'net.minecraft:launchwrapper:1.12']]]
++		def rawConfig = temp.resolve('forge-config.json')
++		Files.writeString(rawConfig, JsonOutput.toJson(original))
++		def sources = new ByteArrayOutputStream()
++		new ZipOutputStream(sources).withCloseable { addEntry(it, 'Example.java', 'class Example {}') }
++		def cached = temp.resolve('forge-userdev.jar')
++		new ZipOutputStream(Files.newOutputStream(cached)).withCloseable { zip ->
++			addEntry(zip, 'merged_at.cfg', '')
++			zip.putNextEntry(new ZipEntry('sources.zip'))
++			zip.write(sources.toByteArray())
++			zip.closeEntry()
++		}
++		def before = Files.readAllBytes(cached)
++		def provider = new ForgeUserdevProvider(project)
++
++		when:
++		provider.provide(dependency)
++
++		then:
++		def libraries = provider.config.libraries()
++		libraries.findAll { it.startsWith('org.jline:') || it.startsWith('java3d:') } == extras
++		libraries.contains('net.minecraft:launchwrapper:1.12')
++		!libraries.any { it.startsWith('net.minecraftforge:legacydev:') }
++		Arrays.equals(Files.readAllBytes(cached), before)
++
++		where:
++		shape             | version            | userdev3 || extras
++		'1.12.2 userdev3'  | '1.12.2-14.23.5.2860' | true     || ['org.jline:jline:3.5.1', 'java3d:vecmath:1.5.2']
++		'其它版本 userdev3' | '1.11.2-13.20.1.2588' | true     || []
++		'原生 FG2'         | '1.12.2-14.23.5.2847' | false    || []
++	}
++
+ 	private static void addEntry(ZipOutputStream zip, String name, String content) {
+ 		zip.putNextEntry(new ZipEntry(name))
+ 		zip.write(content.getBytes(StandardCharsets.UTF_8))

@@ -1,0 +1,115 @@
+From f5c19d89d6e51f3dcc0aadf3824c0bc0f765811c Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:28 +0800
+Subject: [PATCH 016/147] =?UTF-8?q?fix(config-cache):=20=E8=A1=A5=E5=9B=9E?=
+ =?UTF-8?q?=20IDE=20=E9=A9=B1=E5=8A=A8=E5=AE=88=E5=8D=AB=E4=B8=8E=E6=89=A7?=
+ =?UTF-8?q?=E8=A1=8C=E6=9C=9F=20stdin=20=E8=BD=AC=E5=8F=91?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+SourceSetHelper 缺 isIdeDrivenBuild 守卫时，.idea/misc.xml 会被登记为配置缓存输入，
+IDE 每次改写都令缓存失效；RunGameTask 在配置期持有 System.in 会破坏配置缓存序列化。
+两者在重放时整块丢失，此处补回并同步补回测试侧改动。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/task/RunGameTask.java b/src/main/java/net/fabricmc/loom/task/RunGameTask.java
+index b6623fc9d7ac97a5d1a589d2c83547188ae07a70..3283b62f5795c01e2b51f6c595d5d7f23f0e4b43 100644
+--- a/src/main/java/net/fabricmc/loom/task/RunGameTask.java
++++ b/src/main/java/net/fabricmc/loom/task/RunGameTask.java
+@@ -36,8 +36,12 @@ public abstract class RunGameTask extends AbstractRunTask {
+ 	@Inject
+ 	public RunGameTask(RunConfiguration settings) {
+ 		super(proj -> DefaultRunConfigurationSettings.finialise(settings, proj));
++	}
+ 
+-		// Defaults to empty, forwards stdin to mc.
++	@Override
++	public void exec() {
++		// 在执行期设置 stdin 转发，避免配置期持有 System.in 破坏配置缓存序列化
+ 		setStandardInput(System.in);
++		super.exec();
+ 	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/util/gradle/SourceSetHelper.java b/src/main/java/net/fabricmc/loom/util/gradle/SourceSetHelper.java
+index ef79a01bd7d5784195130579eb3fc05cf8c9ae0d..01a077f8a57b8ea333bafafcbc55e7f8a535a671 100644
+--- a/src/main/java/net/fabricmc/loom/util/gradle/SourceSetHelper.java
++++ b/src/main/java/net/fabricmc/loom/util/gradle/SourceSetHelper.java
+@@ -164,8 +164,26 @@ public final class SourceSetHelper {
+ 		return classpath;
+ 	}
+ 
++	/**
++	 * 判断当前构建是否由 IDE 驱动（IntelliJ 同步 / IDE 内运行）.
++	 *
++	 * <p>用于跳过对 IDE 工程文件的探测：命令行构建不需要 IDE 的编译输出目录（使用 Gradle 自己
++	 * 产出的 classes），而无条件探测会让这些文件成为 Gradle 配置缓存输入。</p>
++	 */
++	@VisibleForTesting
++	public static boolean isIdeDrivenBuild() {
++		return IdeaUtils.isIdeaSync() || Boolean.parseBoolean(System.getProperty("idea.active", "false"));
++	}
++
+ 	@VisibleForTesting
+ 	public static List<File> getIdeaClasspath(SourceSetReference reference, Project project) {
++		// 仅在 IDE 驱动构建时注入 IDEA 输出目录。本方法会读取 .idea/misc.xml 的**内容**
++		// （XPath 求 project/output/@url）；若在配置阶段无条件执行，Gradle 会把它登记为配置缓存
++		// 输入 —— IDE 每次改写 misc.xml 都会令配置缓存条目失效，表现为每次构建都重新配置整个工程。
++		if (!isIdeDrivenBuild()) {
++			return Collections.emptyList();
++		}
++
+ 		final File projectDir = project.getRootDir();
+ 		final File dotIdea = new File(projectDir, ".idea");
+ 
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/SourceSetHelperTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/SourceSetHelperTest.groovy
+index ab075c2b26944924c62fefc81e68ad831bc9f124..ba8d48d7deb4883498c51116f3dc46aeecb13d7d 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/SourceSetHelperTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/SourceSetHelperTest.groovy
+@@ -53,6 +53,8 @@ class SourceSetHelperTest extends Specification {
+ 		mockSourceSet.getName() >> "main"
+ 
+ 		System.setProperty("fabric-loom.unit.testing", "true")
++		// IDEA 输出目录仅在 IDE 驱动构建时注入（读 .idea/misc.xml 内容会成为配置缓存输入）
++		System.setProperty("idea.active", "true")
+ 
+ 		def ref = new SourceSetReference(mockSourceSet, mockProject)
+ 		when:
+@@ -65,6 +67,35 @@ class SourceSetHelperTest extends Specification {
+ 		println(result[0].toString())
+ 	}
+ 
++	@RestoreSystemProperties
++	def "idea classpath is skipped for non-ide driven builds"() {
++		given:
++		// 命令行构建（既非 IDE 同步、也未由 IDE 启动）：不得探测 .idea/misc.xml，
++		// 否则该文件内容会成为 Gradle 配置缓存输入，IDE 每次改写都令配置缓存条目失效。
++		def miscXml = new File(projectDir, ".idea/misc.xml")
++		miscXml.parentFile.mkdirs()
++		miscXml.text = MISC_XML
++
++		def mockProject = Mock(Project)
++		def mockSourceSet = Mock(SourceSet)
++
++		mockProject.getName() >> "UnitTest"
++		mockProject.getRootDir() >> projectDir
++		mockSourceSet.getName() >> "main"
++
++		System.setProperty("fabric-loom.unit.testing", "true")
++		System.clearProperty("idea.active")
++		System.clearProperty("idea.sync.active")
++
++		def ref = new SourceSetReference(mockSourceSet, mockProject)
++		when:
++		def result = SourceSetHelper.getIdeaClasspath(ref, mockProject)
++
++		then:
++		!SourceSetHelper.isIdeDrivenBuild()
++		result.isEmpty()
++	}
++
+ 	@RestoreSystemProperties
+ 	def "eclipse classpath"() {
+ 		given:

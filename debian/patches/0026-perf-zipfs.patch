@@ -1,0 +1,608 @@
+From f47a5bd06d3e3949ff4c33856fcd71cc58a95f70 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:34 +0800
+Subject: [PATCH 026/147] =?UTF-8?q?perf(zipfs):=20=E5=8F=AA=E8=AF=BB?=
+ =?UTF-8?q?=E8=B7=AF=E5=BE=84=E6=94=B9=E7=94=A8=E7=8B=AC=E7=AB=8B=E6=96=87?=
+ =?UTF-8?q?=E4=BB=B6=E7=B3=BB=E7=BB=9F=E7=BB=95=E5=BC=80=E5=85=A8=E5=B1=80?=
+ =?UTF-8?q?=E9=94=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+tiny-remapper 的 FileSystemReference 用 static openFsMap 做引用计数，open/close 均以
+synchronized 包住整个 JDK newFileSystem(URI)/close 调用；JDK 的 ZipFileSystemProvider
+又在其 filesystems 登记簿上加第二把全局锁，且锁范围覆盖 zip 中央目录解析。两层锁套娃，
+导致 classpath 上每个依赖 jar 的每次元数据读取都串行化。
+
+实测（32 核，62/64 个 loom-async-cache 线程处于等待，平均线程利用率 1.4%）确认瓶颈
+位于 ZipUtils.unpack → FileSystemUtil.Delegate.close → FileSystemReference.close。
+
+改动：
+
+- FileSystemUtil.Delegate 由 record 改为 final class，支持两条打开路径：经 tiny-remapper
+  引用计数（保留原行为，供写入方使用）与独立文件系统（新增）。close 按 reference 是否为
+  null 分流，独立实例直接关闭，不触及引用计数与 JDK-8291712 的恢复逻辑。
+- 新增 getReadOnlyJarFileSystem(Path)，走 JDK newFileSystem(Path, Map) 重载。该重载不进
+  入进程级 filesystems 登记簿，无 FileSystemAlreadyExistsException，也不与 openFsMap 交互，
+  多线程可并发打开同一 jar。
+- 将 34 处已逐一核实为纯读的调用点切换到新路径，覆盖映射加载、反编译缓存、jar 分裂/合并、
+  Forge/NeoForge 元数据读取等。
+
+刻意不切换的调用点：
+
+- 所有写入方（create=true），以及读写混用的点，例如 GenerateSourcesTask 中与写入共享的
+  缓存 jar、CachedJarProcessor 同一 try-with-resources 语句内承担写入的 outputFs。
+- ZipUtils.unpack：写入方（如 MinecraftJarMerger）在 close() 前内容尚未落盘，独立文件系统
+  从磁盘读取会看不到这些条目。"读取刚写完未关闭的 jar" 是本方法的既有契约，改成独立实例
+  会让上游 MinecraftJarMergerTest 报 NoSuchFileException。unpackAll 与 contains 无此约束，
+  仍走独立实例。
+
+验证：compileJava、checkstyleMain 通过；单元测试 739 项全绿。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerService.java b/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerService.java
+index edb0836fda9c0faa35b3fe2f791dba8417e5de16..e3eb2aabddbe16986345dd9a0f407310a98a9c08 100644
+--- a/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerService.java
++++ b/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerService.java
+@@ -87,7 +87,7 @@ public final class AccessTransformerService extends Service<AccessTransformerSer
+ 	private static List<String> extractAccessTransformers(Path jar, UserdevConfig.AccessTransformerLocation location, TempFiles tempFiles) throws IOException {
+ 		final List<String> extracted = new ArrayList<>();
+ 
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar)) {
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
+ 			for (Path atFile : getAccessTransformerPaths(fs, location)) {
+ 				byte[] atBytes;
+ 
+diff --git a/src/main/java/dev/architectury/loom/forge/FieldMappingsMigrator.java b/src/main/java/dev/architectury/loom/forge/FieldMappingsMigrator.java
+index e7b7aef6384af388558f77a435f689e6bbb66af1..baa57d0bf9eaf7648ebcf92d6557352480a72a1a 100644
+--- a/src/main/java/dev/architectury/loom/forge/FieldMappingsMigrator.java
++++ b/src/main/java/dev/architectury/loom/forge/FieldMappingsMigrator.java
+@@ -184,7 +184,7 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
+ 		}
+ 
+ 		Visitor visitor = new Visitor(Constants.ASM_VERSION);
+-		FileSystemUtil.Delegate system = FileSystemUtil.getJarFileSystem(patchedJar, false);
++		FileSystemUtil.Delegate system = FileSystemUtil.getReadOnlyJarFileSystem(patchedJar);
+ 		completer.onComplete(value -> system.close());
+ 
+ 		for (Path fsPath : (Iterable<? extends Path>) Files.walk(system.get().getPath("/"))::iterator) {
+diff --git a/src/main/java/dev/architectury/loom/forge/ForgeLoggerConfig.java b/src/main/java/dev/architectury/loom/forge/ForgeLoggerConfig.java
+index 8a6ba5b8b8b7748ec1744ec859cadf6bbc2da992..deec8e3761f3fb8e0e6e010412ce2a2289425874 100644
+--- a/src/main/java/dev/architectury/loom/forge/ForgeLoggerConfig.java
++++ b/src/main/java/dev/architectury/loom/forge/ForgeLoggerConfig.java
+@@ -43,7 +43,7 @@ public final class ForgeLoggerConfig {
+ 	}
+ 
+ 	public static void copyToPath(Path libraryFile, Path outputFile) {
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(libraryFile, false)) {
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(libraryFile)) {
+ 			final Path configPath = fs.getPath("log4j2.xml");
+ 			Files.copy(configPath, outputFile, StandardCopyOption.REPLACE_EXISTING);
+ 		} catch (IOException e) {
+diff --git a/src/main/java/dev/architectury/loom/forge/ForgeSourcesService.java b/src/main/java/dev/architectury/loom/forge/ForgeSourcesService.java
+index 1c068e18f3f0a2bc171f7c921c936584f6ec553b..d07f6ef1eb5176b28df6930725d5789069bbc91b 100644
+--- a/src/main/java/dev/architectury/loom/forge/ForgeSourcesService.java
++++ b/src/main/java/dev/architectury/loom/forge/ForgeSourcesService.java
+@@ -231,7 +231,7 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 
+ 		int[] failedToRemap = {0};
+ 
+-		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(tmpOutput, false)) {
++		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getReadOnlyJarFileSystem(tmpOutput)) {
+ 			ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter();
+ 
+ 			for (Map.Entry<String, byte[]> entry : new HashSet<>(sources.entrySet())) {
+@@ -261,7 +261,7 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 		ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter();
+ 
+ 		for (Path path : forgeInstallerSources) {
+-			FileSystemUtil.Delegate system = FileSystemUtil.getJarFileSystem(path, false);
++			FileSystemUtil.Delegate system = FileSystemUtil.getReadOnlyJarFileSystem(path);
+ 			taskCompleter.onComplete(stopwatch -> system.close());
+ 
+ 			for (Path filePath : (Iterable<? extends Path>) Files.walk(system.get().getPath("/"))::iterator) {
+diff --git a/src/main/java/dev/architectury/loom/forge/InnerClassRemapper.java b/src/main/java/dev/architectury/loom/forge/InnerClassRemapper.java
+index d73ffb0ded83014f693ad8df97c9d7f3d57a0c0b..1b31aa8919c87ae0091c01ad503881080555f18b 100644
+--- a/src/main/java/dev/architectury/loom/forge/InnerClassRemapper.java
++++ b/src/main/java/dev/architectury/loom/forge/InnerClassRemapper.java
+@@ -48,7 +48,7 @@ public class InnerClassRemapper {
+ 	public static Set<String> readClassNames(Path jar) {
+ 		Set<String> set = new HashSet<>();
+ 
+-		try (FileSystemUtil.Delegate system = FileSystemUtil.getJarFileSystem(jar, false)) {
++		try (FileSystemUtil.Delegate system = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
+ 			Iterator<Path> iterator = Files.walk(system.get().getPath("/")).iterator();
+ 
+ 			while (iterator.hasNext()) {
+diff --git a/src/main/java/dev/architectury/loom/forge/MethodInheritanceMappingsMigrator.java b/src/main/java/dev/architectury/loom/forge/MethodInheritanceMappingsMigrator.java
+index 8c90d06fec72ae578e417acb9844334fc016f0a4..2b08774c71d5489228f9cb6d500850972e6327cc 100644
+--- a/src/main/java/dev/architectury/loom/forge/MethodInheritanceMappingsMigrator.java
++++ b/src/main/java/dev/architectury/loom/forge/MethodInheritanceMappingsMigrator.java
+@@ -185,7 +185,7 @@ public final class MethodInheritanceMappingsMigrator implements MappingsMigrator
+ 		Visitor visitor = new Visitor(Constants.ASM_VERSION, classInheritanceMap, methods);
+ 
+ 		for (Path jar : jars) {
+-			try (FileSystemUtil.Delegate system = FileSystemUtil.getJarFileSystem(jar, false)) {
++			try (FileSystemUtil.Delegate system = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
+ 				for (Path fsPath : (Iterable<? extends Path>) Files.walk(system.get().getPath("/"))::iterator) {
+ 					if (Files.isRegularFile(fsPath) && fsPath.toString().endsWith(".class")) {
+ 						new ClassReader(Files.readAllBytes(fsPath)).accept(visitor, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java
+index 35e46ad225c2a1255a0f2824cf90f57070bc5144..df7ce18b08bcb032d94b6c61eada103f5b584802 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java
+@@ -414,7 +414,7 @@ public class ForgeUserdevProvider extends DependencyProvider {
+ 		});
+ 
+ 		if (!sourcesMaven.exists(null)) {
+-			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(userdevJarPath, false)) {
++			try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(userdevJarPath)) {
+ 				sourcesMaven.copyToMaven(fs.getPath(LEGACY_SOURCES_FILE), null);
+ 			}
+ 		}
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java
+index c977a5a2e367cbd272c9475dee41861eebc880a5..b7d7311799163991baf6d18ae3df9f6499a65a92 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java
+@@ -104,7 +104,7 @@ public class PatchProvider extends DependencyProvider {
+ 			return;
+ 		}
+ 
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(installerJar, false)) {
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(installerJar)) {
+ 			Files.copy(fs.getPath("data", name), targetPath, StandardCopyOption.REPLACE_EXISTING);
+ 		} catch (IOException e) {
+ 			throw new UncheckedIOException(e);
+@@ -129,7 +129,7 @@ public class PatchProvider extends DependencyProvider {
+ 
+ 		byte[] unpackedBytes;
+ 
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(installerJar, false)) {
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(installerJar)) {
+ 			unpackedBytes = unpack200Lzma(fs.getPath("binpatches.pack.lzma"));
+ 		}
+ 
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+index 901382a52762170b7117bf7246ce33da69a101b2..05dc28a79d78a298a92d96a4c179d095ae5152e4 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+@@ -641,7 +641,7 @@ public class MinecraftPatchedProvider {
+ 
+ 		for (File file : files) {
+ 			if (file.getName().endsWith(".jar")) {
+-				try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(file.toPath())) {
++				try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(file.toPath())) {
+ 					final Path mfPath = fs.getPath("META-INF/MANIFEST.MF");
+ 
+ 					if (Files.exists(mfPath)) {
+diff --git a/src/main/java/dev/architectury/loom/mappings/MCPReader.java b/src/main/java/dev/architectury/loom/mappings/MCPReader.java
+index ef9a9a41f64bf944e1e50feb3529d69e28ec8619..951d0395ae8c9a7b9b7cbb33c73615b788f52523 100644
+--- a/src/main/java/dev/architectury/loom/mappings/MCPReader.java
++++ b/src/main/java/dev/architectury/loom/mappings/MCPReader.java
+@@ -192,7 +192,7 @@ public class MCPReader {
+ 			}
+ 		}
+ 
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(mcpJar, false)) {
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(mcpJar)) {
+ 			Path fields = fs.getPath("fields.csv");
+ 			Path methods = fs.getPath("methods.csv");
+ 			Path params = fs.getPath("params.csv");
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/JarSplitter.java b/src/main/java/net/fabricmc/loom/configuration/mods/JarSplitter.java
+index c98882f8751fbfb3c1e6c460e974112becaabc98..ed93fcd7cb7e60fe04310f28eb27fc1fbb950a34 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/JarSplitter.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/JarSplitter.java
+@@ -58,7 +58,7 @@ public class JarSplitter {
+ 
+ 	@Nullable
+ 	public Target analyseTarget() {
+-		try (FileSystemUtil.Delegate input = FileSystemUtil.getJarFileSystem(inputJar)) {
++		try (FileSystemUtil.Delegate input = FileSystemUtil.getReadOnlyJarFileSystem(inputJar)) {
+ 			final Manifest manifest = input.fromInputStream(Manifest::new, Constants.Manifest.PATH);
+ 
+ 			if (!Boolean.parseBoolean(manifest.getMainAttributes().getValue(Constants.Manifest.SPLIT_ENV))) {
+@@ -122,7 +122,7 @@ public class JarSplitter {
+ 		Files.deleteIfExists(commonOutputJar);
+ 		Files.deleteIfExists(clientOutputJar);
+ 
+-		try (FileSystemUtil.Delegate input = FileSystemUtil.getJarFileSystem(inputJar)) {
++		try (FileSystemUtil.Delegate input = FileSystemUtil.getReadOnlyJarFileSystem(inputJar)) {
+ 			final Manifest manifest = input.fromInputStream(Manifest::new, Constants.Manifest.PATH);
+ 
+ 			if (!Boolean.parseBoolean(manifest.getMainAttributes().getValue(Constants.Manifest.SPLIT_ENV))) {
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/BundleMetadata.java b/src/main/java/net/fabricmc/loom/configuration/providers/BundleMetadata.java
+index aefda28d6d6d7e4966d1f681ee1016bb28c5a4d9..39b342dddd0f19e8a482d0357763acb5da8b21af 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/BundleMetadata.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/BundleMetadata.java
+@@ -53,7 +53,7 @@ public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String
+ 		final List<Entry> versions;
+ 		final String mainClass;
+ 
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar)) {
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
+ 			if (!Files.exists(fs.get().getPath(VERSIONS_LIST_PATH))) {
+ 				// Legacy jar
+ 				return null;
+@@ -103,7 +103,7 @@ public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String
+ 			// 原子发布：先抽取到同目录唯一临时文件并写入 hash 标记，完整后再原子 move 到 dest。
+ 			// 避免跨进程的无锁存在性检查在抽取期间看到半写的 server jar 误判就绪。
+ 			AtomicFiles.publish(dest, tmp -> {
+-				try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar)) {
++				try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
+ 					Files.copy(fs.get().getPath(path()), tmp, StandardCopyOption.REPLACE_EXISTING);
+ 				}
+ 
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+index cbec005cc36e55e2bfb5125f2b3a039826a25cab..d718fff3385a8e06b9a8b27e5263ffff067c2121 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+@@ -231,7 +231,7 @@ public class MappingConfiguration {
+ 		if (Files.notExists(tinyMappings) || refresh) {
+ 			storeMappings(project, serviceFactory, minecraftProvider, inputJar);
+ 		} else {
+-			try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getJarFileSystem(inputJar, false)) {
++			try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getReadOnlyJarFileSystem(inputJar)) {
+ 				extractExtras(fileSystem.get());
+ 			}
+ 		}
+@@ -387,7 +387,7 @@ public class MappingConfiguration {
+ 			return;
+ 		}
+ 
+-		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(inputJar)) {
++		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getReadOnlyJarFileSystem(inputJar)) {
+ 			extractMappings(delegate.fs(), baseTinyMappings);
+ 			extractExtras(delegate.fs());
+ 		}
+@@ -454,7 +454,7 @@ public class MappingConfiguration {
+ 	}
+ 
+ 	private boolean isMCP(Path path) throws IOException {
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(path, false)) {
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(path)) {
+ 			return Files.exists(fs.getPath("fields.csv")) && Files.exists(fs.getPath("methods.csv"));
+ 		}
+ 	}
+@@ -469,7 +469,7 @@ public class MappingConfiguration {
+ 	}
+ 
+ 	public static void extractMappings(Path jar, Path extractTo) throws IOException {
+-		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(jar)) {
++		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
+ 			extractMappings(delegate.fs(), extractTo);
+ 		}
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/TinyMappingsService.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/TinyMappingsService.java
+index 14bed59272cf6e7224656c162a9966d5d9a8ea0a..c842a2d269f8ad1bec6aba2ae3009ce4a94c094b 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/TinyMappingsService.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/TinyMappingsService.java
+@@ -87,7 +87,7 @@ public final class TinyMappingsService extends Service<TinyMappingsService.Optio
+ 		Path mappings = getOptions().getMappings().getAsFile().get().toPath();
+ 
+ 		if (getOptions().getZipEntryPath().isPresent()) {
+-			try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(mappings)) {
++			try (FileSystemUtil.Delegate delegate = FileSystemUtil.getReadOnlyJarFileSystem(mappings)) {
+ 				return readMappings(delegate.fs().getPath(getOptions().getZipEntryPath().get()));
+ 			} catch (IOException e) {
+ 				throw new UncheckedIOException("Failed to read mappings from zip", e);
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/file/FileMappingsLayer.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/file/FileMappingsLayer.java
+index 33a42b3818fd445156ccb57ab182190d86e6b106..8b17e9e4a939a0f7cf1f494d7486634036071ce5 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/file/FileMappingsLayer.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/file/FileMappingsLayer.java
+@@ -64,7 +64,7 @@ public record FileMappingsLayer(
+ 		if (!ZipUtils.isZip(path)) {
+ 			visit(path, mappingVisitor);
+ 		} else {
+-			try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getJarFileSystem(path)) {
++			try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getReadOnlyJarFileSystem(path)) {
+ 				visit(fileSystem.get().getPath(mappingPath), mappingVisitor);
+ 			}
+ 		}
+@@ -108,7 +108,7 @@ public record FileMappingsLayer(
+ 			throw new UnsupportedOperationException("Unpick is only supported for zip file mapping layers.");
+ 		}
+ 
+-		try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getJarFileSystem(path)) {
++		try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getReadOnlyJarFileSystem(path)) {
+ 			final Path unpickMetadata = fileSystem.get().getPath(UnpickMetadata.UNPICK_METADATA_PATH);
+ 			final Path unpickDefinitions = fileSystem.get().getPath(UnpickMetadata.UNPICK_DEFINITIONS_PATH);
+ 
+@@ -140,7 +140,7 @@ public record FileMappingsLayer(
+ 			throw new UnsupportedOperationException("Annotations data is only supported for zip file mapping layers.");
+ 		}
+ 
+-		try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getJarFileSystem(path)) {
++		try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getReadOnlyJarFileSystem(path)) {
+ 			final Path annotations = fileSystem.get().getPath(AnnotationsLayer.ANNOTATIONS_PATH);
+ 
+ 			if (!Files.exists(annotations)) {
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/tiny/TinyJarInfo.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/tiny/TinyJarInfo.java
+index 45d6137dcf5cb57d4e6b4f1bf52f34ff811b2a5d..a7460eff424e83c2310c3c3e4a4306b431915e16 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/tiny/TinyJarInfo.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/tiny/TinyJarInfo.java
+@@ -43,7 +43,7 @@ public record TinyJarInfo(boolean v2, Optional<String> minecraftVersionId) {
+ 	private static final String MANIFEST_VERSION_ID_ATTRIBUTE = "Minecraft-Version-Id";
+ 
+ 	public static TinyJarInfo get(Path jar) {
+-		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getJarFileSystem(jar)) {
++		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
+ 			return new TinyJarInfo(doesJarContainV2Mappings(delegate), getMinecraftVersionId(delegate));
+ 		} catch (IOException e) {
+ 			throw new UncheckedIOException("Failed to read tiny jar info", e);
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftJarSplitter.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftJarSplitter.java
+index 36eb70a4038d446c3b92d1679eca1b90ee8b0385..54010b7b4052267358e8db33ea5e09690b2ddbc6 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftJarSplitter.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftJarSplitter.java
+@@ -79,7 +79,7 @@ public class MinecraftJarSplitter implements AutoCloseable {
+ 	public static Set<String> getJarEntries(Path input) throws IOException {
+ 		Set<String> entries = new HashSet<>();
+ 
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(input);
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(input);
+ 				Stream<Path> walk = Files.walk(fs.get().getPath("/"))) {
+ 			Iterator<Path> iterator = walk.iterator();
+ 
+@@ -106,7 +106,7 @@ public class MinecraftJarSplitter implements AutoCloseable {
+ 	private void copyEntriesToJar(Set<String> entries, Path inputJar, Path outputJar, String env) throws IOException {
+ 		Files.deleteIfExists(outputJar);
+ 
+-		try (FileSystemUtil.Delegate inputFs = FileSystemUtil.getJarFileSystem(inputJar);
++		try (FileSystemUtil.Delegate inputFs = FileSystemUtil.getReadOnlyJarFileSystem(inputJar);
+ 				FileSystemUtil.Delegate outputFs = FileSystemUtil.getJarFileSystem(outputJar, true)) {
+ 			for (String entry : entries) {
+ 				Path inputPath = inputFs.get().getPath(entry);
+diff --git a/src/main/java/net/fabricmc/loom/decompilers/cache/CachedJarProcessor.java b/src/main/java/net/fabricmc/loom/decompilers/cache/CachedJarProcessor.java
+index 0b9650fed0835085ab167df17923fd53ef102b68..b0a618802c8c79ac6aa20cf0fe3a38249b5363e7 100644
+--- a/src/main/java/net/fabricmc/loom/decompilers/cache/CachedJarProcessor.java
++++ b/src/main/java/net/fabricmc/loom/decompilers/cache/CachedJarProcessor.java
+@@ -64,7 +64,7 @@ public record CachedJarProcessor(CachedFileStore<CachedData> fileStore, String b
+ 		int hits = 0;
+ 		int misses = 0;
+ 
+-		try (FileSystemUtil.Delegate inputFs = FileSystemUtil.getJarFileSystem(inputJar, false);
++		try (FileSystemUtil.Delegate inputFs = FileSystemUtil.getReadOnlyJarFileSystem(inputJar);
+ 				FileSystemUtil.Delegate incompleteFs = FileSystemUtil.getJarFileSystem(incompleteJar, true);
+ 				FileSystemUtil.Delegate existingSourcesFs = FileSystemUtil.getJarFileSystem(existingSourcesJar, true);
+ 				FileSystemUtil.Delegate existingClassesFs = FileSystemUtil.getJarFileSystem(existingClassesJar, true)) {
+@@ -164,7 +164,7 @@ public record CachedJarProcessor(CachedFileStore<CachedData> fileStore, String b
+ 			// Sources name -> hash
+ 			Map<String, String> outputNameMap = workToDoJob.outputNameMap();
+ 
+-			try (FileSystemUtil.Delegate outputFs = FileSystemUtil.getJarFileSystem(workToDoJob.output(), false);
++			try (FileSystemUtil.Delegate outputFs = FileSystemUtil.getReadOnlyJarFileSystem(workToDoJob.output());
+ 					Stream<Path> walk = Files.walk(outputFs.getRoot())) {
+ 				Iterator<Path> iterator = walk.iterator();
+ 
+@@ -211,8 +211,10 @@ public record CachedJarProcessor(CachedFileStore<CachedData> fileStore, String b
+ 
+ 		if (workJob instanceof PartialWorkJob partialWorkJob) {
+ 			// Copy all the existing items to the output jar
++			// outputFs 在本块内被写入（见下方 Files.copy），必须保留共享文件系统；
++			// existingFs 仅作为读取源，改用独立文件系统以避免全局锁。
+ 			try (FileSystemUtil.Delegate outputFs = FileSystemUtil.getJarFileSystem(partialWorkJob.output(), false);
+-					FileSystemUtil.Delegate existingFs = FileSystemUtil.getJarFileSystem(partialWorkJob.existingSources(), false);
++					FileSystemUtil.Delegate existingFs = FileSystemUtil.getReadOnlyJarFileSystem(partialWorkJob.existingSources());
+ 					Stream<Path> walk = Files.walk(existingFs.getRoot())) {
+ 				Iterator<Path> iterator = walk.iterator();
+ 
+diff --git a/src/main/java/net/fabricmc/loom/decompilers/cache/JarWalker.java b/src/main/java/net/fabricmc/loom/decompilers/cache/JarWalker.java
+index ccbe52ba983cdcceaad03bee590fd33e9e36a1cf..7c2625ac4f32ef9255beace3b7d6a9acc8d3b044 100644
+--- a/src/main/java/net/fabricmc/loom/decompilers/cache/JarWalker.java
++++ b/src/main/java/net/fabricmc/loom/decompilers/cache/JarWalker.java
+@@ -66,7 +66,7 @@ public final class JarWalker {
+ 	}
+ 
+ 	public static List<ClassEntry> findClasses(Path jar) throws IOException {
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar)) {
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(jar)) {
+ 			return findClasses(fs);
+ 		}
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/task/GenerateForgePatchedSourcesTask.java b/src/main/java/net/fabricmc/loom/task/GenerateForgePatchedSourcesTask.java
+index 4e8e94f0e2d9c618468682a28ec9722b49caeac8..b319fac1e3db4f71e46c3bb0a472842b78b9f5fc 100644
+--- a/src/main/java/net/fabricmc/loom/task/GenerateForgePatchedSourcesTask.java
++++ b/src/main/java/net/fabricmc/loom/task/GenerateForgePatchedSourcesTask.java
+@@ -253,7 +253,7 @@ public abstract class GenerateForgePatchedSourcesTask extends AbstractLoomTask {
+ 			final List<String> sass = getSasOptions().get().getSass().get();
+ 			final List<Path> sasPaths = new ArrayList<>();
+ 
+-			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(getSasOptions().get().getUserdevJar().get().getAsFile(), false)) {
++			try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(getSasOptions().get().getUserdevJar().get().getAsFile().toPath())) {
+ 				for (String sasPath : sass) {
+ 					try {
+ 						final Path from = fs.getPath(sasPath);
+diff --git a/src/main/java/net/fabricmc/loom/task/service/MigrateClassTweakerMappingsService.java b/src/main/java/net/fabricmc/loom/task/service/MigrateClassTweakerMappingsService.java
+index cc04eae83044d16dbebab45c53359c6551c53339..57a06e740f27d53a664c8302b153c2e2883768e2 100644
+--- a/src/main/java/net/fabricmc/loom/task/service/MigrateClassTweakerMappingsService.java
++++ b/src/main/java/net/fabricmc/loom/task/service/MigrateClassTweakerMappingsService.java
+@@ -141,7 +141,7 @@ public final class MigrateClassTweakerMappingsService extends Service<MigrateCla
+ 		final Path mappingFile = targetOptions.getMappings().get().getAsFile().toPath();
+ 
+ 		if (targetOptions.getZipEntryPath().isPresent()) {
+-			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(mappingFile)) {
++			try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(mappingFile)) {
+ 				MappingReader.read(fs.getPath(targetOptions.getZipEntryPath().get()), renamer);
+ 			}
+ 		} else {
+diff --git a/src/main/java/net/fabricmc/loom/task/service/UnpickService.java b/src/main/java/net/fabricmc/loom/task/service/UnpickService.java
+index 266963cd284687a9c29910cc6c63f1f94d4672fe..e322aa3926eeae56a39c3313629c66e664a8f8c6 100644
+--- a/src/main/java/net/fabricmc/loom/task/service/UnpickService.java
++++ b/src/main/java/net/fabricmc/loom/task/service/UnpickService.java
+@@ -246,7 +246,7 @@ public class UnpickService extends Service<UnpickService.Options> {
+ 			var fileSystems = new ArrayList<FileSystemUtil.Delegate>();
+ 
+ 			for (Path path : classpath) {
+-				FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(path, false);
++				FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(path);
+ 				fileSystems.add(fs);
+ 			}
+ 
+diff --git a/src/main/java/net/fabricmc/loom/task/tool/ValidateModProvidedJavadocTask.java b/src/main/java/net/fabricmc/loom/task/tool/ValidateModProvidedJavadocTask.java
+index a8016e94c8df4c48618345a21a3890b6774a3a81..ffdaaa93e6e1ec8d47cd7ae2c1b1909a4a9ecc4d 100644
+--- a/src/main/java/net/fabricmc/loom/task/tool/ValidateModProvidedJavadocTask.java
++++ b/src/main/java/net/fabricmc/loom/task/tool/ValidateModProvidedJavadocTask.java
+@@ -183,7 +183,7 @@ public abstract class ValidateModProvidedJavadocTask extends AbstractLoomTask {
+ 			fileSystems = new ArrayList<>(files.size());
+ 
+ 			for (File file : files) {
+-				fileSystems.add(FileSystemUtil.getJarFileSystem(file.toPath()));
++				fileSystems.add(FileSystemUtil.getReadOnlyJarFileSystem(file.toPath()));
+ 			}
+ 		}
+ 
+diff --git a/src/main/java/net/fabricmc/loom/util/FileSystemUtil.java b/src/main/java/net/fabricmc/loom/util/FileSystemUtil.java
+index 3d457766becaba709a1adc0401bf26e177d723c1..46d5bd5dcd37e45c910e137b74269f7268722d26 100644
+--- a/src/main/java/net/fabricmc/loom/util/FileSystemUtil.java
++++ b/src/main/java/net/fabricmc/loom/util/FileSystemUtil.java
+@@ -36,12 +36,35 @@ import java.nio.file.FileSystems;
+ import java.nio.file.Files;
+ import java.nio.file.NoSuchFileException;
+ import java.nio.file.Path;
++import java.util.Map;
+ import java.util.function.Supplier;
+ 
++import org.jspecify.annotations.Nullable;
++
+ import net.fabricmc.tinyremapper.FileSystemReference;
+ 
+ public final class FileSystemUtil {
+-	public record Delegate(FileSystemReference reference, URI uri) implements AutoCloseable, Supplier<FileSystem> {
++	public static final class Delegate implements AutoCloseable, Supplier<FileSystem> {
++		private final FileSystem fileSystem;
++		// 非 null 表示经 tiny-remapper 引用计数打开（写入路径），close 需归还引用。
++		// 为 null 表示独立文件系统（只读路径），close 直接关闭。
++		private final @Nullable FileSystemReference reference;
++		private final @Nullable URI uri;
++
++		Delegate(FileSystem fileSystem, @Nullable FileSystemReference reference, @Nullable URI uri) {
++			this.fileSystem = fileSystem;
++			this.reference = reference;
++			this.uri = uri;
++		}
++
++		public @Nullable FileSystemReference reference() {
++			return reference;
++		}
++
++		public @Nullable URI uri() {
++			return uri;
++		}
++
+ 		public Path getPath(String path, String... more) {
+ 			return get().getPath(path, more);
+ 		}
+@@ -72,6 +95,12 @@ public final class FileSystemUtil {
+ 
+ 		@Override
+ 		public void close() throws IOException {
++			if (reference == null) {
++				// 独立文件系统未进入 JDK 进程级 filesystems 登记簿，不适用 JDK-8291712，直接关闭。
++				fileSystem.close();
++				return;
++			}
++
+ 			try {
+ 				reference.close();
+ 			} catch (IOException e) {
+@@ -101,7 +130,7 @@ public final class FileSystemUtil {
+ 
+ 		@Override
+ 		public FileSystem get() {
+-			return reference.getFs();
++			return fileSystem;
+ 		}
+ 
+ 		// TODO cleanup
+@@ -113,20 +142,42 @@ public final class FileSystemUtil {
+ 	private FileSystemUtil() {
+ 	}
+ 
++	/**
++	 * 打开只读 jar 文件系统，走 JDK 的 {@code newFileSystem(Path, Map)} 重载.
++	 *
++	 * <p>与 {@link #getJarFileSystem(Path, boolean)} 的差别：该重载返回<b>独立</b>的文件系统实例，
++	 * 不进入 JDK 进程级的 {@code ZipFileSystemProvider.filesystems} 登记簿，因此既不产生
++	 * {@code FileSystemAlreadyExistsException}，也不与 tiny-remapper 的全局锁
++	 * {@code FileSystemReference.openFsMap} 发生交互。多个线程可同时打开同一 jar.
++	 *
++	 * <p>调用方须保证只读取、不写入：独立实例各自持有文件锁，对同一 jar 并发写入会失败
++	 * （{@code AccessDeniedException}）。需要写入时请用 {@link #getJarFileSystem(Path, boolean)}，
++	 * 它经由 tiny-remapper 引用计数共享同一文件系统.
++	 *
++	 * <p>文件不存在时抛 {@code NoSuchFileException}，与原有实现一致.
++	 */
++	public static Delegate getReadOnlyJarFileSystem(Path path) throws IOException {
++		return new Delegate(FileSystems.newFileSystem(path, Map.of()), null, null);
++	}
++
+ 	public static Delegate getJarFileSystem(File file, boolean create) throws IOException {
+-		return new Delegate(FileSystemReference.openJar(file.toPath(), create), toJarUri(file.toPath()));
++		FileSystemReference reference = FileSystemReference.openJar(file.toPath(), create);
++		return new Delegate(reference.getFs(), reference, toJarUri(file.toPath()));
+ 	}
+ 
+ 	public static Delegate getJarFileSystem(Path path, boolean create) throws IOException {
+-		return new Delegate(FileSystemReference.openJar(path, create), toJarUri(path));
++		FileSystemReference reference = FileSystemReference.openJar(path, create);
++		return new Delegate(reference.getFs(), reference, toJarUri(path));
+ 	}
+ 
+ 	public static Delegate getJarFileSystem(Path path) throws IOException {
+-		return new Delegate(FileSystemReference.openJar(path), toJarUri(path));
++		FileSystemReference reference = FileSystemReference.openJar(path);
++		return new Delegate(reference.getFs(), reference, toJarUri(path));
+ 	}
+ 
+ 	public static Delegate getJarFileSystem(URI uri, boolean create) throws IOException {
+-		return new Delegate(FileSystemReference.open(uri, create), uri);
++		FileSystemReference reference = FileSystemReference.open(uri, create);
++		return new Delegate(reference.getFs(), reference, uri);
+ 	}
+ 
+ 	private static URI toJarUri(Path path) {
+diff --git a/src/main/java/net/fabricmc/loom/util/JarPackageIndex.java b/src/main/java/net/fabricmc/loom/util/JarPackageIndex.java
+index cb89253261213cbbe4fc37b98aa095ff13a6091f..9fe8edfc198210e09e3fec012c791a3865bd1ace 100644
+--- a/src/main/java/net/fabricmc/loom/util/JarPackageIndex.java
++++ b/src/main/java/net/fabricmc/loom/util/JarPackageIndex.java
+@@ -63,7 +63,7 @@ public record JarPackageIndex(Map<String, List<String>> packages) {
+ 	}
+ 
+ 	private static List<String> getClasses(Path jar) throws IOException {
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar, false);
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(jar);
+ 				Stream<Path> walk = Files.walk(fs.getRoot())) {
+ 			return walk
+ 					.filter(Files::isRegularFile)
+diff --git a/src/main/java/net/fabricmc/loom/util/ZipUtils.java b/src/main/java/net/fabricmc/loom/util/ZipUtils.java
+index edf9d5c5711df0df7b6bccfa8f9a1c466328cd2b..c510d89ec746e5766a06f7b72b936405412207cf 100644
+--- a/src/main/java/net/fabricmc/loom/util/ZipUtils.java
++++ b/src/main/java/net/fabricmc/loom/util/ZipUtils.java
+@@ -74,7 +74,7 @@ public class ZipUtils {
+ 	}
+ 
+ 	public static boolean contains(Path zip, String path) {
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(zip, false)) {
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(zip)) {
+ 			Path fsPath = fs.get().getPath(path);
+ 
+ 			return Files.exists(fsPath);
+@@ -84,7 +84,7 @@ public class ZipUtils {
+ 	}
+ 
+ 	public static void unpackAll(Path zip, Path output) throws IOException {
+-		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(zip, false);
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(zip);
+ 				Stream<Path> walk = Files.walk(fs.getRoot())) {
+ 			Iterator<Path> iterator = walk.iterator();
+ 
+@@ -108,6 +108,8 @@ public class ZipUtils {
+ 	}
+ 
+ 	public static byte[] unpack(Path zip, String path) throws IOException {
++		// 必须保留共享文件系统：写入方（如 MinecraftJarMerger）在 close() 前内容尚未落盘，
++		// 独立文件系统从磁盘读取会看不到这些条目。读取"刚写完未关闭"的 jar 是本方法的既有契约。
+ 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(zip, false)) {
+ 			return fs.readAllBytes(path);
+ 		}

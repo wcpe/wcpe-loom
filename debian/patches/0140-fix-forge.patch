@@ -1,0 +1,1093 @@
+From 8e2f639feb6eeb80dc4fbbef0c4c819c39107295 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Wed, 25 Nov 2026 01:50:42 +0800
+Subject: [PATCH 140/147] =?UTF-8?q?fix(forge):=20=E4=BB=8E=E5=AE=89?=
+ =?UTF-8?q?=E8=A3=85=E5=8C=85=E8=A1=A5=E9=BD=90=E4=BA=8C=E8=BF=9B=E5=88=B6?=
+ =?UTF-8?q?=E9=93=BE=E7=BC=BA=E5=A4=B1=E7=9A=84=E5=86=85=E9=83=A8=E7=B1=BB?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+扫描确实被引用但缺失的内部类，只从同版安装包取完整类体。让配置期和任务路径使用相同来源，并覆盖缺类检测、补齐和任务等价对照。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: forge-runtime-binpatch-inner-classes
+
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java
+index 7daf2b6b707022d5f0f72d216d896f6962d69733..3a16234257f244cbf15a822f316a7aee235f1384 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java
+@@ -83,6 +83,11 @@ public class PatchProvider extends DependencyProvider {
+ 		}
+ 	}
+ 
++	/** {@return 已解析的运行时补丁来源；尚未解析时为 null}. */
++	public @Nullable Path getRuntimeInstaller() {
++		return installerJar;
++	}
++
+ 	public Path extractClientPatches() {
+ 		if (clientPatches == null) {
+ 			clientPatches = projectCacheFolder.resolve("patches-client.lzma");
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+index 848785be13c17b8403a208b91a079b3d7d02b296..0faa8138a12a58e17cfec6a24c2f1870d632538c 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+@@ -41,6 +41,8 @@ import java.util.Collections;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
++import java.util.Set;
++import java.util.TreeSet;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.function.BiFunction;
+@@ -88,7 +90,13 @@ import org.objectweb.asm.ClassVisitor;
+ import org.objectweb.asm.ClassWriter;
+ import org.objectweb.asm.Label;
+ import org.objectweb.asm.MethodVisitor;
++import org.objectweb.asm.Opcodes;
++import org.objectweb.asm.tree.AbstractInsnNode;
+ import org.objectweb.asm.tree.ClassNode;
++import org.objectweb.asm.tree.FieldInsnNode;
++import org.objectweb.asm.tree.MethodInsnNode;
++import org.objectweb.asm.tree.MethodNode;
++import org.objectweb.asm.tree.TypeInsnNode;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+@@ -125,7 +133,7 @@ import net.fabricmc.tinyremapper.extension.mixin.MixinExtension;
+ 
+ public class MinecraftPatchedProvider {
+ 	private static final String LOOM_PATCH_VERSION_KEY = "Loom-Patch-Version";
+-	protected static final String CURRENT_LOOM_PATCH_VERSION = "10";
++	protected static final String CURRENT_LOOM_PATCH_VERSION = "11";
+ 	private static final String NAME_MAPPING_SERVICE_PATH = "/inject/META-INF/services/cpw.mods.modlauncher.api.INameMappingService";
+ 
+ 	// The version where the bug was introduced.
+@@ -420,8 +428,10 @@ public class MinecraftPatchedProvider {
+ 			wireVanillaJarDependencies(task);
+ 		}));
+ 
++		final Path runtimeInstaller = runtimeInstaller();
+ 		final Producer patchedProducer = RemapMinecraftTaskRegistry.claim(project, patchedIntermediate, Map.of(
+ 				"stage", "forge-patched-intermediate-jar",
++				"runtimeInstaller", runtimeInstaller == null ? "" : runtimeInstaller.toString(),
+ 				"mcVersion", extension.getMinecraftProvider().minecraftVersion(),
+ 				"forgeVersion", extension.getForgeProvider().getVersion().getCombined(),
+ 				"type", type.id
+@@ -435,6 +445,10 @@ public class MinecraftPatchedProvider {
+ 					// 补丁与工具声明都是配置期读项目模型得到的纯值/惰性声明（见 type.patches 与 createBinpatcherTool）
+ 					task.getPatches().set(type.patches.apply(extension.getPatchProvider(), extension.getForgeUserdevProvider()).toFile());
+ 					task.getBinpatcherTool().set(createBinpatcherTool());
++
++					if (runtimeInstaller != null) {
++						task.getRuntimeInstaller().set(runtimeInstaller.toFile());
++					}
+ 					task.getFixParameterAnnotations().set(extension.isForgeLikeAndNotOfficial() && !extension.isUnobfuscatedForge());
+ 					dependsOnProducer(task, prePatchProducer);
+ 				}));
+@@ -1821,6 +1835,13 @@ public class MinecraftPatchedProvider {
+ 		CoreModClassRemapper.remapJar(runtimeMojang, patchedJar, mappings, sourceNamespace);
+ 	}
+ 
++	/** {@return 合包 Forge 已解析的 installer；其它车道返回 null}. */
++	private @Nullable Path runtimeInstaller() {
++		final LoomGradleExtension extension = getExtension();
++		return type == Type.MERGED && extension.isForge() && extension.isModernForgeLike()
++				? extension.getPatchProvider().getRuntimeInstaller() : null;
++	}
++
+ 	/**
+ 	 * 生产打补丁后的中间产物.
+ 	 *
+@@ -1833,16 +1854,123 @@ public class MinecraftPatchedProvider {
+ 				output,
+ 				type.patches.apply(getExtension().getPatchProvider(), getExtension().getForgeUserdevProvider()),
+ 				createBinpatcherTool(),
++				runtimeInstaller(),
+ 				getExtension().isForgeLikeAndNotOfficial() && !getExtension().isUnobfuscatedForge(),
+ 				logger::lifecycle,
+ 				logger::info);
+ 	}
+ 
++	/** zip 条目路径去掉前导斜杠与 .class 后缀. */
++	private static String entryName(Path path) {
++		String name = path.toString().replace('\\', '/');
++
++		while (name.startsWith("/")) {
++			name = name.substring(1);
++		}
++
++		return name.endsWith(".class") ? name.substring(0, name.length() - ".class".length()) : name;
++	}
++
++	/**
++	 * 检测补丁产物里「被指令引用、但类条目不存在」的内部类，返回缺失条目.
++	 *
++	 * <p>为什么需要这一步：Forge 的 userdev 包只发布 <b>merged</b> 补丁（{@code joined.lzma}，
++	 * 实测 1.21.11 + Forge 61.2.5 共 7270 条，其中<b>零</b>条是含 {@code $} 的内部类），
++	 * 而官方 installer 的运行时补丁（{@code data/client.lzma}、{@code data/server.lzma}）
++	 * 各自含 810 / 809 条内部类补丁。也就是说补丁并非天生缺类，是 <b>userdev 这一路的材料不完整</b>：
++	 * 用 userdev 自建 dev 环境时，{@code Items.class} 会被打上活跃的 {@code new Items$1} 与
++	 * {@code invokespecial Items$1.<init>}，但 {@code Items$1.class} 无从产生。
++	 * 普通安装与服务端走运行时补丁，不受影响。
++	 *
++	 * <p>后果：运行到该类初始化时才抛 {@code NoClassDefFoundError}，栈上看到的却是触发方
++	 * （例如 {@code ComposterBlock.boot_strap} 里的 {@code getstatic Items.XXX}），
++	 * 与实际缺陷点相距很远，极难定位。所以在构建期就查出来，并交给
++	 * {@link RuntimeBinpatchExtractor} 从运行时补丁补齐。
++	 *
++	 * <h4>判据为什么以「指令引用」为准，而不是 {@code InnerClasses} 属性</h4>
++	 *
++	 * <p>{@code InnerClasses} 会大量引用<b>不在本 jar 内</b>的外部类（{@code java/util/Map$Entry}、
++	 * guava 的 {@code ImmutableList$Builder} 等），把它们算作缺失会产生成百上千条误报
++	 * （实测 166 条里 156 条属于此类）。而「被 {@code new}/{@code getstatic} 等指令实际引用」
++	 * 的类必然要在运行时被解析，缺失即为真缺陷。两个条件同时收窄到本 jar 应自带的命名空间。
++	 *
++	 * @return 被引用但条目缺失的类名集合（{@code net/minecraft/...} 形式）；为空表示自洽
++	 */
++	public static Set<String> verifyNoDanglingInnerClassReferences(Path patchedJar, Consumer<String> info) throws IOException {
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(patchedJar)) {
++			final Path root = fs.get().getPath("/");
++			final Set<String> present = new TreeSet<>();
++			final List<Path> classes = new ArrayList<>();
++			try (var paths = Files.walk(root)) {
++				paths.filter(Files::isRegularFile).filter(path -> path.toString().endsWith(".class")).forEach(path -> {
++					present.add(entryName(path));
++					classes.add(path);
++				});
++			}
++
++			// 缺失类 -> 引用它的类（去重后按名字排序，报错信息稳定可比对）。
++			final Map<String, Set<String>> missing = new java.util.TreeMap<>();
++
++			for (Path path : classes) {
++				final String own = entryName(path);
++
++				final List<String> refs = new ArrayList<>();
++
++				try {
++					ClassNode node = new ClassNode();
++					new ClassReader(Files.readAllBytes(path)).accept(node, 0);
++
++					for (MethodNode method : node.methods) {
++						for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
++							// 只收「运行时会去解析某个类」的指令。InnerClasses 属性靠不住：
++							// 匿名类那条的 outer_class_info_index 是 0，按 outer 过滤会漏掉 Items$1 这类目标，
++							// 而 new/invokespecial 是实打实要加载该类的。
++							if (insn instanceof TypeInsnNode typeInsn) {
++								switch (typeInsn.getOpcode()) {
++								case Opcodes.NEW:
++								case Opcodes.CHECKCAST:
++								case Opcodes.ANEWARRAY:
++								case Opcodes.INSTANCEOF:
++									refs.add(typeInsn.desc);
++									break;
++								default:
++									break;
++								}
++							} else if (insn instanceof MethodInsnNode methodInsn) {
++								refs.add(methodInsn.owner);
++							} else if (insn instanceof FieldInsnNode fieldInsn) {
++								refs.add(fieldInsn.owner);
++							}
++						}
++					}
++				} catch (RuntimeException e) {
++					// 解析失败的类不参与判定：这里的目标是查缺失，不是校验字节码合法性。
++					continue;
++				}
++
++				for (String ref : refs) {
++					final String cls = ref.startsWith("[") ? org.objectweb.asm.Type.getType(ref).getElementType().getInternalName() : ref;
++
++					if (cls.startsWith("net/minecraft/") && cls.contains("$") && !present.contains(cls)) {
++						missing.computeIfAbsent(cls, k -> new TreeSet<>()).add(own);
++					}
++				}
++			}
++
++			if (missing.isEmpty()) {
++				info.accept(":no dangling inner-class references in patched jar");
++				return Set.of();
++			}
++
++			return missing.keySet();
++		}
++	}
++
+ 	/**
+ 	 * 打补丁后的中间产物的生产实现（配置期路径与执行期任务共用）.
+ 	 *
+-	 * <p>顺序与改造前逐字一致：binpatcher 打补丁 → 补出 pre-patch jar 里存在而补丁结果里缺失的类
+-	 * → 删除 vignette 参数名 → （非 official 的 Forge 系）修补参数注解。
++	 * <p>binpatcher 打补丁 → 补出 pre-patch jar 里存在而补丁结果里缺失的类
++	 * → 删除 vignette 参数名 → （非 official 的 Forge 系）修补参数注解 → 检查并补入缺失内部类。
+ 	 *
+ 	 * <p>静态：任务对象要能被配置缓存序列化，因此生产不能经由 provider 实例（见 {@link ProductionOptions}）。
+ 	 *
+@@ -1856,9 +1984,11 @@ public class MinecraftPatchedProvider {
+ 	 * @param fixParameterAnnotations 是否修补参数注解
+ 	 * @param lifecycle lifecycle 日志出口（配置期是项目 logger，执行期是任务 logger）
+ 	 * @param info info 日志出口（同上）
++	 * @param runtimeInstaller Forge 官方 installer jar（用于补齐缺失内部类）；{@code null} 表示本车道不运行补齐
+ 	 */
+ 	public static void producePatchedIntermediateForTask(Path prePatchJar, Path output, Path patches,
+-			ForgeExternalToolService.Options binpatcherTool, boolean fixParameterAnnotations,
++			ForgeExternalToolService.Options binpatcherTool, @Nullable Path runtimeInstaller,
++			boolean fixParameterAnnotations,
+ 			Consumer<String> lifecycle, Consumer<String> info) throws Exception {
+ 		Stopwatch stopwatch = Stopwatch.createStarted();
+ 		lifecycle.accept(":patching jars");
+@@ -1874,9 +2004,70 @@ public class MinecraftPatchedProvider {
+ 			fixParameterAnnotation(output, info);
+ 		}
+ 
++		if (runtimeInstaller != null) {
++			final Set<String> dangling = verifyNoDanglingInnerClassReferences(output, info);
++
++			if (!dangling.isEmpty()) {
++				fillDanglingInnerClasses(output, dangling, runtimeInstaller, info);
++			}
++		}
++
+ 		lifecycle.accept(":patched jars in " + stopwatch.stop());
+ 	}
+ 
++	/**
++	 * 用官方 installer 的运行时补丁补齐缺失的内部类；缺条目只警告，读取失败仍传播.
++	 *
++	 * <p>警告而非中断：这是 Forge userdev 材料的上游缺口（见
++	 * {@link #verifyNoDanglingInnerClassReferences} 的说明），中断会把所有 Forge 开发环境卡死，
++	 * 而运行时产物走的是另一套完整补丁，实际部署不受影响。补齐失败时把事实讲清楚即可。
++	 *
++	 * @param patchedJar 待补齐的补丁产物
++	 * @param missing    缺失的类名集合
++	 * @param info       日志出口
++	 */
++	private static void fillDanglingInnerClasses(Path patchedJar, Set<String> missing, Path installer,
++			Consumer<String> info) throws IOException {
++		if (Files.notExists(installer)) {
++			info.accept(":警告：补丁产物缺 " + missing.size() + " 个内部类，且没有可用的 Forge installer 可用于补齐。\n"
++					+ "  Forge 的 userdev 补丁（joined.lzma）不含内部类条目，官方 installer 的运行时补丁才是完整的。\n"
++					+ "  运行到这些类会抛 NoClassDefFoundError。缺失清单：" + RuntimeBinpatchExtractor.sorted(missing));
++			return;
++		}
++
++		final Path tempDir = Files.createTempDirectory("loom-binpatch-fill");
++
++		try {
++			final int filled = RuntimeBinpatchExtractor.fillMissingInnerClasses(
++					installer, patchedJar, missing, tempDir, info);
++
++			if (filled < missing.size()) {
++				final Set<String> still = verifyNoDanglingInnerClassReferences(patchedJar, info);
++
++				if (!still.isEmpty()) {
++					info.accept(":警告：仍有 " + still.size() + " 个内部类无法补齐（installer 的运行时补丁里没有）："
++							+ RuntimeBinpatchExtractor.sorted(still));
++				}
++			}
++		} finally {
++			deleteRecursively(tempDir);
++		}
++	}
++
++	private static void deleteRecursively(Path dir) {
++		try (var paths = Files.walk(dir)) {
++			paths.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
++				try {
++					Files.deleteIfExists(p);
++				} catch (IOException ignored) {
++					// 临时目录清理失败不影响构建结果。
++				}
++			});
++		} catch (IOException ignored) {
++			// 同上。
++		}
++	}
++
+ 	/**
+ 	 * 对给定 jar 执行 Forge 的 binary patch.
+ 	 *
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/RuntimeBinpatchExtractor.java b/src/main/java/dev/architectury/loom/forge/minecraft/RuntimeBinpatchExtractor.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..f71e40af7ae009d1e5121a390d5a5cf607afa0dd
+--- /dev/null
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/RuntimeBinpatchExtractor.java
+@@ -0,0 +1,323 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package dev.architectury.loom.forge.minecraft;
++
++import java.io.ByteArrayInputStream;
++import java.io.DataInputStream;
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.StandardCopyOption;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeMap;
++import java.util.TreeSet;
++import java.util.function.Consumer;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipFile;
++
++import lzma.sdk.lzma.Decoder;
++import lzma.streams.LzmaInputStream;
++import org.jspecify.annotations.Nullable;
++import org.objectweb.asm.ClassReader;
++import org.objectweb.asm.tree.ClassNode;
++
++import net.fabricmc.loom.util.FileSystemUtil;
++
++/**
++ * 用 Forge 官方 installer 的运行时补丁包补齐 userdev 产物里缺失的内部类.
++ *
++ * <h2>为什么需要它</h2>
++ *
++ * <p>Forge 的 userdev 包只发布合并后的补丁 {@code joined.lzma}，其中<b>不含任何内部类/匿名类的
++ * 补丁条目</b>（实测 1.21.11 + 61.2.5：7270 条里 {@code $} 条目为 0）。而官方 installer 的运行时
++ * 补丁 {@code data/client.lzma} / {@code data/server.lzma} 是完整的（分别含 810 / 809 条）。
++ * 于是用 userdev 自建开发环境时，{@code Items.class} 会引用 {@code Items$1} 却没有该类，
++ * 运行到类初始化就抛 {@code NoClassDefFoundError}，而栈顶指向的常是无关的触发方
++ * （例如 {@code ComposterBlock.boot_strap} 里的 {@code getstatic Items.XXX}）。
++ *
++ * <p>两份补丁锚定同一份原版 jar，命名空间一致（均为官方名），因此运行时补丁里的类体可以
++ * 直接搬进 userdev 产物，无需任何映射转换。这也是本方案安全的前提：不做名字推断、不做语义改写，
++ * 只是把本该存在、却没被 userdev 补丁覆盖的类原样补上。
++ *
++ * <h2>只补缺失的</h2>
++ *
++ * <p>唯一被改写的是「产物里没有该条目」的类。已存在的一律不动——userdev 产物里那些类可能
++ * 已被重新编译过（参数名删除等），覆盖只会引入差异。
++ */
++public final class RuntimeBinpatchExtractor {
++	private static final byte[] CLASS_MAGIC = {(byte) 0xCA, (byte) 0xFE, (byte) 0xBA, (byte) 0xBE};
++
++	private RuntimeBinpatchExtractor() {
++	}
++
++	/**
++	 * 从 installer 中取出运行时补丁包，补齐 {@code patchedJar} 里缺失的内部类.
++	 *
++	 * @param installer   Forge 官方 installer jar（含 {@code data/client.lzma} 与 {@code data/server.lzma}）
++	 * @param patchedJar  待补齐的补丁产物，原地改写
++	 * @param missing     需要补的类名（{@code net/minecraft/...} 形式，不含 {@code .class}）
++	 * @param tempDir     解压 lzma 用的临时目录
++	 * @param info        日志出口
++	 * @return 实际补入的类数
++	 */
++	public static int fillMissingInnerClasses(Path installer, Path patchedJar, Set<String> missing,
++			Path tempDir, Consumer<String> info) throws IOException {
++		if (missing.isEmpty()) {
++			return 0;
++		}
++
++		// 类名 -> 类体。两份补丁可能都含同名类（client/server 各有侧重），先到先得即可：
++		// 同一版本的 client 与 server 补丁对同一个类产出的字节码是一致的。
++		final Map<String, byte[]> bodies = new TreeMap<>();
++
++		try (ZipFile installerZip = new ZipFile(installer.toFile())) {
++			for (String entry : new String[] {"data/client.lzma", "data/server.lzma"}) {
++				final ZipEntry zipEntry = installerZip.getEntry(entry);
++
++				if (zipEntry == null) {
++					continue;
++				}
++
++				final byte[] lzma = installerZip.getInputStream(zipEntry).readAllBytes();
++				collectFromPatchBundle(lzma, missing, bodies, tempDir);
++			}
++		}
++
++		if (bodies.isEmpty()) {
++			info.accept(":installer 的运行时补丁里没有找到任何待补的类");
++			return 0;
++		}
++
++		return writeIntoJar(patchedJar, bodies, info);
++	}
++
++	/**
++	 * 从一份运行时补丁包（lzma 压缩的 zip）里取出指定类的类体.
++	 *
++	 * <p>补丁包条目形如 {@code net.minecraft.world.item.Items$1.binpatch}——注意是点分全名，
++	 * 且 {@code $} 属于类名而不是包分隔符，转路径时只能在 {@code $} 之前的点换成分隔符。
++	 */
++	private static void collectFromPatchBundle(byte[] lzma, Set<String> missing, Map<String, byte[]> bodies,
++			Path tempDir) throws IOException {
++		final Path archive = tempDir.resolve("runtime-patches-" + System.nanoTime() + ".zip");
++
++		try {
++			// Forge 的 .lzma 是 lzma1 容器，用与 PatchProvider 相同的库解。
++			// 若输入本身已是 zip（例如测试或未来的未压缩发布形态），直接用，不去解 lzma。
++			if (isZip(lzma)) {
++				Files.write(archive, lzma);
++			} else {
++				try (LzmaInputStream in = new LzmaInputStream(new ByteArrayInputStream(lzma), new Decoder())) {
++					Files.copy(in, archive, StandardCopyOption.REPLACE_EXISTING);
++				}
++			}
++
++			try (ZipFile zip = new ZipFile(archive.toFile())) {
++				final var entries = zip.entries();
++
++				while (entries.hasMoreElements()) {
++					final ZipEntry entry = entries.nextElement();
++					final String name = entry.getName();
++
++					if (!name.endsWith(".binpatch")) {
++						continue;
++					}
++
++					final String className = binpatchNameToClassName(name);
++
++					if (className == null || !missing.contains(className) || bodies.containsKey(className)) {
++						continue;
++					}
++
++					final byte[] body = readClassBody(zip.getInputStream(entry).readAllBytes());
++
++				// 条目名不能证明类体已经位于目标命名空间。
++				if (body != null && className.equals(new ClassReader(body).getClassName())) {
++					bodies.put(className, body);
++				}
++				}
++			}
++		} finally {
++			Files.deleteIfExists(archive);
++		}
++	}
++
++	/**
++	 * {@code net.minecraft.world.item.Items$1.binpatch} → {@code net/minecraft/world/item/Items$1}.
++	 *
++	 * <p>不能简单地把所有点换成斜杠：{@code $} 后的编号属于类名，若整体替换，
++	 * {@code Items$1} 仍是 {@code Items$1}（该段内无点），但包名部分必须先转成斜杠。
++	 * 这里按「最后一个 {@code $} 之后不再拆分」的规则处理即可满足 binpatch 的命名。
++	 */
++	private static @Nullable String binpatchNameToClassName(String entryName) {
++		final String base = entryName.substring(0, entryName.length() - ".binpatch".length());
++		final int firstDollar = base.indexOf('$');
++		final String pkgPart = firstDollar >= 0 ? base.substring(0, firstDollar) : base;
++		final String innerPart = firstDollar >= 0 ? base.substring(firstDollar) : "";
++
++		return pkgPart.replace('.', '/') + innerPart;
++	}
++
++	/**
++	 * 从 binpatch 负载里取出内嵌的 class 字节码.
++	 *
++	 * <p>格式（version 1，与 Forge {@code Patch.from(InputStream)} 逐字段对应）：
++	 * {@code u1 版本, UTF 源名, UTF 目标名, boolean exists,
++	 * [exists 时 u4 校验和], u4 数据长度, 数据}。
++	 *
++	 * <p><b>只有 {@code exists == false} 的条目可以安全取出。</b>该标志的语义是「补丁前，
++	 * 原版 jar 里是否已有这个类」：
++	 * <ul>
++	 *   <li>{@code false}——原版没有此类，数据是完整类体，可直接用；</li>
++	 *   <li>{@code true}——原版已有此类，数据是以原类为源的 GDIFF 差分，<b>不是</b>类文件。
++	 *       要还原必须拿到那份原类，而它是官方混淆客户端，本仓库的产物链从未产生，
++	 *       因此这里返回 {@code null}，由调用方跳过（宁可不补，也不补错）。</li>
++	 * </ul>
++	 *
++	 * <p>实测：{@code Items$1} 等缺失类全是 {@code exists == false}；需要差分的那批
++	 * （如 {@code BrewingStandMenu$PotionSlot}）本就不在缺失列表里。
++	 *
++	 * <p>即便标志为 {@code false}，仍用 ASM 复核一遍类结构：早期实现只扫描 {@code CAFEBABE}
++	 * 魔数就返回，遇到差分补丁会把魔数之后的碎片当成类写进产物，直到运行时才暴露。
++	 */
++	private static byte @Nullable [] readClassBody(byte[] binpatch) {
++		try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(binpatch))) {
++			final int version = in.readUnsignedByte();
++
++			if (version != 1) {
++				return null;
++			}
++
++			skipString(in); // 源类名
++			skipString(in); // 目标类名
++			// exists：原版 jar 是否已有该类。为 true 时数据是 GDIFF 差分，无法在此还原。
++			final boolean exists = in.readUnsignedByte() != 0;
++
++			if (exists) {
++				return null;
++			}
++
++			in.readInt(); // 数据长度；按流读到底即可，长度仅用于切分。
++
++			final byte[] rest = in.readAllBytes();
++			final int offset = indexOf(rest, CLASS_MAGIC);
++
++			if (offset < 0) {
++				return null;
++			}
++
++			final byte[] body = new byte[rest.length - offset];
++			System.arraycopy(rest, offset, body, 0, body.length);
++			return isLoadableClass(body) ? body : null;
++		} catch (IOException e) {
++			return null;
++		}
++	}
++
++	/** 用 ASM 复核：能完整读出类结构才算合法，避免把差分碎片当成类写进产物. */
++	private static boolean isLoadableClass(byte[] body) {
++		try {
++			new ClassReader(body).accept(new ClassNode(), 0);
++			return true;
++		} catch (RuntimeException e) {
++			return false;
++		}
++	}
++
++	/** 是否是 zip（PK 魔数）. */
++	private static boolean isZip(byte[] bytes) {
++		return bytes.length >= 4 && bytes[0] == 0x50 && bytes[1] == 0x4B;
++	}
++
++	private static void skipString(DataInputStream in) throws IOException {
++		final int length = in.readUnsignedShort();
++		in.readNBytes(length);
++	}
++
++	private static int indexOf(byte[] haystack, byte[] needle) {
++		outer:
++
++		for (int i = 0; i <= haystack.length - needle.length; i++) {
++			for (int j = 0; j < needle.length; j++) {
++				if (haystack[i + j] != needle[j]) {
++					continue outer;
++				}
++			}
++
++			return i;
++		}
++
++		return -1;
++	}
++
++	/** 把类体写进 jar；已存在的条目一律跳过，返回实际写入数. */
++	private static int writeIntoJar(Path jar, Map<String, byte[]> bodies, Consumer<String> info) throws IOException {
++		int written = 0;
++
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar, false)) {
++			for (Map.Entry<String, byte[]> entry : bodies.entrySet()) {
++				final String path = entry.getKey() + ".class";
++				final Path target = fs.get().getPath(path);
++
++				if (Files.exists(target)) {
++					continue;
++				}
++
++				final Path parent = target.getParent();
++
++				if (parent != null) {
++					Files.createDirectories(parent);
++				}
++
++				Files.write(target, entry.getValue());
++				written++;
++			}
++		}
++
++		if (written > 0) {
++			info.accept(":从 installer 的运行时补丁补入 " + written + " 个缺失内部类");
++		}
++
++		return written;
++	}
++
++	/** 与 {@link #fillMissingInnerClasses} 配套：把待补集合转成排序后的列表，便于稳定日志. */
++	public static List<String> sorted(Set<String> classes) {
++		return new ArrayList<>(new TreeSet<>(classes));
++	}
++
++	/** 仅供测试：直接解析单个 binpatch 的类体. */
++	static byte @Nullable [] readClassBodyForTest(byte[] binpatch) {
++		return readClassBody(binpatch);
++	}
++
++	/** 仅供测试：binpatch 条目名转类名. */
++	static @Nullable String binpatchNameToClassNameForTest(String entryName) {
++		return binpatchNameToClassName(entryName);
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/GenerateForgePatchedIntermediateJarTask.java b/src/main/java/net/fabricmc/loom/pipeline/GenerateForgePatchedIntermediateJarTask.java
+index 25c3b53007c7f40f2766fe97d098514220f50f6e..ddd1798bcbe15a645a881b6d0caf491396265752 100644
+--- a/src/main/java/net/fabricmc/loom/pipeline/GenerateForgePatchedIntermediateJarTask.java
++++ b/src/main/java/net/fabricmc/loom/pipeline/GenerateForgePatchedIntermediateJarTask.java
+@@ -35,6 +35,7 @@ import org.gradle.api.tasks.CacheableTask;
+ import org.gradle.api.tasks.Input;
+ import org.gradle.api.tasks.InputFile;
+ import org.gradle.api.tasks.Nested;
++import org.gradle.api.tasks.Optional;
+ import org.gradle.api.tasks.OutputFile;
+ import org.gradle.api.tasks.PathSensitive;
+ import org.gradle.api.tasks.PathSensitivity;
+@@ -80,6 +81,19 @@ public abstract class GenerateForgePatchedIntermediateJarTask extends DefaultTas
+ 	@Nested
+ 	public abstract Property<ForgeExternalToolService.Options> getBinpatcherTool();
+ 
++	/**
++	 * Forge 官方 installer jar，只用来读它的运行时补丁（{@code data/client.lzma}、{@code data/server.lzma}）.
++	 *
++	 * <p>userdev 发布的补丁（{@code joined.lzma}）不含内部类条目，缺失的类只能从这里取——
++	 * 两份补丁锚定同一份原版 jar、命名空间一致，所以类体可以直接搬。
++	 *
++	 * <p>可选：未配置时不运行补齐；配置的文件不存在或无法解析仍是错误。
++	 */
++	@Optional
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getRuntimeInstaller();
++
+ 	/** 是否在打补丁后修补参数注解（非 official 的 Forge 系）. */
+ 	@Input
+ 	public abstract Property<Boolean> getFixParameterAnnotations();
+@@ -97,6 +111,7 @@ public abstract class GenerateForgePatchedIntermediateJarTask extends DefaultTas
+ 				tmp,
+ 				getPatches().get().getAsFile().toPath(),
+ 				getBinpatcherTool().get(),
++				getRuntimeInstaller().isPresent() ? getRuntimeInstaller().get().getAsFile().toPath() : null,
+ 				getFixParameterAnnotations().get(),
+ 				getLogger()::lifecycle,
+ 				getLogger()::info));
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgePatchedChainTaskEquivalenceTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgePatchedChainTaskEquivalenceTest.groovy
+index 2caede18f011106b5e13b1f32c73814f8086e9c5..f9908eeba40abac797d2239df5f5d628e8bf989e 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgePatchedChainTaskEquivalenceTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgePatchedChainTaskEquivalenceTest.groovy
+@@ -281,6 +281,7 @@ class ForgePatchedChainTaskEquivalenceTest extends Specification implements Grad
+ 					referenceIntermediate.toPath(),
+ 					extension.forgeUserdevProvider.joinedPatches,
+ 					provider.createBinpatcherTool(),
++					extension.patchProvider.getRuntimeInstaller(),
+ 					intermediateTask.fixParameterAnnotations.get(),
+ 					lifecycle,
+ 					info)
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeDanglingInnerClassTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeDanglingInnerClassTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..1206d936a5650317867cf0c77881075e6a46deea
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeDanglingInnerClassTest.groovy
+@@ -0,0 +1,134 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.forge
++
++import java.nio.file.Files
++import java.nio.file.Path
++import java.util.zip.ZipEntry
++import java.util.zip.ZipOutputStream
++
++import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider
++import org.objectweb.asm.ClassWriter
++import org.objectweb.asm.Opcodes
++import spock.lang.Specification
++import spock.lang.TempDir
++
++/**
++ * 校验「悬空内部类检测」的判据：被指令引用但条目缺失时才报，其余一律放过。
++ *
++ * <p>这类缺失是 Forge 二进制补丁的通病（只带引用、不带类体），运行期才炸且栈指向触发方，
++ * 所以要在构建期拦住。用例用合成 jar 覆盖三种情形：真缺失、类在、外部命名空间。
++ */
++class ForgeDanglingInnerClassTest extends Specification {
++	@TempDir
++	Path tempDir
++
++	private static byte[] classReferencing(String selfName, String targetName) {
++		def cw = new ClassWriter(0)
++		cw.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, selfName, null, "java/lang/Object", null)
++
++		// 一个静态初值里 new 一次目标类：这正是 Items.<clinit> 里 new Items$1 的形态。
++		def mv = cw.visitMethod(Opcodes.ACC_STATIC, "<clinit>", "()V", null, null)
++		mv.visitCode()
++		mv.visitTypeInsn(Opcodes.NEW, targetName)
++		mv.visitInsn(Opcodes.DUP)
++		mv.visitMethodInsn(Opcodes.INVOKESPECIAL, targetName, "<init>", "()V", false)
++		mv.visitInsn(Opcodes.POP)
++		mv.visitInsn(Opcodes.RETURN)
++		mv.visitMaxs(2, 0)
++		mv.visitEnd()
++
++		cw.visitEnd()
++		return cw.toByteArray()
++	}
++
++	private static byte[] simpleClass(String name) {
++		def cw = new ClassWriter(0)
++		cw.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, name, null, "java/lang/Object", null)
++		def mv = cw.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null)
++		mv.visitCode()
++		mv.visitVarInsn(Opcodes.ALOAD, 0)
++		mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false)
++		mv.visitInsn(Opcodes.RETURN)
++		mv.visitMaxs(1, 1)
++		mv.visitEnd()
++		cw.visitEnd()
++		return cw.toByteArray()
++	}
++
++	private Path jarWith(Map<String, byte[]> entries) {
++		Path jar = tempDir.resolve("probe-${UUID.randomUUID()}.jar")
++		new ZipOutputStream(Files.newOutputStream(jar)).withCloseable { ZipOutputStream out ->
++			entries.each { name, bytes ->
++				out.putNextEntry(new ZipEntry(name))
++				out.write(bytes)
++				out.closeEntry()
++			}
++		}
++		return jar
++	}
++
++	def "引用了不存在的内部类时把该缺失类报出来"() {
++		given: "宿主类里 new 了一个不存在的内部类"
++		def jar = jarWith([
++			"net/minecraft/world/item/Items.class": classReferencing("net/minecraft/world/item/Items", "net/minecraft/world/item/Items\$1"),
++		])
++
++		when: "检测缺失"
++		def missing = MinecraftPatchedProvider.verifyNoDanglingInnerClassReferences(jar, { String ignored -> } as java.util.function.Consumer)
++
++		then: "返回缺失集合，交由后续补齐步骤处理"
++		missing == [
++			"net/minecraft/world/item/Items\$1"
++		] as Set
++	}
++
++	def "内部类存在时不报错"() {
++		given: "被引用的内部类就在 jar 里"
++		def jar = jarWith([
++			"net/minecraft/world/item/Items.class": classReferencing("net/minecraft/world/item/Items", "net/minecraft/world/item/Items\$1"),
++			"net/minecraft/world/item/Items\$1.class": simpleClass("net/minecraft/world/item/Items\$1"),
++		])
++		when:
++		def missing = MinecraftPatchedProvider.verifyNoDanglingInnerClassReferences(jar, { String ignored -> } as java.util.function.Consumer)
++
++		then: "不报缺失"
++		missing.isEmpty()
++	}
++
++	def "引用外部命名空间的类不算缺失"() {
++		given: "引用了不在本 jar 的 JDK 类与 guava 类"
++		def jar = jarWith([
++			"net/minecraft/world/item/Items.class": classReferencing("net/minecraft/world/item/Items", "java/util/ArrayList"),
++			"net/minecraft/Probe.class": classReferencing("net/minecraft/Probe", "com/google/common/collect/ImmutableList\$Builder"),
++		])
++
++		when:
++		def missing = MinecraftPatchedProvider.verifyNoDanglingInnerClassReferences(jar, { String ignored -> } as java.util.function.Consumer)
++
++		then: "只看 net/minecraft/ 命名空间，不报外部依赖"
++		missing.isEmpty()
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/forge/RuntimeBinpatchExtractorTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/forge/RuntimeBinpatchExtractorTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9bf2fc6096a40c7624b1d78cd6b32e0bdc47e8a
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/forge/RuntimeBinpatchExtractorTest.groovy
+@@ -0,0 +1,252 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.forge
++
++import java.nio.file.Files
++import java.nio.file.Path
++import java.util.zip.ZipEntry
++import java.util.zip.ZipFile
++import java.util.zip.ZipOutputStream
++
++import dev.architectury.loom.forge.minecraft.RuntimeBinpatchExtractor
++import org.objectweb.asm.ClassReader
++import org.objectweb.asm.ClassWriter
++import org.objectweb.asm.Opcodes
++import spock.lang.Specification
++import spock.lang.TempDir
++
++/**
++ * 校验「从 Forge installer 的运行时补丁补齐缺失内部类」的关键步骤。
++ *
++ * <p>背景：userdev 的 joined.lzma 不含内部类条目，而 installer 的 client/server 补丁含
++ * 完整的类体。本工具把后者里指定类的字节码搬进产物。用例聚焦两处最容易出错的逻辑：
++ * 条目名到类名的转换（{@code $} 不是包分隔符）、以及 binpatch 头部之后取内嵌 class。
++ */
++class RuntimeBinpatchExtractorTest extends Specification {
++	@TempDir
++	Path tempDir
++
++	/** 造一份最小 class 字节码，供内嵌到 binpatch 里。 */
++	private static byte[] sampleClass(String name) {
++		def cw = new ClassWriter(0)
++		cw.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, name, null, "java/lang/Object", null)
++		cw.visitEnd()
++		return cw.toByteArray()
++	}
++
++	/**
++	 * 按 binpatch v1 格式拼一份「含完整 class」的补丁：
++	 * u1 版本, u2 源名长 + 源名, u2 目标名长 + 目标名, u1 标志, u4 校验和, 负载。
++	 */
++	private static byte[] binpatchWith(String name, byte[] classBytes) {
++		def out = new ByteArrayOutputStream()
++		def data = new DataOutputStream(out)
++		data.writeByte(1)
++		data.writeUTF(name)
++		data.writeUTF(name)
++		data.writeByte(0)
++		data.writeInt(0)
++		// 负载前置一段无关字节，验证实现是按魔数扫描而不是硬编码偏移。
++		data.write([0xD1, 0xFF, 0xD1, 0xFF, 4, 7] as byte[])
++		data.write(classBytes)
++		data.flush()
++		return out.toByteArray()
++	}
++
++	def "binpatch 条目名转类名时 \$ 不被当作包分隔符"() {
++		expect:
++		RuntimeBinpatchExtractor.binpatchNameToClassNameForTest(entry) == expected
++
++		where:
++		entry                                                | expected
++		"net.minecraft.world.item.Items\$1.binpatch"         | "net/minecraft/world/item/Items\$1"
++		"net.minecraft.world.item.Items.binpatch"            | "net/minecraft/world/item/Items"
++		"com.mojang.blaze3d.opengl.GlStateManager\$1.binpatch" | "com/mojang/blaze3d/opengl/GlStateManager\$1"
++	}
++
++	def "从 binpatch 负载里取出内嵌的 class 字节码"() {
++		given:
++		def original = sampleClass("net/minecraft/world/item/Items\$1")
++		def patch = binpatchWith("net.minecraft.world.item.Items\$1", original)
++
++		when:
++		def extracted = RuntimeBinpatchExtractor.readClassBodyForTest(patch)
++
++		then: "提取到的就是那份 class"
++		extracted != null
++		extracted == original
++		new ClassReader(extracted).getClassName() == "net/minecraft/world/item/Items\$1"
++	}
++
++	def "负载里没有 class 魔数时返回 null 而不是抛错"() {
++		given: "只有头部没有任何类体"
++		def out = new ByteArrayOutputStream()
++		def data = new DataOutputStream(out)
++		data.writeByte(1)
++		data.writeUTF("a.B")
++		data.writeUTF("a.B")
++		data.writeByte(0)
++		data.writeInt(0)
++		data.flush()
++
++		expect:
++		RuntimeBinpatchExtractor.readClassBodyForTest(out.toByteArray()) == null
++	}
++
++	def "版本号不是 1 时保守返回 null"() {
++		given:
++		def cls = sampleClass("a.B")
++		def bad = binpatchWith("a.B", cls)
++		bad[0] = (byte) 2
++
++		expect:
++		RuntimeBinpatchExtractor.readClassBodyForTest(bad) == null
++	}
++
++	def "exists=true 的差分补丁一律返回 null"() {
++		given: "该标志表示原版已有此类，数据是以原类为源的 GDIFF 差分，不是类文件"
++		def original = sampleClass("net/minecraft/world/inventory/BrewingStandMenu\$PotionSlot")
++		def patch = binpatchWith("net/minecraft/world/inventory/BrewingStandMenu\$PotionSlot", original)
++		// 把 exists 字节从 0 改成 1：位置在 版本(1) + UTF(2+len)*2 之后
++		def nameLen = "net/minecraft/world/inventory/BrewingStandMenu\$PotionSlot".length()
++		patch[1 + 2 + nameLen + 2 + nameLen] = (byte) 1
++
++		expect: "即使负载里确实嵌着合法 class，也不许取出来"
++		RuntimeBinpatchExtractor.readClassBodyForTest(patch) == null
++	}
++
++	def "魔数之后的结构不合法时也返回 null"() {
++		given: "负载里有 CAFEBABE，但后面是垃圾 —— 早期实现会把碎片当类写进产物"
++		def out = new ByteArrayOutputStream()
++		def data = new DataOutputStream(out)
++		data.writeByte(1)
++		data.writeUTF("a.Bad")
++		data.writeUTF("a.Bad")
++		data.writeByte(0)
++		data.writeInt(0)
++		data.write([
++			0xCA,
++			0xFE,
++			0xBA,
++			0xBE,
++			0x00,
++			0x00,
++			0x00,
++			0x41,
++			0x6e,
++			0xf9,
++			0x07
++		] as byte[])
++		data.flush()
++
++		expect:
++		RuntimeBinpatchExtractor.readClassBodyForTest(out.toByteArray()) == null
++	}
++
++	def "只补缺失的类，已存在的一律不动"() {
++		given: "产物里已有 Items.class，但没有 Items\$1.class 与 Extra.class"
++		def existing = sampleClass("net/minecraft/world/item/Items")
++		def jar = tempDir.resolve("patched.jar")
++		new ZipOutputStream(Files.newOutputStream(jar)).withCloseable { ZipOutputStream zos ->
++			zos.putNextEntry(new ZipEntry("net/minecraft/world/item/Items.class"))
++			zos.write(existing)
++			zos.closeEntry()
++		}
++
++		and: "构造一份 installer：里面的运行时补丁包含 Items、Items\$1、Extra"
++		def installer = buildInstaller([
++			"net.minecraft.world.item.Items": sampleClass("net/minecraft/world/item/Items"),
++			"net.minecraft.world.item.Items\$1": sampleClass("net/minecraft/world/item/Items\$1"),
++			"net.minecraft.world.item.Extra": sampleClass("net/minecraft/world/item/Extra"),
++		])
++
++		when: "只请求补 Items 与 Items\$1"
++		def filled = RuntimeBinpatchExtractor.fillMissingInnerClasses(
++				installer, jar, [
++					"net/minecraft/world/item/Items",
++					"net/minecraft/world/item/Items\$1"
++				] as Set,
++				tempDir, { String ignored -> } as java.util.function.Consumer)
++
++		then: "只新增缺失的那个，已有条目内容保持不变"
++		filled == 1
++		List<String> names
++		byte[] itemsBytes
++		new ZipFile(jar.toFile()).withCloseable { ZipFile zf ->
++			names = zf.entries().collect { it.name }
++			itemsBytes = zf.getInputStream(zf.getEntry("net/minecraft/world/item/Items.class")).bytes
++		}
++		names.contains("net/minecraft/world/item/Items\$1.class")
++		!names.contains("net/minecraft/world/item/Extra.class")
++		names.size() == 2
++		itemsBytes == existing
++	}
++
++	def "installer 里没有待补的类时不写入任何东西"() {
++		given:
++		def cls = sampleClass("a.B")
++		def jar = tempDir.resolve("empty-patched.jar")
++		new ZipOutputStream(Files.newOutputStream(jar)).withCloseable { ZipOutputStream zos ->
++			zos.putNextEntry(new ZipEntry("a/B.class"))
++			zos.write(cls)
++			zos.closeEntry()
++		}
++		def installer = buildInstaller(["a.B": cls])
++
++		when:
++		def filled = RuntimeBinpatchExtractor.fillMissingInnerClasses(
++				installer, jar, ["net/minecraft/NotThere"] as Set, tempDir, { String ignored -> } as java.util.function.Consumer)
++
++		then:
++		filled == 0
++	}
++
++	/** 造一份 installer：data/client.lzma 里放一个装 binpatch 的 zip（lzma 压缩）. */
++	private Path buildInstaller(Map<String, byte[]> classes) {
++		def patchZip = tempDir.resolve("patches.zip")
++		new ZipOutputStream(Files.newOutputStream(patchZip)).withCloseable { ZipOutputStream zos ->
++			classes.each { String cls, byte[] body ->
++				zos.putNextEntry(new ZipEntry(cls.replace('$', '\$') + ".binpatch"))
++				zos.write(binpatchWith(cls, body))
++				zos.closeEntry()
++			}
++		}
++
++		def lzmaBytes = compressLzma(Files.readAllBytes(patchZip))
++		def installer = tempDir.resolve("installer.jar")
++		new ZipOutputStream(Files.newOutputStream(installer)).withCloseable { ZipOutputStream zos ->
++			zos.putNextEntry(new ZipEntry("data/client.lzma"))
++			zos.write(lzmaBytes)
++			zos.closeEntry()
++		}
++		return installer
++	}
++
++	private static byte[] compressLzma(byte[] raw) {
++		// 测试里直接用未压缩 zip：实现侧对「不是 lzma 的输入」会回退成按 zip 读，
++		// 这样用例聚焦在类提取与写回逻辑上，不依赖 lzma 编码器的稳定性。
++		return raw
++	}
++}

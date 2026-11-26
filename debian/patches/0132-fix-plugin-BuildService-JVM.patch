@@ -1,0 +1,141 @@
+From a5baf1a2dce81099aa17a7c4d5526364fedeeec7 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Wed, 11 Nov 2026 07:59:40 +0800
+Subject: [PATCH 132/147] =?UTF-8?q?fix(plugin):=20=E7=89=88=E6=9C=AC?=
+ =?UTF-8?q?=E6=8F=90=E7=A4=BA=E6=94=B9=E7=94=A8=20BuildService=20=E5=8E=BB?=
+ =?UTF-8?q?=E9=87=8D=EF=BC=8C=E4=B8=8D=E5=86=8D=E5=86=99=20JVM=20=E7=B3=BB?=
+ =?UTF-8?q?=E7=BB=9F=E5=B1=9E=E6=80=A7?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+原来每个构建、每个 Loom 版本只在控制台提示一次版本号，靠的是配置期自修改
+系统属性 `loom.printed.logged`。该写入发生在配置期，会被 Gradle 当作配置副作用，
+**仅打印一行日志就能污染下一次配置缓存指纹**。
+
+改为 `BuildService`：
+
+- `registerIfAbsent("loom-version-log-" + LOOM_VERSION, ...)` 负责并行项目间的去重，
+  生命周期由 Gradle 管理，不持有 JVM 全局状态。
+- 不把自定义服务类型传入任何任务，避免不同插件 classloader 之间的类型耦合。
+
+日志内容与原行为一致（版本号 / beta 提示 / 已弃用提示）。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: version-log-build-service
+
+diff --git a/src/main/java/net/fabricmc/loom/LoomGradlePlugin.java b/src/main/java/net/fabricmc/loom/LoomGradlePlugin.java
+index 05be6cfa6233183ee6981c4f0acaf8d5a3fc080b..1f08af9da8041dd81efe5fa14c2019d93a59de8f 100644
+--- a/src/main/java/net/fabricmc/loom/LoomGradlePlugin.java
++++ b/src/main/java/net/fabricmc/loom/LoomGradlePlugin.java
+@@ -24,12 +24,9 @@
+ 
+ package net.fabricmc.loom;
+ 
+-import java.util.Arrays;
+-import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+-import java.util.Set;
+ 
+ import com.google.gson.Gson;
+ import com.google.gson.GsonBuilder;
+@@ -55,6 +52,7 @@ import net.fabricmc.loom.task.RemapTaskConfiguration;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.LibraryLocationLogger;
+ import net.fabricmc.loom.util.OneDrive;
++import net.fabricmc.loom.util.gradle.LoomVersionLogService;
+ 
+ public class LoomGradlePlugin implements Plugin<PluginAware> {
+ 	public static final String NAME = Constants.PLUGIN_ID;
+@@ -97,19 +95,7 @@ public class LoomGradlePlugin implements Plugin<PluginAware> {
+ 	}
+ 
+ 	private void apply(Project project) {
+-		Set<String> loggedVersions = new HashSet<>(Arrays.asList(System.getProperty("loom.printed.logged", "").split(",")));
+-
+-		if (!loggedVersions.contains(LOOM_VERSION)) {
+-			loggedVersions.add(LOOM_VERSION);
+-			System.setProperty("loom.printed.logged", String.join(",", loggedVersions));
+-			project.getLogger().lifecycle("Architectury Loom: " + LOOM_VERSION);
+-
+-			if (Constants.PLUGIN_BETA) {
+-				project.getLogger().lifecycle("This version of Architectury Loom is in beta! Please report any issues you encounter: https://github.com/architectury/architectury-loom/issues");
+-			} else if (Constants.PLUGIN_DEPRECATED) {
+-				project.getLogger().lifecycle("You are using an outdated version of Architectury Loom! This version will not receive any support, please consider updating!");
+-			}
+-		}
++		LoomVersionLogService.logVersion(project);
+ 
+ 		LibraryLocationLogger.logLibraryVersions();
+ 		OneDrive.verify(project);
+diff --git a/src/main/java/net/fabricmc/loom/util/gradle/LoomVersionLogService.java b/src/main/java/net/fabricmc/loom/util/gradle/LoomVersionLogService.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d63d3572f62ca04e7bc379b584dbeea7c9e0f938
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/util/gradle/LoomVersionLogService.java
+@@ -0,0 +1,62 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.util.gradle;
++
++import javax.inject.Inject;
++
++import org.gradle.api.Project;
++import org.gradle.api.logging.Logging;
++import org.gradle.api.services.BuildService;
++import org.gradle.api.services.BuildServiceParameters;
++
++import net.fabricmc.loom.LoomGradlePlugin;
++import net.fabricmc.loom.util.Constants;
++
++/**
++ * 每个构建、每个 Loom 版本仅输出一次版本提示，不读写 JVM 全局系统属性.
++ *
++ * <p>服务首次实例化时输出日志；registerIfAbsent 负责并行项目间的去重，生命周期由 Gradle 管理。
++ * 不再使用配置期自修改的 loom.printed.logged，避免仅打印日志就污染下一次配置缓存指纹。
++ */
++public abstract class LoomVersionLogService implements BuildService<BuildServiceParameters.None> {
++	public static void logVersion(Project project) {
++		// 只触发首次实例化，不将自定义服务类型传入任务，避免不同插件 classloader 之间的类型耦合。
++		project.getGradle().getSharedServices().registerIfAbsent(
++				"loom-version-log-" + LoomGradlePlugin.LOOM_VERSION, LoomVersionLogService.class, spec -> { }
++		).get();
++	}
++
++	@Inject
++	public LoomVersionLogService() {
++		final var logger = Logging.getLogger(LoomGradlePlugin.class);
++		logger.lifecycle("Architectury Loom: " + LoomGradlePlugin.LOOM_VERSION);
++
++		if (Constants.PLUGIN_BETA) {
++			logger.lifecycle("This version of Architectury Loom is in beta! Please report any issues you encounter: https://github.com/architectury/architectury-loom/issues");
++		} else if (Constants.PLUGIN_DEPRECATED) {
++			logger.lifecycle("You are using an outdated version of Architectury Loom! This version will not receive any support, please consider updating!");
++		}
++	}
++}

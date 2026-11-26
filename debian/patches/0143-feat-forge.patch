@@ -1,0 +1,3267 @@
+From 6f310434f82107084b43ae938a55cf661d493200 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Wed, 25 Nov 2026 01:53:49 +0800
+Subject: [PATCH 143/147] =?UTF-8?q?feat(forge):=20=E6=8E=A5=E5=85=A5?=
+ =?UTF-8?q?=E6=8C=87=E5=AE=9A=E5=90=88=E5=8C=85=E7=9A=84=E5=AE=98=E6=96=B9?=
+ =?UTF-8?q?=E8=BF=90=E8=A1=8C=E4=BA=A7=E7=89=A9=E4=B8=8E=E6=BA=90=E7=A0=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+仅对已限定的混淆版合包重建完整开发用包，将映射及缓存代际与旧二进制链隔离。把同批次的官方源码附挂到命名产物，显式反编译保持独立输出。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: forge-mavenizer-complete-input
+
+diff --git a/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java b/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
+index 782a386d0ef33dc0c786b339dc715568d03189d5..4d271e2dd6e54369942e33a1dfa890c41c5f31d2 100644
+--- a/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
++++ b/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
+@@ -33,7 +33,6 @@ import java.util.Map;
+ import java.util.concurrent.Callable;
+ import java.util.function.Consumer;
+ 
+-import dev.architectury.loom.forge.dependency.ForgeProvider;
+ import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
+ import dev.architectury.loom.mappings.MappingOption;
+ import dev.architectury.loom.util.Stopwatch;
+@@ -170,7 +169,7 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
+ 			return;
+ 		}
+ 
+-		final Path forgeCache = ForgeProvider.getForgeCache(project);
++		final Path forgeCache = MinecraftPatchedProvider.get(project).productionCacheDirectory();
+ 		Files.createDirectories(forgeCache);
+ 
+ 		boolean hasSrg = extension.shouldGenerateSrgTiny();
+@@ -223,8 +222,7 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
+ 		// 决定，同一输入下结果一致，故无锁写入最多互相覆盖成等价内容，不会让读方看到半截文件。
+ 		// 迁移器返回值参与 hash 计算，构成迁移产物的就绪标记。
+ 		final MappingsMigrator.Inputs inputs = new MappingsMigrator.Inputs(forgeCache, rawTinyMappingsWithNs,
+-				patchedIntermediateJar, extension.getForgeUniversalProvider().getForge().toPath(),
+-				extension.getForgeUserdevProvider().getUserdevJar().toPath(), hasSrg, hasMojang,
++				patchedIntermediateJar, inheritanceJars(extension, patchedIntermediateJar), hasSrg, hasMojang,
+ 				extension.refreshDeps(), project.getLogger()::info);
+ 
+ 		for (MappingsMigrator migrator : this.migrators) {
+@@ -250,6 +248,11 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
+ 		});
+ 	}
+ 
++	private static List<Path> inheritanceJars(LoomGradleExtension extension, Path patched) {
++		return MinecraftPatchedProvider.usesMavenizer(extension, extension.getMinecraftProvider()) ? List.of(patched)
++				: List.of(patched, extension.getForgeUniversalProvider().getForge().toPath(), extension.getForgeUserdevProvider().getUserdevJar().toPath());
++	}
++
+ 	/**
+ 	 * 把 mappings 迁移投影成执行期任务.
+ 	 *
+@@ -266,8 +269,7 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
+ 		final Path migratedMappingsWithNs = tinyMappingsWithNs.toAbsolutePath().normalize();
+ 		final Path readyMarker = this.hashPath.toAbsolutePath().normalize();
+ 		final Path patchedIntermediateJar = MinecraftPatchedProvider.get(project).getMinecraftPatchedIntermediateJar();
+-		final Path forgeJar = extension.getForgeUniversalProvider().getForge().toPath();
+-		final Path userdevJar = extension.getForgeUserdevProvider().getUserdevJar().toPath();
++		final List<Path> jars = inheritanceJars(extension, patchedIntermediateJar);
+ 
+ 		// 同一产物路径在本构建内只能有一个生产者：同一构建内两个配置相同的子项目会算出同一条路径。
+ 		// 指纹只放**决定内容**的量，refreshDeps 只影响「这轮要不要重建」故不参与。
+@@ -288,8 +290,12 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
+ 			task.getReadyMarker().set(readyMarker.toFile());
+ 			task.getMigratorCacheDir().set(forgeCache.toAbsolutePath().toString());
+ 			task.getPatchedIntermediateJar().set(patchedIntermediateJar.toFile());
+-			task.getForgeJar().set(forgeJar.toFile());
+-			task.getForgeUserdevJar().set(userdevJar.toFile());
++
++			if (jars.size() > 1) {
++				task.getForgeJar().set(jars.get(1).toFile());
++				task.getForgeUserdevJar().set(jars.get(2).toFile());
++			}
++
+ 			task.getHasSrg().set(hasSrg);
+ 			task.getHasMojang().set(hasMojang);
+ 			task.getRefreshDeps().set(extension.refreshDeps());
+diff --git a/src/main/java/dev/architectury/loom/forge/MappingsMigrator.java b/src/main/java/dev/architectury/loom/forge/MappingsMigrator.java
+index 6eb1339e81fa03d694648493440aa24fc8c3dbbc..ae1fc54fba17bf64c678d21ac8931abc9c2e895d 100644
+--- a/src/main/java/dev/architectury/loom/forge/MappingsMigrator.java
++++ b/src/main/java/dev/architectury/loom/forge/MappingsMigrator.java
+@@ -41,15 +41,23 @@ public interface MappingsMigrator {
+ 	 * @param cache 迁移器缓存所在目录（与 {@code ForgeProvider.getForgeCache} 同一个）
+ 	 * @param rawMappings 迁移前、已按命名空间合并好的映射树
+ 	 * @param patchedIntermediateJar 打补丁后的中间 Minecraft jar（缓存未命中时才读）
+-	 * @param forgeJar Forge 的 universal jar（继承关系来源之一）
+-	 * @param userdevJar Forge 的 userdev jar（同上）
++	 * @param inheritanceJars 实际参与继承扫描的有序输入，完整重编译路线仅有 patchedIntermediateJar
+ 	 * @param hasSrg 本配置是否生成 srg 命名空间的映射
+ 	 * @param hasMojang 本配置是否生成 mojang 命名空间的映射
+ 	 * @param refreshDeps 是否显式要求刷新（刷新时一律走重建分支、忽略缓存）
+ 	 * @param info 日志出口：配置期路径传项目 logger，执行期任务传任务自己的 logger
+ 	 */
+-	record Inputs(Path cache, Path rawMappings, Path patchedIntermediateJar, Path forgeJar, Path userdevJar,
++	record Inputs(Path cache, Path rawMappings, Path patchedIntermediateJar, List<Path> inheritanceJars,
+ 			boolean hasSrg, boolean hasMojang, boolean refreshDeps, Consumer<String> info) {
++		public Inputs {
++			inheritanceJars = List.copyOf(inheritanceJars);
++		}
++
++		public Inputs(Path cache, Path rawMappings, Path patchedIntermediateJar, Path forgeJar, Path userdevJar,
++				boolean hasSrg, boolean hasMojang, boolean refreshDeps, Consumer<String> info) {
++			this(cache, rawMappings, patchedIntermediateJar, List.of(patchedIntermediateJar, forgeJar, userdevJar),
++					hasSrg, hasMojang, refreshDeps, info);
++		}
+ 	}
+ 
+ 	/**
+diff --git a/src/main/java/dev/architectury/loom/forge/MethodInheritanceMappingsMigrator.java b/src/main/java/dev/architectury/loom/forge/MethodInheritanceMappingsMigrator.java
+index 873ee5a484c2f9271f66b3f1716e4cb717b8c0bd..08208eb03e9f66f7ebc9dc2d53dc72fee454d030 100644
+--- a/src/main/java/dev/architectury/loom/forge/MethodInheritanceMappingsMigrator.java
++++ b/src/main/java/dev/architectury/loom/forge/MethodInheritanceMappingsMigrator.java
+@@ -74,7 +74,7 @@ public final class MethodInheritanceMappingsMigrator implements MappingsMigrator
+ 	@Override
+ 	public long setup(Inputs inputs) throws IOException {
+ 		Path cacheFile = inputs.cache().resolve("method-inheritance-migrator.json");
+-		List<Path> jars = List.of(inputs.patchedIntermediateJar(), inputs.forgeJar(), inputs.userdevJar());
++		List<Path> jars = inputs.inheritanceJars();
+ 		// 本代输入的内容键：命名空间开关 + 原始 mappings + 冷分支会读的三个 jar。
+ 		// 只用路径存在性判断缓存是否可用会让「同一份声明输入对应两种产物」——见 MappingsMigratorCache。
+ 		final String key = MappingsMigratorCache.identity(inputs.hasSrg(), inputs.hasMojang(),
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java
+index efbdfb9f47f78e41537f3e5511a6b715f550d3d3..3e5173bd9d716b8f4be2785e05f4abca618fb9cb 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java
+@@ -36,6 +36,7 @@ import java.util.concurrent.Callable;
+ 
+ import dev.architectury.loom.forge.ModDirTransformerDiscovererPatch;
+ import dev.architectury.loom.forge.RemapObjectHolderVisitor;
++import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
+ import dev.architectury.loom.mappings.ForgeMappingsMerger;
+ import dev.architectury.loom.mappings.MappingOption;
+ import dev.architectury.loom.neoforge.StringConstantPatcher;
+@@ -112,7 +113,12 @@ public class ForgeLibrariesProvider {
+ 							version = version.substring(0, atIndex);
+ 						}
+ 
+-						dep = "dev.architectury:mixin-patched" + version + ".+";
++						// 只锁定已验证的 Mavenizer 配方，避免离线配置缓存因动态版本过期而失效。
++						if (":0.8.7".equals(version) && MinecraftPatchedProvider.usesMavenizer(extension, extension.getMinecraftProvider())) {
++							dep = "dev.architectury:mixin-patched:0.8.7.12";
++						} else {
++							dep = "dev.architectury:mixin-patched" + version + ".+";
++						}
+ 					}
+ 				}
+ 			}
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java
+index 3a16234257f244cbf15a822f316a7aee235f1384..d36423f136a994688c4d7019014d000ea6e10291 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/PatchProvider.java
+@@ -43,6 +43,7 @@ import java.util.jar.JarInputStream;
+ import java.util.jar.JarOutputStream;
+ import java.util.zip.ZipEntry;
+ 
++import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
+ import lzma.sdk.lzma.Decoder;
+ import lzma.sdk.lzma.Encoder;
+ import lzma.streams.LzmaInputStream;
+@@ -71,12 +72,19 @@ public class PatchProvider extends DependencyProvider {
+ 	@Override
+ 	public void provide(DependencyInfo dependency) throws Exception {
+ 		init();
+-		// legacy Forge（1.8-1.16）没有独立的 installer，补丁位于 universal jar 内
+-		installerJar = getExtension().isModernForgeLike()
++		var extension = getExtension();
++
++		// 这条合包路线从源码生成整份开发 JAR，不读 installer 的运行时补丁。
++		if (MinecraftPatchedProvider.usesMavenizer(extension, extension.getMinecraftProvider())) {
++			return;
++		}
++
++		// 旧 Forge 的单端补丁位于 universal JAR，而不是独立 installer。
++		installerJar = extension.isModernForgeLike()
+ 				? dependency.resolveFile().orElseThrow(() -> new RuntimeException("Could not resolve Forge installer")).toPath()
+-				: getExtension().getForgeUniversalProvider().getForge().toPath();
++				: extension.getForgeUniversalProvider().getForge().toPath();
+ 
+-		if (getExtension().isLegacyForge()) {
++		if (extension.isLegacyForge()) {
+ 			clientPatches = projectCacheFolder.resolve("patches-client.lzma");
+ 			serverPatches = projectCacheFolder.resolve("patches-server.lzma");
+ 			extractLegacyPatches(clientPatches, serverPatches);
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+index cd04533f307249a1cb30b99ef755a9678403c50c..880bbe5e66de2988dfb7ea84e1a7fcdc9a73f061 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+@@ -70,6 +70,7 @@ import dev.architectury.loom.forge.dependency.ForgeProvider;
+ import dev.architectury.loom.forge.dependency.ForgeUserdevProvider;
+ import dev.architectury.loom.forge.dependency.PatchProvider;
+ import dev.architectury.loom.forge.tool.ForgeExternalToolService;
++import dev.architectury.loom.forge.tool.ForgeMavenizerService;
+ import dev.architectury.loom.mappings.MappingOption;
+ import dev.architectury.loom.mcpconfig.McpConfigProvider;
+ import dev.architectury.loom.mcpconfig.McpExecutor;
+@@ -109,9 +110,11 @@ import net.fabricmc.loom.configuration.providers.mappings.TinyMappingsService;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+ import net.fabricmc.loom.pipeline.AccessTransformForgeJarTask;
++import net.fabricmc.loom.pipeline.GenerateForgeMavenizerJarTask;
+ import net.fabricmc.loom.pipeline.GenerateForgePatchedIntermediateJarTask;
+ import net.fabricmc.loom.pipeline.GenerateForgePatchedJarTask;
+ import net.fabricmc.loom.pipeline.GenerateForgePrePatchJarTask;
++import net.fabricmc.loom.pipeline.PrepareForgeMavenizerSourcesTask;
+ import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
+ import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry.Producer;
+ import net.fabricmc.loom.util.Check;
+@@ -207,9 +210,76 @@ public class MinecraftPatchedProvider {
+ 		return LoomGradleExtension.get(project);
+ 	}
+ 
++	public static final String MAVENIZER_GENERATION = "mavenizer-v1";
++	private static final String MAVENIZER_MCP = "1.21.11-20251223.124241";
++
++	/** 下游按生产策略分流，不根据文件名猜测字节码来源. */
++	public boolean usesMavenizer() {
++		return usesMavenizer(getExtension(), type, minecraftProvider.minecraftVersion());
++	}
++
++	private static boolean usesMavenizer(LoomGradleExtension extension, Type type, String mcVersion) {
++		return type == Type.MERGED && "1.21.11".equals(mcVersion) && extension.isForge()
++				&& !extension.isLegacyForge() && !extension.disableObfuscation() && !extension.isUnobfuscatedForge()
++				&& "1.21.11-61.2.5".equals(extension.getForgeProvider().getVersion().getCombined());
++	}
++
++	public static boolean usesMavenizer(LoomGradleExtension extension, MinecraftProvider minecraft) {
++		return minecraft instanceof MergedForgeMinecraftProvider && usesMavenizer(extension, Type.MERGED, minecraft.minecraftVersion());
++	}
++
++	public static String mappingGenerationSuffix(LoomGradleExtension extension, MinecraftProvider minecraft) {
++		return usesMavenizer(extension, minecraft) ? "-" + MAVENIZER_GENERATION : "";
++	}
++
++	public Path productionCacheDirectory() {
++		Path base = ForgeProvider.getForgeCache(project);
++		return usesMavenizer() ? base.resolve(MAVENIZER_GENERATION) : base;
++	}
++
++	private String mavenizerMcpVersion() {
++		String mcp = getExtension().getForgeUserdevProvider().getConfig().mcp();
++
++		if (!("de.oceanlabs.mcp:mcp_config:" + MAVENIZER_MCP + "@zip").equals(mcp)) {
++			throw new IllegalStateException("Forge 官方源码重编译未验证此 MCP 坐标：" + mcp);
++		}
++
++		return MAVENIZER_MCP;
++	}
++
++	private Provider<ForgeMavenizerService.Options> mavenizerOptions() {
++		return ForgeMavenizerService.createOptions(project, getExtension().getForgeProvider().getVersion().getCombined(),
++				minecraftProvider.minecraftVersion(), mavenizerMcpVersion(), productionCacheDirectory().resolve("tool"));
++	}
++
++	/** 声明同一批次的源码原料；只由源码任务消费，不参与游戏构建或启动. */
++	public Producer registerMavenizerSourcesBundle() {
++		if (!usesMavenizer()) {
++			throw new IllegalStateException("当前 Forge 产物不是 Mavenizer 源码重编译产物");
++		}
++
++		final Path runtime = getMinecraftPatchedIntermediateJar();
++		final Path receipt = ForgeMavenizerService.receipt(runtime);
++		final Path bundle = productionCacheDirectory().resolve("mavenizer-sources-v1.zip");
++		final var identity = Map.of(
++				"stage", "mavenizer-sources-v1", "runtime", runtime.toString(), "mcp", mavenizerMcpVersion());
++
++		return RemapMinecraftTaskRegistry.claim(project, bundle, identity, () -> {
++			return project.getTasks().register(PrepareForgeMavenizerSourcesTask.NAME, PrepareForgeMavenizerSourcesTask.class, task -> {
++				task.setGroup(Constants.TaskGroup.FABRIC);
++				task.getMavenizer().set(mavenizerOptions());
++				task.getRuntimeSrgJar().set(runtime.toFile());
++				task.getRuntimeReceipt().set(receipt.toFile());
++				task.getOutputBundle().set(bundle.toFile());
++				// 收据与运行时同属一个生产任务；配置期回退时两件均已落盘。
++				minecraftProvider.addProducerDependency(task, runtime);
++			});
++		});
++	}
++
+ 	private void initPatchedFiles() {
+ 		String forgeVersion = getExtension().getForgeProvider().getVersion().getCombined();
+-		Path forgeWorkingDir = ForgeProvider.getForgeCache(project);
++		Path forgeWorkingDir = productionCacheDirectory();
+ 		// Note: strings used instead of platform id since FML requires one of these exact strings
+ 		// depending on the loader to recognise Minecraft.
+ 		String patchId = (getExtension().isNeoForge() ? "neoforge" : "forge") + "-" + forgeVersion + "-";
+@@ -222,7 +292,7 @@ public class MinecraftPatchedProvider {
+ 		intermediateNamespace = intermediateId;
+ 		minecraftIntermediateJar = forgeWorkingDir.resolve("minecraft-" + type.id + "-" + intermediateId + ".jar");
+ 		minecraftPatchedIntermediateJar = forgeWorkingDir.resolve("minecraft-" + type.id + "-" + intermediateId + "-patched.jar");
+-		minecraftPatchedIntermediateAtJar = forgeWorkingDir.resolve("minecraft-" + type.id + "-" + intermediateId + "-at-patched.jar");
++		minecraftPatchedIntermediateAtJar = usesMavenizer() ? minecraftPatchedIntermediateJar : forgeWorkingDir.resolve("minecraft-" + type.id + "-" + intermediateId + "-at-patched.jar");
+ 		minecraftPatchedJar = forgeWorkingDir.resolve("minecraft-" + type.id + "-patched.jar");
+ 		minecraftClientExtra = forgeWorkingDir.resolve("client-extra.jar");
+ 	}
+@@ -235,6 +305,10 @@ public class MinecraftPatchedProvider {
+ 	 * 把它计入判定会让 {@link #needsWork()} 恒为真、每次构建都白取一次跨进程锁。
+ 	 */
+ 	protected Path[] getGlobalCaches() {
++		if (usesMavenizer()) {
++			return new Path[] { minecraftPatchedIntermediateJar, minecraftPatchedJar, minecraftClientExtra };
++		}
++
+ 		List<Path> files = new ArrayList<>(Arrays.asList(
+ 				minecraftIntermediateJar,
+ 				minecraftPatchedIntermediateJar,
+@@ -321,6 +395,10 @@ public class MinecraftPatchedProvider {
+ 
+ 		logger.lifecycle("Forge 的 patched 中间产物保持配置期生产：{}", blocker);
+ 
++		if (usesMavenizer()) {
++			prePatchJarProducer = registerPrePatchTask();
++		}
++
+ 		// 无锁快路径：产物齐备且补丁版本最新时，本次仅做内存配置，不触碰共享缓存，不取锁
+ 		if (!needsWork()) {
+ 			this.dirty = false;
+@@ -377,11 +455,9 @@ public class MinecraftPatchedProvider {
+ 	 * <p>同一产物路径在本构建内只能有一个生产者，因此逐产物走
+ 	 * {@link RemapMinecraftTaskRegistry#claim}：同一构建内两个配置相同的子项目不会各自建一个任务写同一个文件。
+ 	 */
+-	private void registerPatchedChainTasks() {
++	private Producer registerPrePatchTask() {
+ 		final var extension = getExtension();
+ 		final Path prePatchJar = minecraftIntermediateJar.toAbsolutePath().normalize();
+-		final Path patchedIntermediate = minecraftPatchedIntermediateJar.toAbsolutePath().normalize();
+-		final Path atPatched = minecraftPatchedIntermediateAtJar.toAbsolutePath().normalize();
+ 
+ 		// 分支判据与配置期 createPrePatchJar 逐字一致
+ 		final boolean installerTools = shouldUseNeoForgeInstallerToolsToCreatePrePatchJar();
+@@ -394,7 +470,7 @@ public class MinecraftPatchedProvider {
+ 		final Path mcpWorkDir = project.getLayout().getBuildDirectory()
+ 				.dir("tmp/" + GenerateForgePrePatchJarTask.NAME + "/" + type.id).get().getAsFile().toPath();
+ 
+-		final Producer prePatchProducer = RemapMinecraftTaskRegistry.claim(project, prePatchJar, Map.of(
++		return RemapMinecraftTaskRegistry.claim(project, prePatchJar, Map.of(
+ 				"stage", "forge-pre-patch-jar",
+ 				"mcVersion", extension.getMinecraftProvider().minecraftVersion(),
+ 				"forgeVersion", extension.getForgeProvider().getVersion().getCombined(),
+@@ -438,6 +514,28 @@ public class MinecraftPatchedProvider {
+ 			// 本任务的输入是 vanilla jar（两条分支都读它，见 wireVanillaJarDependencies）
+ 			wireVanillaJarDependencies(task);
+ 		}));
++	}
++
++	private void registerPatchedChainTasks() {
++		final var extension = getExtension();
++		final Path prePatchJar = minecraftIntermediateJar.toAbsolutePath().normalize();
++		final Path patchedIntermediate = minecraftPatchedIntermediateJar.toAbsolutePath().normalize();
++		final Path atPatched = minecraftPatchedIntermediateAtJar.toAbsolutePath().normalize();
++		final Producer prePatchProducer = registerPrePatchTask();
++		this.prePatchJarProducer = prePatchProducer;
++
++		if (usesMavenizer()) {
++			final Producer producer = RemapMinecraftTaskRegistry.claim(project, patchedIntermediate, Map.of(
++					"stage", MAVENIZER_GENERATION, "mcp", MAVENIZER_MCP, "forge", extension.getForgeProvider().getVersion().getCombined()
++			), () -> project.getTasks().register(GenerateForgeMavenizerJarTask.NAME, GenerateForgeMavenizerJarTask.class, task -> {
++				task.setGroup(Constants.TaskGroup.FABRIC);
++				task.getMavenizer().set(mavenizerOptions());
++				task.getOutputJar().set(patchedIntermediate.toFile());
++			}));
++			minecraftProvider.registerTaskProducedArtifact(patchedIntermediate, producer);
++			logger.lifecycle("Forge 的完整 SRG 产物由官方源码重编译任务承担：{}", producer.taskPath());
++			return;
++		}
+ 
+ 		final Path runtimeInstaller = runtimeInstaller();
+ 		final Producer patchedProducer = RemapMinecraftTaskRegistry.claim(project, patchedIntermediate, Map.of(
+@@ -524,7 +622,6 @@ public class MinecraftPatchedProvider {
+ 		// 中间产物的产出方同样要登记：mappings 迁移任务把它声明成 @InputFile（迁移器缓存未命中时读它），
+ 		// 只按路径声明输入不会带任务依赖，Gradle 的隐式依赖校验会直接拒绝构建
+ 		minecraftProvider.registerTaskProducedArtifact(patchedIntermediate, patchedProducer);
+-		this.prePatchJarProducer = prePatchProducer;
+ 
+ 		logger.lifecycle("Forge 的 patched 三级产物由执行期任务承担：{}",
+ 				List.of(prePatchProducer.taskPath(), patchedProducer.taskPath(), atPatchedProducer.taskPath()));
+@@ -658,7 +755,7 @@ public class MinecraftPatchedProvider {
+ 	 */
+ 	private boolean needsWork() {
+ 		// 无锁读路径：除存在性外还要拒绝空 zip／截断文件等半成品（其它进程可能正在就地重建共享缓存）
+-		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(jar -> !isReusableJar(jar))) {
++		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(jar -> !isReusableProductionJar(jar))) {
+ 			return true;
+ 		}
+ 
+@@ -669,12 +766,31 @@ public class MinecraftPatchedProvider {
+ 		}
+ 	}
+ 
++	private boolean isReusableProductionJar(Path jar) {
++		if (jar.equals(minecraftPatchedIntermediateJar) && usesMavenizer()) {
++			return ForgeMavenizerService.isReusable(jar, getExtension().getForgeProvider().getVersion().getCombined(),
++					minecraftProvider.minecraftVersion(), mavenizerMcpVersion());
++		}
++
++		return isReusableJar(jar);
++	}
++
+ 	private Void providePatched() throws Exception {
+ 		// 锁内二次确认：等锁期间其它进程可能已完成生产。本方法不删除任何共享产物，
+ 		// 「整链重建」由 checkCache 的返回值表达，缺失或损坏的产物则由下面的可复用性判定按件补齐
+ 		final boolean forceRebuild = checkCache();
+ 		this.dirty = forceRebuild;
+ 
++		if (usesMavenizer()) {
++			if (getExtension().refreshDeps() || !isReusableProductionJar(minecraftPatchedIntermediateJar)) {
++				produceMavenizerJar();
++				this.dirty = true;
++			}
++
++			this.dirty |= !isReusableJar(minecraftClientExtra);
++			return null;
++		}
++
+ 		if (forceRebuild || !isReusableJar(minecraftIntermediateJar)) {
+ 			this.dirty = true;
+ 			// 原子落位：临时文件写完才替换最终产物，锁外读方不会看到半截 jar
+@@ -722,7 +838,7 @@ public class MinecraftPatchedProvider {
+ 	public Path getOrProduceMinecraftPatchedIntermediateJar() {
+ 		final Path jar = getMinecraftPatchedIntermediateJar();
+ 
+-		if (isReusableJar(jar)) {
++		if (isReusableProductionJar(jar)) {
+ 			return jar;
+ 		}
+ 
+@@ -739,7 +855,7 @@ public class MinecraftPatchedProvider {
+ 		// 补齐后必须再校验一次：仍然不可复用说明该产物这次没能被完整生产出来
+ 		// （例如锁内判定把它当作可复用而跳过重建，或被外部进程在补齐后再次写坏）。
+ 		// 这里抛异常而不是返回坏路径：坏路径会让下游把「读不出内容」当成「没有内容」，静默产出错误映射
+-		if (!isReusableJar(jar)) {
++		if (!isReusableProductionJar(jar)) {
+ 			throw new UncheckedIOException(new IOException(
+ 					"补齐后共享缓存中的 patched 中间产物仍不可复用（无法作为 zip/jar 打开，或没有任何条目）: " + jar));
+ 		}
+@@ -761,7 +877,18 @@ public class MinecraftPatchedProvider {
+ 	 * 而不是把不存在的路径交给迁移器去读。
+ 	 */
+ 	protected void produceIntermediateJarIfMissing() throws Exception {
+-		provide();
++		if (usesMavenizer()) {
++			produceMavenizerJar();
++		} else {
++			provide();
++		}
++	}
++
++	private void produceMavenizerJar() throws IOException {
++		try (var factory = new ScopedServiceFactory()) {
++			final ForgeMavenizerService mavenizer = factory.get(mavenizerOptions());
++			mavenizer.produce(minecraftPatchedIntermediateJar);
++		}
+ 	}
+ 
+ 	/**
+@@ -861,8 +988,12 @@ public class MinecraftPatchedProvider {
+ 			task.setDescription("Produces the patched Minecraft jar for %s".formatted(
+ 					extension.getMinecraftProvider().minecraftVersion()));
+ 			task.getAtPatchedJar().set(minecraftPatchedIntermediateAtJar.toFile());
+-			task.getForgeJar().set(getForgeJar());
+-			task.getForgeUserdevJar().set(getForgeUserdevJar());
++			task.getCompleteForgeInput().set(usesMavenizer());
++
++			if (!usesMavenizer()) {
++				task.getForgeJar().set(getForgeJar());
++				task.getForgeUserdevJar().set(getForgeUserdevJar());
++			}
+ 
+ 			if (mappingsOptions != null) {
+ 				task.getMappingsServiceOptions().set(mappingsOptions);
+@@ -956,8 +1087,8 @@ public class MinecraftPatchedProvider {
+ 	 */
+ 	public record ProductionOptions(
+ 			Path atPatchedJar,
+-			Path forgeJar,
+-			Path forgeUserdevJar,
++			@Nullable Path forgeJar,
++			@Nullable Path forgeUserdevJar,
+ 			@Nullable Path clientJar,
+ 			@Nullable Path serverJar,
+ 			@Nullable MemoryMappingTree mappings,
+@@ -970,6 +1101,15 @@ public class MinecraftPatchedProvider {
+ 			String remapNamespace,
+ 			String coreModNamespace,
+ 			String distAttribute) {
++		public ProductionOptions {
++			if ((forgeJar == null) != (forgeUserdevJar == null) || forgeJar == null && (!forge || unobfuscatedForge)) {
++				throw new IllegalArgumentException("最终重映射需要完整 Forge 输入，或成对提供 universal 和 userdev");
++			}
++		}
++
++		public boolean completeForgeInput() {
++			return forgeJar == null;
++		}
+ 	}
+ 
+ 	/**
+@@ -987,8 +1127,8 @@ public class MinecraftPatchedProvider {
+ 
+ 		return new ProductionOptions(
+ 				minecraftPatchedIntermediateAtJar,
+-				getForgeJar().toPath(),
+-				getForgeUserdevJar().toPath(),
++				usesMavenizer() ? null : getForgeJar().toPath(),
++				usesMavenizer() ? null : getForgeUserdevJar().toPath(),
+ 				clientExtra ? minecraftProvider.getMinecraftClientJar().toPath() : null,
+ 				needsServerJarForDistManifest(extension) ? getServerJarForDistManifest().toPath() : null,
+ 				mappings,
+@@ -1822,21 +1962,26 @@ public class MinecraftPatchedProvider {
+ 		TinyRemapper remapper = buildRemapper(options, mcInput);
+ 
+ 		try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(mcOutput).build()) {
+-			outputConsumer.addNonClassFiles(forgeJar, NonClassCopyMode.FIX_META_INF, remapper);
+-
+-			InputTag mcTag = remapper.createInputTag();
+-			InputTag forgeTag = remapper.createInputTag();
+-			List<CompletableFuture<?>> futures = new ArrayList<>();
+-			futures.add(remapper.readInputsAsync(mcTag, mcInput));
+-			futures.add(remapper.readInputsAsync(forgeTag, forgeJar, forgeUserdevJar));
+-			CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+-			remapper.apply(outputConsumer, mcTag);
+-			remapper.apply(outputConsumer, forgeTag);
++			if (options.completeForgeInput()) {
++				outputConsumer.addNonClassFiles(mcInput, NonClassCopyMode.FIX_META_INF, remapper);
++				remapper.readInputs(mcInput);
++				remapper.apply(outputConsumer);
++			} else {
++				outputConsumer.addNonClassFiles(forgeJar, NonClassCopyMode.FIX_META_INF, remapper);
++				InputTag mcTag = remapper.createInputTag();
++				InputTag forgeTag = remapper.createInputTag();
++				CompletableFuture.allOf(remapper.readInputsAsync(mcTag, mcInput), remapper.readInputsAsync(forgeTag, forgeJar, forgeUserdevJar)).join();
++				remapper.apply(outputConsumer, mcTag);
++				remapper.apply(outputConsumer, forgeTag);
++			}
+ 		} finally {
+ 			remapper.finish();
+ 		}
+ 
+-		copyUserdevFiles(forgeUserdevJar, mcOutput);
++		if (!options.completeForgeInput()) {
++			copyUserdevFiles(Objects.requireNonNull(forgeUserdevJar), mcOutput);
++		}
++
+ 		remapCoreMods(mcOutput, Objects.requireNonNull(options.mappings(), "coremod 重映射需要映射树"),
+ 				options.coreModNamespace(), options.runtimeMojang());
+ 		applyLoomPatchVersion(mcOutput);
+diff --git a/src/main/java/dev/architectury/loom/forge/tool/ForgeMavenizerArtifact.java b/src/main/java/dev/architectury/loom/forge/tool/ForgeMavenizerArtifact.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..5c47e7ea7021f81c70d6357e99fcd6dab8f6e415
+--- /dev/null
++++ b/src/main/java/dev/architectury/loom/forge/tool/ForgeMavenizerArtifact.java
+@@ -0,0 +1,223 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package dev.architectury.loom.forge.tool;
++
++import java.io.BufferedReader;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.InputStreamReader;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.security.DigestInputStream;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.util.HexFormat;
++import java.util.jar.JarFile;
++import java.util.zip.GZIPInputStream;
++import java.util.zip.ZipFile;
++import java.util.zip.ZipOutputStream;
++
++import com.google.gson.JsonArray;
++import com.google.gson.JsonElement;
++import com.google.gson.JsonObject;
++import com.google.gson.JsonParser;
++
++import net.fabricmc.tinyremapper.NonClassCopyMode;
++import net.fabricmc.tinyremapper.OutputConsumerPath;
++import net.fabricmc.tinyremapper.TinyRemapper;
++import net.fabricmc.tinyremapper.TinyUtils;
++
++/** 已按模块元数据核实的同一套官方重编译产物. */
++public record ForgeMavenizerArtifact(Path classesJar, Path metadataZip, Path sourcesJar, Path officialToSrgMappings) {
++	private static final String GAME = "net/minecraft/client/Minecraft";
++	private static final String FORGE_API = "net/minecraftforge/common/MinecraftForge";
++
++	public static ForgeMavenizerArtifact resolve(Path repository, String forgeVersion, String minecraftVersion, String mcpVersion) throws IOException {
++		for (String version : new String[]{forgeVersion, minecraftVersion, mcpVersion}) {
++			check(version != null && version.matches("[a-zA-Z0-9][a-zA-Z0-9._+-]*"), "Invalid Maven version: " + version);
++		}
++
++		Path root = repository.toRealPath();
++		Path dir = root.resolve("net/minecraftforge/forge").resolve(forgeVersion);
++		Path module = checkedPath(root, dir.resolve("forge-" + forgeVersion + ".module"));
++
++		try (var reader = Files.newBufferedReader(module)) {
++			JsonObject json = JsonParser.parseReader(reader).getAsJsonObject();
++			JsonObject gav = json.getAsJsonObject("component");
++			check(is(gav, "group", "net.minecraftforge") && is(gav, "module", "forge") && is(gav, "version", forgeVersion), "Wrong component: " + gav);
++			JsonObject classes = null;
++			JsonObject metadata = null;
++			JsonObject sources = null;
++
++			for (JsonElement element : json.getAsJsonArray("variants")) {
++				JsonObject variant = element.getAsJsonObject();
++				JsonObject attrs = variant.getAsJsonObject("attributes");
++
++				if (is(attrs, "org.gradle.usage", "metadata")) {
++					metadata = sharedFile(metadata, variant);
++				} else if (is(attrs, "org.gradle.usage", "java-runtime") && is(attrs, "org.gradle.libraryelements", "jar")
++						&& is(attrs, "net.minecraftforge.mappings.channel", "official") && is(attrs, "net.minecraftforge.mappings.version", minecraftVersion)) {
++					if (is(attrs, "org.gradle.category", "library")) {
++						check(hasMappingsDependency(variant, mcpVersion), "Unexpected mappings_official dependency in " + variant.get("name"));
++						classes = sharedFile(classes, variant);
++					} else if (is(attrs, "org.gradle.category", "documentation") && is(attrs, "org.gradle.docstype", "sources")) {
++						sources = sharedFile(sources, variant);
++					}
++				}
++			}
++
++			Path classesJar = artifactFile(dir, classes, ".jar");
++			Path metadataZip = artifactFile(dir, metadata, "-metadata.zip");
++			Path sourcesJar = artifactFile(dir, sources, "-sources.jar");
++			Path mappings = checkedPath(root, root.resolve("net/minecraft/mappings_official").resolve(mcpVersion).resolve("mappings_official-" + mcpVersion + "-map2srg.tsrg.gz"));
++
++			try (JarFile jar = new JarFile(classesJar.toFile()); ZipFile meta = new ZipFile(metadataZip.toFile()); ZipFile src = new ZipFile(sourcesJar.toFile()); BufferedReader map = mappingsReader(mappings)) {
++				// 官方 stubify 保留可供编译的类签名，却会删除运行期资源。
++				check(jar.getManifest() != null && jar.getEntry("META-INF/mods.toml") != null
++						&& jar.getEntry(GAME + ".class") != null && jar.getEntry(FORGE_API + ".class") != null, "Stub or incomplete Forge runtime: " + classesJar);
++				check(meta.getEntry("launcher/runs.json") != null && meta.getEntry("minecraft/version.json") != null, "Incomplete metadata: " + metadataZip);
++				check(src.getEntry(GAME + ".java") != null && src.getEntry(FORGE_API + ".java") != null, "Incomplete sources: " + sourcesJar);
++				// map2obf 也叫 left/right，但它把 Minecraft 本身改成了混淆类名。
++				check("tsrg2 left right".equals(map.readLine()) && map.lines().anyMatch((GAME + " " + GAME)::equals), "Unexpected map2srg direction: " + mappings);
++			}
++
++			return new ForgeMavenizerArtifact(classesJar, metadataZip, sourcesJar, mappings);
++		} catch (RuntimeException e) {
++			throw new IOException("Malformed Mavenizer module: " + module, e);
++		}
++	}
++
++	private static boolean hasMappingsDependency(JsonObject variant, String version) {
++		JsonArray dependencies = variant.getAsJsonArray("dependencies");
++
++		if (dependencies != null) {
++			for (JsonElement entry : dependencies) {
++				JsonObject dep = entry.getAsJsonObject();
++
++				if (is(dep, "group", "net.minecraft") && is(dep, "module", "mappings_official") && is(dep.getAsJsonObject("version"), "requires", version)) {
++					return true;
++				}
++			}
++		}
++
++		return false;
++	}
++
++	private static boolean is(JsonObject object, String key, String value) {
++		return object != null && object.has(key) && value.equals(object.get(key).getAsString());
++	}
++
++	private static JsonObject sharedFile(JsonObject previous, JsonObject variant) throws IOException {
++		JsonArray files = variant.getAsJsonArray("files");
++		check(files != null && files.size() == 1, "Expected exactly one file in " + variant.get("name"));
++		JsonObject next = files.get(0).getAsJsonObject();
++		// 不按列表顺序猜宿主 OS：所有候选必须严格共用同一个文件声明（含摘要）。
++		check(previous == null || previous.equals(next), "Ambiguous Mavenizer files in " + variant.get("name"));
++		return next;
++	}
++
++	private static Path artifactFile(Path dir, JsonObject file, String suffix) throws IOException {
++		check(file != null, "Missing Mavenizer variant for " + suffix + " in " + dir);
++		String name = file.get("name").getAsString();
++		check(is(file, "url", name) && name.matches("[a-zA-Z0-9][a-zA-Z0-9._+-]*") && name.endsWith(suffix), "Invalid artifact name or URL: " + file);
++		Path path = checkedPath(dir, dir.resolve(name));
++		check(file.get("size").getAsLong() == Files.size(path) && is(file, "sha256", sha256(path)), "Artifact size or SHA-256 mismatch: " + path);
++		return path;
++	}
++
++	private static Path checkedPath(Path root, Path path) throws IOException {
++		Path real = path.toRealPath();
++		check(real.startsWith(root) && real.equals(path) && Files.isRegularFile(real), "Invalid Mavenizer path: " + path);
++		return real;
++	}
++
++	private static String sha256(Path path) throws IOException {
++		try {
++			MessageDigest digest = MessageDigest.getInstance("SHA-256");
++
++			try (var input = new DigestInputStream(Files.newInputStream(path), digest)) {
++				input.transferTo(java.io.OutputStream.nullOutputStream());
++			}
++
++			return HexFormat.of().formatHex(digest.digest());
++		} catch (NoSuchAlgorithmException e) {
++			throw new AssertionError(e);
++		}
++	}
++
++	private static BufferedReader mappingsReader(Path path) throws IOException {
++		InputStream input = Files.newInputStream(path);
++
++		try {
++			return new BufferedReader(new InputStreamReader(new GZIPInputStream(input), StandardCharsets.UTF_8));
++		} catch (IOException e) {
++			input.close();
++			throw e;
++		}
++	}
++
++	private static void check(boolean valid, String message) throws IOException {
++		if (!valid) {
++			throw new IOException(message);
++		}
++	}
++
++	/** 只变换一次命名空间；Forge 已应用的 AT 与其他资源保留在包内，不重复处理. */
++	public void writeSrgJar(Path output) throws IOException {
++		// CREATE_NEW 既防止覆盖也取得唯一的清理责任，临时文件不要求有 .jar 后缀。
++		Files.createFile(output);
++		boolean complete = false;
++
++		try (var reader = mappingsReader(officialToSrgMappings)) {
++			try (var seed = new ZipOutputStream(Files.newOutputStream(output))) {
++				seed.finish();
++			}
++
++			TinyRemapper remapper = TinyRemapper.newRemapper()
++					.withMappings(TinyUtils.createTinyMappingProvider(reader, "left", "right"))
++					// 同一 Mojang 方法可能覆写两个各有 SRG 名的接口，优先采用声明所有者的直接映射。
++					.ignoreConflicts(true)
++					.ignoreFieldDesc(true)
++					.build();
++
++			try (var consumer = new OutputConsumerPath.Builder(output).assumeArchive(true).build()) {
++				remapper.readInputs(classesJar);
++				remapper.apply(consumer);
++				consumer.addNonClassFiles(classesJar, NonClassCopyMode.FIX_META_INF, remapper);
++			} finally {
++				remapper.finish();
++			}
++
++			complete = true;
++		} catch (RuntimeException e) {
++			throw new IOException("Failed to remap " + classesJar + " with " + officialToSrgMappings, e);
++		} finally {
++			if (!complete) {
++				Files.deleteIfExists(output);
++			}
++		}
++	}
++}
+diff --git a/src/main/java/dev/architectury/loom/forge/tool/ForgeMavenizerService.java b/src/main/java/dev/architectury/loom/forge/tool/ForgeMavenizerService.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c67046ec65f7b44f7d117df575f6ad8e7c445dc6
+--- /dev/null
++++ b/src/main/java/dev/architectury/loom/forge/tool/ForgeMavenizerService.java
+@@ -0,0 +1,396 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package dev.architectury.loom.forge.tool;
++
++import java.io.IOException;
++import java.io.UncheckedIOException;
++import java.net.URISyntaxException;
++import java.nio.file.Files;
++import java.nio.file.LinkOption;
++import java.nio.file.Path;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.Callable;
++
++import dev.architectury.loom.util.TempFiles;
++import org.gradle.api.Project;
++import org.gradle.api.file.DirectoryProperty;
++import org.gradle.api.model.ObjectFactory;
++import org.gradle.api.provider.Property;
++import org.gradle.api.provider.Provider;
++import org.gradle.api.tasks.Input;
++import org.gradle.api.tasks.Internal;
++import org.gradle.api.tasks.Nested;
++import org.gradle.jvm.toolchain.JavaLauncher;
++import org.gradle.process.ExecResult;
++
++import net.fabricmc.loom.util.Checksum;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.cache.CacheEntryLock;
++import net.fabricmc.loom.util.download.Download;
++import net.fabricmc.loom.util.service.Service;
++import net.fabricmc.loom.util.service.ServiceFactory;
++import net.fabricmc.loom.util.service.ServiceType;
++
++/** 以隔离的官方工具重编译 Forge，并原子发布 Loom 所需的 SRG 中间产物. */
++public final class ForgeMavenizerService extends Service<ForgeMavenizerService.Options> {
++	public static final ServiceType<Options, ForgeMavenizerService> TYPE = new ServiceType<>(Options.class, ForgeMavenizerService.class);
++	private static final String TOOL_VERSION = "0.4.24";
++	private static final String TOOL_JAR = "minecraft-mavenizer-" + TOOL_VERSION + ".jar";
++	private static final String TOOL_URL = "https://maven.minecraftforge.net/net/minecraftforge/minecraft-mavenizer/"
++			+ TOOL_VERSION + "/" + TOOL_JAR;
++	private static final String TOOL_SHA256 = "4659310b6c97938ad80f8d569ec9ca76620533feaa3ff46f7a05d7133d29d700";
++	private static final String MAIN_CLASS = "net.minecraftforge.mcmaven.cli.Main";
++	private static final String RECIPE = "forge-mavenizer/v1|official-to-srg|jdk=8,21,25|sha256=" + TOOL_SHA256;
++	private static final Duration LOCK_TIMEOUT = Duration.ofMinutes(45);
++
++	public interface Options extends Service.Options {
++		@Input
++		Property<String> getForgeVersion();
++
++		@Input
++		Property<String> getMinecraftVersion();
++
++		@Input
++		Property<String> getMcpVersion();
++
++		@Input
++		Property<String> getRecipe();
++
++		@Internal
++		Property<Boolean> getOffline();
++
++		@Internal
++		Property<Boolean> getRefresh();
++
++		@Internal
++		DirectoryProperty getCacheDirectory();
++
++		@Input
++		Property<String> getJava8Home();
++
++		@Input
++		Property<String> getJava21Home();
++
++		@Input
++		Property<String> getJava25Home();
++
++		@Nested
++		Property<ForgeToolService.Options> getTool();
++	}
++
++	public static Provider<Options> createOptions(Project project, String forgeVersion, String minecraftVersion,
++			String mcpVersion, Path cacheDirectory) {
++		final ObjectFactory objects = project.getObjects();
++		final Provider<JavaLauncher> java25 = JavaExecutableFetcher.launcherFor(project, 25);
++		final ForgeToolExecutor.Settings settings = objects.newInstance(ForgeToolExecutor.Settings.class);
++		settings.getExecutable().set(java25.map(launcher -> launcher.getExecutablePath().getAsFile().getAbsolutePath()));
++		// 失败时保留官方工具诊断，不沿用消费工程的 JVM 或抑制错误输出。
++		settings.getShowVerboseStdout().set(ForgeToolExecutor.shouldShowVerboseStdout(project));
++		settings.getShowVerboseStderr().set(true);
++		settings.getMainClass().set(MAIN_CLASS);
++		settings.getProgramArgs();
++		settings.getJvmArgs();
++		settings.getExecClasspath();
++		final ForgeToolService.Options tool = ServiceType.createOptions(objects, ForgeToolService.TYPE,
++				options -> options.getBaseSettings().set(settings));
++		final Options options = ServiceType.createOptions(objects, TYPE, value -> {
++			value.getForgeVersion().set(forgeVersion);
++			value.getMinecraftVersion().set(minecraftVersion);
++			value.getMcpVersion().set(mcpVersion);
++			value.getRecipe().set(RECIPE);
++			value.getCacheDirectory().fileValue(cacheDirectory.toFile());
++			value.getOffline().set(project.getGradle().getStartParameter().isOffline());
++			value.getRefresh().set(project.getGradle().getStartParameter().isRefreshDependencies() || Boolean.getBoolean("loom.refresh"));
++			value.getJava8Home().set(JavaExecutableFetcher.launcherFor(project, 8).map(ForgeMavenizerService::javaHome));
++			value.getJava21Home().set(JavaExecutableFetcher.launcherFor(project, 21).map(ForgeMavenizerService::javaHome));
++			value.getJava25Home().set(java25.map(ForgeMavenizerService::javaHome));
++			value.getTool().set(tool);
++		});
++		return project.provider(() -> options);
++	}
++
++	public ForgeMavenizerService(Options options, ServiceFactory serviceFactory) {
++		super(options, serviceFactory);
++	}
++
++	private static String javaHome(JavaLauncher launcher) {
++		return launcher.getMetadata().getInstallationPath().getAsFile().getAbsolutePath();
++	}
++
++	public static Path receipt(Path output) {
++		return output.resolveSibling(output.getFileName() + ".mavenizer-receipt");
++	}
++
++	/** 仅检查已发布的产物身份，不解析 Mavenizer 或 JDK. */
++	public static boolean isReusable(Path output, String forgeVersion, String minecraftVersion, String mcpVersion) {
++		final Path receipt = receipt(output);
++
++		try {
++			if (!Files.isRegularFile(receipt, LinkOption.NOFOLLOW_LINKS) || !Files.isRegularFile(output, LinkOption.NOFOLLOW_LINKS)) {
++				return false;
++			}
++
++			final List<String> lines = Files.readAllLines(receipt);
++			return lines.size() == 4 && lines.get(0).equals(identity(forgeVersion, minecraftVersion, mcpVersion))
++					&& lines.get(1).matches("[a-f0-9]{64}") && lines.get(2).matches("[a-f0-9]{64}")
++					&& Checksum.of(output).sha256().matchesStr(lines.get(3));
++		} catch (IOException | UncheckedIOException e) {
++			return false;
++		}
++	}
++
++	static String runtimeRecipe() {
++		return RECIPE;
++	}
++
++	private static String identity(String forgeVersion, String minecraftVersion, String mcpVersion) {
++		return RECIPE + "|forge=" + forgeVersion + "|minecraft=" + minecraftVersion + "|mcp=" + mcpVersion;
++	}
++
++	public void produce(Path output) throws IOException {
++		final Path target = output.toAbsolutePath().normalize();
++		final Path cache = getOptions().getCacheDirectory().get().getAsFile().toPath().toAbsolutePath().normalize();
++		final String forge = getOptions().getForgeVersion().get();
++		final String minecraft = getOptions().getMinecraftVersion().get();
++		final String mcp = getOptions().getMcpVersion().get();
++		final boolean refresh = getOptions().getRefresh().get();
++
++		try {
++			withRuntimeLock(target, () -> {
++				if (!refresh && isReusable(target, forge, minecraft, mcp)) {
++					return null;
++				}
++
++				// 同一工具缓存串行读写；仓库由每次运行独占，不能把上一次输出误判成成功。
++				return CacheEntryLock.withLock(cache.resolve("locks"), "mavenizer-cache", LOCK_TIMEOUT, () -> {
++					produceLocked(target, cache, forge, minecraft, mcp);
++					return null;
++				});
++			});
++		} catch (Exception e) {
++			if (e instanceof InterruptedException) {
++				Thread.currentThread().interrupt();
++			}
++
++			throw new IOException("Forge Mavenizer " + TOOL_VERSION + " 无法为 " + forge + " 生成 SRG JAR：" + e.getMessage(), e);
++		}
++	}
++
++	private void produceLocked(Path output, Path cache, String forge, String minecraft, String mcp) throws IOException {
++		export(cache, forge, minecraft, mcp, getOptions().getRefresh().get(), false, artifact ->
++				publish(output, forge, minecraft, mcp, artifact.classesJar(), artifact.officialToSrgMappings(), artifact::writeSrgJar));
++	}
++
++	/** 为已发布的运行时补齐同批源码；热命中不会再次调用工具. */
++	public void prepareSources(Path runtimeSrgJar, Path runtimeReceipt, Path outputBundle) throws IOException {
++		final Path target = runtimeSrgJar.toAbsolutePath().normalize();
++		final Path stamp = runtimeReceipt.toAbsolutePath().normalize();
++		final Path bundle = outputBundle.toAbsolutePath().normalize();
++		final Path cache = getOptions().getCacheDirectory().get().getAsFile().toPath().toAbsolutePath().normalize();
++		final String forge = getOptions().getForgeVersion().get();
++		final String minecraft = getOptions().getMinecraftVersion().get();
++		final String mcp = getOptions().getMcpVersion().get();
++
++		if (bundle.equals(target) || bundle.equals(stamp) || !stamp.equals(receipt(target))) {
++			throw new IOException("Mavenizer 运行时、收据或源码包路径不匹配：" + target + " / " + stamp + " / " + bundle);
++		}
++
++		try {
++			withRuntimeLock(target, () -> {
++				final var runtime = ForgeMavenizerSourcesBundle.readRuntime(target, stamp);
++
++				if (!runtime.recipe().equals(identity(forge, minecraft, mcp))) {
++					throw new IOException("Mavenizer 当前运行时收据与请求的 Forge/Minecraft/MCP 版本不符：" + stamp);
++				}
++
++				if (ForgeMavenizerSourcesBundle.isReusable(bundle, runtime)) {
++					return null;
++				}
++
++				return CacheEntryLock.withLock(cache.resolve("locks"), "mavenizer-cache", LOCK_TIMEOUT, () -> {
++					// 补齐源码只读对照现有运行时身份，不能把刷新当作绕过配对校验的方式。
++					exportSources(getOptions().getOffline().get(), cacheOnly ->
++							export(cache, forge, minecraft, mcp, false, cacheOnly, artifact ->
++									ForgeMavenizerSourcesBundle.publish(bundle, target, stamp, runtime, artifact)));
++					return null;
++				});
++			});
++		} catch (Exception e) {
++			if (e instanceof InterruptedException) {
++				Thread.currentThread().interrupt();
++			}
++
++			throw new IOException("Forge Mavenizer " + TOOL_VERSION + " 无法为 " + forge + " 补齐同批源码：" + e.getMessage(), e);
++		}
++	}
++
++	private static <T> T withRuntimeLock(Path target, Callable<T> action) throws Exception {
++		return CacheEntryLock.withLock(target.getParent().resolve(".loom-locks"), "forge-mavenizer:" + target.getFileName(), LOCK_TIMEOUT, action);
++	}
++
++	static void exportSources(boolean offline, AtomicFiles.IOConsumer<Boolean> export) throws IOException {
++		if (!offline) {
++			export.accept(false);
++			return;
++		}
++
++		try {
++			export.accept(true);
++		} catch (MavenizerCommandException first) {
++			try {
++				// 首次只读已有流水线缓存；缓存路径迁移导致未命中时才尝试正常离线执行。
++				export.accept(false);
++			} catch (MavenizerCommandException second) {
++				final IOException failure = new IOException("Mavenizer 本机离线缓存不足：两种离线导出均失败。请联网补齐同批源码缓存；当前运行时保持不变", second);
++				failure.addSuppressed(first);
++				throw failure;
++			} catch (IOException validation) {
++				validation.addSuppressed(first);
++				throw validation;
++			}
++		}
++	}
++
++	private static final class MavenizerCommandException extends IOException {
++		private MavenizerCommandException(RuntimeException cause) {
++			super("Mavenizer 外部进程启动或执行失败：" + cause.getMessage(), cause);
++		}
++	}
++
++	static IOException commandFailure(RuntimeException failure) {
++		return new MavenizerCommandException(failure);
++	}
++
++	private void export(Path cache, String forge, String minecraft, String mcp, boolean refresh, boolean cacheOnly,
++			AtomicFiles.IOConsumer<ForgeMavenizerArtifact> consumer) throws IOException {
++		final boolean offline = getOptions().getOffline().get();
++		final Path toolJar = resolveTool(cache, offline);
++		final Path workCache = Files.createDirectories(cache.resolve("cache"));
++		final Path jdkCache = Files.createDirectories(cache.resolve("jdk-cache"));
++		final ForgeToolService tool = getServiceFactory().get(getOptions().getTool());
++
++		try (var tmp = new TempFiles()) {
++			final Path repository = tmp.directory("loom-mavenizer-repo-");
++			final List<String> args = cacheOnly ? sourceArguments(forge, workCache, jdkCache, repository)
++					: arguments(forge, workCache, jdkCache, repository, offline, refresh);
++			final String jdkPaths = javaInstallations(getOptions().getJava8Home().get(), getOptions().getJava21Home().get(),
++					getOptions().getJava25Home().get());
++
++			try {
++				final ExecResult result = tool.exec(settings -> {
++					settings.setClasspath(toolJar.toFile());
++					settings.setArgs(args);
++					settings.jvmArgs(jdkPaths);
++				});
++				result.rethrowFailure().assertNormalExitValue();
++			} catch (RuntimeException failure) {
++				// 只标记进程边界的失败；下面的模块、路径、摘要或收据验证绝不触发重试。
++				throw commandFailure(failure);
++			}
++
++			consumer.accept(ForgeMavenizerArtifact.resolve(repository, forge, minecraft, mcp));
++		}
++	}
++
++	static void publish(Path output, String forge, String minecraft, String mcp, Path classes, Path mappings,
++			AtomicFiles.IOConsumer<Path> conversion) throws IOException {
++		final Path jarStage = AtomicFiles.tempSibling(output);
++		final String sourceDigest = Checksum.of(classes).sha256().hex();
++		final String mappingsDigest = Checksum.of(mappings).sha256().hex();
++
++		try {
++			conversion.accept(jarStage);
++			final String digest = Checksum.of(jarStage).sha256().hex();
++			final List<String> stamp = List.of(identity(forge, minecraft, mcp), sourceDigest, mappingsDigest, digest);
++			// 先落位 JAR，再提交摘要；中断若留下旧摘要，下次会因摘要不符而重新生产。
++			AtomicFiles.publish(receipt(output), stage -> {
++				Files.write(stage, stamp);
++				AtomicFiles.move(jarStage, output);
++			});
++		} finally {
++			Files.deleteIfExists(jarStage);
++		}
++	}
++
++	static List<String> arguments(String forge, Path cache, Path jdkCache, Path output, boolean offline, boolean refresh) {
++		final List<String> args = new ArrayList<>(List.of("--maven", "--artifact", "net.minecraftforge:forge", "--version", forge,
++				"--mappings", "official", "--cache", cache.toString(), "--jdk-cache", jdkCache.toString(), "--output", output.toString()));
++
++		if (offline) {
++			args.add("--offline");
++		}
++
++		if (refresh) {
++			args.add("--ignore-cache");
++		}
++
++		return args;
++	}
++
++	static List<String> sourceArguments(String forge, Path cache, Path jdkCache, Path output) {
++		final List<String> args = arguments(forge, cache, jdkCache, output, true, false);
++		args.add("--cache-only");
++		return args;
++	}
++
++	static String javaInstallations(String java8, String java21, String java25) {
++		final List<String> installations = List.of(java8, java21, java25);
++
++		if (installations.stream().anyMatch(path -> path.contains(","))) {
++			throw new IllegalArgumentException("Mavenizer 无法解析含逗号的 JDK 安装路径：" + installations);
++		}
++
++		return "-Dorg.gradle.java.installations.paths=" + String.join(",", installations);
++	}
++
++	static Path resolveTool(Path cache, boolean offline) throws IOException {
++		final Path tool = cache.resolve(TOOL_JAR);
++
++		if (Files.isRegularFile(tool, LinkOption.NOFOLLOW_LINKS) && Checksum.of(tool).sha256().matchesStr(TOOL_SHA256)) {
++			return tool;
++		}
++
++		if (offline) {
++			throw new IOException("离线模式缺少 SHA-256 校验通过的 Mavenizer " + TOOL_VERSION + "：" + tool);
++		}
++
++		AtomicFiles.publish(tool, tmp -> {
++			try {
++				Download.create(TOOL_URL).downloadPath(tmp);
++			} catch (URISyntaxException e) {
++				throw new IOException("Mavenizer 官方下载地址无效", e);
++			}
++
++			final String actual = Checksum.of(tmp).sha256().hex();
++
++			if (!TOOL_SHA256.equals(actual)) {
++				throw new IOException("Mavenizer " + TOOL_VERSION + " SHA-256 不匹配：期望 " + TOOL_SHA256 + "，实际 " + actual);
++			}
++		});
++		return tool;
++	}
++}
+diff --git a/src/main/java/dev/architectury/loom/forge/tool/ForgeMavenizerSourcesBundle.java b/src/main/java/dev/architectury/loom/forge/tool/ForgeMavenizerSourcesBundle.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..54cccde48664c445e38ec83bde64684f16054f4f
+--- /dev/null
++++ b/src/main/java/dev/architectury/loom/forge/tool/ForgeMavenizerSourcesBundle.java
+@@ -0,0 +1,277 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package dev.architectury.loom.forge.tool;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.io.UncheckedIOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.LinkOption;
++import java.nio.file.Path;
++import java.security.DigestInputStream;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.util.HashSet;
++import java.util.HexFormat;
++import java.util.List;
++import java.util.Set;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipFile;
++import java.util.zip.ZipOutputStream;
++
++import net.fabricmc.loom.util.Checksum;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++
++/** 保存同一批 Mavenizer 的 Mojang classes 和源码，并绑定当前 SRG 产物. */
++public record ForgeMavenizerSourcesBundle(Path mojangClassesJar, Path sourcesJar) {
++	private static final String FORMAT = "mavenizer-sources-v1";
++	private static final String STAMP = "identity.txt";
++	private static final String CLASSES = "mojang-classes.jar";
++	private static final String SOURCES = "sources.jar";
++	private static final Set<String> ENTRIES = Set.of(STAMP, CLASSES, SOURCES);
++	private static final int MAX_STAMP = 4096;
++	private static final long MAX_JAR = 128L * 1024 * 1024;
++
++	record RuntimeIdentity(String recipe, String receiptSha, String srgSha, String classesSha, String mappingsSha) {
++	}
++
++	static RuntimeIdentity readRuntime(Path runtimeSrgJar, Path runtimeReceipt) throws IOException {
++		if (!Files.isRegularFile(runtimeReceipt, LinkOption.NOFOLLOW_LINKS) || !Files.isRegularFile(runtimeSrgJar, LinkOption.NOFOLLOW_LINKS)) {
++			throw new IOException("缺少已经发布的 Mavenizer 运行时 JAR 或收据：" + runtimeSrgJar + " / " + runtimeReceipt);
++		}
++
++		try (InputStream input = Files.newInputStream(runtimeReceipt)) {
++			final byte[] bytes = readStamp(input);
++			final List<String> lines = lines(bytes);
++
++			if (lines.size() != 4 || !lines.getFirst().startsWith(ForgeMavenizerService.runtimeRecipe() + "|forge=")
++					|| !lines.subList(1, 4).stream().allMatch(ForgeMavenizerSourcesBundle::isSha256)) {
++				throw new IOException("无效的 Mavenizer 运行时收据：" + runtimeReceipt);
++			}
++
++			if (!sha256(runtimeSrgJar).equals(lines.get(3))) {
++				throw new IOException("Mavenizer SRG JAR 摘要与收据不符：" + runtimeSrgJar);
++			}
++
++			return new RuntimeIdentity(lines.getFirst(), Checksum.of(bytes).sha256().hex(), lines.get(3), lines.get(1), lines.get(2));
++		}
++	}
++
++	static boolean isReusable(Path bundle, RuntimeIdentity runtime) {
++		if (!Files.isRegularFile(bundle, LinkOption.NOFOLLOW_LINKS)) {
++			return false;
++		}
++
++		try (ZipFile zip = new ZipFile(bundle.toFile())) {
++			verify(zip, runtime);
++			return true;
++		} catch (IOException e) {
++			return false;
++		}
++	}
++
++	static void publish(Path bundle, Path runtimeSrgJar, Path runtimeReceipt, RuntimeIdentity runtime, ForgeMavenizerArtifact artifact) throws IOException {
++		if (!runtime.classesSha().equals(sha256(artifact.classesJar())) || !runtime.mappingsSha().equals(sha256(artifact.officialToSrgMappings()))) {
++			throw new IOException("Mavenizer 本次导出的 Mojang classes 或 map2srg 与当前运行时收据不符；保留原运行时与已有源码包");
++		}
++
++		final List<String> identity = List.of(FORMAT, runtime.receiptSha(), runtime.srgSha(), runtime.classesSha(), sha256(artifact.sourcesJar()));
++		AtomicFiles.publish(bundle, stage -> {
++			try (var zip = new ZipOutputStream(Files.newOutputStream(stage))) {
++				zip.setLevel(0);
++				zip.putNextEntry(entry(STAMP));
++				zip.write(String.join("\n", identity).getBytes(StandardCharsets.UTF_8));
++				zip.closeEntry();
++				writeJar(zip, CLASSES, artifact.classesJar());
++				writeJar(zip, SOURCES, artifact.sourcesJar());
++			}
++
++			try (ZipFile zip = new ZipFile(stage.toFile())) {
++				verify(zip, runtime);
++			}
++
++			verifyCurrentRuntime(runtimeSrgJar, runtimeReceipt, runtime);
++		});
++	}
++
++	/** 从固定条目名解包；只在整包和运行时身份通过校验后写入调用方的工作目录. */
++	public static ForgeMavenizerSourcesBundle unpack(Path bundle, Path runtimeSrgJar, Path runtimeReceipt, Path workDirectory) throws IOException {
++		final RuntimeIdentity runtime = readRuntime(runtimeSrgJar, runtimeReceipt);
++
++		if (!Files.isRegularFile(bundle, LinkOption.NOFOLLOW_LINKS)) {
++			throw new IOException("Mavenizer 源码包不存在或不是普通文件：" + bundle);
++		}
++
++		try (ZipFile zip = new ZipFile(bundle.toFile())) {
++			final String sourcesSha = verify(zip, runtime);
++			final Path directory = Files.createTempDirectory(Files.createDirectories(workDirectory), "mavenizer-sources-");
++			final Path classes = directory.resolve(CLASSES);
++			final Path sources = directory.resolve(SOURCES);
++
++			try {
++				extract(zip, CLASSES, classes, runtime.classesSha());
++				extract(zip, SOURCES, sources, sourcesSha);
++				verifyCurrentRuntime(runtimeSrgJar, runtimeReceipt, runtime);
++				return new ForgeMavenizerSourcesBundle(classes, sources);
++			} catch (IOException e) {
++				try {
++					Files.deleteIfExists(sources);
++					Files.deleteIfExists(classes);
++					Files.deleteIfExists(directory);
++				} catch (IOException cleanup) {
++					e.addSuppressed(cleanup);
++				}
++
++				throw e;
++			}
++		}
++	}
++
++	private static void verifyCurrentRuntime(Path runtimeSrgJar, Path runtimeReceipt, RuntimeIdentity runtime) throws IOException {
++		if (!runtime.equals(readRuntime(runtimeSrgJar, runtimeReceipt))) {
++			throw new IOException("准备 Mavenizer 源码期间运行时身份已变更：" + runtimeSrgJar);
++		}
++	}
++
++	private static String verify(ZipFile zip, RuntimeIdentity runtime) throws IOException {
++		final Set<String> found = new HashSet<>();
++		final var entries = zip.entries();
++
++		while (entries.hasMoreElements()) {
++			final ZipEntry entry = entries.nextElement();
++
++			if (!ENTRIES.contains(entry.getName()) || entry.isDirectory() || !found.add(entry.getName())) {
++				throw new IOException("Mavenizer 源码包含非预期或重复条目：" + entry.getName());
++			}
++		}
++
++		if (!found.equals(ENTRIES)) {
++			throw new IOException("Mavenizer 源码包条目不完整：" + zip.getName());
++		}
++
++		try (InputStream input = zip.getInputStream(zip.getEntry(STAMP))) {
++			final List<String> lines = lines(readStamp(input));
++			final List<String> expected = List.of(FORMAT, runtime.receiptSha(), runtime.srgSha(), runtime.classesSha());
++
++			if (lines.size() != 5 || !lines.subList(0, 4).equals(expected) || !isSha256(lines.get(4))) {
++				throw new IOException("Mavenizer 源码包身份与当前 SRG JAR 或收据不符：" + zip.getName());
++			}
++
++			try (OutputStream discard = OutputStream.nullOutputStream()) {
++				copyJar(zip, CLASSES, runtime.classesSha(), discard);
++				copyJar(zip, SOURCES, lines.get(4), discard);
++			}
++
++			return lines.get(4);
++		}
++	}
++
++	private static void copyJar(ZipFile zip, String name, String expected, OutputStream output) throws IOException {
++		final ZipEntry entry = zip.getEntry(name);
++		final MessageDigest digest;
++
++		try {
++			digest = MessageDigest.getInstance("SHA-256");
++		} catch (NoSuchAlgorithmException e) {
++			throw new IllegalStateException(e);
++		}
++
++		try (var input = new DigestInputStream(zip.getInputStream(entry), digest)) {
++			final long size = entry.getSize();
++
++			if (size <= 0 || size > MAX_JAR) {
++				throw new IOException("Mavenizer 源码包 JAR 尺寸异常：" + name);
++			}
++
++			final byte[] buffer = new byte[8192];
++			long remaining = size;
++
++			while (remaining > 0) {
++				final int read = input.read(buffer, 0, (int) Math.min(remaining, buffer.length));
++
++				if (read < 0) {
++					throw new IOException("Mavenizer 源码包 JAR 被截断：" + name);
++				}
++
++				output.write(buffer, 0, read);
++				remaining -= read;
++			}
++
++			if (input.read() != -1) {
++				throw new IOException("Mavenizer 源码包 JAR 实际尺寸超出声明：" + name);
++			}
++		}
++
++		if (!expected.equals(HexFormat.of().formatHex(digest.digest()))) {
++			throw new IOException("Mavenizer 源码包 JAR 摘要不符：" + name);
++		}
++	}
++
++	private static void extract(ZipFile zip, String name, Path target, String expected) throws IOException {
++		try (OutputStream output = Files.newOutputStream(target)) {
++			copyJar(zip, name, expected, output);
++		}
++	}
++
++	private static void writeJar(ZipOutputStream zip, String name, Path jar) throws IOException {
++		zip.putNextEntry(entry(name));
++		Files.copy(jar, zip);
++		zip.closeEntry();
++	}
++
++	private static ZipEntry entry(String name) {
++		final ZipEntry entry = new ZipEntry(name);
++		entry.setTimeLocal(java.time.LocalDateTime.of(1980, 1, 1, 0, 0));
++		return entry;
++	}
++
++	private static String sha256(Path file) throws IOException {
++		try {
++			return Checksum.of(file).sha256().hex();
++		} catch (UncheckedIOException e) {
++			throw e.getCause();
++		}
++	}
++
++	private static byte[] readStamp(InputStream input) throws IOException {
++		final byte[] bytes = input.readNBytes(MAX_STAMP + 1);
++
++		if (bytes.length > MAX_STAMP) {
++			throw new IOException("Mavenizer 身份文件超出允许大小");
++		}
++
++		return bytes;
++	}
++
++	private static List<String> lines(byte[] bytes) {
++		return new String(bytes, StandardCharsets.UTF_8).lines().toList();
++	}
++
++	private static boolean isSha256(String value) {
++		return value.matches("[a-f0-9]{64}");
++	}
++}
+diff --git a/src/main/java/dev/architectury/loom/forge/tool/JavaExecutableFetcher.java b/src/main/java/dev/architectury/loom/forge/tool/JavaExecutableFetcher.java
+index 1c7d5a723cbc609d1768638b0e788d3267f19afe..6adcc1986266b15be3ee8b788404509471481f00 100644
+--- a/src/main/java/dev/architectury/loom/forge/tool/JavaExecutableFetcher.java
++++ b/src/main/java/dev/architectury/loom/forge/tool/JavaExecutableFetcher.java
+@@ -5,6 +5,7 @@ import javax.inject.Inject;
+ import org.gradle.api.Project;
+ import org.gradle.api.plugins.JavaPluginExtension;
+ import org.gradle.api.provider.Provider;
++import org.gradle.jvm.toolchain.JavaLanguageVersion;
+ import org.gradle.jvm.toolchain.JavaLauncher;
+ import org.gradle.jvm.toolchain.JavaToolchainService;
+ import org.gradle.jvm.toolchain.JavaToolchainSpec;
+@@ -13,6 +14,11 @@ public abstract class JavaExecutableFetcher {
+ 	@Inject
+ 	protected abstract JavaToolchainService getToolchainService();
+ 
++	static Provider<JavaLauncher> launcherFor(Project project, int majorVersion) {
++		final JavaExecutableFetcher fetcher = project.getObjects().newInstance(JavaExecutableFetcher.class);
++		return fetcher.getToolchainService().launcherFor(spec -> spec.getLanguageVersion().set(JavaLanguageVersion.of(majorVersion)));
++	}
++
+ 	public static Provider<String> getJavaToolchainExecutable(Project project) {
+ 		return project.provider(() -> {
+ 			final JavaExecutableFetcher fetcher = project.getObjects().newInstance(JavaExecutableFetcher.class);
+diff --git a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+index faac20950e49348d240d3ece17f984a9ee6270cf..d0aaaf0457fc13c573f86e5d56f013c2e731a6d0 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+@@ -44,6 +44,7 @@ import dev.architectury.loom.forge.dependency.ForgeUserdevProvider;
+ import dev.architectury.loom.forge.dependency.PatchProvider;
+ import dev.architectury.loom.forge.dependency.SrgProvider;
+ import dev.architectury.loom.forge.minecraft.ForgeMinecraftProvider;
++import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
+ import dev.architectury.loom.mcpconfig.McpConfigProvider;
+ import org.gradle.api.Action;
+ import org.gradle.api.Project;
+@@ -185,7 +186,7 @@ public abstract class CompileConfiguration implements Runnable {
+ 				// TODO: Find a better place for this?
+ 				//   This has to be after dependencyManager.handleDependencies() above
+ 				//   because of https://github.com/architectury/architectury-loom/issues/72.
+-				if (!ModConfigurationRemapper.isCIBuild()) {
++				if (!ModConfigurationRemapper.isCIBuild() && !MinecraftPatchedProvider.usesMavenizer(extension, extension.getMinecraftProvider())) {
+ 					try {
+ 						ForgeSourcesService.addForgeSourcesDuringProjectConfiguration(getProject(), configContext.serviceFactory());
+ 					} catch (IOException e) {
+diff --git a/src/main/java/net/fabricmc/loom/configuration/decompile/SingleJarDecompileConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/decompile/SingleJarDecompileConfiguration.java
+index e2718f715a56ac81ffbf84fffe39e85d20b19bd9..b560df9f2dc513b439a1bad705bba36ff8802def 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/decompile/SingleJarDecompileConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/decompile/SingleJarDecompileConfiguration.java
+@@ -24,9 +24,13 @@
+ 
+ package net.fabricmc.loom.configuration.decompile;
+ 
++import java.nio.file.Path;
+ import java.util.List;
++import java.util.Map;
+ 
+ import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
++import dev.architectury.loom.forge.tool.ForgeMavenizerService;
++import dev.architectury.loom.mappings.MappingOption;
+ import org.gradle.api.Project;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
+@@ -34,8 +38,12 @@ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJar;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
+ import net.fabricmc.loom.configuration.providers.minecraft.mapped.MappedMinecraftProvider;
++import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
++import net.fabricmc.loom.task.GenerateForgeMavenizerSourcesTask;
+ import net.fabricmc.loom.task.GenerateForgePatchedSourcesTask;
+ import net.fabricmc.loom.task.GenerateSourcesTask;
++import net.fabricmc.loom.task.service.MappingsService;
++import net.fabricmc.loom.task.service.SourceRemapperService;
+ import net.fabricmc.loom.util.Constants;
+ 
+ public class SingleJarDecompileConfiguration extends DecompileConfiguration<MappedMinecraftProvider> {
+@@ -43,6 +51,47 @@ public class SingleJarDecompileConfiguration extends DecompileConfiguration<Mapp
+ 		super(project, minecraftProvider);
+ 	}
+ 
++	private void registerOfficialSources(MinecraftJar minecraftJar) {
++		final var patched = MinecraftPatchedProvider.get(project);
++		final var bundle = patched.registerMavenizerSourcesBundle();
++		final Path runtime = patched.getMinecraftPatchedIntermediateJar();
++		final Path receipt = ForgeMavenizerService.receipt(runtime);
++		final var mappings = extension.getMappingConfiguration();
++		final Path mappingFile = mappings.getMappingsPath(MappingOption.WITH_SRG);
++		final Path output = GenerateSourcesTask.getJarFileWithSuffix("-sources.jar", minecraftJar.getPath()).toPath();
++		final var libraries = project.getConfigurations().getByName(Constants.Configurations.MINECRAFT_COMPILE_LIBRARIES);
++		final var remapper = SourceRemapperService.TYPE.create(project, options -> {
++			options.getMappings().set(MappingsService.createOptions(project, mappingFile, "mojang", "named", true));
++			options.getJavaCompileRelease().set(21);
++			// 只传游戏及 Forge 的库，游戏类由已校验的同批 Mojang JAR 单独提供。
++			options.getClasspath().from(libraries);
++		});
++		final var producer = RemapMinecraftTaskRegistry.claim(project, output, Map.of(
++				"stage", "mavenizer-named-sources-v1", "bundle", bundle.artifact().toString(), "mappings", mappingFile.toString(),
++				"named", minecraftJar.getPath().toString(), "java", "21",
++				"libraries", libraries.getAllDependencies().stream().map(Object::toString).sorted().collect(java.util.stream.Collectors.joining("\n"))
++		), () -> project.getTasks().register(GenerateForgeMavenizerSourcesTask.NAME, GenerateForgeMavenizerSourcesTask.class, task -> {
++			task.setGroup(Constants.TaskGroup.FABRIC);
++			task.setDescription("生成与 Forge 运行时同批的 named 官方源码。");
++			task.getBundle().set(bundle.artifact().toFile());
++			task.getRuntimeSrgJar().set(runtime.toFile());
++			task.getRuntimeReceipt().set(receipt.toFile());
++			task.getNamedJar().set(minecraftJar.toFile());
++			task.getSourceRemapper().set(remapper);
++			task.getOutputJar().set(output.toFile());
++			task.dependsOn(bundle.taskPath());
++			task.dependsOn(extension.getMinecraftJarsCollection(MappingsNamespace.NAMED));
++			mappings.addMappingsProducerDependency(task);
++		}));
++
++		if (project.getTasks().findByName(GenerateForgeMavenizerSourcesTask.NAME) == null) {
++			project.getTasks().register(GenerateForgeMavenizerSourcesTask.NAME, task -> {
++				task.setGroup(Constants.TaskGroup.FABRIC);
++				task.dependsOn(producer.taskPath());
++			});
++		}
++	}
++
+ 	@Override
+ 	public String getTaskName(MinecraftJar.Type type) {
+ 		return "genSources";
+@@ -54,6 +103,11 @@ public class SingleJarDecompileConfiguration extends DecompileConfiguration<Mapp
+ 		assert minecraftJars.size() == 1;
+ 		final MinecraftJar minecraftJar = minecraftJars.get(0);
+ 		final String taskBaseName = getTaskName(minecraftJar.getType());
++		final boolean officialSources = MinecraftPatchedProvider.usesMavenizer(extension, extension.getMinecraftProvider());
++
++		if (officialSources) {
++			registerOfficialSources(minecraftJar);
++		}
+ 
+ 		LoomGradleExtension.get(project).getDecompilerOptions().forEach(options -> {
+ 			final String decompilerName = options.getFormattedName();
+@@ -61,7 +115,15 @@ public class SingleJarDecompileConfiguration extends DecompileConfiguration<Mapp
+ 			// Decompiler will be passed to the constructor of GenerateSourcesTask
+ 			project.getTasks().register(taskName, GenerateSourcesTask.class, options).configure(task -> {
+ 				task.getInputJarName().set(minecraftJar.getName());
+-				task.getSourcesOutputJar().fileValue(GenerateSourcesTask.getJarFileWithSuffix("-sources.jar", minecraftJar.getPath()));
++
++				if (officialSources) {
++					var output = project.getLayout().getBuildDirectory().dir("loom/decompile/" + options.getName());
++					task.getSourcesOutputJar().set(output.map(directory -> directory.file("minecraft-sources.jar")));
++					task.getClassesOutputJar().set(output.map(directory -> directory.file("minecraft-linenumbers.jar")));
++					task.getLineMapOutput().set(output.map(directory -> directory.file("minecraft.linemap.txt")));
++				} else {
++					task.getSourcesOutputJar().fileValue(GenerateSourcesTask.getJarFileWithSuffix("-sources.jar", minecraftJar.getPath()));
++				}
+ 
+ 				task.dependsOn(project.getTasks().named("validateAccessWidener"));
+ 				task.setDescription("Decompile minecraft using %s.".formatted(decompilerName));
+@@ -73,11 +135,12 @@ public class SingleJarDecompileConfiguration extends DecompileConfiguration<Mapp
+ 			task.setDescription("Decompile minecraft using the default decompiler.");
+ 			task.setGroup(Constants.TaskGroup.FABRIC);
+ 
+-			task.dependsOn(project.getTasks().named("genSourcesWith" + DecompileConfiguration.DEFAULT_DECOMPILER));
++			task.dependsOn(project.getTasks().named(officialSources ? GenerateForgeMavenizerSourcesTask.NAME
++					: "genSourcesWith" + DecompileConfiguration.DEFAULT_DECOMPILER));
+ 		});
+ 
+ 		// TODO: Support for env-only jars?
+-		if (extension.isForge() && !extension.isLegacyForge() && extension.getMinecraftJarConfiguration().get() == MinecraftJarConfiguration.MERGED) {
++		if (!officialSources && extension.isForge() && !extension.isLegacyForge() && extension.getMinecraftJarConfiguration().get() == MinecraftJarConfiguration.MERGED) {
+ 			project.getTasks().register("genForgePatchedSources", GenerateForgePatchedSourcesTask.class, task -> {
+ 				task.setDescription("Decompile Minecraft using Forge's toolchain.");
+ 				task.setGroup(Constants.TaskGroup.FABRIC);
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+index 89e94153f4a4ba9893136b2013034adbc956d976..0a875b44e6c945bd7e020f1b6a9ad2b819546fc4 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+@@ -49,6 +49,7 @@ import java.util.zip.ZipFile;
+ 
+ import dev.architectury.loom.forge.ForgeMigratedMappingConfiguration;
+ import dev.architectury.loom.forge.dependency.SrgProvider;
++import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
+ import dev.architectury.loom.mappings.ForgeMappingsMerger;
+ import dev.architectury.loom.mappings.MCPReader;
+ import dev.architectury.loom.mappings.MappingOption;
+@@ -142,7 +143,7 @@ public class MappingConfiguration {
+ 				minecraftProvider.minecraftVersion(),
+ 				Boolean.toString(extension.getUseIntermediateMappings().get()),
+ 				Boolean.toString(extension.disableObfuscation()),
+-				forgeVersion);
++				forgeVersion + MinecraftPatchedProvider.mappingGenerationSuffix(extension, minecraftProvider));
+ 		return Checksum.of(rawKey).sha256().hex();
+ 	}
+ 
+@@ -238,7 +239,8 @@ public class MappingConfiguration {
+ 		String mappingsIdentifier;
+ 
+ 		if (extension.isForgeLike()) {
+-			mappingsIdentifier = createForgeMappingsIdentifier(extension, mappingsName, version, getMappingsClassifier(dependency, jarInfo.v2()), minecraftProvider.minecraftVersion());
++			mappingsIdentifier = createForgeMappingsIdentifier(extension, mappingsName, version, getMappingsClassifier(dependency, jarInfo.v2()), minecraftProvider.minecraftVersion())
++					+ MinecraftPatchedProvider.mappingGenerationSuffix(extension, minecraftProvider);
+ 		} else {
+ 			mappingsIdentifier = createMappingsIdentifier(mappingsName, version, getMappingsClassifier(dependency, jarInfo.v2()), minecraftProvider.minecraftVersion());
+ 		}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
+index 7a1d512640f1e8bdc8409454ec25b8d32b2e0a3b..bda84621b4b1ff597b2d5196dd421098fa4eee27 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
+@@ -418,15 +418,15 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 			return extension.getMinecraftProvider().minecraftVersion();
+ 		}
+ 
+-final String version = "%s-%s".formatted(extension.getMinecraftProvider().minecraftVersion(), extension.getMappingConfiguration().mappingsIdentifier());
++		final String version = "%s-%s".formatted(extension.getMinecraftProvider().minecraftVersion(), extension.getMappingConfiguration().mappingsIdentifier());
+ 
+-// 两项修复影响不同的输入产物，各自隔离旧缓存。
+-return version + (extension.isLegacyForge() ? "-legacy-members-v2" : "")
+-		+ (bridgeForgeRenamedMethods() ? "-forge-method-bridge-v1" : "");
+-}
++		// 两项修复影响不同的输入产物，各自隔离旧缓存。
++		return version + (extension.isLegacyForge() ? "-legacy-members-v2" : "")
++				+ (bridgeForgeRenamedMethods() ? "-forge-method-bridge-v1" : "");
++	}
+ 
+-private boolean bridgeForgeRenamedMethods() {
+-return extension.isForge() && !extension.disableObfuscation() && "1.16.5".equals(minecraftProvider.minecraftVersion());
++	private boolean bridgeForgeRenamedMethods() {
++		return extension.isForge() && !extension.disableObfuscation() && "1.16.5".equals(minecraftProvider.minecraftVersion());
+ 	}
+ 
+ 	protected String getDependencyNotation(MinecraftJar.Type type) {
+@@ -685,7 +685,7 @@ return extension.isForge() && !extension.disableObfuscation() && "1.16.5".equals
+ 	private List<Path> remapClasspath(RemappedJars remappedJars) {
+ 		final List<Path> classpath = new ArrayList<>(List.of(remappedJars.remapClasspath()));
+ 
+-		if (extension.isForgeLike()) {
++		if (extension.isForgeLike() && !MinecraftPatchedProvider.usesMavenizer(extension, minecraftProvider)) {
+ 			final Path forgeJar = extension.getForgeUniversalProvider().getForge().toPath();
+ 
+ 			if (Files.isRegularFile(forgeJar) && !classpath.contains(forgeJar)) {
+@@ -922,6 +922,12 @@ return extension.isForge() && !extension.disableObfuscation() && "1.16.5".equals
+ 		final boolean bridgeForgeRenamedMethods = bridgeForgeRenamedMethods();
+ 		identity.put("bridgeForgeRenamedMethods", Boolean.toString(bridgeForgeRenamedMethods));
+ 		identity.put("forgeLike", Boolean.toString(extension.isForgeLike()));
++		final boolean completeForgeInput = MinecraftPatchedProvider.usesMavenizer(extension, minecraftProvider);
++
++		if (completeForgeInput) {
++			identity.put("forgeProducer", MinecraftPatchedProvider.MAVENIZER_GENERATION);
++		}
++
+ 		identity.put("validateTargetNamespace", Boolean.toString(validateTargetNamespace));
+ 		// innerClassNames 没有指纹项：它不再是配置期读出来的值，而是 (inputJar, forgeLike) 的纯函数，
+ 		// 由 RemapMinecraftTask 在执行期现算（见 resolveInnerClassNames）。这两个判据都已经在上面
+@@ -1000,6 +1006,7 @@ return extension.isForge() && !extension.disableObfuscation() && "1.16.5".equals
+ 					task.getFixRecords().set(fixRecords);
+ 					task.getBridgeForgeRenamedMethods().set(bridgeForgeRenamedMethods);
+ 					task.getForgeLike().set(extension.isForgeLike());
++					task.getCompleteForgeInput().set(completeForgeInput);
+ 
+ 					// named 参考 jar 可能尚未落盘；冷缓存也必须由任务图保证它先产出。
+ 					if (forgeReferenceJars != null) {
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/GenerateForgeMavenizerJarTask.java b/src/main/java/net/fabricmc/loom/pipeline/GenerateForgeMavenizerJarTask.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..1911b2eb405e972d1ca18103ed9f2989e4b4fade
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/pipeline/GenerateForgeMavenizerJarTask.java
+@@ -0,0 +1,68 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.pipeline;
++
++import java.io.File;
++import java.io.IOException;
++
++import dev.architectury.loom.forge.tool.ForgeMavenizerService;
++import org.gradle.api.DefaultTask;
++import org.gradle.api.file.RegularFileProperty;
++import org.gradle.api.provider.Property;
++import org.gradle.api.tasks.Nested;
++import org.gradle.api.tasks.OutputFile;
++import org.gradle.api.tasks.TaskAction;
++import org.gradle.work.DisableCachingByDefault;
++
++import net.fabricmc.loom.util.service.ScopedServiceFactory;
++
++/** 由 Mavenizer 生产 Forge SRG 中间 JAR，与配置期共用同一生成服务. */
++@DisableCachingByDefault(because = "Mavenizer 管理的外部依赖并未全部声明为 Gradle 输入")
++public abstract class GenerateForgeMavenizerJarTask extends DefaultTask {
++	public static final String NAME = "generateForgeMavenizerJar";
++
++	public GenerateForgeMavenizerJarTask() {
++		getOutputs().upToDateWhen(task -> !((GenerateForgeMavenizerJarTask) task).getMavenizer().get().getRefresh().get());
++	}
++
++	@Nested
++	public abstract Property<ForgeMavenizerService.Options> getMavenizer();
++
++	@OutputFile
++	public abstract RegularFileProperty getOutputJar();
++
++	@OutputFile
++	public File getOutputReceipt() {
++		return ForgeMavenizerService.receipt(getOutputJar().get().getAsFile().toPath()).toFile();
++	}
++
++	@TaskAction
++	public void generate() throws IOException {
++		try (var factory = new ScopedServiceFactory()) {
++			final ForgeMavenizerService mavenizer = factory.get(getMavenizer());
++			mavenizer.produce(getOutputJar().get().getAsFile().toPath());
++		}
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/GenerateForgePatchedJarTask.java b/src/main/java/net/fabricmc/loom/pipeline/GenerateForgePatchedJarTask.java
+index 34eeb02701fbbbd15ed31783d95db1370a334cbc..a00ef4685cc72173263fec18feed4a5607f8fd88 100644
+--- a/src/main/java/net/fabricmc/loom/pipeline/GenerateForgePatchedJarTask.java
++++ b/src/main/java/net/fabricmc/loom/pipeline/GenerateForgePatchedJarTask.java
+@@ -99,12 +99,18 @@ public abstract class GenerateForgePatchedJarTask extends DefaultTask {
+ 	@PathSensitive(PathSensitivity.NONE)
+ 	public abstract RegularFileProperty getAtPatchedJar();
+ 
+-	/** Forge 的 universal jar. */
++	/** 是否从已经包含 Forge 类与资源的完整 SRG 产物重映射. */
++	@Input
++	public abstract Property<Boolean> getCompleteForgeInput();
++
++	/** Forge 的 universal jar；完整重编译产物不再合入它. */
++	@Optional
+ 	@InputFile
+ 	@PathSensitive(PathSensitivity.NONE)
+ 	public abstract RegularFileProperty getForgeJar();
+ 
+-	/** Forge 的 userdev jar. */
++	/** Forge 的 userdev jar；完整重编译产物不再注入它. */
++	@Optional
+ 	@InputFile
+ 	@PathSensitive(PathSensitivity.NONE)
+ 	public abstract RegularFileProperty getForgeUserdevJar();
+@@ -220,8 +226,8 @@ public abstract class GenerateForgePatchedJarTask extends DefaultTask {
+ 
+ 			final var options = new MinecraftPatchedProvider.ProductionOptions(
+ 					path(getAtPatchedJar()),
+-					path(getForgeJar()),
+-					path(getForgeUserdevJar()),
++					getCompleteForgeInput().get() ? null : path(getForgeJar()),
++					getCompleteForgeInput().get() ? null : path(getForgeUserdevJar()),
+ 					optionalPath(getClientJar()),
+ 					optionalPath(getServerJar()),
+ 					mappings,
+@@ -242,7 +248,8 @@ public abstract class GenerateForgePatchedJarTask extends DefaultTask {
+ 					optionalPath(getClientExtraJar()),
+ 					Path.of(getLockRoot().get()),
+ 					getLockKey().get(),
+-					getRefreshDeps().get(),
++					// 任务已因输入变化而执行，不能只因旧产物的 manifest 仍有效就跳过重映射。
++					getRefreshDeps().get() || options.completeForgeInput(),
+ 					getLogger()::lifecycle);
+ 		}
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/ManipulateForgeMappingsTask.java b/src/main/java/net/fabricmc/loom/pipeline/ManipulateForgeMappingsTask.java
+index dcec18a68d47dee70f8f018131f94a18ae705160..7052d9df87a6734cef278d74ea5d25992181bfb6 100644
+--- a/src/main/java/net/fabricmc/loom/pipeline/ManipulateForgeMappingsTask.java
++++ b/src/main/java/net/fabricmc/loom/pipeline/ManipulateForgeMappingsTask.java
+@@ -27,6 +27,7 @@ package net.fabricmc.loom.pipeline;
+ import java.io.IOException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.util.List;
+ 
+ import dev.architectury.loom.forge.ForgeMigratedMappingConfiguration;
+ import dev.architectury.loom.forge.MappingsMigrator;
+@@ -36,6 +37,7 @@ import org.gradle.api.provider.Property;
+ import org.gradle.api.tasks.CacheableTask;
+ import org.gradle.api.tasks.Input;
+ import org.gradle.api.tasks.InputFile;
++import org.gradle.api.tasks.Optional;
+ import org.gradle.api.tasks.OutputFile;
+ import org.gradle.api.tasks.PathSensitive;
+ import org.gradle.api.tasks.PathSensitivity;
+@@ -96,11 +98,13 @@ public abstract class ManipulateForgeMappingsTask extends DefaultTask {
+ 	public abstract RegularFileProperty getPatchedIntermediateJar();
+ 
+ 	/** Forge 的 universal jar：{@code MethodInheritanceMappingsMigrator} 的继承关系来源之一. */
++	@Optional
+ 	@InputFile
+ 	@PathSensitive(PathSensitivity.NONE)
+ 	public abstract RegularFileProperty getForgeJar();
+ 
+ 	/** Forge 的 userdev jar：同上. */
++	@Optional
+ 	@InputFile
+ 	@PathSensitive(PathSensitivity.NONE)
+ 	public abstract RegularFileProperty getForgeUserdevJar();
+@@ -142,15 +146,19 @@ public abstract class ManipulateForgeMappingsTask extends DefaultTask {
+ 		final Path cacheDir = Path.of(getMigratorCacheDir().get());
+ 		Files.createDirectories(cacheDir);
+ 
++		final Path patched = getPatchedIntermediateJar().get().getAsFile().toPath();
++		final List<Path> jars = getForgeJar().isPresent() || getForgeUserdevJar().isPresent()
++				? List.of(patched, getForgeJar().get().getAsFile().toPath(), getForgeUserdevJar().get().getAsFile().toPath())
++				: List.of(patched);
++
+ 		// 全程不触碰 Project：配置缓存开启时执行期调用 Task.project 会被 Gradle 直接拒绝。
+ 		// 因此生产实现只认这里构造的纯值输入，日志出口是任务自己的 logger。
+ 		ForgeMigratedMappingConfiguration.manipulate(
+ 				new MappingsMigrator.Inputs(
+ 						cacheDir,
+ 						getRawMappingsWithNs().get().getAsFile().toPath(),
+-						getPatchedIntermediateJar().get().getAsFile().toPath(),
+-						getForgeJar().get().getAsFile().toPath(),
+-						getForgeUserdevJar().get().getAsFile().toPath(),
++						patched,
++						jars,
+ 						getHasSrg().get(),
+ 						getHasMojang().get(),
+ 						getRefreshDeps().get(),
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/PrepareForgeMavenizerSourcesTask.java b/src/main/java/net/fabricmc/loom/pipeline/PrepareForgeMavenizerSourcesTask.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..4cf92ed00315843eebf57cf6c7b7e1a654919397
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/pipeline/PrepareForgeMavenizerSourcesTask.java
+@@ -0,0 +1,70 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.pipeline;
++
++import java.io.IOException;
++
++import dev.architectury.loom.forge.tool.ForgeMavenizerService;
++import org.gradle.api.DefaultTask;
++import org.gradle.api.file.RegularFileProperty;
++import org.gradle.api.provider.Property;
++import org.gradle.api.tasks.InputFile;
++import org.gradle.api.tasks.Nested;
++import org.gradle.api.tasks.OutputFile;
++import org.gradle.api.tasks.PathSensitive;
++import org.gradle.api.tasks.PathSensitivity;
++import org.gradle.api.tasks.TaskAction;
++import org.gradle.work.DisableCachingByDefault;
++
++import net.fabricmc.loom.util.service.ScopedServiceFactory;
++
++/** 仅在生成开发源码时，为当前 SRG 产物准备同批 Mojang classes 和源码. */
++@DisableCachingByDefault(because = "Mavenizer 管理的外部依赖并未全部声明为 Gradle 输入")
++public abstract class PrepareForgeMavenizerSourcesTask extends DefaultTask {
++	public static final String NAME = "prepareForgeMavenizerSources";
++
++	@Nested
++	public abstract Property<ForgeMavenizerService.Options> getMavenizer();
++
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getRuntimeSrgJar();
++
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getRuntimeReceipt();
++
++	@OutputFile
++	public abstract RegularFileProperty getOutputBundle();
++
++	@TaskAction
++	public void prepare() throws IOException {
++		try (var factory = new ScopedServiceFactory()) {
++			final ForgeMavenizerService mavenizer = factory.get(getMavenizer());
++			mavenizer.prepareSources(getRuntimeSrgJar().get().getAsFile().toPath(), getRuntimeReceipt().get().getAsFile().toPath(),
++					getOutputBundle().get().getAsFile().toPath());
++		}
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/RemapMinecraftTask.java b/src/main/java/net/fabricmc/loom/pipeline/RemapMinecraftTask.java
+index 93909e70367fade889eece5336ae93a05935216f..55d2fd1afb95736da0d61c4f3e4bcd844e3b2d35 100644
+--- a/src/main/java/net/fabricmc/loom/pipeline/RemapMinecraftTask.java
++++ b/src/main/java/net/fabricmc/loom/pipeline/RemapMinecraftTask.java
+@@ -135,6 +135,7 @@ public abstract class RemapMinecraftTask extends DefaultTask {
+ 		// 理由见各输入的说明。
+ 		getCopyOnly().convention(false);
+ 		getBridgeForgeRenamedMethods().convention(false);
++		getCompleteForgeInput().convention(false);
+ 		getInjectClientSidedVisitor().convention(false);
+ 		getInjectMixinExtension().convention(false);
+ 	}
+@@ -416,6 +417,10 @@ public abstract class RemapMinecraftTask extends DefaultTask {
+ 	@Input
+ 	public abstract Property<Boolean> getBridgeForgeRenamedMethods();
+ 
++	/** 完整源码重编译产物不需要二进制兼容修复. */
++	@Input
++	public abstract Property<Boolean> getCompleteForgeInput();
++
+ 	@TaskAction
+ 	public void remap() throws IOException {
+ 		final Path inputJar = getInputJar().get().getAsFile().toPath();
+@@ -439,7 +444,7 @@ public abstract class RemapMinecraftTask extends DefaultTask {
+ 
+ 			remapJar(inputJar, outputJar);
+ 
+-			if (getForgeLike().get() && getBridgeForgeRenamedMethods().get()) {
++			if (!getCompleteForgeInput().get() && getForgeLike().get() && getBridgeForgeRenamedMethods().get()) {
+ 				MinecraftPatchedProvider.bridgeRenamedVanillaMethods(outputJar, LOGGER::info);
+ 			}
+ 		}
+diff --git a/src/main/java/net/fabricmc/loom/task/GenerateForgeMavenizerSourcesTask.java b/src/main/java/net/fabricmc/loom/task/GenerateForgeMavenizerSourcesTask.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..ffd8c659ec277640c654c816a471f1396c8261a1
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/task/GenerateForgeMavenizerSourcesTask.java
+@@ -0,0 +1,87 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.task;
++
++import java.io.IOException;
++import java.nio.file.Path;
++
++import dev.architectury.loom.forge.tool.ForgeMavenizerSourcesBundle;
++import dev.architectury.loom.util.TempFiles;
++import org.gradle.api.DefaultTask;
++import org.gradle.api.file.RegularFileProperty;
++import org.gradle.api.provider.Property;
++import org.gradle.api.tasks.CacheableTask;
++import org.gradle.api.tasks.InputFile;
++import org.gradle.api.tasks.Nested;
++import org.gradle.api.tasks.OutputFile;
++import org.gradle.api.tasks.PathSensitive;
++import org.gradle.api.tasks.PathSensitivity;
++import org.gradle.api.tasks.TaskAction;
++
++import net.fabricmc.loom.task.service.SourceRemapperService;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.service.ScopedServiceFactory;
++
++/** 将与当前运行时同批的完整 Mojang 源码转换为项目的 named 源码附挂. */
++@CacheableTask
++public abstract class GenerateForgeMavenizerSourcesTask extends DefaultTask {
++	public static final String NAME = "genForgePatchedSources";
++
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getBundle();
++
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getRuntimeSrgJar();
++
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getRuntimeReceipt();
++
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getNamedJar();
++
++	@Nested
++	public abstract Property<SourceRemapperService.Options> getSourceRemapper();
++
++	@OutputFile
++	public abstract RegularFileProperty getOutputJar();
++
++	@TaskAction
++	public void generate() throws IOException {
++		try (var temporary = new TempFiles(); var factory = new ScopedServiceFactory()) {
++			final var input = ForgeMavenizerSourcesBundle.unpack(path(getBundle()), path(getRuntimeSrgJar()),
++					path(getRuntimeReceipt()), temporary.directory("loom-forge-sources-"));
++			final SourceRemapperService remapper = factory.get(getSourceRemapper());
++			AtomicFiles.publish(path(getOutputJar()), output -> remapper.remapSourcesJarStrict(input.sourcesJar(), output, input.mojangClassesJar()));
++		}
++	}
++
++	private static Path path(RegularFileProperty file) {
++		return file.get().getAsFile().toPath();
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java b/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
+index 4171a5f40fc75c80e69b8dbb4d1ea2fd14eb5d44..e777de6c8946c980698025b8f3ff4dd0596a8af3 100644
+--- a/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
++++ b/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
+@@ -50,6 +50,7 @@ import java.util.stream.Stream;
+ import javax.inject.Inject;
+ 
+ import dev.architectury.loom.forge.ForgeSourcesService;
++import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
+ import org.gradle.api.file.ConfigurableFileCollection;
+ import org.gradle.api.file.FileCollection;
+ import org.gradle.api.file.RegularFileProperty;
+@@ -136,7 +137,12 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
+ 
+ 	// Contains the remapped linenumbers
+ 	@OutputFile
+-	protected abstract RegularFileProperty getClassesOutputJar();
++	public abstract RegularFileProperty getClassesOutputJar();
++
++	/** 独立反编译任务的行号表，不写到共享 backup 旁. */
++	@Optional
++	@OutputFile
++	public abstract RegularFileProperty getLineMapOutput();
+ 
+ 	@Input
+ 	@Option(option = "use-cache", description = "Use the decompile cache")
+@@ -284,14 +290,15 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
+ 
+ 		getDaemonUtilsContext().set(getProject().getObjects().newInstance(DaemonUtils.Context.class, getProject()));
+ 
+-		getForgeSourcesOptions().set(ForgeSourcesService.createOptions(getProject()));
++		if (!MinecraftPatchedProvider.usesMavenizer(getExtension(), getExtension().getMinecraftProvider())) {
++			getForgeSourcesOptions().set(ForgeSourcesService.createOptions(getProject()));
+ 
+-		// 提前展开 Forge 源码包（声明式、可缓存），避免每次执行都手工遍历归档。
+-		// 用 provider 延迟探测任务是否存在，避免在尚未注册时抛错。
+-		dependsOn(getProject().getProviders().provider(() ->
+-				getProject().getTasks().findByName(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME) == null
+-						? java.util.List.of()
+-						: java.util.List.of(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME)));
++			// 提前展开 Forge 源码包；延迟探测任务以避免注册顺序约束。
++			dependsOn(getProject().getProviders().provider(() ->
++					getProject().getTasks().findByName(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME) == null
++							? java.util.List.of()
++							: java.util.List.of(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME)));
++		}
+ 
+ 		mustRunAfter(getProject().getTasks().withType(AbstractRemapJarTask.class));
+ 	}
+@@ -300,6 +307,10 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
+ 	public void run() throws IOException {
+ 		final Platform platform = Platform.CURRENT;
+ 
++		if (getLineMapOutput().isPresent()) {
++			Files.createDirectories(getSourcesOutputJar().get().getAsFile().toPath().getParent());
++		}
++
+ 		if (!platform.getArchitecture().is64Bit()) {
+ 			throw new UnsupportedOperationException("GenSources task requires a 64bit JVM to run due to the memory requirements.");
+ 		}
+@@ -650,7 +661,8 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
+ 		final var remapper = new LineNumberRemapper(lineNumbers);
+ 		remapper.process(inputJar, outputJar);
+ 
+-		final Path lineMap = inputJar.resolveSibling(inputJar.getFileName() + ".linemap.txt");
++		final Path lineMap = getLineMapOutput().isPresent() ? getLineMapOutput().get().getAsFile().toPath()
++				: inputJar.resolveSibling(inputJar.getFileName() + ".linemap.txt");
+ 
+ 		try (BufferedWriter writer = Files.newBufferedWriter(lineMap)) {
+ 			lineNumbers.write(writer);
+diff --git a/src/main/java/net/fabricmc/loom/task/service/SourceRemapperService.java b/src/main/java/net/fabricmc/loom/task/service/SourceRemapperService.java
+index 17894e19d0b190d2400c7755425d7105cb5f6ecd..9386a2740fe60ddf4dd217200eaa0883f5f26d81 100644
+--- a/src/main/java/net/fabricmc/loom/task/service/SourceRemapperService.java
++++ b/src/main/java/net/fabricmc/loom/task/service/SourceRemapperService.java
+@@ -127,6 +127,25 @@ public final class SourceRemapperService extends Service<SourceRemapperService.O
+ 		}
+ 	}
+ 
++	/** 使用同批 Mojang 类解析官方源码，所有声明转换成功后才替换目标归档. */
++	public void remapSourcesJarStrict(Path source, Path destination, Path mojangClassesJar) throws IOException {
++		MappingsService mappings = getServiceFactory().get(getOptions().getMappings());
++		var tree = mappings.getMemoryMappingTree();
++
++		if (!"mojang".equals(mappings.getFrom()) || !"named".equals(mappings.getTo())
++				|| tree.getNamespaceId("mojang") < -1 || tree.getNamespaceId("named") < -1) {
++			throw new IOException("Expected mojang -> named mappings, got " + tree.getSrcNamespace() + " -> " + tree.getDstNamespaces());
++		}
++
++		if (Files.isSameFile(source, mojangClassesJar) || (Files.exists(destination) && (Files.isSameFile(source, destination) || Files.isSameFile(mojangClassesJar, destination)))) {
++			throw new IOException("Source archive, classes and output must be distinct");
++		}
++
++		var mercury = createMercury();
++		mercury.getClassPath().addFirst(mojangClassesJar.toRealPath());
++		StrictSourceArchive.remap(source, destination, mercury, tree);
++	}
++
+ 	private Mercury createMercury() throws IOException {
+ 		var mercury = new Mercury();
+ 		mercury.setGracefulClasspathChecks(true);
+diff --git a/src/main/java/net/fabricmc/loom/task/service/StrictSourceArchive.java b/src/main/java/net/fabricmc/loom/task/service/StrictSourceArchive.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..2f215e979df0ebcd9308d53062edc544e8c65bf5
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/task/service/StrictSourceArchive.java
+@@ -0,0 +1,221 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.task.service;
++
++import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardCopyOption;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeSet;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipFile;
++import java.util.zip.ZipOutputStream;
++
++import org.cadixdev.mercury.Mercury;
++import org.cadixdev.mercury.SourceContext;
++import org.cadixdev.mercury.shadow.org.eclipse.jdt.core.ToolFactory;
++import org.cadixdev.mercury.shadow.org.eclipse.jdt.core.compiler.IProblem;
++import org.cadixdev.mercury.shadow.org.eclipse.jdt.core.compiler.ITerminalSymbols;
++import org.cadixdev.mercury.shadow.org.eclipse.jdt.core.compiler.InvalidInputException;
++
++import net.fabricmc.loom.util.DeletingFileVisitor;
++import net.fabricmc.mappingio.tree.MappingTreeView;
++
++/** 官方完整源码归档转换；只发布覆盖校验后的结果. */
++final class StrictSourceArchive {
++	private final Path input;
++	private final Path output;
++	private final Map<String, String> javaFiles = new HashMap<>();
++	private final Set<String> entries = new TreeSet<>();
++	private final Set<String> seen = new HashSet<>();
++	private final List<String> problems = new ArrayList<>();
++
++	private StrictSourceArchive(Path work) throws IOException {
++		input = Files.createDirectory(work.resolve("mojang"));
++		output = Files.createDirectory(work.resolve("named"));
++	}
++
++	static void remap(Path source, Path destination, Mercury mercury, MappingTreeView mappings) throws IOException {
++		Path target = destination.toAbsolutePath();
++		Files.createDirectories(target.getParent());
++		Path work = Files.createTempDirectory(target.getParent(), ".forge-src-");
++
++		try {
++			var archive = new StrictSourceArchive(work);
++			archive.extract(source, mappings, mercury.getSourceCompatibility());
++			archive.rewrite(mercury);
++			Path jar = work.resolve("complete.jar");
++			archive.pack(jar);
++			Files.move(jar, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
++		} finally {
++			Files.walkFileTree(work, new DeletingFileVisitor());
++		}
++	}
++
++	private void extract(Path source, MappingTreeView mappings, String release) throws IOException {
++		int from = mappings.getNamespaceId("mojang");
++		int to = mappings.getNamespaceId("named");
++
++		try (var zip = new ZipFile(source.toFile())) {
++			var files = zip.entries();
++			var inputs = new HashSet<String>();
++
++			while (files.hasMoreElements()) {
++				ZipEntry file = files.nextElement();
++
++				if (file.isDirectory()) {
++					continue;
++				}
++
++				String name = file.getName();
++				String mapped = name;
++				Path resource = safePath(output, name);
++
++				if (!inputs.add(name)) {
++					throw new IOException("Duplicate source entry: " + name);
++				}
++
++				try (var stream = zip.getInputStream(file)) {
++					if (name.endsWith(".java")) {
++						byte[] bytes = stream.readAllBytes();
++
++						if (hasJavaTokens(bytes, release)) {
++							String owner = name.substring(0, name.length() - ".java".length());
++							mapped = mappings.mapClassName(owner, from, to) + ".java";
++							safePath(output, mapped);
++							javaFiles.put(name, mapped);
++							Path src = safePath(input, name);
++							Files.createDirectories(src.getParent());
++							Files.write(src, bytes);
++						} else {
++							// 只有词法上确认为空/纯注释的 Java 才原样复制；损坏的源不能走此分支。
++							Files.createDirectories(resource.getParent());
++							Files.write(resource, bytes);
++						}
++					} else {
++						Files.createDirectories(resource.getParent());
++						Files.copy(stream, resource);
++					}
++				}
++
++				if (!entries.add(mapped)) {
++					throw new IOException("Multiple source entries map to " + mapped);
++				}
++			}
++		}
++
++		if (javaFiles.isEmpty()) {
++			throw new IOException("No Java declarations in " + source);
++		}
++	}
++
++	private static boolean hasJavaTokens(byte[] bytes, String release) throws IOException {
++		var scanner = ToolFactory.createScanner(false, false, false, release);
++		scanner.setSource(StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString().toCharArray());
++
++		try {
++			return scanner.getNextToken() != ITerminalSymbols.TokenNameEOF;
++		} catch (InvalidInputException e) {
++			throw new IOException("Invalid Java source token", e);
++		}
++	}
++
++	private static Path safePath(Path root, String name) throws IOException {
++		Path path = root.resolve(name).normalize();
++
++		if (name.isEmpty() || !path.startsWith(root) || !root.relativize(path).toString().replace('\\', '/').equals(name) || name.contains("\\")) {
++			throw new IOException("Invalid source archive path: " + name);
++		}
++
++		return path;
++	}
++
++	private void checkSource(SourceContext context) {
++		String source = input.relativize(context.getSourceFile()).toString().replace('\\', '/');
++		var unit = context.getCompilationUnit();
++
++		for (var problem : unit.getProblems()) {
++			if (problem.isError() && (problem.getID() & IProblem.Syntax) != 0) {
++				problems.add(source + ":" + problem.getSourceLineNumber() + ": " + problem.getMessage());
++				return;
++			}
++		}
++
++		if (unit.types().isEmpty() && unit.getModule() == null && unit.getPackage() == null) {
++			problems.add("No Java declaration in " + source);
++		}
++	}
++
++	private void rewrite(Mercury mercury) throws IOException {
++		mercury.getProcessors().addFirst(this::checkSource);
++		// Mercury 会吞掉单文件处理器的异常；完成回调与实际输出文件必须同时存在。
++		mercury.getProcessors().add(context -> {
++			String source = input.relativize(context.getSourceFile()).toString().replace('\\', '/');
++			String actual = context.getQualifiedPrimaryType().replace('.', '/') + ".java";
++
++			if (!actual.equals(javaFiles.get(source))) {
++				problems.add(source + " -> " + actual + ", expected " + javaFiles.get(source));
++			}
++
++			seen.add(source);
++		});
++
++		try {
++			mercury.rewrite(input, output);
++		} catch (Exception e) {
++			throw new IOException("Failed to rewrite Forge sources", e);
++		}
++
++		if (!problems.isEmpty()) {
++			throw new IOException("Invalid Forge source rewrite (" + problems.size() + "): " + problems.getFirst());
++		}
++
++		for (var file : javaFiles.entrySet()) {
++			if (!seen.contains(file.getKey()) || !Files.isRegularFile(output.resolve(file.getValue())) || Files.size(output.resolve(file.getValue())) == 0) {
++				throw new IOException("Missing rewritten Forge source " + file.getKey() + " -> " + file.getValue());
++			}
++		}
++	}
++
++	private void pack(Path jar) throws IOException {
++		try (var zip = new ZipOutputStream(Files.newOutputStream(jar))) {
++			for (String name : entries) {
++				var entry = new ZipEntry(name);
++				entry.setTime(0);
++				zip.putNextEntry(entry);
++				Files.copy(output.resolve(name), zip);
++				zip.closeEntry();
++			}
++		}
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMavenizerArtifactTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMavenizerArtifactTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..fb73c7e86ba187b78dcc55de199e715145070cca
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMavenizerArtifactTest.groovy
+@@ -0,0 +1,199 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.forge
++
++import java.nio.file.Files
++import java.nio.file.Path
++import java.security.MessageDigest
++import java.util.jar.JarFile
++import java.util.zip.GZIPOutputStream
++import java.util.zip.ZipEntry
++import java.util.zip.ZipOutputStream
++
++import dev.architectury.loom.forge.tool.ForgeMavenizerArtifact
++import groovy.json.JsonOutput
++import org.objectweb.asm.ClassReader
++import org.objectweb.asm.ClassWriter
++import org.objectweb.asm.Opcodes
++import org.objectweb.asm.tree.ClassNode
++import spock.lang.Specification
++import spock.lang.TempDir
++
++class ForgeMavenizerArtifactTest extends Specification {
++	private static final String MC = '1.21.11'
++	private static final String FORGE = '1.21.11-61.2.5'
++	private static final String MCP = '1.21.11-20251223.124241'
++	private static final String GAME = 'net/minecraft/client/Minecraft'
++	private static final String API = 'net/minecraftforge/common/MinecraftForge'
++	@TempDir Path repo
++	Path dir, module, classes, mappings
++	Map descriptor
++
++	def setup() {
++		dir = Files.createDirectories(repo.resolve("net/minecraftforge/forge/$FORGE"))
++		classes = dir.resolve("forge-${FORGE}.jar")
++		zip(classes, [(GAME + '.class'): type(GAME), (API + '.class'): type(API),
++			'META-INF/MANIFEST.MF': 'Manifest-Version: 1.0\r\nAutomatic-Module-Name: net.minecraftforge.forge\r\n\r\n',
++			'META-INF/services/demo.Service': 'demo.Provider\n', 'META-INF/mods.toml': 'modId="forge"'])
++		def metadata = dir.resolve("forge-${FORGE}-metadata.zip")
++		zip(metadata, ['launcher/runs.json': '{}', 'minecraft/version.json': '{}'])
++		def sources = dir.resolve("forge-${FORGE}-sources.jar")
++		zip(sources, [(GAME + '.java'): '// 游戏源码', (API + '.java'): '// Forge 源码'])
++		def mapped = ['net.minecraftforge.mappings.channel': 'official', 'net.minecraftforge.mappings.version': MC,
++			'org.gradle.usage': 'java-runtime', 'org.gradle.libraryelements': 'jar']
++		def runtime = mapped + ['org.gradle.category': 'library']
++		descriptor = [component: [group: 'net.minecraftforge', module: 'forge', version: FORGE], variants: [
++				[name: 'classes', attributes: runtime, files: [fileEntry(classes)], dependencies: [
++						[group: 'net.minecraft', module: 'mappings_official', version: [requires: MCP]]
++					]],
++				[name: 'sources', attributes: mapped + ['org.gradle.category': 'documentation', 'org.gradle.docstype': 'sources'], files: [fileEntry(sources)]],
++				[name: 'metadata', attributes: ['org.gradle.usage': 'metadata'], files: [fileEntry(metadata)]]
++			]]
++		module = dir.resolve("forge-${FORGE}.module")
++		mappings = Files.createDirectories(repo.resolve("net/minecraft/mappings_official/$MCP")).resolve("mappings_official-${MCP}-map2srg.tsrg.gz")
++		new GZIPOutputStream(Files.newOutputStream(mappings)).withCloseable { it.write("tsrg2 left right\n$GAME $GAME\n\tvalue f_1_\n".bytes) }
++	}
++
++	def '共享运行文件重映射字段而保留服务、Forge 类和清单'() {
++		given:
++		def runtime = descriptor.variants.remove(0)
++		['linux', 'macos', 'windows'].each { os ->
++			descriptor.variants << runtime + [name: "classes-$os", attributes: runtime.attributes + ['net.minecraftforge.native.operatingSystem': os]]
++		}
++		def output = repo.resolve('converted.tmp')
++
++		when:
++		def resolved = resolve()
++		resolved.writeSrgJar(output)
++
++		then:
++		resolved.classesJar() == classes
++		resolved.officialToSrgMappings() == mappings
++		new JarFile(output.toFile()).withCloseable { jar ->
++			def node = new ClassNode()
++			new ClassReader(jar.getInputStream(jar.getEntry(GAME + '.class'))).accept(node, 0)
++			assert node.fields*.name == ['f_1_']
++			assert jar.getEntry(API + '.class')
++			assert jar.getEntry('META-INF/mods.toml')
++			assert jar.getInputStream(jar.getEntry('META-INF/services/demo.Service')).text.trim() == 'demo.Provider'
++			assert jar.manifest.mainAttributes.getValue('Automatic-Module-Name') == 'net.minecraftforge.forge'
++			true
++		}
++	}
++
++	def '拒绝与当前生产不一致的模块：#reason'() {
++		when:
++		mutate(descriptor)
++		resolve()
++
++		then:
++		thrown(IOException)
++
++		where:
++		reason   | mutate
++		'坐标'   | { it.component.module = 'other' }
++		'命名'   | { it.variants[0].attributes['net.minecraftforge.mappings.channel'] = 'srg' }
++		'版本'   | { it.variants[0].attributes['net.minecraftforge.mappings.version'] = '1.21.10' }
++		'跨目录' | { it.variants[0].files[0].url = '../outside.jar' }
++		'校验和' | { it.variants[0].files[0].sha256 = '0' * 64 }
++		'旧映射' | { it.variants[0].dependencies[0].version.requires = 'other' }
++	}
++
++	def '不把同目录的 map2obf 当作缺失的 map2srg'() {
++		given:
++		Files.move(mappings, mappings.resolveSibling(mappings.fileName.toString().replace('map2srg', 'map2obf')))
++
++		when:
++		resolve()
++
++		then:
++		thrown(IOException)
++	}
++
++	def '拒绝只有类签名没有 Forge 运行资源的 stub 包'() {
++		given:
++		zip(classes, [(GAME + '.class'): type(GAME), (API + '.class'): type(API), 'META-INF/MANIFEST.MF': 'Manifest-Version: 1.0\r\n\r\n'])
++		descriptor.variants[0].files = [fileEntry(classes)]
++
++		when:
++		resolve()
++
++		then:
++		thrown(IOException)
++	}
++
++	def '同名 TSRG2 头也不能把混淆方向误认为 SRG'() {
++		given:
++		new GZIPOutputStream(Files.newOutputStream(mappings)).withCloseable { it.write("tsrg2 left right\n$GAME abc\n".bytes) }
++
++		when:
++		resolve()
++
++		then:
++		thrown(IOException)
++	}
++
++	def '不同 OS 文件不能被当成共享包而取首个'() {
++		given:
++		def variant = descriptor.variants.first()
++		descriptor.variants << variant + [files: [
++				fileEntry(classes) + [url: 'windows.jar']
++			]]
++
++		when:
++		resolve()
++
++		then:
++		thrown(IOException)
++	}
++
++	private ForgeMavenizerArtifact resolve() {
++		Files.writeString(module, JsonOutput.toJson(descriptor))
++		return ForgeMavenizerArtifact.resolve(repo, FORGE, MC, MCP)
++	}
++
++	private static Map fileEntry(Path path) {
++		def name = path.fileName.toString()
++		return [name: name, url: name, size: Files.size(path), sha256: MessageDigest.getInstance('SHA-256').digest(Files.readAllBytes(path)).encodeHex().toString()]
++	}
++
++	private static byte[] type(String name) {
++		def writer = new ClassWriter(0)
++		writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, name, null, 'java/lang/Object', null)
++		writer.visitField(Opcodes.ACC_PUBLIC, 'value', 'I', null, null).visitEnd()
++		writer.visitEnd()
++		return writer.toByteArray()
++	}
++
++	private static void zip(Path path, Map entries) {
++		new ZipOutputStream(Files.newOutputStream(path)).withCloseable { out ->
++			entries.each { name, value ->
++				out.putNextEntry(new ZipEntry(name))
++				out.write(value instanceof String ? value.bytes : value)
++				out.closeEntry()
++			}
++		}
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMavenizerRoutingTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMavenizerRoutingTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9df4985dd280e868fe40b56bb837522bc7f84b0
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMavenizerRoutingTest.groovy
+@@ -0,0 +1,77 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.forge
++
++import dev.architectury.loom.forge.dependency.ForgeProvider
++import dev.architectury.loom.forge.dependency.ForgeProvider.ForgeVersion
++import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider
++import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider.Type
++import org.gradle.api.Project
++import org.gradle.api.plugins.ExtensionContainer
++import spock.lang.Specification
++
++import net.fabricmc.loom.LoomGradleExtension
++import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider
++
++class ForgeMavenizerRoutingTest extends Specification {
++	def '仅已验证的混淆 Forge 合包启用 Mavenizer：#profile'() {
++		given:
++		ForgeProvider forge = Stub(ForgeProvider) {
++			getVersion() >> new ForgeVersion(forgeVersion)
++		}
++		LoomGradleExtension loom = Stub(LoomGradleExtension) {
++			isForge() >> forgePlatform
++			isLegacyForge() >> legacy
++			disableObfuscation() >> noRemap
++			isUnobfuscatedForge() >> unobfuscated
++			getForgeProvider() >> forge
++		}
++		ExtensionContainer extensions = Stub(ExtensionContainer) {
++			getByName('loom') >> loom
++		}
++		Project project = Stub(Project) {
++			getExtensions() >> extensions
++		}
++		MinecraftProvider minecraft = Stub(MinecraftProvider) {
++			minecraftVersion() >> gameVersion
++		}
++
++		expect:
++		new MinecraftPatchedProvider(project, minecraft, type).usesMavenizer() == enabled
++
++		where:
++		profile         | gameVersion | forgeVersion          | type             | forgePlatform | legacy | noRemap | unobfuscated || enabled
++		'目标混淆合包'        | '1.21.11'   | '1.21.11-61.2.5'      | Type.MERGED      | true          | false  | false   | false        || true
++		'仅客户端'          | '1.21.11'   | '1.21.11-61.2.5'      | Type.CLIENT_ONLY | true          | false  | false   | false        || false
++		'仅服务端'          | '1.21.11'   | '1.21.11-61.2.5'      | Type.SERVER_ONLY | true          | false  | false   | false        || false
++		'其他 Forge 构建'   | '1.21.11'   | '1.21.11-61.2.4'      | Type.MERGED      | true          | false  | false   | false        || false
++		'1.20.1 原有路径'    | '1.20.1'    | '1.20.1-47.4.0'       | Type.MERGED      | true          | false  | false   | false        || false
++		'1.16.5 MCPConfig' | '1.16.5'    | '1.16.5-36.2.42'      | Type.MERGED      | true          | false  | false   | false        || false
++		'1.12.2 FG2'       | '1.12.2'    | '1.12.2-14.23.5.2860' | Type.MERGED      | true          | true   | false   | false        || false
++		'非 Forge 平台'     | '1.21.11'   | '1.21.11-61.2.5'      | Type.MERGED      | false         | false  | false   | false        || false
++		'禁止重映射'         | '1.21.11'   | '1.21.11-61.2.5'      | Type.MERGED      | true          | false  | true    | false        || false
++		'非混淆 Forge'      | '1.21.11'   | '1.21.11-61.2.5'      | Type.MERGED      | true          | false  | false   | true         || false
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMavenizerServiceTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMavenizerServiceTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..52b3625ff01e510c6e1775f5a624cd1935d574c6
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMavenizerServiceTest.groovy
+@@ -0,0 +1,227 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.forge
++
++import java.lang.reflect.InvocationTargetException
++import java.nio.file.Files
++import java.nio.file.Path
++
++import dev.architectury.loom.forge.tool.ForgeMavenizerService
++import spock.lang.Specification
++import spock.lang.TempDir
++
++import net.fabricmc.loom.util.cache.AtomicFiles
++
++class ForgeMavenizerServiceTest extends Specification {
++	private static final String FORGE = "1.21.11-61.2.5"
++	private static final String MC = "1.21.11"
++	private static final String MCP = "1.21.11-20251223.124241"
++
++	@TempDir
++	Path root
++
++	def "离线与刷新分别传给 CLI，三个版本的 JDK 支持含空格的安装路径"() {
++		given:
++		def cache = root.resolve("download cache")
++		def jdks = root.resolve("jdk cache")
++		def repo = root.resolve("staging repository")
++		def home8 = root.resolve("jdk 8").toString()
++		def home21 = root.resolve("jdk 21").toString()
++		def home25 = root.resolve("jdk 25").toString()
++
++		expect:
++		invoke("arguments", FORGE, cache, jdks, repo, false, false) == [
++			"--maven",
++			"--artifact",
++			"net.minecraftforge:forge",
++			"--version",
++			FORGE,
++			"--mappings",
++			"official",
++			"--cache",
++			cache.toString(),
++			"--jdk-cache",
++			jdks.toString(),
++			"--output",
++			repo.toString()
++		]
++		invoke("arguments", FORGE, cache, jdks, repo, true, false).last() == "--offline"
++		invoke("arguments", FORGE, cache, jdks, repo, false, true).last() == "--ignore-cache"
++		invoke("arguments", FORGE, cache, jdks, repo, true, true).takeRight(2) == ["--offline", "--ignore-cache"]
++		invoke("javaInstallations", home8, home21, home25) ==
++				"-Dorg.gradle.java.installations.paths=${home8},${home21},${home25}"
++	}
++
++	def "离线拒绝未经校验的工具且不修改缓存"() {
++		given:
++		def tool = Files.writeString(root.resolve("minecraft-mavenizer-0.4.24.jar"), "未固定的工具")
++
++		when:
++		invoke("resolveTool", root, true)
++
++		then:
++		def failure = thrown(IOException)
++		failure.message.contains("SHA-256")
++		Files.readString(tool) == "未固定的工具"
++	}
++
++	def "产物摘要拒绝不同坐标或被替换的同名产物"() {
++		given:
++		def classes = Files.writeString(root.resolve("official.jar"), "官方字节")
++		def mappings = Files.writeString(root.resolve("map2srg.tsrg.gz"), "映射字节")
++		def result = root.resolve("srg.jar")
++
++		when:
++		invoke("publish", result, FORGE, MC, MCP, classes, mappings, { stage ->
++			Files.writeString(stage, "转换字节")
++		} as AtomicFiles.IOConsumer)
++
++		then:
++		ForgeMavenizerService.isReusable(result, FORGE, MC, MCP)
++		!ForgeMavenizerService.isReusable(result, FORGE, MC, "different-mcp")
++
++		when:
++		Files.writeString(result, "替换字节")
++
++		then:
++		!ForgeMavenizerService.isReusable(result, FORGE, MC, MCP)
++	}
++
++	def "转换失败后不会发布部分产物或摘要"() {
++		given:
++		def classes = Files.writeString(root.resolve("official.jar"), "官方字节")
++		def mappings = Files.writeString(root.resolve("map2srg.tsrg.gz"), "映射字节")
++		def result = root.resolve("srg.jar")
++
++		when:
++		invoke("publish", result, FORGE, MC, MCP, classes, mappings, { stage ->
++			Files.writeString(stage, "部分字节")
++			throw new IOException("转换失败")
++		} as AtomicFiles.IOConsumer)
++
++		then:
++		def failure = thrown(IOException)
++		failure.message == "转换失败"
++		!Files.exists(result)
++		!Files.exists(ForgeMavenizerService.receipt(result))
++		root.toFile().list().toList().sort() == [
++			"map2srg.tsrg.gz",
++			"official.jar"
++		]
++	}
++
++	def "源码补齐固定使用上游 cache-only 参数，正常编译和刷新参数不变"() {
++		expect:
++		invoke("sourceArguments", FORGE, root, root, root) ==
++				invoke("arguments", FORGE, root, root, root, true, false) + ["--cache-only"]
++		!invoke("arguments", FORGE, root, root, root, true, true).contains("--cache-only")
++		!invoke("arguments", FORGE, root, root, root, false, false).contains("--cache-only")
++	}
++
++	def "源码导出离线先只读缓存，在线保持原调用"() {
++		given:
++		def attempts = []
++
++		when:
++		invoke("exportSources", offline, { cacheOnly -> attempts.add(cacheOnly) } as AtomicFiles.IOConsumer)
++
++		then:
++		attempts == expected
++
++		where:
++		offline | expected
++		true    | [true]
++		false   | [false]
++	}
++
++	def "离线只在外部进程失败后重试一次普通导出"() {
++		given:
++		def attempts = []
++		def cliFailure = invoke("commandFailure", new IllegalStateException("listLibraries cache miss"))
++
++		when:
++		invoke("exportSources", true, { cacheOnly ->
++			attempts.add(cacheOnly)
++			if (cacheOnly) {
++				throw cliFailure
++			}
++		} as AtomicFiles.IOConsumer)
++
++		then:
++		attempts == [true, false]
++	}
++
++	def "模块或配对校验失败以及在线进程失败不能重试"() {
++		given:
++		def attempts = []
++		def cliFailure = invoke("commandFailure", new IllegalStateException("process failed"))
++		def failure = onlineFailure ? cliFailure : new IOException("module or receipt validation failed")
++
++		when:
++		invoke("exportSources", !onlineFailure, { cacheOnly ->
++			attempts.add(cacheOnly)
++			throw failure
++		} as AtomicFiles.IOConsumer)
++
++		then:
++		def actual = thrown(IOException)
++		actual.is(failure)
++		attempts == [!onlineFailure]
++
++		where:
++		onlineFailure << [false, true]
++	}
++
++	def "两次 CLI 失败保留完整原因且提示本机离线缓存"() {
++		given:
++		def attempts = []
++		def first = invoke("commandFailure", new IllegalStateException("cache-only failed"))
++		def second = invoke("commandFailure", new IllegalStateException("offline failed"))
++
++		when:
++		invoke("exportSources", true, { cacheOnly ->
++			attempts.add(cacheOnly)
++			throw cacheOnly ? first : second
++		} as AtomicFiles.IOConsumer)
++
++		then:
++		def failure = thrown(IOException)
++		failure.message.contains("离线缓存")
++		failure.cause.is(second)
++		failure.suppressed.toList() == [first]
++		attempts == [true, false]
++	}
++
++	private static Object invoke(String name, Object... args) {
++		def method = ForgeMavenizerService.declaredMethods.find { it.name == name }
++		method.setAccessible(true)
++
++		try {
++			return method.invoke(null, args)
++		} catch (InvocationTargetException e) {
++			throw e.cause
++		}
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMavenizerSourcesBundleTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMavenizerSourcesBundleTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..b5ff2dfdf5f0a3069f628fa382e3344beaf2b9cb
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMavenizerSourcesBundleTest.groovy
+@@ -0,0 +1,174 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.forge
++
++import java.lang.reflect.InvocationTargetException
++import java.nio.file.Files
++import java.nio.file.Path
++import java.util.zip.ZipEntry
++import java.util.zip.ZipFile
++import java.util.zip.ZipOutputStream
++
++import dev.architectury.loom.forge.tool.ForgeMavenizerArtifact
++import dev.architectury.loom.forge.tool.ForgeMavenizerService
++import dev.architectury.loom.forge.tool.ForgeMavenizerSourcesBundle
++import spock.lang.Specification
++import spock.lang.TempDir
++
++import net.fabricmc.loom.util.Checksum
++import net.fabricmc.loom.util.cache.AtomicFiles
++
++class ForgeMavenizerSourcesBundleTest extends Specification {
++	@TempDir
++	Path root
++	private Path runtime
++	private Path receipt
++	private Path classes
++	private Path sources
++	private Path mappings
++	private Path output
++	private Object snapshot
++
++	def setup() {
++		runtime = root.resolve('runtime.jar')
++		classes = Files.writeString(root.resolve('classes.jar'), 'Mojang classes')
++		sources = Files.writeString(root.resolve('sources.jar'), 'Mojang sources')
++		mappings = Files.writeString(root.resolve('map2srg.tsrg.gz'), 'TSRG')
++		output = root.resolve('mavenizer-sources-v1.zip')
++		receipt = ForgeMavenizerService.receipt(runtime)
++		invoke(ForgeMavenizerService, 'publish', runtime, 'forge', 'mc', 'mcp', classes, mappings, { stage ->
++			Files.writeString(stage, 'SRG classes')
++		} as AtomicFiles.IOConsumer)
++		snapshot = invoke(ForgeMavenizerSourcesBundle, 'readRuntime', runtime, receipt)
++	}
++
++	def '同批源码包可直接复用并还原两个原件'() {
++		given:
++		publish()
++		def original = Checksum.of(output).sha256().hex()
++
++		when:
++		def first = ForgeMavenizerSourcesBundle.unpack(output, runtime, receipt, root.resolve('first'))
++		def second = ForgeMavenizerSourcesBundle.unpack(output, runtime, receipt, root.resolve('second'))
++
++		then:
++		invoke(ForgeMavenizerSourcesBundle, 'isReusable', output, snapshot)
++		Checksum.of(output).sha256().hex() == original
++		Files.mismatch(first.mojangClassesJar(), classes) == -1
++		Files.mismatch(second.sourcesJar(), sources) == -1
++		first.sourcesJar() != second.sourcesJar()
++	}
++
++	def '暖导出的原始 classes 或 TSRG 不同就不覆盖已发布源码包与运行产物'() {
++		given:
++		publish()
++		def original = Checksum.of(output).sha256().hex()
++		def runtimeDigest = Checksum.of(runtime).sha256().hex()
++		Files.writeString(changeMappings ? mappings : classes, '另一次导出')
++
++		when:
++		publish()
++
++		then:
++		thrown(IOException)
++		Checksum.of(output).sha256().hex() == original
++		Checksum.of(runtime).sha256().hex() == runtimeDigest
++
++		where:
++		changeMappings << [false, true]
++	}
++
++	def '源包被替换时检查内容摘要和固定 ZIP 布局'() {
++		given:
++		publish()
++		def altered = root.resolve('altered.zip')
++		new ZipFile(output.toFile()).withCloseable { original ->
++			new ZipOutputStream(Files.newOutputStream(altered)).withCloseable { zip ->
++				original.entries().each { entry ->
++					zip.putNextEntry(new ZipEntry(entry.name))
++					if (!extraEntry && entry.name == 'sources.jar') {
++						zip.write('替换源码'.getBytes('UTF-8'))
++					} else {
++						original.getInputStream(entry).withCloseable { source -> source.transferTo(zip) }
++					}
++					zip.closeEntry()
++				}
++				if (extraEntry) {
++					zip.putNextEntry(new ZipEntry('unexpected.jar'))
++					zip.closeEntry()
++				}
++			}
++		}
++
++		when:
++		ForgeMavenizerSourcesBundle.unpack(altered, runtime, receipt, root.resolve('work'))
++
++		then:
++		thrown(IOException)
++		!invoke(ForgeMavenizerSourcesBundle, 'isReusable', altered, snapshot)
++		!Files.exists(root.resolve('work'))
++
++		where:
++		extraEntry << [false, true]
++	}
++
++	def '收据字节或运行时 JAR 更换后无法读取已有源码包'() {
++		given:
++		publish()
++		def original = Files.readAllBytes(receipt)
++		if (changeReceipt) {
++			Files.writeString(receipt, Files.readString(receipt).replace('|forge=forge', '|forge=other'))
++		} else {
++			Files.writeString(runtime, '另一份 SRG')
++		}
++
++		when:
++		ForgeMavenizerSourcesBundle.unpack(output, runtime, receipt, root.resolve('work'))
++
++		then:
++		thrown(IOException)
++		!Files.exists(root.resolve('work'))
++		changeReceipt != (Files.readAllBytes(receipt) == original)
++
++		where:
++		changeReceipt << [false, true]
++	}
++
++	private void publish() {
++		def artifact = new ForgeMavenizerArtifact(classes, root.resolve('unused.zip'), sources, mappings)
++		invoke(ForgeMavenizerSourcesBundle, 'publish', output, runtime, receipt, snapshot, artifact)
++	}
++
++	private static Object invoke(Class<?> type, String name, Object... args) {
++		def method = type.declaredMethods.find { it.name == name }
++		method.setAccessible(true)
++
++		try {
++			return method.invoke(null, args)
++		} catch (InvocationTargetException e) {
++			throw e.cause
++		}
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeStrictSourcesTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeStrictSourcesTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..64aeab62ff4eb313aa2210ef770116db6fecc13a
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeStrictSourcesTest.groovy
+@@ -0,0 +1,133 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.forge
++
++import java.nio.file.Files
++import java.nio.file.Path
++import java.util.zip.ZipEntry
++import java.util.zip.ZipFile
++import java.util.zip.ZipOutputStream
++
++import javax.tools.ToolProvider
++
++import org.gradle.testfixtures.ProjectBuilder
++import spock.lang.Specification
++import spock.lang.TempDir
++
++import net.fabricmc.loom.task.service.MappingsService
++import net.fabricmc.loom.task.service.SourceRemapperService
++import net.fabricmc.loom.util.service.ScopedServiceFactory
++
++class ForgeStrictSourcesTest extends Specification {
++	@TempDir Path root
++	private static final String HEADER = 'tiny\t2\t0\tmojang\tnamed\n'
++	private static final String NAMES = 'c\tgame/Payload\tgame/Packet\n\tm\t()I\ttype\tkind\n\tf\tI\tVALUE\tMARKER\n'
++	private static final String API = 'package game; public interface Payload { int VALUE = 17; int type(); }'
++	private static final String IMPL = '''package forge;
++import game.Payload;
++public class Hook implements Payload {
++    @Override public int type() { return Payload.VALUE; }
++    public int call(Payload payload) { return payload.type(); }
++}
++'''
++
++	def '自定义命名空间覆盖游戏接口、Forge 覆写和调用点，完整保留资源和注释源'() {
++		given:
++		def src = root.resolve('game-sources.jar')
++		def out = root.resolve('named.jar')
++		def blank = '// class NotADeclaration {}\n/* interface Ignored {} */\n'
++		archive(src, ['game/Payload.java': API, 'forge/Hook.java': IMPL, 'forge/Disabled.java': blank,
++			'forge/package-info.java': '/** 说明 */ package forge;', 'forge/Unused.java': 'package forge;',
++			'Empty.java': '', 'module-info.java': 'module smoke { exports forge; }', 'LICENSE': '许可'])
++
++		when:
++		convert(src, out, HEADER + NAMES)
++
++		then:
++		new ZipFile(out.toFile()).withCloseable { z ->
++			def text = { name -> z.getInputStream(z.getEntry(name)).text }
++			assert !z.getEntry('game/Payload.java')
++			assert text('game/Packet.java').contains('int kind()')
++			assert text('forge/Hook.java').contains('implements Packet')
++			assert text('forge/Hook.java').contains('int kind()')
++			assert text('forge/Hook.java').contains('Packet.MARKER')
++			assert text('forge/Hook.java').contains('payload.kind()')
++			assert text('forge/Disabled.java') == blank
++			assert text('forge/package-info.java').contains('package forge;')
++			assert text('forge/Unused.java') == 'package forge;'
++			assert text('Empty.java') == ''
++			assert text('module-info.java').contains('module smoke')
++			assert text('LICENSE') == '许可'
++			true
++		}
++	}
++
++	def '失败不覆盖旧目标：#reason'() {
++		given:
++		def src = root.resolve('input.jar')
++		def out = root.resolve('named.jar')
++		Files.writeString(out, '既有完整产物')
++		archive(src, entries)
++
++		when:
++		convert(src, out, mapping)
++
++		then:
++		thrown(IOException)
++		Files.readString(out) == '既有完整产物'
++
++		where:
++		reason     | entries                                                 | mapping
++		'空归档'   | [:]                                                     | HEADER + NAMES
++		'缺少列'   | ['game/Payload.java': API]                              | (HEADER + NAMES).replace('mojang', 'official')
++		'无效声明' | ['game/Bad.java': 'package game; public class Bad {']   | HEADER + NAMES
++		'错误路径' | ['wrong/Payload.java': API]                             | HEADER + NAMES
++		'同名输出' | ['game/Payload.java': API, 'game/Packet.java': '// 占用'] | HEADER + NAMES
++	}
++
++	private void convert(Path src, Path out, String tiny) {
++		def project = ProjectBuilder.builder().withProjectDir(root.toFile()).build()
++		def map = Files.writeString(root.resolve('names.tiny'), tiny)
++		def api = Files.writeString(root.resolve('Payload.java'), API)
++		assert ToolProvider.systemJavaCompiler.run(null, null, null, '-d', root.toString(), api.toString()) == 0
++		def classes = root.resolve('classes.jar')
++		archive(classes, ['game/Payload.class': Files.readAllBytes(root.resolve('game/Payload.class'))])
++		def opts = SourceRemapperService.TYPE.create(project) { o ->
++			o.mappings.set(MappingsService.createOptions(project, map, 'mojang', 'named', false))
++			o.javaCompileRelease.set(21)
++		}
++		new ScopedServiceFactory().withCloseable { factory -> factory.get(opts).remapSourcesJarStrict(src, out, classes) }
++	}
++
++	private static void archive(Path path, Map entries) {
++		new ZipOutputStream(Files.newOutputStream(path)).withCloseable { z ->
++			entries.each { name, value ->
++				z.putNextEntry(new ZipEntry(name))
++				z.write(value instanceof String ? value.bytes : value)
++				z.closeEntry()
++			}
++		}
++	}
++}

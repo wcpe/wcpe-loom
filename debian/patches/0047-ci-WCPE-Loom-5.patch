@@ -1,0 +1,46 @@
+From f730ff221e1113059b85eae6a812a5e6c077134b Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:48 +0800
+Subject: [PATCH 047/147] =?UTF-8?q?ci:=20=E5=8F=91=E5=B8=83=E6=A0=87?=
+ =?UTF-8?q?=E9=A2=98=E7=BB=9F=E4=B8=80=E4=B8=BA=E3=80=8CWCPE=20Loom=20<?=
+ =?UTF-8?q?=E7=89=88=E6=9C=AC=E5=8F=B7>=E3=80=8D=20(#5)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+历史 Release 标题混有 "fabric-loom v…"、"wcpe-loom v…"、"wcpe-loom wcpe-v…"
+三种写法（最后一种把 tag 名重复了一遍），列表看着杂乱。改为从 tag 推导版本号并
+统一输出「WCPE Loom 1.17.8」这一种简洁形式。
+
+注：已有的 21 条历史 Release 标题已通过 API 统一，1.15/1.16 代系条目另加了冻结说明。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/.github/workflows/publish.yml b/.github/workflows/publish.yml
+index abbc647870a9f4be12ab6a0cfc8ec2a46e18379b..cd763d8a4216140dc6b6ceb6662bedfdee3abe71 100644
+--- a/.github/workflows/publish.yml
++++ b/.github/workflows/publish.yml
+@@ -160,6 +160,8 @@ jobs:
+         # 导致上一版的内容被重复列出、Full Changelog 从更早的版本起算。
+         # 另外 --generate-notes 只统计 PR 合入的改动，直推默认分支的提交不会出现，
+         # 故在其后追加一节列出这类提交，避免正式发布的实际内容缺失说明。
++        # 标题用「WCPE Loom <版本号>」：历史条目里曾混有 "fabric-loom v…"、"wcpe-loom wcpe-v…"
++        # 等多种写法（后者把 tag 名重复了一遍），这里统一为一种简洁形式。
+         # 重跑或重复推送同一 tag 时保留现有 Release，避免 gh release create 返回 422。
+         run: |
+           if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+@@ -171,9 +173,12 @@ jobs:
+           PREV_TAG="$(git describe --tags --abbrev=0 --match 'wcpe-v*' "${TAG_NAME}^")"
+           echo "变更区间: ${PREV_TAG}..${TAG_NAME}"
+ 
++          # wcpe-v1.17.8 → 1.17.8
++          VERSION="${TAG_NAME#wcpe-v}"
++
+           if gh release create "$TAG_NAME" \
+             --repo "$GITHUB_REPOSITORY" \
+-            --title "wcpe-loom $TAG_NAME" \
++            --title "WCPE Loom ${VERSION}" \
+             --notes-start-tag "$PREV_TAG" \
+             --generate-notes; then
+             :

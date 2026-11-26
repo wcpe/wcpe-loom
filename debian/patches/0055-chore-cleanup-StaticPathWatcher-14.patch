@@ -1,0 +1,119 @@
+From 07e3e9ae56b552822b4222c1694f39883b8bbfd3 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:55 +0800
+Subject: [PATCH 055/147] =?UTF-8?q?chore(cleanup):=20=E5=88=A0=E9=99=A4?=
+ =?UTF-8?q?=E5=B7=B2=E6=97=A0=E8=B0=83=E7=94=A8=E6=96=B9=E7=9A=84=20Static?=
+ =?UTF-8?q?PathWatcher=20(#14)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+该类的唯一消费点是 MappingsCache 的 hasFileChanged 调用，而 MappingsCache
+已由上游提交 9d9be1b8 整体删除，此后它一直是没有调用方的孤儿。
+
+- INSTANCE / hasFileChanged / pathsObserved / changeCache 四个标识符在全仓库
+  （含 src/test 与 src/decompilers 各源集）只出现在其自身文件内，零外部引用
+- 非 api 包（net.fabricmc.loom.util），不在 META-INF/services，无反射注册
+- 它属于「配置期观察文件以决定手写缓存条目是否可复用」那一族协议，删除方向
+  与把产物有效性交给 Gradle 判定的整体工作一致
+
+已在本分支单独验证：从 dev/1.17-wcpe 拉出仅含本改动的分支可正常 compileJava。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/util/StaticPathWatcher.java b/src/main/java/net/fabricmc/loom/util/StaticPathWatcher.java
+deleted file mode 100644
+index ffdced68caf10c7264eb662cd89b208ead29fd32..0000000000000000000000000000000000000000
+--- a/src/main/java/net/fabricmc/loom/util/StaticPathWatcher.java
++++ /dev/null
+@@ -1,89 +0,0 @@
+-/*
+- * This file is part of fabric-loom, licensed under the MIT License (MIT).
+- *
+- * Copyright (c) 2016-2021 FabricMC
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a copy
+- * of this software and associated documentation files (the "Software"), to deal
+- * in the Software without restriction, including without limitation the rights
+- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+- * copies of the Software, and to permit persons to whom the Software is
+- * furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice shall be included in all
+- * copies or substantial portions of the Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+- * SOFTWARE.
+- */
+-
+-package net.fabricmc.loom.util;
+-
+-import java.io.IOException;
+-import java.nio.file.FileSystems;
+-import java.nio.file.Files;
+-import java.nio.file.Path;
+-import java.nio.file.StandardWatchEventKinds;
+-import java.nio.file.WatchEvent;
+-import java.nio.file.WatchKey;
+-import java.nio.file.WatchService;
+-import java.util.HashMap;
+-import java.util.Map;
+-
+-public final class StaticPathWatcher {
+-	public static final StaticPathWatcher INSTANCE = new StaticPathWatcher();
+-
+-	private final Map<Path, Boolean> changeCache = new HashMap<>();
+-	private final WatchService service;
+-	private final Map<Path, WatchKey> pathsObserved = new HashMap<>();
+-
+-	private StaticPathWatcher() {
+-		try {
+-			service = FileSystems.getDefault().newWatchService();
+-		} catch (IOException e) {
+-			throw new RuntimeException(e);
+-		}
+-	}
+-
+-	public boolean hasFileChanged(Path filePath) {
+-		if (!Files.exists(filePath)) {
+-			return true;
+-		}
+-
+-		WatchKey key;
+-
+-		while ((key = service.poll()) != null) {
+-			for (WatchEvent<?> event : key.pollEvents()) {
+-				Object ctx = event.context();
+-
+-				if (ctx instanceof Path path) {
+-					changeCache.put(path.toAbsolutePath(), true);
+-				}
+-			}
+-		}
+-
+-		filePath = filePath.toAbsolutePath();
+-		Path parentPath = filePath.getParent();
+-
+-		if (changeCache.containsKey(filePath)) {
+-			return true;
+-		} else {
+-			if (!pathsObserved.containsKey(parentPath)) {
+-				try {
+-					pathsObserved.put(parentPath, parentPath.register(service, StandardWatchEventKinds.ENTRY_MODIFY, StandardWatchEventKinds.ENTRY_DELETE));
+-
+-					return true;
+-				} catch (IOException e) {
+-					throw new RuntimeException(e);
+-				}
+-			} else {
+-				return false;
+-			}
+-		}
+-	}
+-}

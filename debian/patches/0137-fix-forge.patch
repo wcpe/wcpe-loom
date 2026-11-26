@@ -1,0 +1,590 @@
+From ad850d2fe2ec9033aca26889127f8a8d99ab7b1b Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Wed, 25 Nov 2026 01:38:07 +0800
+Subject: [PATCH 137/147] =?UTF-8?q?fix(forge):=20=E6=8C=89=E5=BD=92?=
+ =?UTF-8?q?=E4=B8=80=E5=8C=96=E6=8F=8F=E8=BF=B0=E7=AC=A6=E8=A1=A5=E8=AF=91?=
+ =?UTF-8?q?=E6=97=A7=E7=89=88=E6=88=90=E5=91=98=E5=BC=95=E7=94=A8?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+参考包中的改名方法仅在描述符能唯一配对且目标声明确实存在时补译。把参考包纳入任务输入与生产依赖，并隔离旧缓存。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: legacy-forge-member-descriptor-remap
+
+diff --git a/src/main/java/dev/architectury/loom/forge/ForgeMemberNameFixer.java b/src/main/java/dev/architectury/loom/forge/ForgeMemberNameFixer.java
+index f3f447acd4d66ff4b6160615d6ea9093c10d9916..1701bfd65b2ffdaefab5223256f03833714376a3 100644
+--- a/src/main/java/dev/architectury/loom/forge/ForgeMemberNameFixer.java
++++ b/src/main/java/dev/architectury/loom/forge/ForgeMemberNameFixer.java
+@@ -37,6 +37,7 @@ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.function.UnaryOperator;
+ import java.util.zip.ZipEntry;
+ import java.util.zip.ZipFile;
+ import java.util.zip.ZipOutputStream;
+@@ -54,36 +55,18 @@ import org.objectweb.asm.commons.Remapper;
+ import net.fabricmc.mappingio.tree.MappingTree;
+ 
+ /**
+- * 把最终 MC jar 里「对 Forge 成员的未翻译引用」改写成 Forge 侧的最终名字.
++ * 补译最终 Minecraft jar 内仍用官方混淆名引用的 Forge 成员.
+  *
+- * <h2>为什么需要这一步</h2>
+- * legacy Forge 的 binpatch 会把 Forge 自己的调用写进 MC 类。这些调用在补丁里以 <b>srg 名</b>
+- * 出现（如 {@code ModelLoader.a()}），而 Forge universal jar 随后被重映射到 named
+- * （同方法改叫 {@code setupModelRegistry}）。MC jar 的重映射表只含 MC 自身成员，
+- * 查不到 Forge 成员，于是这些引用被原样保留，运行期抛
+- * {@code NoSuchMethodError: ModelLoader.a()Lnet/minecraft/util/registry/IRegistry;}。
++ * <p>Legacy Forge 的 binpatch 给 Minecraft 类加入了对 Forge 成员的调用。例如，原版调用
++ * {@code ModelLoader.a()Lfm;}，而另行重映射的 Forge 已把声明改成 {@code setupModelRegistry}。
++ * Minecraft 的映射表未记录 Forge 的这些方法名，只能翻译描述符，导致运行时找不到方法。
+  *
+- * <h2>映射从哪来</h2>
+- * Forge 会同时提供 {@code forge-universal.jar}（srg 空间）与重映射后的 forge jar（named 空间）。
+- * 两份 jar 由同一份源码编译，<b>同类内成员的出现顺序一致</b>，因此按顺序对齐即可得到
+- * 「srg 名 → named 名」的对应关系。这条映射不依赖 MC 映射表，所以能覆盖 MC 表里没有的 Forge 成员。
++ * <p>方法以两份 Forge 参考 jar 的声明为依据：将 universal 的描述符换成 named，先排除未改名的签名，
++ * 只配对剩余的一对一签名。补译时按 owner、旧方法名和最终描述符查表，且必须在目标 jar 确认真正的声明。
++ * 这样不会把已正确链接的同名重载、构造器或无法唯一配对的方法一起改名。
+  *
+- * <h2>为什么按 owner+name 匹配而不是按描述符</h2>
+- * 最终 jar 里这些引用的描述符可能已经是 named 形
+- * （{@code ()Lnet/minecraft/util/registry/IRegistry;}），而映射键里的描述符是 srg 形
+- * （{@code ()Lfm;}），两者不等。若按「名字+描述符」精确匹配会静默失效
+- * （实测：仅 2 个 class 被改写且目标引用未变）。故这里忽略描述符、只按 owner + name 匹配。
+- *
+- * <p><b>该匹配方式的前提</b>：同一 owner 下的同名重载会映射到同一个目标名。
+- * 对 1.12.2 的 Forge 实测结果正确（重载在 srg 与 named 两版间保持同序，且改名后不与其他成员冲突）。
+- * 若将来 Forge 引入「同名重载被改成不同名字」的情况，这里会改错，需改为携带描述符的匹配。
+- *
+- * <h2>字段引用：直接表 + 继承链</h2>
+- * 上面两张表只含 Forge 类<b>自己声明</b>的成员。但 Forge 代码也会读<b>从 MC 父类继承</b>的字段，
+- * 例如 {@code World.initCapabilities} 里的 {@code WorldCapabilityData.a}（= {@code WorldSavedData.mapName}）。
+- * Forge 类不在 MC 映射表里，TinyRemapper 解析不到这类引用，名字会原样留成官方名。
+- * 因此字段<b>引用</b>还额外沿类层次向上查 MC 映射表，详见 {@link FieldResolver}；
+- * 字段<b>声明</b>则只查直接表，详见 {@link DeclarationSafeClassRemapper}。
++ * <p>字段保持独立：Forge 类自己声明的字段使用直接表，字段引用还可沿父类查找 Minecraft 映射。
++ * 详见 {@link FieldResolver} 和 {@link DeclarationSafeClassRemapper}。
+  */
+ public final class ForgeMemberNameFixer {
+ 	/** Forge 类的包前缀：只处理这些包下的成员，MC 自身成员不受影响. */
+@@ -93,34 +76,37 @@ public final class ForgeMemberNameFixer {
+ 	}
+ 
+ 	/**
+-	 * 改写 {@code targetJar} 中对 Forge 成员的 srg 名引用.
++	 * 补译 {@code targetJar} 中未翻译的 Forge 成员引用.
+ 	 *
+ 	 * <p>就地改写：读原文件、写同目录临时文件、成功后替换。任一步失败时原文件保持不动。
+ 	 *
+-	 * @param targetJar 待改写的 jar（最终 MC jar，已处于目标命名空间）
+-	 * @param srgForgeJar Forge 的 universal jar（srg 空间）
++	 * @param targetJar 已重映射、包含 Forge 类的最终 Minecraft jar
++	 * @param universalForgeJar Forge 发布的 universal jar（official 命名空间）
+ 	 * @param namedForgeJar 已重映射到 named 的 Forge jar
+-	 * @param mappings MC 映射树；为 {@code null} 时不做继承字段解析（退化成「只改直接表」）
+-	 * @param fromNamespace 重映射的源命名空间——{@code targetJar} 里没被翻译的引用保持的就是这个空间的名字
+-	 * @param toNamespace 重映射的目标命名空间
+-	 * @return 改写统计；两份 Forge jar 缺失或对不上时返回全零
++	 * @param mappings Minecraft 映射树；为 {@code null} 时仅按原始描述符匹配方法，不解析继承字段
++	 * @param fromNamespace Minecraft 重映射的源命名空间，未翻译的字段名属于此空间
++	 * @param toNamespace Minecraft 重映射的目标命名空间
++	 * @return 改写统计；缺少参考 JAR 或没有可用映射时返回全零
+ 	 * @throws IOException 读写失败
+ 	 */
+-	public static Stats fix(Path targetJar, Path srgForgeJar, Path namedForgeJar,
++	public static Stats fix(Path targetJar, Path universalForgeJar, Path namedForgeJar,
+ 			@Nullable MappingTree mappings, String fromNamespace, String toNamespace) throws IOException {
+-		final MemberMapping mapping = buildMapping(srgForgeJar, namedForgeJar);
+-
+-		if (mapping.isEmpty()) {
+-			// 映射为空说明两份 Forge jar 缺失或对不上：改写没有意义，跳过而不是产出半成品
++		if (!Files.isRegularFile(universalForgeJar) || !Files.isRegularFile(namedForgeJar)) {
+ 			return new Stats(0, 0, 0);
+ 		}
+ 
++		final MemberMapping mapping = buildMapping(targetJar, universalForgeJar, namedForgeJar, mappings, toNamespace);
+ 		final FieldResolver resolver = FieldResolver.create(targetJar, mapping.fields(), mappings, fromNamespace, toNamespace);
+ 
++		// Forge 直接差异为空时，引用仍可能需要沿继承链查找 Minecraft 父类的字段映射。
++		if (mapping.isEmpty() && resolver.classesByTargetName.isEmpty()) {
++			return new Stats(0, 0, 0);
++		}
++
+ 		final Remapper remapper = new Remapper() {
+ 			@Override
+ 			public String mapMethodName(String owner, String name, String descriptor) {
+-				return mapping.methods().getOrDefault(owner + "." + name, name);
++				return mapping.methods().getOrDefault(owner + '.' + name + descriptor, name);
+ 			}
+ 
+ 			@Override
+@@ -237,43 +223,51 @@ public final class ForgeMemberNameFixer {
+ 		}
+ 	}
+ 
+-	/**
+-	 * 按「同类内、同种类成员的顺序对齐」建立 srg 名 → named 名的映射.
+-	 *
+-	 * <p><b>字段与方法必须分表</b>：srg 空间里 Forge 自己的方法名也被 srg 化（`a` / `b` / `d`），
+-	 * 与 named 空间按下标对齐后会得到 `a → readFromNBT` 这类**方法**映射；若字段与方法共用一张表，
+-	 * 引用父类字段的 `getfield Owner.a` 会命中这张表并改写成方法名，运行期 NoSuchFieldError。
+-	 * （实测 1.12.2：`World.initCapabilities` 引用 `WorldSavedData.mapName`，被改成 `readFromNBT`。）
+-	 *
+-	 * <p>只收录名字确实发生变化的成员；名字相同的无需改写。
+-	 */
+-	private static MemberMapping buildMapping(Path srgForgeJar, Path namedForgeJar) throws IOException {
+-		if (!Files.isRegularFile(srgForgeJar) || !Files.isRegularFile(namedForgeJar)) {
+-			return MemberMapping.EMPTY;
+-		}
+-
+-		final Map<String, ClassMembers> srgClasses = readMemberNames(srgForgeJar);
+-		final Map<String, ClassMembers> namedClasses = readMemberNames(namedForgeJar);
++	/** 建立 Forge 字段和方法的两张补译表，两者即使同名也不能混用. */
++	private static MemberMapping buildMapping(Path targetJar, Path universalForgeJar, Path namedForgeJar,
++			@Nullable MappingTree mappings, String toNamespace) throws IOException {
++		final Map<String, ClassMembers> universalClasses = readMemberNames(universalForgeJar, descriptorMapper(mappings, "official", "named"));
++		final Map<String, ClassMembers> namedClasses = readMemberNames(namedForgeJar, UnaryOperator.identity());
++		final Map<String, ClassMembers> targetClasses = readMemberNames(targetJar, UnaryOperator.identity());
++		final UnaryOperator<String> namedToTarget = descriptorMapper(mappings, "named", toNamespace);
+ 		final Map<String, String> fields = new HashMap<>();
+ 		final Map<String, String> methods = new HashMap<>();
+ 
+-		for (Map.Entry<String, ClassMembers> entry : srgClasses.entrySet()) {
++		for (Map.Entry<String, ClassMembers> entry : universalClasses.entrySet()) {
+ 			final String owner = entry.getKey();
+-			final ClassMembers srg = entry.getValue();
++			final ClassMembers universal = entry.getValue();
+ 			final ClassMembers named = namedClasses.get(owner);
+ 
+ 			if (named == null) {
+ 				continue;
+ 			}
+ 
+-			// 字段只与字段对齐、方法只与方法对齐；两侧数量不等时整组跳过（宁可不改也不改错）
+-			collect(srg.fieldNames(), named.fieldNames(), owner, fields);
+-			collect(srg.methodNames(), named.methodNames(), owner, methods);
++			collect(universal.fieldNames(), named.fieldNames(), owner, fields);
++			final ClassMembers target = targetClasses.get(owner);
++
++			if (target != null) {
++				collectMethods(universal.methods(), named.methods(), target.methods(), owner, namedToTarget, methods);
++			}
+ 		}
+ 
+ 		return new MemberMapping(fields, methods);
+ 	}
+ 
++	private static UnaryOperator<String> descriptorMapper(@Nullable MappingTree mappings, String from, String to) {
++		if (mappings == null || from.equals(to)) {
++			return UnaryOperator.identity();
++		}
++
++		final int fromId = mappings.getNamespaceId(from);
++		final int toId = mappings.getNamespaceId(to);
++
++		if (fromId == MappingTree.NULL_NAMESPACE_ID || toId == MappingTree.NULL_NAMESPACE_ID) {
++			return UnaryOperator.identity();
++		}
++
++		return descriptor -> mappings.mapDesc(descriptor, fromId, toId);
++	}
++
+ 	/** 把一组同种类成员按下标对齐后写入映射表；两侧数量不等时跳过该组. */
+ 	private static void collect(List<String> srgNames, List<String> namedNames, String owner, Map<String, String> out) {
+ 		if (srgNames.size() != namedNames.size()) {
+@@ -290,14 +284,42 @@ public final class ForgeMemberNameFixer {
+ 		}
+ 	}
+ 
+-	/** 一个类在两份 Forge jar 里的成员名（按 class 文件声明顺序，字段与方法分开）. */
+-	private record ClassMembers(List<String> fieldNames, List<String> methodNames) {
++	/** 先排除同描述符下未改名的方法，只对两侧均唯一的剩余方法建立映射. */
++	private static void collectMethods(Map<String, Set<String>> universal, Map<String, Set<String>> named,
++			Map<String, Set<String>> target, String owner, UnaryOperator<String> namedToTarget, Map<String, String> out) {
++		for (Map.Entry<String, Set<String>> entry : universal.entrySet()) {
++			final String descriptor = entry.getKey();
++			final Set<String> oldNames = entry.getValue();
++			final Set<String> newNames = named.get(descriptor);
++
++			if (newNames == null || oldNames.size() != newNames.size()) {
++				continue;
++			}
++
++			final List<String> removed = oldNames.stream().filter(name -> !newNames.contains(name)).toList();
++
++			if (removed.size() != 1) {
++				continue;
++			}
++
++			final String oldName = removed.getFirst();
++			final String newName = newNames.stream().filter(name -> !oldNames.contains(name)).findFirst().orElseThrow();
++			final String targetDescriptor = namedToTarget.apply(descriptor);
++			final Set<String> targetNames = target.get(targetDescriptor);
++
++			// 已经能解析的签名与不存在目标声明的签名都不能改，否则可能重命名声明本身或制造新断链。
++			if (targetNames != null && !targetNames.contains(oldName) && targetNames.contains(newName)) {
++				out.put(owner + '.' + oldName + targetDescriptor, newName);
++			}
++		}
++	}
++
++	/** 一个 Forge 类的字段声明顺序及按方法描述符分组的名字. */
++	private record ClassMembers(List<String> fieldNames, Map<String, Set<String>> methods) {
+ 	}
+ 
+ 	/** 字段与方法分开的两张映射表. */
+ 	private record MemberMapping(Map<String, String> fields, Map<String, String> methods) {
+-		static final MemberMapping EMPTY = new MemberMapping(Map.of(), Map.of());
+-
+ 		boolean isEmpty() {
+ 			return fields.isEmpty() && methods.isEmpty();
+ 		}
+@@ -542,8 +564,8 @@ public final class ForgeMemberNameFixer {
+ 	private record ClassShape(@Nullable String superName, Set<String> fieldKeys) {
+ 	}
+ 
+-	/** 读一个 jar 内全部 Forge 类的成员名（字段与方法分开，各自按 class 文件中的声明顺序）. */
+-	private static Map<String, ClassMembers> readMemberNames(Path jar) throws IOException {
++	/** 读取 jar 中的 Forge 声明，按提供的转换统一方法描述符. */
++	private static Map<String, ClassMembers> readMemberNames(Path jar, UnaryOperator<String> mapDescriptor) throws IOException {
+ 		final Map<String, ClassMembers> result = new HashMap<>();
+ 
+ 		try (ZipFile zip = new ZipFile(jar.toFile())) {
+@@ -560,7 +582,7 @@ public final class ForgeMemberNameFixer {
+ 				try (InputStream in = zip.getInputStream(entry)) {
+ 					final ClassReader reader = new ClassReader(readAll(in));
+ 					final List<String> fields = new ArrayList<>();
+-					final List<String> methods = new ArrayList<>();
++					final Map<String, Set<String>> methods = new HashMap<>();
+ 
+ 					reader.accept(new ClassVisitor(Opcodes.ASM9) {
+ 						@Override
+@@ -571,11 +593,13 @@ public final class ForgeMemberNameFixer {
+ 
+ 						@Override
+ 						public MethodVisitor visitMethod(int access, String methodName, String descriptor, String signature, String[] exceptions) {
+-							methods.add(methodName);
++							if (!methodName.startsWith("<")) {
++								methods.computeIfAbsent(mapDescriptor.apply(descriptor), unused -> new HashSet<>()).add(methodName);
++							}
++
+ 							return null;
+ 						}
+-					}, 0);
+-
++}, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+ 					result.put(reader.getClassName(), new ClassMembers(fields, methods));
+ 				} catch (RuntimeException e) {
+ 					// 单个类解析失败只跳过该类
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
+index 523cbe7a3d7ed30fade5271098ecc174d963e474..2c32e198e38b6fd11112125bde86f85dcdcdb033 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
+@@ -417,7 +417,10 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 			return extension.getMinecraftProvider().minecraftVersion();
+ 		}
+ 
+-		return "%s-%s".formatted(extension.getMinecraftProvider().minecraftVersion(), extension.getMappingConfiguration().mappingsIdentifier());
++		final String version = "%s-%s".formatted(extension.getMinecraftProvider().minecraftVersion(), extension.getMappingConfiguration().mappingsIdentifier());
++
++		// 旧 Legacy 产物可能只补译了继承字段，仍包含未翻译的 Forge 方法引用。
++		return extension.isLegacyForge() ? version + "-legacy-members-v2" : version;
+ 	}
+ 
+ 	protected String getDependencyNotation(MinecraftJar.Type type) {
+@@ -631,35 +634,24 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 	}
+ 
+ 	/**
+-	 * {@return 补充翻译所需的两份 Forge 参考 jar（依次为 srg 版、named 版），拿不到时返回 {@code null}}.
+-	 *
+-	 * <p>只有 legacy Forge 同时存在这两份：{@code forge-universal.jar} 按 SRG 名发布，
+-	 * {@code forge.jar} 由本 provider 重映射成 named。现代 Forge/NeoForge 的 universal jar
+-	 * 本身就在 named 空间、没有可对比的第二份，故在那里返回 {@code null}，工序自动跳过。
++	 * {@return Legacy Forge 的官方 universal / named 参考 jar 路径；缺少参考时返回 {@code null}}.
+ 	 *
+-	 * <p>配置期生产路径（{@link #fixForgeMemberNames(RemappedJars)}）与执行期任务路径
+-	 * （{@link #registerRemapTasks}）共用本方法，两条路径因此对「该不该做这一步、用哪两份 jar」
+-	 * 保持一致——不一致会让同一车道在两种生产形态下得到不同的产物。
++	 * <p>任务化的 named jar 在冷缓存中要到执行期才会生成，注册阶段不能只按磁盘存在性判断。
+ 	 */
+ 	@Nullable
+ 	private Path[] getForgeReferenceJars() {
+-		if (!(minecraftProvider instanceof ForgeMinecraftProvider withForge)) {
++		if (!(minecraftProvider instanceof ForgeMinecraftProvider withForge) || !extension.isLegacyForge() || extension.disableObfuscation()) {
+ 			return null;
+ 		}
+ 
+ 		final Path namedForgeJar = withForge.getPatchedProvider().getNamedForgeJar();
+ 
+-		if (namedForgeJar == null || !Files.isRegularFile(namedForgeJar)) {
+-			return null;
+-		}
+-
+-		final Path srgForgeJar = extension.getForgeUniversalProvider().getForge().toPath();
+-
+-		if (!Files.isRegularFile(srgForgeJar)) {
++		if (namedForgeJar == null || (minecraftProvider.productionTaskPath(namedForgeJar) == null && !Files.isRegularFile(namedForgeJar))) {
+ 			return null;
+ 		}
+ 
+-		return new Path[] { srgForgeJar, namedForgeJar };
++		final Path universalForgeJar = extension.getForgeUniversalProvider().getForge().toPath();
++		return Files.isRegularFile(universalForgeJar) ? new Path[] { universalForgeJar, namedForgeJar } : null;
+ 	}
+ 
+ 	protected void configureRemapper(RemappedJars remappedJars, TinyRemapper.Builder tinyRemapperBuilder) {
+@@ -937,6 +929,12 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 		identity.put("outputPom", outputPom.toString());
+ 		identity.put("outputBackupJar", orEmpty(outputBackupJar));
+ 
++		final Path[] forgeReferenceJars = getForgeReferenceJars();
++
++		if (forgeReferenceJars != null) {
++			identity.put("forgeReferenceJars", fingerprintPaths(forgeReferenceJars));
++		}
++
+ 		return RemapMinecraftTaskRegistry.claim(project, outputJar, Map.copyOf(identity), () ->
+ 				project.getTasks().register(taskName(remappedJars), RemapMinecraftTask.class, task -> {
+ 					task.setGroup(Constants.TaskGroup.FABRIC);
+@@ -990,18 +988,11 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 					task.getFixRecords().set(fixRecords);
+ 					task.getForgeLike().set(extension.isForgeLike());
+ 
+-					// legacy Forge 的补充翻译：MC 的重映射表只含 MC 自身成员，Forge 的 binpatch 写进
+-					// MC 类的「对 Forge 成员 srg 名引用」不会随之翻译（如 ModelLoader.a →
+-					// setupModelRegistry），运行期抛 NoSuchMethodError。这里把 Forge 自身两份 jar
+-					// 交给任务，由它在重映射落位后补做一次改写。
+-					//
+-					// 只有 legacy Forge 同时存在「universal（srg）+ named」两份 jar；现代 Forge/NeoForge
+-					// 车道取不到可对比的两份，故不设置这两个输入，任务侧自动跳过（不是失败）。
+-					final Path[] forgeReferenceJars = getForgeReferenceJars();
+-
++					// named 参考 jar 可能尚未落盘；冷缓存也必须由任务图保证它先产出。
+ 					if (forgeReferenceJars != null) {
+ 						task.getForgeSrgJar().set(forgeReferenceJars[0].toFile());
+ 						task.getForgeNamedJar().set(forgeReferenceJars[1].toFile());
++						minecraftProvider.addProducerDependency(task, forgeReferenceJars[1]);
+ 					}
+ 
+ 					task.getValidateTargetNamespace().set(validateTargetNamespace);
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMemberNameFixerTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMemberNameFixerTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9dfa854dc54f0fadf7fb1460cee254f4d6f0547
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeMemberNameFixerTest.groovy
+@@ -0,0 +1,209 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.forge
++
++import java.nio.file.Files
++import java.nio.file.Path
++import java.util.zip.ZipEntry
++import java.util.zip.ZipFile
++import java.util.zip.ZipOutputStream
++
++import dev.architectury.loom.forge.ForgeMemberNameFixer
++import org.objectweb.asm.ClassReader
++import org.objectweb.asm.ClassWriter
++import org.objectweb.asm.Opcodes
++import org.objectweb.asm.tree.ClassNode
++import org.objectweb.asm.tree.FieldInsnNode
++import org.objectweb.asm.tree.MethodInsnNode
++import spock.lang.Specification
++import spock.lang.TempDir
++
++import net.fabricmc.mappingio.MappingReader
++import net.fabricmc.mappingio.tree.MemoryMappingTree
++
++class ForgeMemberNameFixerTest extends Specification {
++	private static final String PARENT = 'net/minecraft/WorldData'
++	private static final String CHILD = 'net/minecraftforge/test/ForgeData'
++	private static final String CALLER = 'net/minecraft/World'
++	private static final String MODEL_LOADER = 'net/minecraftforge/client/model/ModelLoader'
++
++	@TempDir Path dir
++
++	def '无 Forge 成员差异时仍检查继承字段：#scenario'() {
++		given:
++		def srg = writeJar('forge-srg.jar', [(CHILD): type(CHILD, 'b')])
++		def named = hasReference ? writeJar('forge-named.jar', [(CHILD): type(CHILD, PARENT)]) : dir.resolve('missing.jar')
++		def target = writeJar('target.jar', [(PARENT): type(PARENT, 'java/lang/Object', 'mapName'),
++			(CHILD): type(CHILD, PARENT), (CALLER): caller(originalName)])
++		def mappings = new MemoryMappingTree()
++		def tiny = "tiny\t2\t0\tofficial\tnamed\nc\tb\t${PARENT}\n\tf\tI\ta\tmapName\n"
++		MappingReader.read(new StringReader(tiny), mappings)
++
++		when:
++		def stats = ForgeMemberNameFixer.fix(target, srg, named, mappings, fromNamespace, 'named')
++
++		then:
++		stats.mappingCount() == 0
++		stats.resolvedInheritedFields() == expectedResolutions
++		fieldReference(target) == expectedName
++
++		where:
++		scenario       | hasReference | fromNamespace | originalName || expectedName | expectedResolutions
++		'继承字段已改名'  | true         | 'official'    | 'a'          || 'mapName'    | 1
++		'现有引用已正确'  | true         | 'official'    | 'mapName'    || 'mapName'    | 0
++		'Forge 参考缺失' | false        | 'official'    | 'a'          || 'a'          | 0
++		'映射源不匹配'    | true         | 'srg'         | 'a'          || 'a'          | 0
++	}
++
++	def 'Forge 方法按 #namespace 描述符补译且不误改同名重载或歧义签名'() {
++		given:
++		def mappings = new MemoryMappingTree()
++		def tiny = 'tiny\t2\t0\tofficial\tsrg\tnamed\nc\tfm\tnet/minecraft/SrgRegistry\tnet/minecraft/Registry\n'
++		MappingReader.read(new StringReader(tiny), mappings)
++		def oldDescriptor = '()Lfm;'
++		def namedDescriptor = '()Lnet/minecraft/Registry;'
++		String targetDescriptor = "()L${registry};"
++		String scalarDescriptor = "(L${registry};)V"
++		String arrayDescriptor = "([L${registry};)V"
++		def ambiguousDescriptor = '(Ljava/lang/String;)V'
++		def missingDescriptor = '(Ljava/lang/Object;)V'
++		def validDescriptor = '(Ljava/lang/Number;)V'
++		def universal = writeJar('forge-universal.jar', [(MODEL_LOADER): modelLoader([
++			['a', oldDescriptor], ['a', '(Lfm;)V'], ['a', '([Lfm;)V'], ['unchanged', '(Lfm;)V'],
++			['left', ambiguousDescriptor], ['right', ambiguousDescriptor], ['oldMissing', missingDescriptor], ['oldValid', validDescriptor]
++		])])
++		def named = writeJar('forge-named.jar', [(MODEL_LOADER): modelLoader([
++			['renamedRight', ambiguousDescriptor], ['a', '([Lnet/minecraft/Registry;)V'], ['setupModelRegistry', namedDescriptor],
++			['renamedLeft', ambiguousDescriptor], ['loadModel', '(Lnet/minecraft/Registry;)V'], ['unchanged', '(Lnet/minecraft/Registry;)V'],
++			['newMissing', missingDescriptor], ['newValid', validDescriptor]
++		])])
++		def target = writeJar('target.jar', [(MODEL_LOADER): modelLoader([
++			['setupModelRegistry', targetDescriptor], ['loadModel', scalarDescriptor], ['unchanged', scalarDescriptor], ['a', arrayDescriptor],
++			['renamedLeft', ambiguousDescriptor], ['renamedRight', ambiguousDescriptor], ['oldValid', validDescriptor], ['newValid', validDescriptor]
++		]), (CALLER): modelCaller([
++			['a', targetDescriptor], ['a', scalarDescriptor], ['a', arrayDescriptor], ['left', ambiguousDescriptor],
++			['setupModelRegistry', targetDescriptor], ['oldMissing', missingDescriptor], ['oldValid', validDescriptor]
++		])])
++
++		when:
++		ForgeMemberNameFixer.fix(target, universal, named, mappings, 'official', namespace)
++
++		then:
++		def calls = readCaller(target).methods.first().instructions.toArray().findAll { it instanceof MethodInsnNode }
++		calls*.name == ['setupModelRegistry', 'loadModel', 'a', 'left', 'setupModelRegistry', 'oldMissing', 'oldValid']
++		calls*.owner.every { it == MODEL_LOADER }
++		calls*.desc == [targetDescriptor, scalarDescriptor, arrayDescriptor, ambiguousDescriptor,
++			targetDescriptor, missingDescriptor, validDescriptor]
++
++		where:
++		namespace | registry
++		'named'   | 'net/minecraft/Registry'
++		'srg'     | 'net/minecraft/SrgRegistry'
++	}
++
++	private Path writeJar(String name, Map<String, byte[]> classes) {
++		def path = dir.resolve(name)
++		new ZipOutputStream(Files.newOutputStream(path)).withCloseable { out ->
++			classes.each { String internalName, byte[] data ->
++				out.putNextEntry(new ZipEntry(internalName + '.class'))
++				out.write(data)
++				out.closeEntry()
++			}
++		}
++		return path
++	}
++
++	private static byte[] type(String name, String parent, String field = null) {
++		def writer = new ClassWriter(0)
++		writer.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC, name, null, parent, null)
++		if (field != null) {
++			writer.visitField(Opcodes.ACC_PUBLIC, field, 'I', null, null).visitEnd()
++		}
++		writer.visitEnd()
++		return writer.toByteArray()
++	}
++
++	private static byte[] caller(String field) {
++		def writer = new ClassWriter(0)
++		writer.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC, CALLER, null, 'java/lang/Object', null)
++		def method = writer.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, 'readField', "(L${CHILD};)I", null, null)
++		method.visitCode()
++		method.visitVarInsn(Opcodes.ALOAD, 0)
++		method.visitFieldInsn(Opcodes.GETFIELD, CHILD, field, 'I')
++		method.visitInsn(Opcodes.IRETURN)
++		method.visitMaxs(1, 1)
++		method.visitEnd()
++		writer.visitEnd()
++		return writer.toByteArray()
++	}
++
++	private static byte[] modelLoader(List<List<String>> methods) {
++		def writer = new ClassWriter(0)
++		writer.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC | Opcodes.ACC_ABSTRACT, MODEL_LOADER, null, 'java/lang/Object', null)
++		methods.each { method ->
++			writer.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_ABSTRACT, method[0], method[1], null, null).visitEnd()
++		}
++		writer.visitEnd()
++		return writer.toByteArray()
++	}
++
++	private static byte[] modelCaller(List<List<String>> calls) {
++		def writer = new ClassWriter(0)
++		writer.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC, CALLER, null, 'java/lang/Object', null)
++		def method = writer.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, 'reload', "(L${MODEL_LOADER};)V", null, null)
++		method.visitCode()
++		calls.each { call ->
++			String descriptor = call[1]
++			method.visitVarInsn(Opcodes.ALOAD, 0)
++			if (!descriptor.startsWith('()')) {
++				method.visitInsn(Opcodes.ACONST_NULL)
++			}
++			method.visitMethodInsn(Opcodes.INVOKEVIRTUAL, MODEL_LOADER, call[0], descriptor, false)
++			if (!descriptor.endsWith('V')) {
++				method.visitInsn(Opcodes.POP)
++			}
++		}
++		method.visitInsn(Opcodes.RETURN)
++		method.visitMaxs(2, 1)
++		method.visitEnd()
++		writer.visitEnd()
++		return writer.toByteArray()
++	}
++
++	private static String fieldReference(Path jar) {
++		def field = readCaller(jar).methods.first().instructions.toArray().find { it instanceof FieldInsnNode } as FieldInsnNode
++		return field.name
++	}
++
++	private static ClassNode readCaller(Path jar) {
++		def node = new ClassNode()
++		new ZipFile(jar.toFile()).withCloseable { zip ->
++			zip.getInputStream(zip.getEntry(CALLER + '.class')).withCloseable { stream ->
++				new ClassReader(stream).accept(node, 0)
++			}
++		}
++		return node
++	}
++	}

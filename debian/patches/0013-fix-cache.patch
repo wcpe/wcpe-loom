@@ -1,0 +1,204 @@
+From 80df41847eb56117c44d914e5867f7532ff875c1 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:27 +0800
+Subject: [PATCH 013/147] =?UTF-8?q?fix(cache):=20=E8=A1=A5=E5=9B=9E?=
+ =?UTF-8?q?=E9=87=8D=E6=94=BE=E6=97=B6=E4=B8=A2=E5=A4=B1=E7=9A=84=E8=A1=A5?=
+ =?UTF-8?q?=E4=B8=81=E5=86=85=E5=AE=B9?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+补回跨子项目共享元数据缓存、setupMinecraft 的跨进程缓存锁、重映射任务的 Manifest
+版本输入登记、源码重映射的跨进程锁，以及无混淆模式下的库排除短路。这些不是新功能，
+而是重放时被丢掉的部分。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+index 5d7d3bcc6fd7315875d5f195149233129900f350..974542fb02a7cca634378d1178556d3b79683f96 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+@@ -96,6 +96,7 @@ import net.fabricmc.loom.util.Checksum;
+ import net.fabricmc.loom.util.ExceptionUtil;
+ import net.fabricmc.loom.util.ProcessUtil;
+ import net.fabricmc.loom.util.gradle.GradleUtils;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.loom.util.gradle.SourceSetHelper;
+ import net.fabricmc.loom.util.gradle.daemon.DaemonUtils;
+ import net.fabricmc.loom.util.service.ScopedServiceFactory;
+@@ -137,15 +138,26 @@ public abstract class CompileConfiguration implements Runnable {
+ 				extension.setRefreshDeps(true);
+ 			}
+ 
++			// 跨进程缓存锁：getGlobalLockObject 只覆盖 JVM 内（同一 daemon 的多个 classloader），
++			// 多个 daemon 并发构建同一版本时会同时进入 setupMinecraft 生产共享缓存产物并互相踩踏。
++			// 外层叠加 per-key 跨进程文件锁，键按 Minecraft 版本 + 映射标识隔离，不同版本仍可并行。
++			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
++			final var lockRoot = extension.getFiles().getCacheLocks().toPath();
++			final String setupLockKey = "minecraft-setup:" + extension.getMinecraftProvider().minecraftVersion()
++					+ ":" + (extension.disableObfuscation() ? "deobf" : extension.getMappingConfiguration().mappingsIdentifier);
++
+ 			try {
+-				// Setting up loom across Gradle projects is not thread safe, synchronize it here to ensure that multiple projects cannot use it.
+-				// There is no easy way around this, as we want to use the same global cache for downloaded or generated files.
+-				synchronized (getGlobalLockObject()) {
+-					setupMinecraft(configContext);
+-				}
++				cacheService.runExclusive(lockRoot, setupLockKey, LoomCacheService.defaultTimeout(), () -> {
++					// Setting up loom across Gradle projects is not thread safe, synchronize it here to ensure that multiple projects cannot use it.
++					// There is no easy way around this, as we want to use the same global cache for downloaded or generated files.
++					synchronized (getGlobalLockObject()) {
++						setupMinecraft(configContext);
++					}
+ 
+-				var dependencyManager = new LoomDependencyManager(getProject(), serviceFactory, extension);
+-				dependencyManager.handleDependencies();
++					var dependencyManager = new LoomDependencyManager(getProject(), serviceFactory, extension);
++					dependencyManager.handleDependencies();
++					return null;
++				});
+ 			} catch (Exception e) {
+ 				ExceptionUtil.processException(e, DaemonUtils.Context.fromProject(getProject()));
+ 				disownLock();
+diff --git a/src/main/java/net/fabricmc/loom/configuration/ide/RuntimeLibraries.java b/src/main/java/net/fabricmc/loom/configuration/ide/RuntimeLibraries.java
+index 7da8062ffd030850c1a08dd24c703d6b263e4eb5..c885f20933517e62b8b5a65d7a7cc82aca56e16f 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/ide/RuntimeLibraries.java
++++ b/src/main/java/net/fabricmc/loom/configuration/ide/RuntimeLibraries.java
+@@ -49,6 +49,13 @@ public class RuntimeLibraries {
+ 			return Collections.emptyList();
+ 		}
+ 
++		// 无混淆（MC 26.x）dev 服运行 client+server 合并 jar，且经 ForgeBootstrap 做 JPMS 模块解析：
++		// 若按 client-only 排除 lwjgl 等 API jar，natives 模块的 requires 将无法解析
++		//（Module org.lwjgl.vma not found）。此场景不做排除，保证模块图完整。
++		if (LoomGradleExtension.get(project).disableObfuscation()) {
++			return Collections.emptyList();
++		}
++
+ 		final LoomGradleExtension extension = LoomGradleExtension.get(project);
+ 		final BundleMetadata bundleMetadata = extension.getMinecraftProvider().getServerBundleMetadata();
+ 
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java b/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java
+index 30bf279ac9712cb1814201f82584df5f48352033..f30ab6babbd34bc0614dde03defb495242d7a481 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java
+@@ -78,6 +78,7 @@ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.ExceptionUtil;
+ import net.fabricmc.loom.util.ModPlatform;
+ import net.fabricmc.loom.util.SourceRemapper;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.loom.util.gradle.SourceSetHelper;
+ import net.fabricmc.loom.util.service.ServiceFactory;
+ 
+@@ -88,6 +89,7 @@ public class ModConfigurationRemapper {
+ 	public static final String MISSING_GROUP = "unspecified";
+ 
+ 	private static final Logger LOGGER = LoggerFactory.getLogger(ModConfigurationRemapper.class);
++	private static final String ARTIFACT_METADATA_CACHE = "artifactMetadata";
+ 
+ 	public static void supplyModConfigurations(Project project, ServiceFactory serviceFactory, String mappingsSuffix, LoomGradleExtension extension, SourceRemapper sourceRemapper) {
+ 		final DependencyHandler dependencies = project.getDependencies();
+@@ -160,7 +162,7 @@ public class ModConfigurationRemapper {
+ 		// the installer data. The installer data has to be added before
+ 		// any mods are remapped since remapping needs the dependencies provided by that data.
+ 		final Map<Provider<? extends Configuration>, List<ModDependency>> dependenciesBySourceConfig = new HashMap<>();
+-		AsyncCache<ArtifactMetadata> metaCache = new AsyncCache<>();
++		AsyncCache<ArtifactMetadata> metaCache = getSharedMetaCache(project);
+ 		configsToRemap.forEach((sourceConfig, remappedConfig) -> {
+ 			/*
+ 			sourceConfig - The source configuration where the intermediary named artifacts come from. i.e "modApi"
+@@ -236,6 +238,16 @@ public class ModConfigurationRemapper {
+ 		});
+ 	}
+ 
++	/**
++	 * 返回当前 Loom classloader 服务内的跨子项目共享 {@link AsyncCache}.
++	 *
++	 * <p>缓存仅存活于 Gradle build service 生命周期内，不会跨 daemon 构建泄漏；多个子项目
++	 * 解析同一个 mod jar 时可复用同一个 future，同时不会跨 classloader 共享强类型对象。
++	 */
++	private static AsyncCache<ArtifactMetadata> getSharedMetaCache(Project project) {
++		return LoomCacheService.get(project).get().getAsyncCache(ARTIFACT_METADATA_CACHE);
++	}
++
+ 	private static Map<ArtifactRef, ArtifactMetadata> getMetadata(List<ArtifactRef> artifacts, AsyncCache<ArtifactMetadata> cache, @Nullable Project project, ModPlatform platform, ArtifactMetadata.MixinRemapType defaultMixinRemapType) {
+ 		var futures = new HashMap<ArtifactRef, CompletableFuture<ArtifactMetadata>>();
+ 
+diff --git a/src/main/java/net/fabricmc/loom/task/AbstractRemapJarTask.java b/src/main/java/net/fabricmc/loom/task/AbstractRemapJarTask.java
+index f366c6c8495d28991d5695b8a0a5836332af8948..c0375ff3e4ecae8b1ebb32ef81a07d68de4b29af 100644
+--- a/src/main/java/net/fabricmc/loom/task/AbstractRemapJarTask.java
++++ b/src/main/java/net/fabricmc/loom/task/AbstractRemapJarTask.java
+@@ -156,6 +156,12 @@ public abstract class AbstractRemapJarTask extends Jar {
+ 
+ 		jarManifestServiceProvider = JarManifestService.get(getProject());
+ 		usesService(jarManifestServiceProvider);
++		// BuildService 的参数不会自动进入任务缓存键，必须登记实际写入 Manifest 的版本值。
++		getInputs().property("loomManifestVersions", jarManifestServiceProvider.map(JarManifestService::getManifestVersions));
++		getOutputs().doNotCacheIf("归档未启用可重现文件顺序或保留了原始时间戳", task -> {
++			AbstractRemapJarTask remapTask = (AbstractRemapJarTask) task;
++			return remapTask.isPreserveFileTimestamps() || !remapTask.isReproducibleFileOrder();
++		});
+ 
+ 		getModPlatform().value(LoomGradleExtension.get(getProject()).getPlatform()).finalizeValue();
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/util/SourceRemapper.java b/src/main/java/net/fabricmc/loom/util/SourceRemapper.java
+index f29d8935c3a9ed934c42f444f2b89876c7e0774e..a20f163927573d4a21cd47d02c0df0ba3aaf281d 100644
+--- a/src/main/java/net/fabricmc/loom/util/SourceRemapper.java
++++ b/src/main/java/net/fabricmc/loom/util/SourceRemapper.java
+@@ -48,6 +48,7 @@ import net.fabricmc.loom.api.RemapConfigurationSettings;
+ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration;
+ import net.fabricmc.loom.task.service.LorenzMappingService;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.loom.util.service.ServiceFactory;
+ 
+ public class SourceRemapper {
+@@ -93,22 +94,39 @@ public class SourceRemapper {
+ 	}
+ 
+ 	public void remapAll() {
++		// 无待办则直接返回：暖缓存下没有任何源码需要重映射（scheduleRemapSources 受 isCacheInvalid 守卫），
++		// 因此根本不会走到下面取锁——同一 checkout 的并发构建在暖缓存下互不阻塞。
+ 		if (remapTasks.isEmpty()) {
+ 			return;
+ 		}
+ 
+-		project.getLogger().lifecycle(":remapping sources (Mercury, {} -> {})", from, to);
++		// 写 LOCAL 共享 remapped_mods 源码缓存：用与二进制 mod 重映射相同的 mod-deps 锁串行化，
++		// 避免同一 checkout 的多个并发构建（如同时跑 client/server）踩踏。
++		final LoomGradleExtension extension = LoomGradleExtension.get(project);
++		final Path lockRoot = extension.getFiles().getCacheLocks().toPath();
++		final String lockKey = LoomCacheService.modDepsKey(project.getRootDir(), extension.getMappingConfiguration().mappingsIdentifier);
+ 
+-		ProgressLoggerFactory progressLoggerFactory = ((ProjectInternal) project).getServices().get(ProgressLoggerFactory.class);
+-		ProgressLogger progressLogger = progressLoggerFactory.newOperation(SourceRemapper.class.getName());
+-		progressLogger.start("Remapping dependency sources", "sources");
++		try {
++			LoomCacheService.get(project).get().runExclusive(lockRoot, lockKey, LoomCacheService.defaultTimeout(), () -> {
++				project.getLogger().lifecycle(":remapping sources (Mercury, {} -> {})", from, to);
++
++				ProgressLoggerFactory progressLoggerFactory = ((ProjectInternal) project).getServices().get(ProgressLoggerFactory.class);
++				ProgressLogger progressLogger = progressLoggerFactory.newOperation(SourceRemapper.class.getName());
++				progressLogger.start("Remapping dependency sources", "sources");
+ 
+-		remapTasks.forEach(consumer -> consumer.accept(progressLogger));
++				remapTasks.forEach(consumer -> consumer.accept(progressLogger));
+ 
+-		progressLogger.completed();
++				progressLogger.completed();
+ 
+-		// TODO: FIXME - WORKAROUND https://github.com/FabricMC/fabric-loom/issues/45
+-		System.gc();
++				// TODO: FIXME - WORKAROUND https://github.com/FabricMC/fabric-loom/issues/45
++				System.gc();
++				return null;
++			});
++		} catch (RuntimeException e) {
++			throw e;
++		} catch (Exception e) {
++			throw new RuntimeException("Failed to remap dependency sources", e);
++		}
+ 	}
+ 
+ 	private void remapSourcesInner(File source, File destination) throws Exception {

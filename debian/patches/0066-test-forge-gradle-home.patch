@@ -1,0 +1,142 @@
+From 0d79ca2a74f7d1229d7f96be822028c07b57ae1a Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:31:04 +0800
+Subject: [PATCH 066/147] =?UTF-8?q?test(forge):=20=E5=86=B7=20gradle=20hom?=
+ =?UTF-8?q?e=20=E6=8B=B7=E8=B4=9D=E6=97=B6=E8=B7=B3=E8=BF=87=E9=94=81?=
+ =?UTF-8?q?=E6=96=87=E4=BB=B6=EF=BC=8C=E4=BF=AE=E6=8E=89=E6=89=B9=E9=87=8F?=
+ =?UTF-8?q?=E8=B7=91=E6=97=B6=E7=9A=84=E5=81=B6=E5=8F=91=E5=A4=B1=E8=B4=A5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ForgeSourcesColdCacheTest 在目录级批量跑时偶发失败、单跑从不复现。根因不是
+「文件暂时被占用」，而是被【持续】持有：
+
+  Could not copy ...\gradle_home\caches\9.5.0
+  Caused by: FileSystemException:
+    ...\caches\9.5.0\fileContent\fileContent.lock
+
+源目录是共享的 TestKit gradle home，其中 fileContent.lock 等锁文件由正在运行的
+Gradle 守护进程持有。守护进程活着就一直占着，所以退避重试无效（实测 5 次全败）。
+锁文件是运行时产物，对「冷 home 种子」没有意义，直接跳过即可除根。
+
+保留一层退避重试，用于覆盖其它真正的短暂占用。
+
+ForgeColdLoomCache 中有同名声的重复实现，一并按同一行为修改并互相注明，
+将来若合并需保持一致。
+
+验证：integration.pipeline 目录整体实跑由 16 tests / 1 failure 转为 16 tests / 0
+failures；compileTestGroovy / codenarcTest / spotlessGroovyCheck 通过。
+
+注：该失败本是间歇性的，一次转绿不足以统计证明；但机制解释是因果性的——
+锁被守护进程持有则非暂时，除根只能靠不拷贝它。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeSourcesColdCacheTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeSourcesColdCacheTest.groovy
+index d3f95a83830c29baaa61a064a8b578d3db650e31..479a4546da3c83a860d76725d26bf55de5334eb6 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeSourcesColdCacheTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeSourcesColdCacheTest.groovy
+@@ -269,17 +269,44 @@ class ForgeSourcesColdCacheTest extends Specification implements GradleProjectTe
+ 		}
+ 	}
+ 
++	/**
++	 * 拷贝冷 gradle home，跳过 {@code *.lock} 并对其余失败短暂退避重试。
++	 *
++	 * <p>源目录是共享的 TestKit gradle home，其中 {@code caches/<版本>/fileContent/fileContent.lock}
++	 * 等锁文件被**正在运行的 Gradle 守护进程持续持有**——实测在 Windows 上拷贝这些文件必然以
++	 * FileSystemException 失败，且**不是暂时性的**（重试再多次也一样，因为守护进程活着就一直占着）。
++	 * 锁文件是运行时产物，对「冷 home 种子」没有意义，直接跳过。
++	 *
++	 * <p>保留重试是为了覆盖其它真正的短暂占用（例如刚写完尚未释放）。此外本失败只在目录级批量跑
++	 * 时出现——单跑时没有别的用例的守护进程持有那些锁。
++	 *
++	 * <p>本方法与 {@link net.fabricmc.loom.test.util.ForgeColdLoomCache} 中的同名声重复，
++	 * 两处需保持行为一致。
++	 */
+ 	private static void copyIfExists(File source, File target) {
+ 		if (!source.exists()) {
+ 			return
+ 		}
+ 
+-		if (source.isDirectory()) {
+-			target.mkdirs()
+-			FileUtils.copyDirectory(source, target)
+-		} else {
+-			target.parentFile.mkdirs()
+-			FileUtils.copyFile(source, target)
++		IOException last = null
++
++		for (int attempt = 0; attempt < 5; attempt++) {
++			try {
++				if (source.isDirectory()) {
++					target.mkdirs()
++					FileUtils.copyDirectory(source, target, { File file -> !file.name.endsWith(".lock") } as FileFilter)
++				} else {
++					target.parentFile.mkdirs()
++					FileUtils.copyFile(source, target)
++				}
++
++				return
++			} catch (IOException e) {
++				last = e
++				Thread.sleep(200L * (attempt + 1))
++			}
+ 		}
++
++		throw new RuntimeException("Could not copy " + source + " to " + target + " after retries", last)
+ 	}
+ }
+diff --git a/src/test/groovy/net/fabricmc/loom/test/util/ForgeColdLoomCache.groovy b/src/test/groovy/net/fabricmc/loom/test/util/ForgeColdLoomCache.groovy
+index 603619ee7cd981d4d48c3a8ef57521a168dcf432..03f99a7f36e26b7c82f2c7598181a7819e44f1a4 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/util/ForgeColdLoomCache.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/util/ForgeColdLoomCache.groovy
+@@ -95,17 +95,40 @@ final class ForgeColdLoomCache {
+ 		}
+ 	}
+ 
++	/**
++	 * 拷贝冷 gradle home，跳过 {@code *.lock} 并对其余失败短暂退避重试。
++	 *
++	 * <p>源目录是共享的 TestKit gradle home，其中 {@code caches/<版本>/fileContent/fileContent.lock}
++	 * 等锁文件被**正在运行的 Gradle 守护进程持续持有**——实测在 Windows 上拷贝这些文件必然以
++	 * FileSystemException 失败，且**不是暂时性的**（重试再多次也一样，因为守护进程活着就一直占着）。
++	 * 锁文件是运行时产物，对「冷 home 种子」没有意义，直接跳过。
++	 *
++	 * <p>保留重试是为了覆盖其它真正的短暂占用（例如刚写完尚未释放）。
++	 */
+ 	private static void copyIfExists(File source, File target) {
+ 		if (!source.exists()) {
+ 			return
+ 		}
+ 
+-		if (source.isDirectory()) {
+-			target.mkdirs()
+-			FileUtils.copyDirectory(source, target)
+-		} else {
+-			target.parentFile.mkdirs()
+-			FileUtils.copyFile(source, target)
++		IOException last = null
++
++		for (int attempt = 0; attempt < 5; attempt++) {
++			try {
++				if (source.isDirectory()) {
++					target.mkdirs()
++					FileUtils.copyDirectory(source, target, { File file -> !file.name.endsWith(".lock") } as FileFilter)
++				} else {
++					target.parentFile.mkdirs()
++					FileUtils.copyFile(source, target)
++				}
++
++				return
++			} catch (IOException e) {
++				last = e
++				Thread.sleep(200L * (attempt + 1))
++			}
+ 		}
++
++		throw new RuntimeException("Could not copy " + source + " to " + target + " after retries", last)
+ 	}
+ }

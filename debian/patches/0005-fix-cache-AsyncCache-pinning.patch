@@ -1,0 +1,61 @@
+From 3bf8fa5df119e0f6fdd6c2fed75a8f41aae3e4a4 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:22 +0800
+Subject: [PATCH 005/147] =?UTF-8?q?fix(cache):=20AsyncCache=20=E6=94=B9?=
+ =?UTF-8?q?=E7=94=A8=E5=B9=B3=E5=8F=B0=E7=BA=BF=E7=A8=8B=E6=B1=A0=E9=81=BF?=
+ =?UTF-8?q?=E5=85=8D=E8=99=9A=E6=8B=9F=E7=BA=BF=E7=A8=8B=20pinning?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+虚拟线程执行阻塞 IO 时会被 pin 住载体线程，改用平台线程池。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/src/main/java/net/fabricmc/loom/util/AsyncCache.java b/src/main/java/net/fabricmc/loom/util/AsyncCache.java
+index 28bb3e153257889e3e264faa8695c17d06cf2ba9..b6780a8003b131ea06405ff290b3c19f0e6c404a 100644
+--- a/src/main/java/net/fabricmc/loom/util/AsyncCache.java
++++ b/src/main/java/net/fabricmc/loom/util/AsyncCache.java
+@@ -29,14 +29,39 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.concurrent.CompletionException;
++import java.util.concurrent.ArrayBlockingQueue;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.Executor;
+-import java.util.concurrent.Executors;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
+ import java.util.function.Supplier;
+ import java.util.stream.Collectors;
+ 
+ public class AsyncCache<T> {
+-	private static final Executor EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
++	// 使用平台线程池而非虚拟线程池。
++	// 根因：tiny-remapper 的 FileSystemReference.open()/close() 使用 synchronized(openFsMap) 全局锁，
++	// 虚拟线程进入 synchronized 块时会 pin 住 carrier 线程。并行配置下多个子项目同时解析 mod jar，
++	// 大量虚拟线程争抢 openFsMap 锁导致 carrier 线程池耗尽（pinning），后续虚拟线程无法调度，
++	// 配置线程在 CompletableFuture.join() 上永久阻塞，Gradle daemon 失去响应后被客户端杀死（进程消失）。
++	// 平台线程进入 synchronized 块时不会 pin carrier，仅阻塞自身，其他线程仍可正常运行。
++	private static final Executor EXECUTOR = createExecutor();
++
++	private static Executor createExecutor() {
++		final int poolSize = Math.max(4, Runtime.getRuntime().availableProcessors());
++		// 使用有界队列 + CallerRuns 策略：队列满时由调用线程直接执行，提供背压并避免无界提交。
++		return new ThreadPoolExecutor(
++				poolSize, poolSize,
++				60L, TimeUnit.SECONDS,
++				new ArrayBlockingQueue<>(128),
++				r -> {
++					Thread t = new Thread(r, "loom-async-cache");
++					t.setDaemon(true);
++					return t;
++				},
++				new ThreadPoolExecutor.CallerRunsPolicy()
++		);
++	}
++
+ 	private final Map<Object, CompletableFuture<T>> cache = new ConcurrentHashMap<>();
+ 
+ 	public CompletableFuture<T> get(Object cacheKey, Supplier<T> supplier) {

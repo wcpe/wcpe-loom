@@ -1,0 +1,90 @@
+From 53fee5608212303876cee967e6146bd9ef892283 Mon Sep 17 00:00:00 2001
+From: wcpe-loom <dev@wcpe.top>
+Date: Sun, 1 Nov 2026 07:13:23 +0800
+Subject: [PATCH 114/147] =?UTF-8?q?perf(configuration):=20extractNatives?=
+ =?UTF-8?q?=20=E7=9A=84=20natives=20=E9=85=8D=E7=BD=AE=E6=94=B9=E4=B8=BA?=
+ =?UTF-8?q?=E6=83=B0=E6=80=A7=E8=A7=A3=E6=9E=90?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ExtractNativesTask 在**构造函数里**遍历 minecraftNatives.getFiles()，任务一被 realize
+（哪怕本次构建不执行它）就会解析整个 natives 配置：一次网络 + 磁盘动作，纯属配置期白付，
+也让配置缓存在「只是列任务」的构建里白做。
+
+改为 named(...).flatMap(configuration -> configuration.getElements().map(...))，
+把每个 natives jar 的 zipTree 推迟到 Gradle 真正需要这份文件树时（输入指纹计算或执行）：
+- 任务不参与本次构建：配置不解析；
+- 任务参与构建：与改造前等价，仍是同一个配置、同一批 jar、同样的 exclude/rename 规则；
+- up-to-date 与缓存行为不变——解析出的文件依旧作为本任务输入参与快照比对。
+
+zipTree 改走注入的 ArchiveOperations，避免在 provider 的求值回调里访问 Project。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: eager-resolution
+
+diff --git a/src/main/java/net/fabricmc/loom/task/ExtractNativesTask.java b/src/main/java/net/fabricmc/loom/task/ExtractNativesTask.java
+index 41a78473b22b9ca264fd422af6497a9e884a3d74..b925b71019e85f6bb235234f39c7e8bd4b376703 100644
+--- a/src/main/java/net/fabricmc/loom/task/ExtractNativesTask.java
++++ b/src/main/java/net/fabricmc/loom/task/ExtractNativesTask.java
+@@ -24,28 +24,49 @@
+ 
+ package net.fabricmc.loom.task;
+ 
+-import java.io.File;
+-
+ import javax.inject.Inject;
+ 
++import org.gradle.api.file.ArchiveOperations;
+ import org.gradle.api.tasks.Sync;
+ import org.gradle.work.DisableCachingByDefault;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.util.Constants;
+ 
++/**
++ * 下载并把 Minecraft 的平台相关 natives 解压到 natives 目录.
++ *
++ * <p>输入一律以 {@link org.gradle.api.provider.Provider} 形态登记：早先的实现在<b>构造函数里</b>遍历
++ * {@code getFiles()}，任务一被 realize（哪怕本次构建根本不跑它，例如 {@code gradle help}）就会解析整个
++ * {@code minecraftNatives} 配置——一次网络 + 磁盘动作，配置阶段白付，且让配置缓存无法避开.
++ *
++ * <p>改用 {@code named(...).flatMap(...).map(...)} 之后，解析推迟到「Gradle 真正需要这份文件树」时：
++ * <ul>
++ *   <li>任务不参与本次构建：配置与解析都不发生；</li>
++ *   <li>任务参与构建：在输入指纹计算/执行时解析，与改造前等价（仍是同一个配置、同一批 jar）；</li>
++ *   <li>up-to-date 与缓存行为不变——解析出来的文件仍是本任务的输入，供 {@link Sync} 比对快照。</li>
++ * </ul>
++ *
++ * <p>产物仍是每个 natives jar 一棵 {@code zipTree}，各自套一份 {@code exclude}/{@code rename} 规则，
++ * 与改造前逐 jar 构建 CopySpec 的形态一一对应，不改变叠加顺序之外的任何语义。
++ */
+ @DisableCachingByDefault
+ public abstract class ExtractNativesTask extends Sync {
++	@Inject
++	protected abstract ArchiveOperations getArchiveOperations();
++
+ 	@Inject
+ 	public ExtractNativesTask() {
+-		// Is there a lazy way to do this for many files? - Doesnt seem there is...
+-		for (File nativeFile : getProject().getConfigurations().getByName(Constants.Configurations.MINECRAFT_NATIVES).getFiles()) {
+-			from(getProject().zipTree(nativeFile), copySpec -> {
+-				copySpec.exclude("META-INF/**");
+-				// Fix pre LWJGL 3 versions on Macos. See: https://github.com/FabricMC/fabric-loom/issues/955
+-				copySpec.rename(s -> s.replace(".jnilib", ".dylib"));
+-			});
+-		}
++		// 只在「有人要这份文件树」时才解析配置：named().flatMap() 不立即求值，
++		// 因此任务的 realize 本身不再触发 minecraftNatives 配置的解析。
++		from(getProject().getConfigurations().named(Constants.Configurations.MINECRAFT_NATIVES).flatMap(configuration ->
++				configuration.getElements().map(artifacts -> artifacts.stream()
++						.map(artifact -> getArchiveOperations().zipTree(artifact.getAsFile()))
++						.toList())), copySpec -> {
++							copySpec.exclude("META-INF/**");
++							// Fix pre LWJGL 3 versions on Macos. See: https://github.com/FabricMC/fabric-loom/issues/955
++							copySpec.rename(s -> s.replace(".jnilib", ".dylib"));
++						});
+ 
+ 		into(LoomGradleExtension.get(getProject()).getFiles().getNativesDirectory(getProject()));
+ 

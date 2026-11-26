@@ -1,0 +1,2404 @@
+From bfcd1c08c36df381aa4a0c04a8f5d6569c9bc8d8 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:59 +0800
+Subject: [PATCH 060/147] =?UTF-8?q?feat(pipeline):=20=E4=B8=BA=E6=89=A7?=
+ =?UTF-8?q?=E8=A1=8C=E6=9C=9F=E9=87=8D=E5=BB=BA=E8=A1=A5=E4=B8=8A=E5=A4=84?=
+ =?UTF-8?q?=E7=90=86=E5=99=A8=E5=A5=91=E7=BA=A6=EF=BC=8C=E5=B9=B6=E5=BC=95?=
+ =?UTF-8?q?=E5=85=A5=20jar=20=E7=94=9F=E4=BA=A7=E4=BB=BB=E5=8A=A1=20(#19)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* fix(sources): SourceRemapper 不再静默丢弃 MC classpath，重映射器构造脱离 Project
+
+两处问题：
+
+1. SourceRemapper 组装 classpath 时会把不存在的路径一并过滤掉，而过滤粒度过粗，
+   连 MC 的 classpath 一起丢掉，导致源码重映射在缺少 MC 类型的上下文里进行。
+   实测同一输入下 17 个条目里有 6 个产出内容不同——且不报错，属静默损坏。
+   修正过滤语义：只跳过确实不存在的路径，目录照常加入。
+
+2. TinyRemapperHelper 的构造入口依赖 Project 去读 extension（knownIndyBsms 等），
+   使执行期无法在没有 Project 的情况下构造重映射器。改为由调用方传入，
+   去掉该依赖，Fabric 与 Forge（含内部类映射）两个分支都加了用例覆盖。
+
+新增 SourceRemapperTest 与 TinyRemapperHelperTest 共 6 条用例：
+classpath 过滤语义、空 classpath 仍可构造、两条不依赖 Project 的构造路径、
+未开启 record 修复时不改变构造结果、knownIndyBsms 由参数传入而非读 extension。
+
+本分支已验证可独立 compileJava，上述 6 条用例全部 PASSED。
+
+* feat(core,spec): 引入执行期 jar 操作的抽象与派生数据缓存
+
+core/：把「重映射 MC jar」「重映射 mod jar」「mod jar 后处理」三件事的输入契约
+与执行逻辑从配置期 provider 中抽出来，使其不依赖 Project 与 SourceSet，可在执行期
+由任务重建。这是后续把这两条线的产物生产搬进 Gradle 任务的前提。
+
+spec/：EnvironmentSpec 声明各环境需要哪些映射/迁移步骤，SpecStore 提供按
+「命名空间 + 身份 + 维度」寻址的纯派生数据缓存。缓存只存解析结果，丢失仅意味着
+多解析一次，不参与任何产物就绪标记。
+
+SpecStore 的身份沿用输入文件的大小与修改时间：清单被刷新后身份自然变化，
+不会读到过期条目——该自失效语义是有意的。
+
+新增 SpecStoreTest 9 条用例覆盖命中/未命中、命名空间与维度隔离、空内容哨兵、
+同名覆盖、维度值含路径分隔符、以及 inputIdentity 对文件大小/修改时间的敏感与
+对不存在文件返回空。
+
+本分支基于 #16（TinyRemapperHelper 的不依赖 Project 构造重载）之上，已验证可编译
+且上述 9 条用例 PASSED。
+
+* feat(pipeline): 为执行期重建补上处理器契约，并引入 jar 生产任务
+
+为让 jar 生产脱离配置期，先把「执行期重建处理器实例」所需的契约补上：
+
+- ProcessorContext 收窄并新增 getJarConfiguration()，使处理器不再从 Project 取配置
+- MinecraftJarProcessor 新增 ProcessorDescriptor 契约（descriptor()），处理器据此
+  声明重建所需的纯值
+- 各内置处理器（access widener、interface injection、AT、jsr 注解、javadoc 等）
+  补齐 descriptor()，不再依赖 Project / SourceSet / Project 模型对象
+- LoomGradleExtension 与 extension 实现相应调整，LoomProjectData 同步
+
+在此之上引入 pipeline 的任务实现：RemapMinecraftTask（重映射 MC jar）、
+ProcessMinecraftJarTask（执行处理器链）、WriteMinecraftJarSidecarsTask（写 pom
+等伴随文件）、ExecutionProcessorContext（执行期处理器上下文）。
+
+LocalMavenHelper 新增 getRelativeArtifactPath，供任务侧判定 pom 与 jar 是否落在
+同一构件目录——两侧必须成对，否则 maven 仓库里会出现孤儿。
+
+mod 线任务 RemapModsTask 不属本层，留待 mod 线接入时一并提交。
+
+本分支基于 #17（core/ 与 spec/）之上，已验证可 compileJava。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/LoomGradleExtension.java b/src/main/java/net/fabricmc/loom/LoomGradleExtension.java
+index 40a0b1d37d2e309d8fa72788f51e8b5c4af3a1ec..a0e41fc36db9714b0eebe60225c89a784ef16781 100644
+--- a/src/main/java/net/fabricmc/loom/LoomGradleExtension.java
++++ b/src/main/java/net/fabricmc/loom/LoomGradleExtension.java
+@@ -155,8 +155,49 @@ public interface LoomGradleExtension extends LoomGradleExtensionAPI {
+ 		};
+ 	}
+ 
++	/**
++	 * 取某个命名空间下的 Minecraft jar 集合.
++	 *
++	 * <p>已登记任务产出（见 {@link #setMinecraftJarsTaskOutputs}）时，返回的集合派生自产出任务，
++	 * 携带任务依赖；未登记时回退到配置期已经落盘的文件，此时集合里是裸 {@link java.io.File}，
++	 * 不携带任何任务依赖。
++	 *
++	 * <h4>同一命名空间返回的是同一份集合实例</h4>
++	 * 消费方通常在**自己的任务注册期**就调用本方法，而产出方的登记发生在更晚（{@code afterEvaluate}
++	 * 里的 {@code provide}）。因此登记不是「换一份新集合」，而是把任务产出并进已发出的那一份
++	 * （见 {@link #setMinecraftJarsTaskOutputs}）；否则先取走引用的消费方手里永远是未登记时的快照，
++	 * 任务依赖会静默丢失，冷缓存下消费方就会读到一个还不存在的 jar。
++	 *
++	 * @param mappingsNamespace 目标命名空间
++	 * @return 该命名空间下的 Minecraft jar 集合
++	 */
+ 	FileCollection getMinecraftJarsCollection(MappingsNamespace mappingsNamespace);
+ 
++	/**
++	 * 登记某个命名空间下、由任务产出的 Minecraft jar 集合.
++	 *
++	 * <h4>为什么必须由产出方登记</h4>
++	 * 消费方（{@code ValidateAccessWidenerTask}、{@code ValidateModProvidedJavadocTask} 等）
++	 * 在注册自己的任务时看不到产出 MC jar 的那个 {@code TaskProvider}，无法自行接上依赖；
++	 * 产出方在注册任务之后调用本方法，是唯一能把这份依赖传播给全部消费方的位置。
++	 *
++	 * <h4>对入参的要求</h4>
++	 * {@code taskOutputs} 必须派生自 {@code TaskProvider}，例如
++	 * {@code project.files(remapTask.flatMap(t -> t.getOutputJar()))}。
++	 * 携带任务依赖的是 {@code Provider} 本身，裸 {@code File}/{@code Path} 不会携带——
++	 * 传入裸文件等价于没有登记。
++	 *
++	 * <h4>登记是「并进」而不是「替换引用」</h4>
++	 * 本方法把 {@code taskOutputs} 并进 {@link #getMinecraftJarsCollection} 为该命名空间返回的
++	 * 那一份集合实例（尚未取过则现建一份），因此已经持有引用的消费方同样能拿到任务依赖。
++	 * 同一命名空间重复登记时内容以最后一次为准——后一次会整体替换前一次的内容，
++	 * 而不是把两份 jar 都留在集合里（例如 processed provider 覆盖未处理的 provider）。
++	 *
++	 * @param mappingsNamespace 该集合所属的命名空间
++	 * @param taskOutputs 由任务产出的 jar 集合
++	 */
++	void setMinecraftJarsTaskOutputs(MappingsNamespace mappingsNamespace, FileCollection taskOutputs);
++
+ 	@Override
+ 	MixinExtension getMixin();
+ 
+diff --git a/src/main/java/net/fabricmc/loom/api/processor/MinecraftJarProcessor.java b/src/main/java/net/fabricmc/loom/api/processor/MinecraftJarProcessor.java
+index fc47f9dad241d65c1860aaa4bd7ae45f0f919bd8..ee0966532d71335bb50051a851c7b9acb5da9e7f 100644
+--- a/src/main/java/net/fabricmc/loom/api/processor/MinecraftJarProcessor.java
++++ b/src/main/java/net/fabricmc/loom/api/processor/MinecraftJarProcessor.java
+@@ -25,9 +25,11 @@
+ package net.fabricmc.loom.api.processor;
+ 
+ import java.io.IOException;
++import java.io.Serializable;
+ import java.nio.file.Path;
+ 
+ import org.gradle.api.Named;
++import org.gradle.api.model.ObjectFactory;
+ import org.jspecify.annotations.Nullable;
+ 
+ import net.fabricmc.mappingio.tree.MemoryMappingTree;
+@@ -43,6 +45,23 @@ public interface MinecraftJarProcessor<S extends MinecraftJarProcessor.Spec> ext
+ 		return null;
+ 	}
+ 
++	/**
++	 * 返回一个描述符，用于在执行期重建本 processor 的实例.
++	 *
++	 * <p>配置期构造的 processor 实例常常持有无法放进任务状态的对象（例如 {@link org.gradle.api.Project}、
++	 * Gradle 服务对象、任意的第三方实现），直接作为任务输入会破坏配置缓存。因此把重建所需的最小输入
++	 * 提取成描述符中的纯值，由执行期的任务调用 {@link ProcessorDescriptor#createProcessor} 重建实例。
++	 *
++	 * <p>默认实现直接抛出异常，以保证对既有第三方实现的二进制与源码兼容：未实现本方法的 processor
++	 * 依然可以正常参与配置期的处理，只是无法参与执行期重建。
++	 */
++	default ProcessorDescriptor<?> descriptor() {
++		throw new UnsupportedOperationException(("Jar processor '%s' (%s) does not implement MinecraftJarProcessor#descriptor(), "
++				+ "so it cannot be recreated at execution time. Implement descriptor() to return a configuration cache serializable "
++				+ "ProcessorDescriptor that recreates this processor from its constructor inputs.")
++				.formatted(getName(), getClass().getName()));
++	}
++
+ 	interface Spec {
+ 		// Must make sure hashCode is correctly implemented.
+ 	}
+@@ -50,4 +69,23 @@ public interface MinecraftJarProcessor<S extends MinecraftJarProcessor.Spec> ext
+ 	interface MappingsProcessor<S> {
+ 		boolean transform(MemoryMappingTree mappings, S spec, MappingProcessorContext context);
+ 	}
++
++	/**
++	 * 描述如何在执行期重建一个 {@link MinecraftJarProcessor} 实例.
++	 *
++	 * <p>实现必须是配置缓存可序列化的：只允许持有字符串、基本类型、枚举以及它们的集合/映射这类纯值，
++	 * 不得持有 {@link org.gradle.api.Project}、Gradle 服务、文件系统句柄或 processor 实例本身。
++	 * 需要在重建时用到的 Gradle 服务由 {@link #createProcessor} 的调用方注入。
++	 *
++	 * @param <T> 被重建的 processor 类型
++	 */
++	interface ProcessorDescriptor<T extends MinecraftJarProcessor<?>> extends Serializable {
++		/**
++		 * 使用给定的 {@link ObjectFactory} 重建 processor 实例.
++		 *
++		 * @param objectFactory 用于实例化带 {@code @Inject} 构造函数的 processor，可安全地在执行期使用
++		 * @return 重建出的 processor 实例
++		 */
++		T createProcessor(ObjectFactory objectFactory);
++	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/api/processor/ProcessorContext.java b/src/main/java/net/fabricmc/loom/api/processor/ProcessorContext.java
+index 756beaba40b0db82fd0f187c004d8abb7f34e6f3..cc69717138c5b6885499bd904d7e4b2284ff103c 100644
+--- a/src/main/java/net/fabricmc/loom/api/processor/ProcessorContext.java
++++ b/src/main/java/net/fabricmc/loom/api/processor/ProcessorContext.java
+@@ -25,13 +25,22 @@
+ package net.fabricmc.loom.api.processor;
+ 
+ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+-import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
+ import net.fabricmc.loom.util.LazyCloseable;
+ import net.fabricmc.mappingio.tree.MemoryMappingTree;
+ import net.fabricmc.tinyremapper.TinyRemapper;
+ 
+ public interface ProcessorContext {
+-	MinecraftJarConfiguration getJarConfiguration();
++	/**
++	 * 本上下文服务的 jar 是否来自 split（客户端与服务端分开产出）配置.
++	 *
++	 * <p>split 配置会产出两个 jar，它们与 client only / server only 配置产出的 jar 在
++	 * {@link #isMerged()}、{@link #includesClient()}、{@link #includesServer()} 上完全一致：
++	 * 单看一个 jar 无法区分「这是 split 的一半」还是「本来就是单边配置」。
++	 * 只有本方法能给出这一信息，需要在 split 下改变行为的 processor 必须用它判断。
++	 *
++	 * @return 本 jar 是否属于 split 配置
++	 */
++	boolean isSplit();
+ 
+ 	boolean isMerged();
+ 
+@@ -46,4 +55,16 @@ public interface ProcessorContext {
+ 	boolean disableObfuscation();
+ 
+ 	MappingsNamespace getProductionNamespace();
++
++	/**
++	 * 本平台在工具链中自带数据文件所用的命名空间：fabric/quilt 为 {@code intermediary}、
++	 * forge 为 {@code srg}、neoforge 为 {@code mojang}.
++	 *
++	 * <p>它与 {@link #getProductionNamespace()} 不是一回事：后者可以被用户配置成
++	 * {@code official} 之类的取值，而平台自带的文件（例如 Forge 的 {@code accesstransformer.cfg}）
++	 * 始终写在平台自己的命名空间里。
++	 *
++	 * @return 平台默认命名空间
++	 */
++	MappingsNamespace getIntermediaryNamespace();
+ }
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/LocalMavenHelper.java b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/LocalMavenHelper.java
+index 5e8a383c931923e411a2f42ca02e247d66b9f557..0ac114cf1963a60835bbd5b68df7bf763f2a0849 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/LocalMavenHelper.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/LocalMavenHelper.java
+@@ -24,6 +24,7 @@
+ 
+ package net.fabricmc.loom.configuration.mods.dependency;
+ 
++import java.io.File;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.UncheckedIOException;
+@@ -160,6 +161,16 @@ public record LocalMavenHelper(String group, String name, String version, @Nulla
+ 		return getDirectory().resolve(fileName);
+ 	}
+ 
++	/**
++	 * 产出文件相对于仓库根的路径（以 {@code /} 分隔）.
++	 *
++	 * <p>供文件依赖构造使用：任务持有产出根目录，消费方据此换算出文件依赖，
++	 * 从而获得携带任务依赖的引用（见架构 §5.1.1）。
++	 */
++	public String getRelativeArtifactPath(@Nullable String classifier) {
++		return root.relativize(getOutputFile(classifier)).toString().replace(File.separatorChar, '/');
++	}
++
+ 	public LocalMavenHelper withClassifier(String classifier) {
+ 		return new LocalMavenHelper(group, name, version, classifier, root);
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/processors/ContextImplHelper.java b/src/main/java/net/fabricmc/loom/configuration/processors/ContextImplHelper.java
+index ada21edc3758c22d2699722f8a50554c23d90895..1cafaff69d78ab5e49e38ea4c748904f766a5143 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/processors/ContextImplHelper.java
++++ b/src/main/java/net/fabricmc/loom/configuration/processors/ContextImplHelper.java
+@@ -24,9 +24,13 @@
+ 
+ package net.fabricmc.loom.configuration.processors;
+ 
++import java.io.File;
+ import java.io.IOException;
+ import java.io.UncheckedIOException;
+ import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Set;
+ 
+ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.configuration.ConfigContext;
+@@ -34,16 +38,30 @@ import net.fabricmc.loom.util.LazyCloseable;
+ import net.fabricmc.loom.util.TinyRemapperHelper;
+ import net.fabricmc.tinyremapper.TinyRemapper;
+ 
++/**
++ * 构造带 MC classpath 的 remapper 的共用实现.
++ *
++ * <p>调用方有两条：配置期的 jar processor（{@code ProcessorContextImpl} /
++ * {@code MappingProcessorContextImpl}），以及执行期的 {@code SourceMappingsService}（genSources 用它
++ * 生成源码映射）。两者都用 {@link ConfigContext} 取输入，因此这里只做「取 MC jar → 装配 remapper」。
++ */
+ public final class ContextImplHelper {
+ 	private ContextImplHelper() {
+ 	}
+ 
++	/**
++	 * {@return 惰性构造的 remapper} 首次读取时才真正装配，并在此刻读入 MC classpath.
++	 *
++	 * @param configContext 配置上下文
++	 * @param from 源命名空间，决定取哪个命名空间的 MC jar 做 classpath
++	 * @param to 目标命名空间
++	 */
+ 	public static LazyCloseable<TinyRemapper> createRemapper(ConfigContext configContext, MappingsNamespace from, MappingsNamespace to) {
+ 		return new LazyCloseable<>(() -> {
+ 			try {
+ 				TinyRemapper tinyRemapper = TinyRemapperHelper.getTinyRemapper(configContext.project(), configContext.serviceFactory(), from.toString(), to.toString());
+ 
+-				for (Path minecraftJar : configContext.extension().getMinecraftJars(from)) {
++				for (Path minecraftJar : minecraftClassPath(configContext, from)) {
+ 					tinyRemapper.readClassPath(minecraftJar);
+ 				}
+ 
+@@ -53,4 +71,38 @@ public final class ContextImplHelper {
+ 			}
+ 		}, TinyRemapper::finish);
+ 	}
++
++	/**
++	 * {@return {@code from} 命名空间下作为 remapper classpath 的 MC jar}.
++	 *
++	 * <p>取的是 {@code getMinecraftJarsCollection} 而不是裸的 {@code getMinecraftJars}：两者路径相同，
++	 * 但前者在产出已登记为任务时与任务产出是**同一份来源**，而且这里会把「产物还不存在」当场报成一条
++	 * 可定位的错误，而不是把裸路径交给 tiny-remapper 让它抛更含糊的异常。
++	 *
++	 * <p>注意本方法**不**（也无法）替调用方声明任务依赖——任务依赖只能由调用方那条任务自己声明
++	 * （执行期的那条链是 {@code GenerateSourcesTask}，它已按扩展登记的产出集合声明了 named jar 的依赖）。
++	 * 因此这里的报错文案要把这件事说清楚：缺产物要么是「生产者的依赖没接上」，要么是「在生产者执行前
++	 * 就被读了」。
++	 *
++	 * @param configContext 配置上下文
++	 * @param from 源命名空间
++	 * @throws IllegalStateException 该命名空间的 MC jar 已被登记为任务产出，但产物当前不存在
++	 */
++	private static List<Path> minecraftClassPath(ConfigContext configContext, MappingsNamespace from) {
++		final Set<File> minecraftJars = configContext.extension().getMinecraftJarsCollection(from).getFiles();
++		final List<Path> classPath = new ArrayList<>(minecraftJars.size());
++
++		for (File minecraftJar : minecraftJars) {
++			if (!minecraftJar.isFile()) {
++				throw new IllegalStateException(("Minecraft jar %s（命名空间 %s）尚不存在，无法作为 remapper 的 classpath。"
++						+ "该产物由任务在生产期落位（RemapMinecraftTask / ProcessMinecraftJarTask）："
++						+ "若本处位于执行期，说明消费它的任务没有声明产出依赖；若位于配置期，说明产物尚未生产。")
++						.formatted(minecraftJar, from));
++			}
++
++			classPath.add(minecraftJar.toPath());
++		}
++
++		return classPath;
++	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/configuration/processors/JsrAnnotationRemapperProcessor.java b/src/main/java/net/fabricmc/loom/configuration/processors/JsrAnnotationRemapperProcessor.java
+index 08ba51c2cd5773e021404bca75a9a95a2f5853d4..4d1b96c45d66bf68020573f20386286127af9f0e 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/processors/JsrAnnotationRemapperProcessor.java
++++ b/src/main/java/net/fabricmc/loom/configuration/processors/JsrAnnotationRemapperProcessor.java
+@@ -30,6 +30,7 @@ import java.util.Map;
+ 
+ import javax.inject.Inject;
+ 
++import org.gradle.api.model.ObjectFactory;
+ import org.jspecify.annotations.Nullable;
+ 
+ import net.fabricmc.loom.api.processor.MinecraftJarProcessor;
+@@ -80,9 +81,28 @@ public class JsrAnnotationRemapperProcessor implements MinecraftJarProcessor<Jsr
+ 		return name;
+ 	}
+ 
++	@Override
++	public Descriptor descriptor() {
++		return new Descriptor(name);
++	}
++
+ 	public record Spec(Map<String, String> annotationMapping) implements MinecraftJarProcessor.Spec {
+ 		public IMappingProvider getMappings() {
+ 			return out -> annotationMapping.forEach(out::acceptClass);
+ 		}
+ 	}
++
++	/**
++	 * 用于在执行期重建 {@link JsrAnnotationRemapperProcessor} 的描述符.
++	 *
++	 * <p>映射表本身是常量，重建时不需要保存，故描述符中只有 processor 名称。
++	 *
++	 * @param name processor 名称
++	 */
++	public record Descriptor(String name) implements MinecraftJarProcessor.ProcessorDescriptor<JsrAnnotationRemapperProcessor> {
++		@Override
++		public JsrAnnotationRemapperProcessor createProcessor(ObjectFactory objectFactory) {
++			return objectFactory.newInstance(JsrAnnotationRemapperProcessor.class, name);
++		}
++	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/configuration/processors/MinecraftJarProcessorManager.java b/src/main/java/net/fabricmc/loom/configuration/processors/MinecraftJarProcessorManager.java
+index 154c18af4e7327efaa2fb3db4b56aa66daac3c78..823bae6777c3fa141f4b59c28b6e4dd2091774ee 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/processors/MinecraftJarProcessorManager.java
++++ b/src/main/java/net/fabricmc/loom/configuration/processors/MinecraftJarProcessorManager.java
+@@ -125,6 +125,25 @@ public final class MinecraftJarProcessorManager {
+ 		return Checksum.of(getCacheValue()).sha1().hex(10);
+ 	}
+ 
++	/**
++	 * {@return 本 manager 实际会执行的有序 processor 链，顺序即处理顺序}.
++	 *
++	 * <p>返回的链与 {@link #processJar} 内部遍历的那一张表是同一份（已剔除 spec 为 null 的
++	 * processor），因此把链投影成任务输入时不必在别处重建——重建会得到第二份语义。
++	 */
++	public List<MinecraftJarProcessor<?>> getProcessors() {
++		return jarProcessors.stream()
++				.<MinecraftJarProcessor<?>>map(ProcessorEntry::processor)
++				.toList();
++	}
++
++	/** {@return 与 {@link #getProcessors()} 一一对应的 spec 链，顺序一致}. */
++	public List<MinecraftJarProcessor.Spec> getSpecs() {
++		return jarProcessors.stream()
++				.<MinecraftJarProcessor.Spec>map(ProcessorEntry::spec)
++				.toList();
++	}
++
+ 	public String getSourceMappingsHash() {
+ 		return Checksum.of(getCacheValue()).sha1().hex();
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/processors/ModJavadocProcessor.java b/src/main/java/net/fabricmc/loom/configuration/processors/ModJavadocProcessor.java
+index 4ca4081d1ae33fd23e909d405f48276b42524ef4..e7481a1458379e5332d6488a5eece464616dca59 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/processors/ModJavadocProcessor.java
++++ b/src/main/java/net/fabricmc/loom/configuration/processors/ModJavadocProcessor.java
+@@ -40,6 +40,7 @@ import java.util.Objects;
+ import javax.inject.Inject;
+ 
+ import com.google.gson.JsonElement;
++import org.gradle.api.model.ObjectFactory;
+ import org.jspecify.annotations.Nullable;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -76,6 +77,11 @@ public abstract class ModJavadocProcessor implements MinecraftJarProcessor<ModJa
+ 		return name;
+ 	}
+ 
++	@Override
++	public Descriptor descriptor() {
++		return new Descriptor(name);
++	}
++
+ 	@Override
+ 	public ModJavadocProcessor.@Nullable Spec buildSpec(SpecContext context) {
+ 		List<ModJavadoc> javadocs = new ArrayList<>();
+@@ -99,6 +105,21 @@ public abstract class ModJavadocProcessor implements MinecraftJarProcessor<ModJa
+ 	public record Spec(List<ModJavadoc> javadocs) implements MinecraftJarProcessor.Spec {
+ 	}
+ 
++	/**
++	 * 用于在执行期重建 {@link ModJavadocProcessor} 的描述符.
++	 *
++	 * <p>本 processor 只在 {@code processMappings} 中生效，重建时除名称外不需要其他输入。
++	 *
++	 * @param name processor 名称
++	 */
++	public record Descriptor(String name) implements MinecraftJarProcessor.ProcessorDescriptor<ModJavadocProcessor> {
++		@Override
++		public ModJavadocProcessor createProcessor(ObjectFactory objectFactory) {
++			// 本类是抽象类，交由 Gradle 生成子类实例，因此必须经由 ObjectFactory 而不是 new
++			return objectFactory.newInstance(ModJavadocProcessor.class, name);
++		}
++	}
++
+ 	@Override
+ 	public void processJar(Path jar, Spec spec, ProcessorContext context) {
+ 		// Nothing to do for the jar
+diff --git a/src/main/java/net/fabricmc/loom/configuration/processors/ProcessorContextImpl.java b/src/main/java/net/fabricmc/loom/configuration/processors/ProcessorContextImpl.java
+index 3d31165b2fd69d4e36d6f6747c9e6add31d64177..37e94f6b2f41f045bfab3fb4049c917ae0eef6ff 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/processors/ProcessorContextImpl.java
++++ b/src/main/java/net/fabricmc/loom/configuration/processors/ProcessorContextImpl.java
+@@ -29,6 +29,7 @@ import dev.architectury.loom.mappings.MappingOption;
+ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.api.processor.ProcessorContext;
++import net.fabricmc.loom.build.IntermediaryNamespaces;
+ import net.fabricmc.loom.configuration.ConfigContext;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJar;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
+@@ -38,8 +39,10 @@ import net.fabricmc.tinyremapper.TinyRemapper;
+ 
+ public record ProcessorContextImpl(ConfigContext configContext, MinecraftJar minecraftJar) implements ProcessorContext {
+ 	@Override
+-	public MinecraftJarConfiguration getJarConfiguration() {
+-		return configContext.extension().getMinecraftJarConfiguration().get();
++	public boolean isSplit() {
++		// split 配置的两个 jar 与单边的 server only / client only 在环境信息上完全一致，
++		// 只能回到配置本身来区分
++		return configContext.extension().getMinecraftJarConfiguration().get() == MinecraftJarConfiguration.SPLIT;
+ 	}
+ 
+ 	@Override
+@@ -78,4 +81,9 @@ public record ProcessorContextImpl(ConfigContext configContext, MinecraftJar min
+ 	public MappingsNamespace getProductionNamespace() {
+ 		return configContext().extension().getProductionNamespaceEnum().get();
+ 	}
++
++	@Override
++	public MappingsNamespace getIntermediaryNamespace() {
++		return IntermediaryNamespaces.intermediaryNamespace(configContext().project());
++	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionApiImpl.java b/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionApiImpl.java
+index d4bc5defc7f4609fe9851cbf47b5efb3afeb4a79..acac00cdba971bce8a51f2db9efb2958f25b035c 100644
+--- a/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionApiImpl.java
++++ b/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionApiImpl.java
+@@ -615,9 +615,9 @@ public abstract class LoomGradleExtensionApiImpl implements LoomGradleExtensionA
+ 
+ 	@Override
+ 	public FileCollection getNamedMinecraftJars() {
+-		final ConfigurableFileCollection jars = getProject().getObjects().fileCollection();
+-		jars.from(getProject().provider(() -> LoomGradleExtension.get(getProject()).getMinecraftJars(MappingsNamespace.NAMED)));
+-		return jars;
++		// 走 getMinecraftJarsCollection：登记了任务产出时它会携带产出任务，而直接包一个
++		// Provider<List<Path>> 的集合不携带任务依赖。
++		return LoomGradleExtension.get(getProject()).getMinecraftJarsCollection(MappingsNamespace.NAMED);
+ 	}
+ 
+ 	@Override
+diff --git a/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java b/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java
+index fcd8d52a32531823371347e0ec10cea306e513ec..99f62e142b667d63c1f91885853b4d8c23f4acb2 100644
+--- a/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java
++++ b/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java
+@@ -29,7 +29,9 @@ import java.nio.file.Path;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.EnumMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Objects;
+ import java.util.function.Supplier;
+ 
+@@ -79,6 +81,19 @@ public abstract class LoomGradleExtensionImpl extends LoomGradleExtensionApiImpl
+ 	private final LoomFiles loomFiles;
+ 	private final ConfigurableFileCollection unmappedMods;
+ 
++	/** 各命名空间下由任务产出的 MC jar 集合；接线前为空，{@code getMinecraftJarsCollection} 会回退到配置期落盘的文件. */
++	private final Map<MappingsNamespace, FileCollection> minecraftJarTaskOutputs = new EnumMap<>(MappingsNamespace.class);
++
++	/**
++	 * 每个命名空间「同一份」可配置文件集合：消费方取走的是它，产出方登记时也把任务产出并进它.
++	 *
++	 * <p>必须是同一份实例：消费方（{@code ValidateAccessWidenerTask}、{@code TinyRemapperService} 等）
++	 * 通常在**自己的任务注册期**就调用 {@code getMinecraftJarsCollection}，而产出方的登记发生在更晚的
++	 * {@code afterEvaluate}。若每次返回新实例，消费方手里那份永远是「尚未登记」的快照——里面是裸文件、
++	 * 不携带任何任务依赖，接线会静默失效（表现为冷缓存下消费方读不到还不存在的 jar）。
++	 */
++	private final Map<MappingsNamespace, ConfigurableFileCollection> minecraftJarCollections = new EnumMap<>(MappingsNamespace.class);
++
+ 	private final List<AccessWidenerFile> transitiveAccessWideners = new ArrayList<>();
+ 
+ 	private LoomDependencyManager dependencyManager;
+@@ -257,11 +272,42 @@ public abstract class LoomGradleExtensionImpl extends LoomGradleExtensionApiImpl
+ 
+ 	@Override
+ 	public FileCollection getMinecraftJarsCollection(MappingsNamespace mappingsNamespace) {
+-		return getProject().files(
+-			getProject().provider(() ->
+-				getProject().files(getMinecraftJars(mappingsNamespace).stream().map(Path::toFile).toList())
+-			)
+-		);
++		return minecraftJarsCollection(mappingsNamespace);
++	}
++
++	/** {@return 该命名空间的集合实例} 见 {@link #minecraftJarCollections} 对「必须是同一份实例」的说明. */
++	private ConfigurableFileCollection minecraftJarsCollection(MappingsNamespace mappingsNamespace) {
++		// 同一命名空间只建一次：消费方在登记之前取走的引用，会在登记时被并进任务产出（见 setMinecraftJarsTaskOutputs）
++		return minecraftJarCollections.computeIfAbsent(mappingsNamespace, namespace -> {
++			final ConfigurableFileCollection collection = getProject().getObjects().fileCollection();
++
++			// 未登记时的回退：配置期已经落盘的文件。外层 Provider 只做延迟解析，内层是裸 File 列表，
++			// 不携带任何任务依赖——消费侧看不到「谁产出这些 jar」，也就不会在消费前先跑产出任务。
++			// 登记之后本项会被 setFrom 整体替换掉，因此「未登记」与「已登记」不会同时生效。
++			collection.from(getProject().provider(() ->
++					getMinecraftJars(namespace).stream().map(Path::toFile).toList()
++			));
++
++			final FileCollection registered = minecraftJarTaskOutputs.get(namespace);
++
++			if (registered != null) {
++				// 本次调用发生在登记之后：直接把任务产出放进来
++				collection.setFrom(registered);
++			}
++
++			return collection;
++		});
++	}
++
++	@Override
++	public void setMinecraftJarsTaskOutputs(MappingsNamespace mappingsNamespace, FileCollection taskOutputs) {
++		Objects.requireNonNull(taskOutputs, "taskOutputs");
++		minecraftJarTaskOutputs.put(mappingsNamespace, taskOutputs);
++		// setFrom 而不是新建实例：消费方可能已经取走过集合引用，换实例会把任务依赖留在旧实例上。
++		// setFrom 也顺带满足「同一命名空间重复登记以最后一次为准」——后一次登记（例如 processed provider
++		// 覆盖未处理的 provider）整体替换掉前一次的内容，而不是把两份 jar 都留在集合里。
++		// 任务依赖由入参自身携带（它派生自 TaskProvider），setFrom 会把它一并纳入。
++		minecraftJarsCollection(mappingsNamespace).setFrom(taskOutputs);
+ 	}
+ 
+ 	@Override
+diff --git a/src/main/java/net/fabricmc/loom/internal/LoomProjectData.java b/src/main/java/net/fabricmc/loom/internal/LoomProjectData.java
+index b675ff9cbcbdb89b3fb03934363aaa1329dbd586..6aff282e4370d05116c08bee63f29e309946a34e 100644
+--- a/src/main/java/net/fabricmc/loom/internal/LoomProjectData.java
++++ b/src/main/java/net/fabricmc/loom/internal/LoomProjectData.java
+@@ -301,9 +301,13 @@ public final class LoomProjectData implements Serializable {
+ 			return Optional.empty();
+ 		}
+ 
+-		// 能解析出文件说明数据确实存在，之后任何失败都是真失败。
+-		return Optional.of(read(path).orElseThrow(() -> new IllegalStateException(
+-				"Loom project data file of dependency " + dependency.getPath() + " is missing: " + path)));
++		// 解析成功只说明「依赖项目声明了这个产物路径」，**不代表文件已产出**：冷启动（或该依赖
++		// 从未构建过）时 exportLoomProjectData 尚未执行，这里必然拿到一个不存在的路径。
++		// 因此「文件不存在」属于常规情形，直接返回空，绝不能升级成失败——那会在配置期把冷启动
++		// 打死：配置本项目的 afterEvaluate → 需要该数据文件 → 文件需对端任务产出 → 任务需所有
++		// 项目配置完成 → 回到起点。
++		// 文件存在却读不出来仍由 read 抛出（见其 javadoc），损坏不会被伪装成「没有数据」。
++		return read(path);
+ 	}
+ 
+ 	/**
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/DownloadArtifactTask.java b/src/main/java/net/fabricmc/loom/pipeline/DownloadArtifactTask.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d7ca5e050b478eb5a71e67c5f36a3cf205fbd4d1
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/pipeline/DownloadArtifactTask.java
+@@ -0,0 +1,143 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.pipeline;
++
++import java.io.IOException;
++import java.net.URISyntaxException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++
++import org.gradle.api.DefaultTask;
++import org.gradle.api.file.RegularFileProperty;
++import org.gradle.api.provider.Property;
++import org.gradle.api.tasks.CacheableTask;
++import org.gradle.api.tasks.Input;
++import org.gradle.api.tasks.Internal;
++import org.gradle.api.tasks.Optional;
++import org.gradle.api.tasks.OutputFile;
++import org.gradle.api.tasks.TaskAction;
++
++import net.fabricmc.loom.util.download.Download;
++import net.fabricmc.loom.util.download.DownloadBuilder;
++
++/**
++ * L3 流水线：把一个远程制品下载到指定位置.
++ *
++ * <p>这是 L3 的第一个节点，也是「产物有效性交给 Gradle」的最小完整示范。对照被它取代的旧路径
++ * （{@code MinecraftProvider.provide()} 内的下载分支）：
++ *
++ * <table>
++ *   <caption>旧路径 vs 本任务</caption>
++ *   <tr><th></th><th>旧路径</th><th>本任务</th></tr>
++ *   <tr><td>是否需要下载</td><td>配置期 {@code Files.exists} 判定（配置缓存输入）</td>
++ *       <td>Gradle up-to-date 检查</td></tr>
++ *   <tr><td>并发保护</td><td>跨进程文件锁 + 锁内二次确认</td>
++ *       <td>Gradle 任务图</td></tr>
++ *   <tr><td>产物损坏恢复</td><td>手写内容校验（开 zip 列举条目）</td>
++ *       <td>依赖 sha1 输入 + 构建缓存重新恢复</td></tr>
++ *   <tr><td>执行时机</td><td>配置期（{@code afterEvaluate}）</td><td>执行期</td></tr>
++ * </table>
++ *
++ * <h2>为什么输入里没有 Project</h2>
++ * 旧路径通过 {@code extension.download(url)} 构造下载器，该方法做的事只有三件：
++ * 建下载器、按命令行是否离线设置 offline、按是否刷新依赖设置 forceDownload。
++ * 三者都可以表示为任务输入，因此本任务不需要触碰任何项目模型——
++ * 这正是它能在执行期安全运行、且配置缓存友好的原因。
++ *
++ * <h2>为什么输出可以位于用户级共享目录</h2>
++ * 产物刻意落在跨项目共享的位置（如 {@code ~/.gradle/caches/fabric-loom/<mcVersion>/}）：
++ * 同一版本被多个项目使用时，让它们指向同一份文件比各自持有一份更省空间与带宽。
++ * Gradle 的 up-to-date 检查以「输入指纹」为准，多个项目实例对同一路径的判定是一致的，
++ * 因此共享输出不会造成互相踩踏——这与旧实现需要跨进程锁的情形不同。
++ */
++@CacheableTask
++public abstract class DownloadArtifactTask extends DefaultTask {
++	/** 远程制品地址. */
++	@Input
++	public abstract Property<String> getUrl();
++
++	/** 期望的 sha1；为空时按 maxAge 缓存策略处理. */
++	@Input
++	@Optional
++	public abstract Property<String> getSha1();
++
++	/** 命令行是否要求离线；离线且产物缺失时应当明确失败而不是尝试联网. */
++	@Input
++	public abstract Property<Boolean> getOffline();
++
++	/** 是否强制重新下载（对应 {@code --refresh-dependencies}）. */
++	@Input
++	public abstract Property<Boolean> getForceDownload();
++
++	/** 走 {@code maxAge} 缓存策略还是严格按 sha1 校验. */
++	@Input
++	public abstract Property<Boolean> getUseDefaultCache();
++
++	@OutputFile
++	public abstract RegularFileProperty getOutputFile();
++
++	/**
++	 * 下载产物所在位置，供诊断输出使用（不参与缓存键）.
++	 */
++	@Internal
++	public Path getOutputPath() {
++		return getOutputFile().get().getAsFile().toPath();
++	}
++
++	@TaskAction
++	public void download() throws IOException {
++		final DownloadBuilder builder = createBuilder();
++		final Path target = getOutputPath();
++
++		Files.createDirectories(target.getParent());
++		builder.downloadPath(target);
++	}
++
++	private DownloadBuilder createBuilder() {
++		final DownloadBuilder builder;
++
++		try {
++			builder = Download.create(getUrl().get());
++		} catch (URISyntaxException e) {
++			throw new IllegalArgumentException("Invalid download url: " + getUrl().get(), e);
++		}
++
++		if (getSha1().isPresent()) {
++			builder.sha1(getSha1().get());
++		} else if (getUseDefaultCache().get()) {
++			builder.defaultCache();
++		}
++
++		if (getOffline().get()) {
++			builder.offline();
++		}
++
++		if (getForceDownload().get()) {
++			builder.forceDownload();
++		}
++
++		return builder;
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/ExecutionProcessorContext.java b/src/main/java/net/fabricmc/loom/pipeline/ExecutionProcessorContext.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d16ebb1bc5022134d2761d2c24fd19d56ad27bcb
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/pipeline/ExecutionProcessorContext.java
+@@ -0,0 +1,242 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.pipeline;
++
++import java.util.Objects;
++import java.util.function.Supplier;
++
++import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
++import net.fabricmc.loom.api.processor.ProcessorContext;
++import net.fabricmc.loom.configuration.providers.mappings.TinyMappingsService;
++import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJar;
++import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
++import net.fabricmc.loom.task.service.TinyRemapperService;
++import net.fabricmc.loom.util.Lazy;
++import net.fabricmc.loom.util.LazyCloseable;
++import net.fabricmc.loom.util.service.ServiceFactory;
++import net.fabricmc.mappingio.tree.MemoryMappingTree;
++import net.fabricmc.tinyremapper.TinyRemapper;
++
++/**
++ * 执行期可用的 {@link ProcessorContext} 实现.
++ *
++ * <p>{@code ProcessorContextImpl} 只能在配置期使用：它持有 {@code ConfigContext}，并通过
++ * {@code LoomGradleExtension} 读项目模型。本类把这些依赖整体换成两类输入——**可被配置缓存
++ * 序列化的值**与**执行期由 {@link ServiceFactory} 取得的服务**，从而让 jar 处理器能在 Gradle 任务
++ * 里运行。
++ *
++ * <h2>各项输入的来源</h2>
++ * <table>
++ *   <caption>输入与来源</caption>
++ *   <tr><th>接口方法</th><th>本类输入</th><th>配置期对应物</th></tr>
++ *   <tr><td>{@link #isSplit()}</td><td>{@link JarConfigurationKind}</td>
++ *       <td>是否 {@code MinecraftJarConfiguration.SPLIT}</td></tr>
++ *   <tr><td>{@link #isMerged()} / {@link #includesClient()} / {@link #includesServer()}</td>
++ *       <td>{@link MinecraftJar.Type}</td><td>{@code MinecraftJar} 实例上的同名方法</td></tr>
++ *   <tr><td>{@link #getMappings()}</td><td>{@link TinyMappingsService.Options}</td>
++ *       <td>{@code MappingConfiguration.getMappingsService(...)}</td></tr>
++ *   <tr><td>{@link #createRemapper(MappingsNamespace, MappingsNamespace)}</td>
++ *       <td>{@link TinyRemapperService.Options}</td>
++ *       <td>{@code TinyRemapperHelper.getTinyRemapper(project, ...)}</td></tr>
++ *   <tr><td>{@link #disableObfuscation()} / {@link #getProductionNamespace()} /
++ *       {@link #getIntermediaryNamespace()}</td>
++ *       <td>布尔值 / 两个枚举</td><td>{@code LoomGradleExtension} 上的同名取值</td></tr>
++ * </table>
++ *
++ * <h2>与原实现的语义差异</h2>
++ * <ol>
++ *   <li>{@code ProcessorContextImpl.createRemapper} 返回的 {@link LazyCloseable} 在 {@code close()} 时
++ *       调用 {@code TinyRemapper.finish()}；本类返回的 remapper 归 {@link TinyRemapperService} 所有，
++ *       由该服务在自身 {@code close()} 时 finish，故本类的 {@code close()} 不再重复 finish。
++ *       这与 {@code MinecraftJarRemap} 对「外部装配的 remapper」的处理一致。</li>
++ *   <li>{@code createRemapper} 只能提供任务已经装配好的那一对命名空间（见该方法说明）。</li>
++ * </ol>
++ */
++public final class ExecutionProcessorContext implements ProcessorContext {
++	private final ServiceFactory serviceFactory;
++	private final JarConfigurationKind jarConfiguration;
++	private final MinecraftJar.Type jarType;
++	private final boolean disableObfuscation;
++	private final MappingsNamespace productionNamespace;
++	private final MappingsNamespace intermediaryNamespace;
++	private final TinyMappingsService.Options mappingsOptions;
++	private final TinyRemapperService.Options remapperOptions;
++	private final Supplier<MemoryMappingTree> mappings;
++
++	/**
++	 * @param serviceFactory 执行期的作用域服务工厂，通常在一次任务动作内创建并随任务结束关闭
++	 * @param jarConfiguration 本次构建的 jar 配置身份
++	 * @param jarType 本上下文服务的那个 jar 的类型
++	 * @param disableObfuscation 是否禁用混淆
++	 * @param productionNamespace 生产命名空间
++	 * @param intermediaryNamespace 平台默认命名空间，例如 Forge 的 {@code srg}
++	 * @param mappingsOptions 取映射树所需的映射服务配置
++	 * @param remapperOptions 取重映射器所需的重映射服务配置
++	 */
++	public ExecutionProcessorContext(ServiceFactory serviceFactory, JarConfigurationKind jarConfiguration,
++			MinecraftJar.Type jarType, boolean disableObfuscation, MappingsNamespace productionNamespace,
++			MappingsNamespace intermediaryNamespace, TinyMappingsService.Options mappingsOptions,
++			TinyRemapperService.Options remapperOptions) {
++		this.serviceFactory = Objects.requireNonNull(serviceFactory, "serviceFactory");
++		this.jarConfiguration = Objects.requireNonNull(jarConfiguration, "jarConfiguration");
++		this.jarType = Objects.requireNonNull(jarType, "jarType");
++		this.disableObfuscation = disableObfuscation;
++		this.productionNamespace = Objects.requireNonNull(productionNamespace, "productionNamespace");
++		this.intermediaryNamespace = Objects.requireNonNull(intermediaryNamespace, "intermediaryNamespace");
++		this.mappingsOptions = Objects.requireNonNull(mappingsOptions, "mappingsOptions");
++		this.remapperOptions = Objects.requireNonNull(remapperOptions, "remapperOptions");
++		// 映射树只在真正被读时才解析；处理器可能整轮都不需要它
++		this.mappings = Lazy.of(() -> getMappingsService().getMappingTree());
++	}
++
++	private TinyMappingsService getMappingsService() {
++		return serviceFactory.get(mappingsOptions);
++	}
++
++	private TinyRemapperService getRemapperService() {
++		return serviceFactory.get(remapperOptions);
++	}
++
++	@Override
++	public boolean isSplit() {
++		return jarConfiguration == JarConfigurationKind.SPLIT;
++	}
++
++	@Override
++	public boolean isMerged() {
++		// 只有 merged 配置会产出 MinecraftJar.Merged
++		return jarType == MinecraftJar.Type.MERGED;
++	}
++
++	@Override
++	public boolean includesClient() {
++		return jarType == MinecraftJar.Type.MERGED || jarType == MinecraftJar.Type.CLIENT || jarType == MinecraftJar.Type.CLIENT_ONLY;
++	}
++
++	@Override
++	public boolean includesServer() {
++		return jarType == MinecraftJar.Type.MERGED || jarType == MinecraftJar.Type.SERVER || jarType == MinecraftJar.Type.COMMON;
++	}
++
++	@Override
++	public MemoryMappingTree getMappings() {
++		return mappings.get();
++	}
++
++	@Override
++	public boolean disableObfuscation() {
++		return disableObfuscation;
++	}
++
++	@Override
++	public MappingsNamespace getProductionNamespace() {
++		return productionNamespace;
++	}
++
++	@Override
++	public MappingsNamespace getIntermediaryNamespace() {
++		return intermediaryNamespace;
++	}
++
++	/**
++	 * {@inheritDoc}
++	 *
++	 * <p>执行期的重映射器由 {@link TinyRemapperService} 统一装配，而它的 from/to 是任务输入的一部分，
++	 * 不能被调用方任意改写。因此只有当请求的命名空间对与 {@link TinyRemapperService.Options} 声明的
++	 * 那一对一致时才返回 remapper，否则抛出异常——现有处理器请求的都是
++	 * {@code productionNamespace -> named}，任务按这一对装配即可。
++	 */
++	@Override
++	public LazyCloseable<TinyRemapper> createRemapper(MappingsNamespace from, MappingsNamespace to) {
++		final String expectedFrom = remapperOptions.getFrom().get();
++		final String expectedTo = remapperOptions.getTo().get();
++		final String requestedFrom = from.toString();
++		final String requestedTo = to.toString();
++
++		if (!expectedFrom.equals(requestedFrom) || !expectedTo.equals(requestedTo)) {
++			throw new IllegalStateException("执行期 ProcessorContext 只装配了 %s -> %s 的 remapper，但被请求 %s -> %s".formatted(expectedFrom, expectedTo, requestedFrom, requestedTo));
++		}
++
++		// 不在此处 finish：remapper 的生命周期归 TinyRemapperService，它已在构造时读完 classpath，
++		// 并会在自己关闭时 finish。重复 finish 会与服务的 close() 冲突。
++		return new LazyCloseable<>(() -> getRemapperService().getTinyRemapperForInputs(), remapper -> { });
++	}
++
++	/**
++	 * {@link MinecraftJarConfiguration} 的可序列化身份.
++	 *
++	 * <p>{@code MinecraftJarConfiguration} 本身进不了任务输入：它是持有 6 个工厂方法引用的 record，
++	 * 其 {@code create*Provider} 方法都要 {@code Project}/{@code ConfigContext} 才能工作，只在配置期成立。
++	 * 任务只需要记住「是哪一种配置」，执行期用它回答 {@link ProcessorContext#isSplit()}。
++	 *
++	 * <p>注意 {@code MERGED} 与 {@code LEGACY_MERGED} 的 jar 布局完全相同（都是单个 merged jar），
++	 * 二者只在 provider 实现上不同；{@code SPLIT} 的两个 jar 也分别与 {@code SERVER_ONLY}、
++	 * {@code CLIENT_ONLY} 的 jar 完全相同，只有配置身份能区分它们。
++	 */
++	public enum JarConfigurationKind {
++		MERGED,
++
++		LEGACY_MERGED,
++
++		SERVER_ONLY,
++
++		CLIENT_ONLY,
++
++		SPLIT;
++
++		/**
++		 * 由配置期的配置常量得到可序列化身份.
++		 *
++		 * @param configuration 配置期的 jar 配置，须是 {@code MinecraftJarConfiguration} 的五个常量之一
++		 * @return 对应的身份
++		 * @throws IllegalArgumentException 传入的不是已知常量
++		 */
++		public static JarConfigurationKind of(MinecraftJarConfiguration<?, ?, ?> configuration) {
++			Objects.requireNonNull(configuration, "configuration");
++
++			if (configuration == MinecraftJarConfiguration.MERGED) {
++				return MERGED;
++			}
++
++			if (configuration == MinecraftJarConfiguration.LEGACY_MERGED) {
++				return LEGACY_MERGED;
++			}
++
++			if (configuration == MinecraftJarConfiguration.SERVER_ONLY) {
++				return SERVER_ONLY;
++			}
++
++			if (configuration == MinecraftJarConfiguration.CLIENT_ONLY) {
++				return CLIENT_ONLY;
++			}
++
++			if (configuration == MinecraftJarConfiguration.SPLIT) {
++				return SPLIT;
++			}
++
++			throw new IllegalArgumentException("未知的 MinecraftJarConfiguration: " + configuration);
++		}
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/ProcessMinecraftJarTask.java b/src/main/java/net/fabricmc/loom/pipeline/ProcessMinecraftJarTask.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..cc5beb27a3d7d914a330b0d53f4c6132081ceb86
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/pipeline/ProcessMinecraftJarTask.java
+@@ -0,0 +1,271 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.pipeline;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.List;
++import java.util.Objects;
++
++import javax.inject.Inject;
++
++import org.gradle.api.DefaultTask;
++import org.gradle.api.file.RegularFileProperty;
++import org.gradle.api.model.ObjectFactory;
++import org.gradle.api.provider.ListProperty;
++import org.gradle.api.provider.Property;
++import org.gradle.api.tasks.CacheableTask;
++import org.gradle.api.tasks.Input;
++import org.gradle.api.tasks.InputFile;
++import org.gradle.api.tasks.Internal;
++import org.gradle.api.tasks.Nested;
++import org.gradle.api.tasks.OutputFile;
++import org.gradle.api.tasks.PathSensitive;
++import org.gradle.api.tasks.PathSensitivity;
++import org.gradle.api.tasks.TaskAction;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
++import net.fabricmc.loom.api.processor.MinecraftJarProcessor;
++import net.fabricmc.loom.api.processor.ProcessorContext;
++import net.fabricmc.loom.configuration.providers.mappings.TinyMappingsService;
++import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJar;
++import net.fabricmc.loom.task.service.TinyRemapperService;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.service.ScopedServiceFactory;
++
++/**
++ * L3 流水线：对「命名映射后的 Minecraft jar」执行 jar processor 链.
++ *
++ * <p>它取代 {@code ProcessedNamedMinecraftProvider.provide()} 里那段配置期同步执行的
++ * 「存在性检查 → 取跨进程锁 → copyToMaven 落位 → processJar」：是否需要重跑交给 Gradle 的
++ * up-to-date 判定与构建缓存，跨进程互斥交给任务图。与 {@link RemapMinecraftTask} 串联——
++ * 后者的产物是本任务的输入，故两者必须同批接线。
++ *
++ * <p>链的执行语义与配置期逐项对齐：先原子落位（对应 {@code LocalMavenHelper.copyToMaven}），
++ * 再由每个 processor 就地对产物路径做改写（processor 的契约就是「就地改 jar」），
++ * 失败时与 {@code MinecraftJarProcessorManager.processJar} 一样尽力删除半成品。
++ *
++ * <h2>链的输入设计</h2>
++ * 链是有序的，且顺序变了结果就变，因此三个与链有关的输入都是有序 {@code ListProperty}
++ * （Gradle 对列表输入的指纹含顺序，故「换序」会正确地触发重跑），都不能退化为 {@code SetProperty}：
++ * <ul>
++ *   <li>{@link #getProcessorDescriptors()}：{@code @Input}。执行期凭它重建 processor 实例；
++ *       {@code ProcessorDescriptor} 按接口契约是 {@code Serializable} 的纯值，可以直接作为值输入。</li>
++ *   <li>{@link #getProcessorSpecs()}：{@code @Internal}。仅供执行期重建后的 processor 使用，不参与指纹。</li>
++ *   <li>{@link #getSpecFingerprints()}：{@code @Input}。spec 的指纹，与链一一对应，参与指纹。</li>
++ * </ul>
++ *
++ * <h3>为什么 spec 不是 {@code @Input}，而是 {@code @Internal} + 指纹</h3>
++ * {@code MinecraftJarProcessor.Spec} 不继承 {@code Serializable}，因此 spec 不能作为值输入：
++ * 实测（Gradle 9.5，{@code org.gradle.configuration-cache=true}）把一个 record 实现的 spec 放进
++ * {@code @Input} 会直接失败——{@code Cannot fingerprint input property 'x': value '[Spec[...]]' cannot be serialized}。
++ * spec 的身份在 loom 既有协议里就是 {@code spec.hashCode()}（{@code MinecraftJarProcessorManager.getCacheValue()}
++ * 用它组成缓存值，产物目录名与 {@code getJarHash()} 均由该缓存值派生），故本任务沿用同一身份：
++ * 对象本体用 {@code @Internal} 带到执行期，指纹用 {@code @Input} 参与判定。
++ * 代价如实记下：{@code hashCode} 碰撞时任务不会重跑——这与既有协议同源（既有协议同样以该哈希命名产物），
++ * 不是本任务新引入的风险；但 {@code hashCode} 实现不稳定（例如用身份哈希）的类型会让任务每次都重跑。
++ *
++ * <h3>为什么链不能用 {@code @Nested}</h3>
++ * 实测结论（同一环境）：把 descriptor/spec 放进 {@code @Nested} 的 {@code ListProperty} 里，
++ * 由于 record 的访问器不带 {@code get}/{@code is} 前缀，Gradle 内省不出任何属性，
++ * 链的值就完全不进指纹——改了 descriptor 或 spec 的值，任务仍然报 {@code UP-TO-DATE}，
++ * 也就是「任务成功、产物是旧的」这种静默损坏。相比之下 {@code @Nested} 一旦能内省出属性
++ * （带 {@code get} 前缀的访问器）就会要求每个子属性自带输入注解，对第三方 descriptor 同样不可行。
++ *
++ * <h2>本任务不产出的东西</h2>
++ * 配置期那条路径在落位时还顺带产生了两个本任务不管的文件，接线时必须由别处继续产出，
++ * 否则会出现「任务成功但下游缺文件」：
++ * <ul>
++ *   <li>{@code <name>-<version>.pom}：由 {@code LocalMavenHelper.savePom()} 写出（内容是坐标的纯函数，
++ *       与 jar 无关），缺失会让按坐标注入的依赖解析失败。</li>
++ *   <li>{@code <jar>.backup}：由 {@code ProcessedNamedMinecraftProvider} 在链跑完后复制，是
++ *       {@code GenerateSourcesTask} 的 {@code @Classpath} 输入，缺失会让 genSources 直接失败。
++ *       它必须在链跑完之后产生，因此不能留在配置期同步执行。</li>
++ * </ul>
++ */
++@CacheableTask
++public abstract class ProcessMinecraftJarTask extends DefaultTask {
++	private static final Logger LOGGER = LoggerFactory.getLogger(ProcessMinecraftJarTask.class);
++
++	/** 待处理的 jar（命名映射后的产物）. */
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getInputJar();
++
++	/**
++	 * 产物：processor 链就地对这个路径做改写.
++	 *
++	 * <p>它的位置沿用 maven 仓库里的既有路径（消费侧按坐标找它），不由本任务决定。
++	 * 任务先把它替换为输入的原子副本，再交给链改写——输入 jar 因此保持只读，
++	 * 任务可重复执行，缓存与 up-to-date 判定不会因为「输入被自己改过」而失真。
++	 */
++	@OutputFile
++	public abstract RegularFileProperty getOutputJar();
++
++	/**
++	 * processor 链的描述符，顺序即处理顺序.
++	 *
++	 * <p>{@code @Input}：{@code ProcessorDescriptor} 按契约是配置缓存可序列化的纯值，
++	 * Gradle 对它的值指纹直接可用，无需额外指纹。
++	 */
++	@Input
++	public abstract ListProperty<MinecraftJarProcessor.ProcessorDescriptor<?>> getProcessorDescriptors();
++
++	/**
++	 * 与 {@link #getProcessorDescriptors()} 一一对应的 spec，顺序一致.
++	 *
++	 * <p>{@code @Internal}：{@code Spec} 不保证可序列化（见类注释），故不参与指纹，
++	 * 只随配置缓存带到执行期供重建后的 processor 使用。指纹由 {@link #getSpecFingerprints()} 承担。
++	 */
++	@Internal
++	public abstract ListProperty<MinecraftJarProcessor.Spec> getProcessorSpecs();
++
++	/**
++	 * 与 {@link #getProcessorSpecs()} 一一对应的指纹，顺序一致.
++	 *
++	 * <p>取 {@code spec.hashCode()}：与 loom 既有的 spec 身份一致（见类注释）。
++	 */
++	@Input
++	public abstract ListProperty<Integer> getSpecFingerprints();
++
++	/** 本次构建的 jar 配置身份，供执行期上下文回答「是否 split 形态」. */
++	@Input
++	public abstract Property<ExecutionProcessorContext.JarConfigurationKind> getJarConfiguration();
++
++	/** 本任务处理的 jar 类型，供执行期上下文回答「是否 merged / 含客户端 / 含服务端」. */
++	@Input
++	public abstract Property<MinecraftJar.Type> getJarType();
++
++	/** 是否禁用混淆（与配置期的 {@code ProcessorContextImpl.disableObfuscation()} 同源）. */
++	@Input
++	public abstract Property<Boolean> getDisableObfuscation();
++
++	/** 生产命名空间；processor 请求 remapper 时用的源命名空间. */
++	@Input
++	public abstract Property<MappingsNamespace> getProductionNamespace();
++
++	/** 平台默认命名空间（例如 Forge 的 {@code srg}），供 processor 使用. */
++	@Input
++	public abstract Property<MappingsNamespace> getIntermediaryNamespace();
++
++	/** 映射服务配置；执行期据此取出映射树. */
++	@Nested
++	public abstract Property<TinyMappingsService.Options> getMappingsServiceOptions();
++
++	/**
++	 * 重映射服务配置；执行期据此取出 remapper.
++	 *
++	 * <p>processor 请求的是「生产命名空间 → named」那一对（{@code context.createRemapper(context.getProductionNamespace(), MappingsNamespace.NAMED)}），
++	 * 装配时必须与它一致：{@code ExecutionProcessorContext.createRemapper} 对不匹配的请求直接抛异常，
++	 * 而不是返回一个配置不同的 remapper。
++	 */
++	@Nested
++	public abstract Property<TinyRemapperService.Options> getRemapperServiceOptions();
++
++	/** 重建 processor 实例所需的 Gradle 工厂；执行期由 Gradle 注入，进不了序列化状态. */
++	@Inject
++	protected abstract ObjectFactory getObjectFactory();
++
++	@TaskAction
++	public void process() throws IOException {
++		final List<MinecraftJarProcessor.ProcessorDescriptor<?>> descriptors = getProcessorDescriptors().get();
++		final List<MinecraftJarProcessor.Spec> specs = getProcessorSpecs().get();
++		final List<Integer> fingerprints = getSpecFingerprints().get();
++
++		if (descriptors.size() != specs.size() || descriptors.size() != fingerprints.size()) {
++			throw new IllegalStateException("processor 链的三个输入长度不一致：descriptor=%d, spec=%d, fingerprint=%d"
++					.formatted(descriptors.size(), specs.size(), fingerprints.size()));
++		}
++
++		final Path inputJar = getInputJar().get().getAsFile().toPath();
++		final Path outputJar = getOutputJar().get().getAsFile().toPath();
++
++		LOGGER.info("Processing {} with {} jar processor(s)", outputJar.getFileName(), descriptors.size());
++
++		// 原子落位：等价于配置期 copyToMaven 的替换语义（同目录唯一临时文件 + 原子 move）。
++		// 之后的链对 outputJar 原地改写，inputJar 始终不变。
++		AtomicFiles.copy(inputJar, outputJar);
++
++		// 执行期上下文所需的服务只在本次任务动作内存在：作用域服务工厂随 try-with-resources 关闭，
++		// 与 RemapMinecraftTask 的做法一致（配置期的 ConfigContext 携带的 service factory 在配置结束后已关闭）。
++		try (ScopedServiceFactory serviceFactory = new ScopedServiceFactory()) {
++			final ProcessorContext context = new ExecutionProcessorContext(
++					serviceFactory,
++					getJarConfiguration().get(),
++					getJarType().get(),
++					getDisableObfuscation().get(),
++					getProductionNamespace().get(),
++					getIntermediaryNamespace().get(),
++					getMappingsServiceOptions().get(),
++					getRemapperServiceOptions().get()
++			);
++
++			for (int i = 0; i < descriptors.size(); i++) {
++				processStep(descriptors.get(i), specs.get(i), outputJar, context);
++			}
++		}
++	}
++
++	/**
++	 * 重建第 {@code descriptor} 个 processor 并让它处理产物.
++	 *
++	 * <p>逐个重建而不是先全部重建：processor 实例可能持有只在处理期间才需要的资源，
++	 * 且配置期也是「一个 entry 一个 processor」的顺序处理。
++	 */
++	private void processStep(MinecraftJarProcessor.ProcessorDescriptor<?> descriptor, MinecraftJarProcessor.Spec spec,
++			Path jar, ProcessorContext context) throws IOException {
++		final MinecraftJarProcessor<?> processor = Objects.requireNonNull(descriptor, "processor descriptor")
++				.createProcessor(getObjectFactory());
++
++		try {
++			runProcessor(processor, spec, jar, context);
++		} catch (IOException e) {
++			// 与配置期 MinecraftJarProcessorManager.processJar 一致：失败后尽力删除半成品，
++			// 避免跨进程的读方把「改了一半的 jar」当成有效产物（任务失败时 Gradle 也不会记录该产出为最新）
++			try {
++				Files.deleteIfExists(jar);
++			} catch (IOException ioe) {
++				LOGGER.error("Failed to delete jar after failed processing: {}", jar, ioe);
++			}
++
++			throw new IOException("Failed to process jar when running jar processor: %s - %s".formatted(processor.getName(), e.getMessage()), e);
++		}
++	}
++
++	/**
++	 * 以「同一对 spec/context」调用 processor 的处理入口.
++	 *
++	 * <p>助手方法只为消掉泛型：{@code ProcessorDescriptor<?>} 的类型参数是捕获类型，
++	 * 无法在此处写成 {@code MinecraftJarProcessor<S>}，而配置期 {@code ProcessorEntry}
++	 * 也做了同样的非检查转换——两边调用的是同一个方法签名。
++	 */
++	@SuppressWarnings({"unchecked", "rawtypes"})
++	private static void runProcessor(MinecraftJarProcessor processor, MinecraftJarProcessor.Spec spec, Path jar, ProcessorContext context) throws IOException {
++		processor.processJar(jar, spec, context);
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/RemapMinecraftTask.java b/src/main/java/net/fabricmc/loom/pipeline/RemapMinecraftTask.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..8ba0cf2729f43e8fb2c78ec10040cfd1a0850660
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/pipeline/RemapMinecraftTask.java
+@@ -0,0 +1,535 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.pipeline;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.Map;
++import java.util.Set;
++import java.util.function.Consumer;
++
++import org.gradle.api.DefaultTask;
++import org.gradle.api.file.ConfigurableFileCollection;
++import org.gradle.api.file.RegularFileProperty;
++import org.gradle.api.provider.MapProperty;
++import org.gradle.api.provider.Property;
++import org.gradle.api.provider.SetProperty;
++import org.gradle.api.tasks.CacheableTask;
++import org.gradle.api.tasks.Classpath;
++import org.gradle.api.tasks.Input;
++import org.gradle.api.tasks.InputFile;
++import org.gradle.api.tasks.Internal;
++import org.gradle.api.tasks.Nested;
++import org.gradle.api.tasks.Optional;
++import org.gradle.api.tasks.OutputFile;
++import org.gradle.api.tasks.PathSensitive;
++import org.gradle.api.tasks.PathSensitivity;
++import org.gradle.api.tasks.TaskAction;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import net.fabricmc.loom.configuration.providers.mappings.extras.annotations.AnnotationsData;
++import net.fabricmc.loom.core.MinecraftJarRemap;
++import net.fabricmc.loom.configuration.mods.dependency.LocalMavenHelper;
++import net.fabricmc.loom.configuration.providers.mappings.TinyMappingsService;
++import net.fabricmc.loom.util.SidedClassVisitor;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.service.ScopedServiceFactory;
++import net.fabricmc.mappingio.tree.MemoryMappingTree;
++import net.fabricmc.tinyremapper.TinyRemapper;
++
++/**
++ * L3 流水线：把 Minecraft jar 重映射到目标命名空间.
++ *
++ * <p>这是「把 mapped jar 的生产移出配置期」的落点。它取代的是
++ * {@code AbstractMappedMinecraftProvider.provide()} 里那段配置期同步执行的
++ * 「判断是否需要重建 → 取跨进程锁 → 重映射 → 落位」。
++ *
++ * <table>
++ *   <caption>旧路径 vs 本任务</caption>
++ *   <tr><th></th><th>旧路径</th><th>本任务</th></tr>
++ *   <tr><td>是否需要重建</td><td>{@code shouldRefreshOutputs}（配置期开 zipfs 逐产物判定）</td>
++ *       <td>Gradle up-to-date 检查</td></tr>
++ *   <tr><td>并发保护</td><td>跨进程文件锁 + 锁内二次确认</td><td>任务图 + 构建缓存</td></tr>
++ *   <tr><td>产物损坏</td><td>{@code JarReusability} 手工判残骸</td><td>构建缓存重新恢复</td></tr>
++ *   <tr><td>执行时机</td><td>配置期 {@code afterEvaluate}</td><td>执行期</td></tr>
++ * </table>
++ *
++ * <h2>为什么 remapper 由 service 装配而不是本类自建</h2>
++ * remapper 的构造需要映射服务、已知 BSB、以及第三方 remapper 扩展
++ * （{@code RemapperExtensionHolder}）。这些在既有实现里统一由
++ * {@link net.fabricmc.loom.task.service.TinyRemapperService} 装配，并通过 {@code @Nested} 的 Options 序列化进任务输入。
++ * 本类沿用该路径，以避免出现「两套构造逻辑产生不同 remapper」的分叉。
++ *
++ * <p>实际的重映射 I/O 交给 L4 的 {@link MinecraftJarRemap}——它不认识 Gradle，
++ * 且已保留「原子发布 + 发布终态」的契约。
++ *
++ * <h2>配置期的钩子与分支如何变成输入</h2>
++ * 配置期 {@code AbstractMappedMinecraftProvider} 有三处语义不在「输入 jar + 映射」之内。
++ * 本任务用三个 {@code @Input} 显式承载它们，而不是在任务里重新判断——任务只拿到一对路径，
++ * 平台配置（是否 NeoForge、是否是 split 形态的 client-only jar）它无从得知：
++ * <ul>
++ *   <li>{@code configureRemapper} 钩子的效果 → {@link #getInjectClientSidedVisitor()}。
++ *       四处覆写（各 provider 的 {@code SplitImpl}）都只给 client-only jar 追加
++ *       {@code @Environment(CLIENT)}，故可收敛成一个布尔值。</li>
++ *   <li>{@code disableObfuscation} 下 {@code remapJar} 走原子复制而非重映射 → {@link #getCopyOnly()}。</li>
++ *   <li>{@code remapJar} 把 {@code isNeoForge()} 当作 {@code injectMixinExtension} 交给 L4 →
++ *       {@link #getInjectMixinExtension()}。它与 {@code forgeLike} 不同源，理由见该输入的说明。</li>
++ * </ul>
++ * 三者的缺省值都取 {@code false}，即「重映射 + 无额外 remapper 配置」——与本次改造前任务的唯一行为
++ * 逐位一致；需要非缺省取值的接线路径必须显式设置。
++ *
++ * <h2>产物落位：三个具体文件，绝不声明目录</h2>
++ * 一个 {@code RemappedJars} 对应 maven 仓库里的同一个构件目录，该目录里属于本任务的文件有三个：
++ * <ol>
++ *   <li>{@link #getOutputJar()}——重映射产物本身；</li>
++ *   <li>{@link #getOutputPom()}——同名的 {@code .pom}，由 {@link LocalMavenHelper#savePom} 写出
++ *       （本任务不另行生成内容，理由见该输出的说明），缺失会让坐标式依赖解析失败；</li>
++ *   <li>{@link #getOutputBackupJar()}——jar 的逐字节副本，是 genSources 的 {@code @Classpath} 输入，
++ *       缺失会让 {@code GenerateSourcesTask} 直接抛错；provider 不需要备份时（中间映射产物不会被反编译）
++ *       不设置该输出，此时本任务不产出它。</li>
++ * </ol>
++ * 三者都声明为 {@code @OutputFile}，本任务不声明任何 {@code @OutputDirectory}：构件目录位于共享 maven
++ * 仓库，仓库根与版本目录里还有别的 provider、别的 MC 版本的产物，把它们纳入本任务的快照与清理范围会互相破坏
++ * （既有实现正是为此在「按前缀扫描清理同目录」上踩过坑）。
++ *
++ * <p>该共享仓库决定了「同一条产物路径上不该有两个生产者」：{@code MavenScope.GLOBAL} 下路径跨项目、跨工作树
++ * 共享。这件事不在本任务里协调——由 {@link RemapMinecraftTaskRegistry} 在同一构建内保证唯一生产者，
++ * 跨构建则由 {@code @OutputFile} 的 up-to-date 判定与原子落位承担。
++ */
++@CacheableTask
++public abstract class RemapMinecraftTask extends DefaultTask {
++	private static final Logger LOGGER = LoggerFactory.getLogger(RemapMinecraftTask.class);
++
++	public RemapMinecraftTask() {
++		// 缺省值 = 本次改造前任务的唯一行为：重映射、不挂任何额外 remapper 配置。
++		// 这只是「与改造前逐位一致」，并不等于「与配置期一致」：NeoForge（缺 mixin 扩展）
++		// 与 split 形态的 client-only jar（缺 @Environment(CLIENT)）都必须由接线侧显式设为 true，
++		// 理由见各输入的说明。
++		getCopyOnly().convention(false);
++		getInjectClientSidedVisitor().convention(false);
++		getInjectMixinExtension().convention(false);
++	}
++
++	/**
++	 * 是否只做原子复制、不重映射（直通模式）.
++	 *
++	 * <p>开启后本任务与配置期 {@code AbstractMappedMinecraftProvider.remapJar} 在
++	 * {@code disableObfuscation} 分支下的行为一致：不改写字节码，只把输入 jar 原子复制到产物位置；
++	 * 不开启则走重映射。两种产物不同，任务自身无从分辨（它只有一对输入/输出路径），
++	 * 因此该判断只能由掌握平台配置的接线侧给出。
++	 *
++	 * <h4>为什么用 AtomicFiles 而不是裸 Files.copy</h4>
++	 * 产物位于跨进程、跨 daemon 共享的 maven 仓库，落位必须原子：否则读方会读到半写的 jar，
++	 * 而内容判定只能发现截断、发现不了「完整但没写完」。这条契约是仓库既有的
++	 * （见 {@link AtomicFiles} 的类注释），复制模式同样受它约束。
++	 *
++	 * <h4>与其它输入的关系</h4>
++	 * 复制模式下不读取映射、也不装配 remapper 扩展，但任务协议不变：映射、命名空间等输入照常由接线侧
++	 * 提供（它们是任务身份的一部分，不该随模式变化而消失）。
++	 */
++	@Input
++	public abstract Property<Boolean> getCopyOnly();
++
++	/** 待重映射的 jar. */
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getInputJar();
++
++	/** 重映射 classpath（通常是上一阶段的产物 + 编译期库）. */
++	@Classpath
++	public abstract ConfigurableFileCollection getRemapClasspath();
++
++	/**
++	 * 映射服务配置；执行期据此取出映射树.
++	 *
++	 * <p>刻意用 {@link TinyMappingsService.Options} 而不是别处的映射来源：配置期的
++	 * {@code AbstractMappedMinecraftProvider.remapJar} 正是通过
++	 * {@code MappingConfiguration.getMappingsService(project, serviceFactory, MappingOption.forPlatform(extension))}
++	 * 拿到这一份映射树。换用其它来源（例如 {@code MappingsService.createOptionsWithProjectMappings}）
++	 * 会解析到不同的映射文件，产出与配置期不等价——这正是等价性测试发现的问题。
++	 */
++	@Nested
++	public abstract Property<TinyMappingsService.Options> getMappingsServiceOptions();
++
++	/** 源命名空间. */
++	@Input
++	public abstract Property<String> getFromNamespace();
++
++	/** 目标命名空间. */
++	@Input
++	public abstract Property<String> getToNamespace();
++
++	/** 是否修复 record 组件（Java 16+ 目标需要）. */
++	@Input
++	public abstract Property<Boolean> getFixRecords();
++
++	/** 是否 Forge/NeoForge 系，影响内部类重映射. */
++	@Input
++	public abstract Property<Boolean> getForgeLike();
++
++	/**
++	 * 是否向 remapper 注入 mixin 扩展（NeoForge 系需要）.
++	 *
++	 * <p>对应配置期 {@code remapJar} 传给 L4 的 {@code extension.isNeoForge()}：为真时 L4 会往
++	 * remapper 上挂 {@code new MixinExtension(inputTag -> true)}。该扩展只作用于「带 mixin 注解的类」：
++	 * 硬目标（{@code @Shadow}/{@code @Overwrite}/{@code @Accessor}/{@code @Invoker}/{@code @Implements}）
++	 * 用于解析目标成员，软目标（{@code @Mixin}/{@code @Inject}/{@code @At} 等注解里的字符串）用于改写
++	 * 注解内的类名与方法描述符；它不处理 mixin 配置 JSON，也不生成 refmap。
++	 *
++	 * <h4>与 forgeLike 不是同一件事</h4>
++	 * {@link #getForgeLike()} 是 {@code isForgeLike()}（影响冲突忽略策略与内部类映射），本输入是
++	 * {@code isNeoForge()}。NeoForge 是 forgeLike 的真子集：「Forge 但非 NeoForge」这一支两者取值不同，
++	 * 故本输入无法由 {@link #getForgeLike()} 推导，必须独立承载。
++	 *
++	 * <h4>它的实际影响随 NeoForge 版本而变</h4>
++	 * 实测：NeoForge 21.0.77-beta 的 jar 内含 {@code net/neoforged/neoforge/mixins/*} 访问器 mixin
++	 * （类常量池里带 mixin 注解描述符），NeoForge 自身的类又会被并进 MC jar，故这一支上该扩展有实际作用；
++	 * 而 NeoForge 20.2.93 及更早的 jar 里不存在任何 mixin 注解，此时它是空操作。因为作用随版本而变、
++	 * 不能假定为零，任务必须把它当输入承载，不能写死 {@code false}。
++	 *
++	 * <h4>缺省 false 的边界</h4>
++	 * 缺省 {@code false} 与 Fabric、Forge 路径的配置期取值一致；NeoForge 系接线时必须显式设为
++	 * {@code true}，否则 NeoForge 自身那些 mixin 类在重映射后会与配置期产物不同。
++	 */
++	@Input
++	public abstract Property<Boolean> getInjectMixinExtension();
++
++	/**
++	 * 是否给产物追加 {@code @Environment(CLIENT)} 注解（split jar 的 client-only 那一个）.
++	 *
++	 * <p>对应配置期的 {@code configureRemapper} 钩子。该钩子是实例方法、效果不可序列化，
++	 * 但四处覆写（intermediary／named／srg／mojang 的 {@code SplitImpl}）都只做一件事——给 client-only
++	 * 的 jar 追加 {@code SidedClassVisitor.CLIENT}——因此它的效果可收敛为一个布尔值。
++	 *
++	 * <h4>装配路径与配置期同源</h4>
++	 * 为真时任务挂的是 {@link SidedClassVisitor#CLIENT}，即 {@code configureSplitRemapper} 与各覆写
++	 * 使用的同一个常量，走同一条 {@code extraPostApplyVisitor} 装配，不存在第二套 visitor 构造逻辑。
++	 *
++	 * <h4>缺省 false 的边界</h4>
++	 * 缺省 {@code false}：对 merged／single jar 就是配置期的取值（基类钩子是空实现）。split 形态下
++	 * 只有 client-only 那个 jar 的任务需要设为 {@code true}；漏设会让客户端产物缺少该注解——产物仍能
++	 * 构建成功，只是语义与配置期不同，故接线时必须按 provider 形态显式设置。
++	 */
++	@Input
++	public abstract Property<Boolean> getInjectClientSidedVisitor();
++
++	/** 是否校验目标命名空间存在. */
++	@Input
++	public abstract Property<Boolean> getValidateTargetNamespace();
++
++	/** Forge 系内部类重映射所需的类名集合. */
++	@Input
++	public abstract SetProperty<String> getInnerClassNames();
++
++	/** 已知的 indy BSM 集合. */
++	@Input
++	public abstract SetProperty<String> getKnownIndyBsms();
++
++	/** 签名修复表；为空表示无需修复. */
++	@Input
++	public abstract MapProperty<String, String> getSignatureFixes();
++
++	/** 注解重映射数据的 JSON；为空表示无. */
++	@Input
++	@Optional
++	public abstract Property<String> getAnnotationsJson();
++
++	/** object holder 改写的类名；为空表示不做该步骤. */
++	@Input
++	@Optional
++	public abstract Property<String> getObjectHolderClassName();
++
++	/** object holder 改写所用的源命名空间；为空表示不做该步骤. */
++	@Input
++	@Optional
++	public abstract Property<String> getObjectHolderSourceNamespace();
++
++	/** object holder 改写所用的目标命名空间. */
++	@Input
++	public abstract Property<String> getObjectHolderTargetNamespace();
++
++	/** 产物. */
++	@OutputFile
++	public abstract RegularFileProperty getOutputJar();
++
++	/**
++	 * 产物的 pom：maven 仓库里与 jar 同名同目录、只有扩展名不同的那个文件.
++	 *
++	 * <p>内容与落位都由 {@link LocalMavenHelper#savePom} 决定——本任务按坐标调用它，不另行拼模板、
++	 * 也不另写一份格式，因此与配置期写出的 pom 逐字节一致。缺失它会让按坐标
++	 * （{@code net.minecraft:<name>:<version>}）解析该构件的依赖直接失败：pom 是坐标式解析的必要条件，
++	 * 不是可选的附产物。
++	 *
++	 * <h4>为什么坐标是输入而不是从输出路径反推</h4>
++	 * pom 的内容只由 {@code group/name/version} 决定，是这三个值的函数，因此三者必须是 {@code @Input}，
++	 * 否则改坐标不会让本任务失效。{@link #getPomMavenRoot()} 只决定落位、不决定内容，故为 {@code @Internal}。
++	 *
++	 * <h4>可选性的边界</h4>
++	 * 未设置表示本次不产出 pom。经 {@code registerRemapTask} 接线时必定设置（配置期两条分支都会写 pom）；
++	 * 直接注册本任务的场景（例如与配置期做等价性对照的探针）不设置它，因此这里保持可选而非必填。
++	 * 一旦设置了它，{@link #getPomGroup()} 等坐标就必须同时给出，否则执行期直接失败——见 {@link #remap()}。
++	 */
++	@Optional
++	@OutputFile
++	public abstract RegularFileProperty getOutputPom();
++
++	/**
++	 * pom 的 group；只参与 pom 内容的生成与落位.
++	 *
++	 * <p>{@code @Optional} 的理由见 {@link #getOutputPom()} 的「可选性的边界」：只有声明了 pom 输出时
++	 * 才需要坐标，未声明时留着默认空值。执行期对「声明了输出却缺坐标」的校验在 {@link #remap()}。
++	 */
++	@Optional
++	@Input
++	public abstract Property<String> getPomGroup();
++
++	/** pom 的 artifact 名，与构件 jar 的主名相同；可选性同 {@link #getPomGroup()}. */
++	@Optional
++	@Input
++	public abstract Property<String> getPomName();
++
++	/** pom 的版本，即「MC 版本 + 映射标识」；可选性同 {@link #getPomGroup()}. */
++	@Optional
++	@Input
++	public abstract Property<String> getPomVersion();
++
++	/**
++	 * pom 所在的 maven 仓库根.
++	 *
++	 * <p>只用于让 {@link LocalMavenHelper} 复算落位（它把 group、name、version 展开成目录，本任务不复算
++	 * 这套布局规则），不参与 pom 内容的判定，故为 {@code @Internal}：同一坐标落在哪个仓库根，pom 的内容都一样。
++	 * 它与声明出来的 {@link #getOutputPom()} 是否指向同一处，执行期会校验。
++	 */
++	@Internal
++	public abstract Property<File> getPomMavenRoot();
++
++	/**
++	 * jar 的逐字节副本，作为 genSources 的输入.
++	 *
++	 * <p>genSources 按 {@code AbstractMappedMinecraftProvider.getBackupJarPath} 找这个文件
++	 * （jar 路径加上 {@code .backup}），找不到就直接抛错；配置期也是先出 jar、再复制出 backup，
++	 * 且 backup 被当作「产物齐了」的标志（见 {@code createBackupJars} 的注释）。
++	 *
++	 * <h4>为什么用 AtomicFiles 而不是裸 Files.copy</h4>
++	 * 副本与正本同处跨进程共享的 maven 仓库，落位必须原子，否则读方会读到半写的 backup 而误判产物就绪。
++	 * 这条契约与 {@link #getCopyOnly()} 的复制模式同源，见 {@link AtomicFiles} 的类注释。
++	 *
++	 * <h4>可选性的边界</h4>
++	 * 未设置表示本 provider 不需要 backup（中间映射产物不会被反编译，见
++	 * {@code AbstractMappedMinecraftProvider.requiresBackupJars}）。设置之后本任务按 jar 的逐字节副本写出，
++	 * 并在执行期校验路径确实是 {@code <jar>.backup}，避免写出一份没人读的副本而让 genSources 找不到输入。
++	 */
++	@Optional
++	@OutputFile
++	public abstract RegularFileProperty getOutputBackupJar();
++
++	@TaskAction
++	public void remap() throws IOException {
++		final Path inputJar = getInputJar().get().getAsFile().toPath();
++		final Path outputJar = getOutputJar().get().getAsFile().toPath();
++
++		if (getCopyOnly().get()) {
++			// 直通模式：配置期 disableObfuscation 分支的等价路径。不改写字节码，也不是裸复制——
++			// 落位必须原子，否则读方会读到半写的 jar（见 AtomicFiles 的类注释）
++			LOGGER.info("Copying {} to {} without remapping", inputJar.getFileName(), outputJar.getFileName());
++			AtomicFiles.copy(inputJar, outputJar);
++		} else {
++			remapJar(inputJar, outputJar);
++		}
++
++		// 落位顺序与配置期一致：jar → pom → backup。直通模式同样要产出后两者——配置期在该分支下也是
++		// 「复制 jar + savePom」，backup 则由 provide() 在两个分支上统一复制。
++		writePom(outputJar);
++		writeBackupJar(outputJar);
++	}
++
++	private void remapJar(Path inputJar, Path outputJar) throws IOException {
++		LOGGER.info("Remapping {} to namespace {}", inputJar.getFileName(), getToNamespace().get());
++
++		// 配置期由 configureRemapper 钩子挂载的 remapper 扩展：任务侧按输入装配。
++		// 无扩展时传 null，与本次改造前逐位一致（早先的等价性验证即在该取值下完成）。
++		final Consumer<TinyRemapper.Builder> extraRemapperConfig;
++
++		if (getInjectClientSidedVisitor().get()) {
++			// 与 configureSplitRemapper、各 SplitImpl 覆写挂的是同一个 visitor 常量
++			extraRemapperConfig = builder -> builder.extraPostApplyVisitor(SidedClassVisitor.CLIENT);
++		} else {
++			extraRemapperConfig = null;
++		}
++
++		try (ScopedServiceFactory serviceFactory = new ScopedServiceFactory()) {
++			final TinyMappingsService.Options mappingsOptions = getMappingsServiceOptions().get();
++			final TinyMappingsService mappingsService = serviceFactory.get(mappingsOptions);
++			final MemoryMappingTree mappings = mappingsService.getMappingTree();
++
++			MinecraftJarRemap.run(new MinecraftJarRemap.Options(
++					null,
++					inputJar,
++					outputJar,
++					getRemapClasspath().getFiles().stream()
++							.map(File::toPath)
++							.toList(),
++					mappings,
++					getFromNamespace().get(),
++					getToNamespace().get(),
++					getForgeLike().get(),
++					getInjectMixinExtension().get(),
++					getFixRecords().get(),
++					getValidateTargetNamespace().get(),
++					Set.copyOf(getInnerClassNames().get()),
++					Set.copyOf(getKnownIndyBsms().get()),
++					readAnnotations(),
++					Map.copyOf(getSignatureFixes().getOrElse(Map.of())),
++					getObjectHolderClassName().getOrNull(),
++					getObjectHolderSourceNamespace().getOrNull(),
++					getObjectHolderTargetNamespace().get(),
++					extraRemapperConfig
++			));
++		}
++	}
++
++	/**
++	 * 写出 pom，并把「声明出来的输出」与「{@link LocalMavenHelper#savePom} 实际写入的位置」对齐校验.
++	 *
++	 * <p>内容不在这里生成：模板与替换都由 {@code savePom} 负责（它写的是 {@code mod_compile_template.pom}
++	 * 模板加上 group/name/version 三处替换，且以「唯一临时文件 + 原子 move」落位）。本方法只做三件事：
++	 * 校验声明位置就是它会写入的位置、保证构件目录存在、以及确认写出的确实是本任务声明的那个文件。
++	 *
++	 * <p>若不校验，坐标式解析会在该位置长期读到「缺 pom」或「别处来的 pom」——前者让依赖解析失败，
++	 * 后者更糟：依赖能解析但拿到的是另一份内容。
++	 */
++	private void writePom(Path outputJar) throws IOException {
++		if (!getOutputPom().isPresent()) {
++			// 未声明 = 本次不产出 pom。接线侧（registerRemapTask）必定声明它，见 getOutputPom() 的说明
++			return;
++		}
++
++		if (!getPomGroup().isPresent() || !getPomName().isPresent() || !getPomVersion().isPresent() || !getPomMavenRoot().isPresent()) {
++			throw new IllegalStateException("声明了 pom 输出 %s，但缺少生成它所需的坐标（pomGroup=%s, pomName=%s, pomVersion=%s, pomMavenRoot=%s）。"
++					.formatted(getOutputPom().get().getAsFile(),
++							getPomGroup().getOrNull(), getPomName().getOrNull(), getPomVersion().getOrNull(), getPomMavenRoot().getOrNull()));
++		}
++
++		final Path pom = getOutputPom().get().getAsFile().toPath().toAbsolutePath().normalize();
++		final LocalMavenHelper mavenHelper = mavenHelper();
++
++		// 用 LocalMavenHelper 自己的公开接口复算落位：group 的点号展开、name/version 的拼接仍只由它负责，
++		// 本任务只按「pom 是 jar 的同名兄弟」把扩展名换掉（见 pomPathFor）。两侧都必须与声明出来的位置一致：
++		//   - 与 savePom 的落位一致，才能保证写出的就是声明的那个文件；
++		//   - 与 jar 的落位一致（同一构件目录），才能保证 pom 与 jar 成对。
++		final Path expectedPom = pomPathFor(
++				mavenHelper.root().resolve(mavenHelper.getRelativeArtifactPath(null)).toAbsolutePath().normalize());
++
++		if (!expectedPom.equals(pom) || !pomPathFor(outputJar.toAbsolutePath().normalize()).equals(pom)) {
++			throw new IllegalStateException("声明的 pom 输出 %s 与 LocalMavenHelper 会写入的 pom %s 不是同一个文件"
++					.formatted(pom, expectedPom)
++					+ "（或与声明的 jar %s 不同目录/不同名）。".formatted(outputJar)
++					+ "pom 的位置由 LocalMavenHelper 按 group/name/version 展开，本任务的 pom 输出必须与之一致，"
++					+ "否则坐标式依赖解析会缺 pom，或拿到不在构件目录里的那份。");
++		}
++
++		// savePom 不建目录：它把内容写进目标同目录的临时文件，目录不存在会直接失败
++		Files.createDirectories(pom.getParent());
++		mavenHelper.savePom();
++
++		if (Files.notExists(pom)) {
++			throw new IllegalStateException("savePom 之后本任务声明的 pom 输出 %s 仍不存在：说明声明的坐标/仓库根与实际落位不一致。"
++					.formatted(pom));
++		}
++	}
++
++	/**
++	 * 写出 jar 的逐字节副本（backup）.
++	 *
++	 * <p>顺序上是最后一步：配置期把 backup 当作「产物齐了」的就绪标志（见 {@code createBackupJars} 的注释），
++	 * 消费者（genSources）也按 {@code <jar>.backup} 找它，所以它必须在本任务的其它产物都落位之后再出现。
++	 */
++	private void writeBackupJar(Path outputJar) throws IOException {
++		if (!getOutputBackupJar().isPresent()) {
++			// 未声明 = 本 provider 不需要 backup（例如中间映射产物不会被反编译）
++			return;
++		}
++
++		final Path backupJar = getOutputBackupJar().get().getAsFile().toPath().toAbsolutePath().normalize();
++		final String expectedName = outputJar.getFileName() + ".backup";
++		final Path artifactJar = outputJar.toAbsolutePath().normalize();
++
++		// 消费者按固定规则找这个文件，声明的位置必须与之一致：否则会写出一份没人读的副本，
++		// 而 genSources 会在真正的路径上找不到输入（抛 IllegalStateException）
++		if (!expectedName.equals(backupJar.getFileName().toString()) || !artifactJar.getParent().equals(backupJar.getParent())) {
++			throw new IllegalStateException("声明的 backup 输出 %s 必须与 jar %s 同目录且名为 %s。"
++					.formatted(backupJar, artifactJar, expectedName));
++		}
++
++		// 副本与正本同处共享 maven 仓库，必须原子落位，避免读方读到半写的 backup 而误判产物就绪
++		AtomicFiles.copy(artifactJar, backupJar);
++	}
++
++	/**
++	 * {@return 与产物 jar 同名同目录、只有扩展名不同的 pom 路径}.
++	 *
++	 * <p>{@link LocalMavenHelper} 用同一对 {@code name/version} 计算构件的 jar 与 pom
++	 * （jar 是 {@code %s-%s.jar}、pom 是 {@code %s-%s.pom}），两者文件名主干完全相同，只差扩展名。
++	 * 因此「pom 是 jar 的同名兄弟」这一条就足以确定 pom 位置，不需要在任务侧复算 maven 目录布局
++	 * （group 的点号转斜杠等规则仍只由 LocalMavenHelper 负责）。
++	 *
++	 * <p>只认构件可能的扩展名（{@link LocalMavenHelper#copyToMaven} 接受的 {@code .jar} / {@code .zip}）：
++	 * 若按「最后一个点」盲切，像 {@code minecraft-merged-1.20.1-yarn} 这种没有扩展名、但名字里带版本号点号的
++	 * 路径会被切出一个看似合理却错误的 pom 名——那会让产物写到没人读的位置，且不报错。
++	 *
++	 * @param artifactJar 构件 jar 的路径
++	 */
++	public static Path pomPathFor(Path artifactJar) {
++		final String fileName = artifactJar.getFileName().toString();
++		final String stem;
++
++		if (fileName.endsWith(".jar")) {
++			stem = fileName.substring(0, fileName.length() - ".jar".length());
++		} else if (fileName.endsWith(".zip")) {
++			stem = fileName.substring(0, fileName.length() - ".zip".length());
++		} else {
++			throw new IllegalArgumentException("产物 %s 不是 .jar / .zip 构件，无法推导它的 pom".formatted(artifactJar));
++		}
++
++		return artifactJar.resolveSibling(stem + ".pom");
++	}
++
++	/** {@return 按当前输入构造的 maven 构件助手，用于复用 {@code savePom} 的内容与落位规则}. */
++	private LocalMavenHelper mavenHelper() {
++		return new LocalMavenHelper(getPomGroup().get(), getPomName().get(), getPomVersion().get(), null,
++				getPomMavenRoot().get().toPath());
++	}
++
++	private AnnotationsData readAnnotations() {
++		if (getAnnotationsJson().isPresent()) {
++			return AnnotationsData.GSON.fromJson(getAnnotationsJson().get(), AnnotationsData.class);
++		}
++
++		return null;
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/RemapMinecraftTaskRegistry.java b/src/main/java/net/fabricmc/loom/pipeline/RemapMinecraftTaskRegistry.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..5f6255eb8b1bcdb09e2f6f5fdd82d5134d3cff59
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/pipeline/RemapMinecraftTaskRegistry.java
+@@ -0,0 +1,329 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.pipeline;
++
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeMap;
++import java.util.TreeSet;
++import java.util.function.Function;
++import java.util.function.Supplier;
++
++import org.gradle.api.Project;
++import org.gradle.api.Task;
++import org.gradle.api.invocation.Gradle;
++import org.gradle.api.plugins.ExtraPropertiesExtension;
++import org.gradle.api.tasks.TaskProvider;
++import org.jspecify.annotations.Nullable;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * 「同一个产物路径，同一构建内只有一个生产者任务」的登记表.
++ *
++ * <p>本表覆盖所有把产物写进**跨项目共享 maven 仓库**的任务——重映射任务（{@link RemapMinecraftTask}）、
++ * 处理链任务（{@link ProcessMinecraftJarTask}）、补出 pom/backup 的伴随任务
++ * （{@link WriteMinecraftJarSidecarsTask}）与 mod 重映射任务（{@link RemapModsTask}，产物落在构建根的
++ * {@code remapped_mods} 仓库，构建内所有项目共用同一个目录）：{@code MavenScope.GLOBAL} 下是 Gradle 用户目录里的全局仓库
++ * （同一台机器上的所有构建、所有工作树共用），{@code MavenScope.LOCAL} 下则是构建根目录下的仓库
++ * （同一构建的多个子项目共用）。因此同一构建内两个配置相同的子项目会算出**同一条产物路径**——
++ * 处理链任务与伴随任务落在 LOCAL 仓库，同样受影响（它们的路径只由 MC 版本、映射标识、jar processor 哈希
++ * 与 jar 类型决定，与项目无关）。
++ *
++ * <p>既有实现靠「跨进程文件锁 + 原子落位」协调这件事，而不是靠「各任务各写各的产物」：同一条路径上本来就
++ * 允许出现多个生产者，谁先完成谁生效。改成任务后这条前提不再成立，而且失败是静默的——实测 Gradle 9.5 对
++ * 「不同项目的两个任务声明同一个 {@code @OutputFile}」既不报错也不排序，两个任务都会执行、后完成的覆盖
++ * 先完成的（本仓库 7436 class 的等价性对照正是建立在一份确定的产物上）；只有在有人按该路径取产物时，Gradle 的
++ * 隐式依赖校验才会以「uses this output of task ... without declaring an explicit or implicit dependency」让构建失败。
++ * 也就是说：这个共享不是「可以容忍的重复」，而是必须显式建模的所有权关系。
++ *
++ * <h2>本表如何建模</h2>
++ * 以产物路径为键做登记：第一次登记创建任务并成为该路径的**唯一生产者**，后续登记（同一构建内的其它项目）
++ * 只取回生产者的**任务路径**，不再创建第二个任务。消费方按该任务路径建依赖（{@code dependsOn} /
++ * {@code builtBy}）时，Gradle 会把它解析成真正的跨项目任务依赖，从而满足上面那条隐式依赖校验；
++ * 只声明 {@code mustRunAfter} 不够，它只排序、不保证产物存在。
++ *
++ * <p>生产单位是**批次**时（{@link RemapModsTask}：一批 mod 必须整批重映射）用 {@link #claimAll}：
++ * 逐条判定、只接手尚无人认领的产物，任务只写出并只声明属于自己的那些文件。这样做而不是「按批次整体比对」，
++ * 是因为两个项目的批次往往只是部分重叠（多模块工程里各模块的 mod 集合不同），按批次比对要么漏判、
++ * 要么把重叠的那部分又变成两个生产者；批次本身也不因此被截断——任务仍按完整批次读取输入，
++ * 因此每条产物的字节与「谁先登记」无关。
++ *
++ * <h2>为什么这张表必须跨 classloader 共享</h2>
++ * 同一构建里的各个项目未必由同一份 Loom 配置：约定插件/构建逻辑（included build、buildSrc）各自把 Loom
++ * 放到自己的 classpath 上时，不同项目拿到的是**不同 classloader 里的 Loom**。实测一个真实多模块工程
++ * （146 个模块、两条 MC 版本车道）在一次构建里出现了三份 Loom classloader，其中“车道根项目”与“车道内的模块”
++ * 分属两份。按 classloader 分表就等于承认「同一条产物路径上有多个生产者」，于是两边各注册一个
++ * {@code remapMinecraftNamedMerged} 写同一个文件，消费方的隐式依赖校验直接把构建打挂——
++ * 这正是本表存在的理由，所以表必须落在**构建级**、且只放 classloader 无关的数据。
++ *
++ * <p>表放在 {@link Gradle} 的扩展属性里（{@code gradle.ext}）：{@link ExtraPropertiesExtension} 是 Gradle
++ * 核心对象，同一构建的各个 classloader 拿到的是同一个实例；表内只允许出现
++ * {@code Map<String, Map<String, String>>} 这类 JDK 类型——若表里放本 classloader 定义的对象，
++ * 另一份 classloader 取回来时会在强制转换处抛 {@link ClassCastException}（同一个类名在两份 classloader 里
++ * 不是同一个类型）。也正是这个理由让 {@link Producer} 只带任务**路径**而不是 {@link TaskProvider}。
++ *
++ * <h2>为什么要比对输入指纹，而不是只按路径共享</h2>
++ * 复用同一个任务实例意味着第二个请求方拿到的是第一个请求方那次生产的产物。若两者输入不同（例如只有其中一个
++ * 项目改过 {@code loom.knownIndyBsms}、中间映射开关或 classpath），共享就会把 A 的产物当成 B 的产物——
++ * 这正是配置期旧路径的静默行为（第二个项目会被 {@code JarReusability} 判为「已就绪」而直接复用），
++ * 换成任务后必须变成可见的失败。因此每个请求方都带一份自己的输入指纹，指纹不同即拒绝共享并指出差异项。
++ *
++ * <h2>跨构建的那一半不在这里</h2>
++ * 本表的作用域是一次 Gradle 调用（同一构建的多个项目），覆盖不了「另一个工作树 / 另一个 daemon 正在写同一条
++ * 路径」：那一半仍由 {@code @OutputFile} 的 up-to-date 判定与产物的原子落位承担（见
++ * {@link net.fabricmc.loom.util.cache.AtomicFiles}）。本表只解决「同一构建内不该有两个生产者」，
++ * 且不改变任何已有产物的路径。
++ */
++public final class RemapMinecraftTaskRegistry {
++	private static final Logger LOGGER = LoggerFactory.getLogger(RemapMinecraftTaskRegistry.class);
++
++	/** 表在 {@code gradle.ext} 下的名字；带上 Loom 前缀避免与构建脚本自己的扩展属性撞名. */
++	private static final String CLAIMS_EXTENSION_NAME = "loomSharedArtifactProducers";
++
++	/** 表内记录生产者任务路径的保留键；保留键一律以 {@code @} 开头，与输入指纹的键（驼峰标识符）不会撞. */
++	private static final String PRODUCER_TASK_KEY = "@task";
++
++	/** 表内记录生产者所属项目路径的保留键，只在诊断输出里用. */
++	private static final String PRODUCER_PROJECT_KEY = "@project";
++
++	private RemapMinecraftTaskRegistry() {
++	}
++
++	/**
++	 * 登记一条产物路径的生产请求，返回该产物的唯一生产者.
++	 *
++	 * <p>第一次登记时调用 {@code registrar} 创建任务；后续登记的路径相同且 {@code identity} 完全一致时
++	 * 直接返回既有生产者的任务路径，{@code registrar} 不会被调用（因此不会产生第二个「同一产物的生产者」）。
++	 *
++	 * @param project 发起登记的项目
++	 * @param artifact 产物路径（本任务的 jar 输出）；路径本身相同即视为同一个构件
++	 * @param identity 本次登记的输入指纹，见类注释；键是输入名、值是它的可比较表示，值不得为 {@code null}，
++	 *         且键不得以 {@code @} 开头（那是本表的保留键）
++	 * @param registrar 创建任务的回调，仅在本次登记成为生产者时调用
++	 * @return 该产物的唯一生产者；产物路径已归一化为绝对路径
++	 * @throws IllegalStateException 同一构建内同一路径已被另一组输入登记为产物时
++	 */
++	public static Producer claim(Project project, Path artifact, Map<String, String> identity,
++			Supplier<TaskProvider<? extends Task>> registrar) {
++		final Path key = artifact.toAbsolutePath().normalize();
++		final Gradle gradle = project.getGradle();
++		final ExtraPropertiesExtension extensions = extraProperties(gradle);
++
++		// 整段持锁：查表 → 建任务 → 写表之间不允许插入另一个 classloader 的登记，否则两边都会查不到条目、
++		// 各自建一个任务。锁对象取 ExtraPropertiesExtension 本身——它是构建级核心对象，两份 classloader
++		// 拿到的是同一个实例，而各自的静态锁管不到对方。
++		synchronized (extensions) {
++			final Map<String, Map<String, String>> claims = claims(extensions);
++			final Map<String, String> existing = claims.get(key.toString());
++
++			if (existing != null) {
++				requireSameIdentity(key, existing, identity, project);
++				LOGGER.info("产物 {} 已由 {} 登记为唯一生产者，{} 复用同一个任务（不重复生产）",
++						key, existing.get(PRODUCER_PROJECT_KEY), project.getPath());
++				return new Producer(key, existing.get(PRODUCER_TASK_KEY));
++			}
++
++			final TaskProvider<? extends Task> task = registrar.get();
++			final Map<String, String> entry = new LinkedHashMap<>(identity);
++			entry.put(PRODUCER_TASK_KEY, absoluteTaskPath(project, task.getName()));
++			entry.put(PRODUCER_PROJECT_KEY, project.getPath());
++			claims.put(key.toString(), entry);
++			return new Producer(key, entry.get(PRODUCER_TASK_KEY));
++		}
++	}
++
++	/**
++	 * 登记一批产物路径的生产请求，返回**每一条**请求路径的生产者.
++	 *
++	 * <p>与 {@link #claim} 唯一的差别是「一次登记覆盖多条产物」。需要它是因为有些生产单位天然是批量的：
++	 * mod 重映射必须整批进行（跨 mod 的类型上下文不能拆开逐个重映射，否则结果与既有实现不等价），
++	 * 而这条批次里的每一条产物路径在别的项目里都可能已经被登记。
++	 *
++	 * <p>逐条判定、只接手尚无人认领的那些，并且**只对认领到的产物负责**：任务仍然按完整批次读取输入
++	 * （这样每一条产物的字节与「谁先登记」无关），但只写出、也只声明属于自己的那些产物。
++	 * 于是同一路径在同一构建内始终只有一个生产者，而批次本身不会因为共享而被截断。
++	 *
++	 * @param project 发起登记的项目
++	 * @param artifacts 本批次会写出的全部产物路径
++	 * @param identity 本批次的输入指纹（见类注释）；批内每条产物相同，且不得含对象身份
++	 * @param registrar 创建任务的回调，仅在存在无人认领的产物时调用一次，参数是**本任务拥有的产物路径**
++	 * @return 入参中每条路径（已归一化）的生产者；已被别人登记的返回既有的那个
++	 * @throws IllegalStateException 同一构建内同一路径已被另一组输入登记为产物时
++	 */
++	public static Map<Path, Producer> claimAll(Project project, List<Path> artifacts, Map<String, String> identity,
++			Function<List<Path>, TaskProvider<? extends Task>> registrar) {
++		final List<Path> distinct = new ArrayList<>(new LinkedHashSet<>(
++				artifacts.stream().map(artifact -> artifact.toAbsolutePath().normalize()).toList()));
++		final Gradle gradle = project.getGradle();
++		final ExtraPropertiesExtension extensions = extraProperties(gradle);
++
++		synchronized (extensions) {
++			final Map<String, Map<String, String>> claims = claims(extensions);
++			final Map<Path, Producer> producers = new LinkedHashMap<>();
++			final List<Path> owned = new ArrayList<>();
++
++			for (Path artifact : distinct) {
++				final Map<String, String> existing = claims.get(artifact.toString());
++
++				if (existing == null) {
++					owned.add(artifact);
++					continue;
++				}
++
++				requireSameIdentity(artifact, existing, identity, project);
++				producers.put(artifact, new Producer(artifact, existing.get(PRODUCER_TASK_KEY)));
++			}
++
++			if (!owned.isEmpty()) {
++				final TaskProvider<? extends Task> task = registrar.apply(List.copyOf(owned));
++				final String taskPath = absoluteTaskPath(project, task.getName());
++
++				for (Path artifact : owned) {
++					final Map<String, String> entry = new LinkedHashMap<>(identity);
++					entry.put(PRODUCER_TASK_KEY, taskPath);
++					entry.put(PRODUCER_PROJECT_KEY, project.getPath());
++					claims.put(artifact.toString(), entry);
++					producers.put(artifact, new Producer(artifact, taskPath));
++				}
++			}
++
++			return producers;
++		}
++	}
++
++	/**
++	 * 校验同一路径上的两次登记输入一致，不一致即拒绝共享并指出差异项.
++	 *
++	 * <p>共享一份输入不同的产物，等于把别的配置的结果静默交给本项目，因此这里必须是失败而不是复用。
++	 *
++	 * @param key 产物路径（已归一化）
++	 * @param existing 表内已有的登记条目
++	 * @param identity 本次登记的输入指纹
++	 * @param project 发起本次登记的项目
++	 * @throws IllegalStateException 两组输入不一致时
++	 */
++	private static void requireSameIdentity(Path key, Map<String, String> existing, Map<String, String> identity, Project project) {
++		final Map<String, String> existingIdentity = identityOf(existing);
++
++		if (existingIdentity.equals(new TreeMap<>(identity))) {
++			return;
++		}
++
++		throw new IllegalStateException(("产物 %s 在同一构建内被以两组不同的输入请求生产，无法共享同一个任务：\n"
++				+ "%s"
++				+ "该路径位于跨项目共享的 maven 仓库，同一条路径只能有一个生产者——不同输入写到同一路径，"
++				+ "会让先完成的一方被另一方覆盖，产物与请求方的配置不符。可行处置：\n"
++				+ "  1. 若两个项目本就该产出同一个 jar，请让它们的输入完全一致（见上面的差异项）；\n"
++				+ "  2. 若确实需要两个不同的 jar，需要不同的产物路径，即不同的 name/version"
++				+ "（映射、MC 版本、中间映射提供者或 jar processor 配置）；\n"
++				+ "  3. 若差异来自按项目设置的扩展项（loom.knownIndyBsms、useIntermediateMappings 等），"
++				+ "请在各项目间统一。")
++				.formatted(key, describeDifference(existingIdentity, existing.get(PRODUCER_PROJECT_KEY), project, identity)));
++	}
++
++	/** {@return 构建级的登记表} 不存在时创建；只在 {@link ExtraPropertiesExtension} 的锁内调用. */
++	@SuppressWarnings("unchecked")
++	private static Map<String, Map<String, String>> claims(ExtraPropertiesExtension extensions) {
++		if (extensions.has(CLAIMS_EXTENSION_NAME)) {
++			// 只可能装本方法写入的 Map<String, Map<String, String>>：值是 JDK 类型，
++			// 因此另一份 classloader 取回来的对象本 classloader 也能直接当 Map 用（见类注释）
++			return (Map<String, Map<String, String>>) extensions.get(CLAIMS_EXTENSION_NAME);
++		}
++
++		final Map<String, Map<String, String>> claims = new LinkedHashMap<>();
++		extensions.set(CLAIMS_EXTENSION_NAME, claims);
++		return claims;
++	}
++
++	/** {@return 构建级扩展属性容器} 跨 classloader 是同一个实例，故既能当共享存储也能当锁. */
++	private static ExtraPropertiesExtension extraProperties(Gradle gradle) {
++		return gradle.getExtensions().getExtraProperties();
++	}
++
++	/** {@return 剥离保留键后的输入指纹} 用于比较两次登记是否等价. */
++	private static Map<String, String> identityOf(Map<String, String> entry) {
++		final Map<String, String> identity = new TreeMap<>(entry);
++		identity.remove(PRODUCER_TASK_KEY);
++		identity.remove(PRODUCER_PROJECT_KEY);
++		return identity;
++	}
++
++	/** {@return 项目内任务的绝对路径} 直接交给 {@code dependsOn}/{@code builtBy} 使用. */
++	private static String absoluteTaskPath(Project project, String taskName) {
++		return project.getPath().equals(":") ? ":" + taskName : project.getPath() + ":" + taskName;
++	}
++
++	/**
++	 * {@return 两组输入指纹的差异，逐项列出「本次」与「已在生产者」的取值}.
++	 *
++	 * <p>按输入名排序输出，便于两次构建的日志互相对照；只在一边出现的键同样列出，避免「对方没设」被当成「一致」.
++	 */
++	private static String describeDifference(Map<String, String> existing, @Nullable String producerProject,
++			Project project, Map<String, String> identity) {
++		final Set<String> keys = new TreeSet<>(existing.keySet());
++		keys.addAll(identity.keySet());
++		final Map<String, String> sorted = new TreeMap<>(identity);
++		final StringBuilder difference = new StringBuilder();
++
++		for (String key : keys) {
++			final String claimed = sorted.get(key);
++			final String current = existing.get(key);
++
++			if (claimed == null || !claimed.equals(current)) {
++				difference.append("  - ").append(key)
++						.append(": 本次（").append(project.getPath()).append("）=").append(describeValue(claimed))
++						.append("，已在生产者（").append(producerProject).append("）=").append(describeValue(current))
++						.append('\n');
++			}
++		}
++
++		return difference.toString();
++	}
++
++	private static String describeValue(@Nullable String value) {
++		return value == null ? "<未设置>" : value;
++	}
++
++	/**
++	 * 一条共享产物的生产位置.
++	 *
++	 * <p>只带「产物路径」与「产出它的任务的绝对路径」两个 JDK 值：产出方可能由另一份 classloader 加载的
++	 * Loom 注册（见类注释），此时把对方的 {@link TaskProvider} 交给本 classloader 会在使用它的地方抛
++	 * {@link ClassCastException}；任务路径是字符串，交给 {@code Task#dependsOn}、
++	 * {@code ConfigurableFileCollection#builtBy} 都能被 Gradle 解析成真正的任务依赖。
++	 *
++	 * @param artifact 产物文件（绝对规范化路径）
++	 * @param taskPath 产出该产物的任务的绝对路径（如 {@code :a:remapMinecraftNamedMerged}）；
++	 *         产物由配置期生产（未投影成任务）时为 {@code null}
++	 */
++	public record Producer(Path artifact, @Nullable String taskPath) {
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/WriteMinecraftJarSidecarsTask.java b/src/main/java/net/fabricmc/loom/pipeline/WriteMinecraftJarSidecarsTask.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe65a1a4315d566e09e98c758761a6c391779adb
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/pipeline/WriteMinecraftJarSidecarsTask.java
+@@ -0,0 +1,185 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.pipeline;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++
++import org.gradle.api.DefaultTask;
++import org.gradle.api.file.RegularFileProperty;
++import org.gradle.api.provider.Property;
++import org.gradle.api.tasks.CacheableTask;
++import org.gradle.api.tasks.Input;
++import org.gradle.api.tasks.InputFile;
++import org.gradle.api.tasks.Optional;
++import org.gradle.api.tasks.OutputFile;
++import org.gradle.api.tasks.PathSensitive;
++import org.gradle.api.tasks.PathSensitivity;
++import org.gradle.api.tasks.TaskAction;
++
++import net.fabricmc.loom.configuration.mods.dependency.LocalMavenHelper;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++
++/**
++ * 补出 maven 构件目录里「不属于 jar processor 链」的两个文件：pom 与 backup.
++ *
++ * <p>{@link ProcessMinecraftJarTask} 只产出 jar，且这是刻意的设计（见其类注释的「本任务不产出的东西」）：
++ * 它按「处理器链就地改 jar」建模，而 pom 是坐标的纯函数、backup 是链跑完之后才该出现的副本。
++ * 但配置期那条路径在 {@code copyToMaven} 与 {@code createBackupJars} 里顺带产生了这两个文件，
++ * 缺它们会直接破坏下游：缺 pom 让按坐标解析该构件的依赖失败，缺 backup 让 {@code genSources} 抛
++ * 「Input minecraft jar not found」。因此切换生产路径时必须由别处继续产出它们——就是本任务。
++ *
++ * <h2>为什么单独一个任务，而不是塞进处理任务</h2>
++ * 两者的就绪前提不同：pom 与 backup 都必须在链**跑完之后**产生（backup 更是 jar 的逐字节副本，
++ * 早于链完成就复制等于复制了一份半成品）。拆开之后 {@link ProcessMinecraftJarTask} 保持原样，
++ * 顺序由 Gradle 从本任务对 jar 的 {@code @InputFile} 依赖推出。
++ *
++ * <h2>落位必须原子</h2>
++ * 两个文件都位于跨进程、跨 daemon 共享的 maven 仓库，且配置期就已是原子落位
++ * （{@code savePom} 的唯一临时文件 + 原子 move，{@code createBackupJars} 的 {@code AtomicFiles.copy}）。
++ * 本任务沿用同一条契约：否则读方会读到半写的 pom / backup，而「内容判定」发现不了这类残骸。
++ */
++@CacheableTask
++public abstract class WriteMinecraftJarSidecarsTask extends DefaultTask {
++	/** 已由处理任务落位的 jar；本任务只为它补出同构件目录里的 pom 与 backup. */
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getJar();
++
++	/**
++	 * pom 的输出位置，由接线侧按 {@link LocalMavenHelper} 的 name/version 算出.
++	 *
++	 * <p>未设置 = 本次不产出 pom（例如调用方按文件而不是坐标消费该构件）。
++	 */
++	@Optional
++	@OutputFile
++	public abstract RegularFileProperty getPom();
++
++	/** 写 pom 所需坐标之一；未设置 {@link #getPom()} 时无意义. */
++	@Optional
++	@Input
++	public abstract Property<String> getPomGroup();
++
++	/** 写 pom 所需坐标之一；未设置 {@link #getPom()} 时无意义. */
++	@Optional
++	@Input
++	public abstract Property<String> getPomName();
++
++	/** 写 pom 所需坐标之一；未设置 {@link #getPom()} 时无意义. */
++	@Optional
++	@Input
++	public abstract Property<String> getPomVersion();
++
++	/** 写 pom 所需坐标之一（maven 仓库根）；未设置 {@link #getPom()} 时无意义. */
++	@Optional
++	@Input
++	public abstract Property<String> getPomMavenRoot();
++
++	/**
++	 * jar 的逐字节副本的输出位置.
++	 *
++	 * <p>未设置 = 本 provider 不需要 backup（中间映射产物不会被反编译）。
++	 */
++	@Optional
++	@OutputFile
++	public abstract RegularFileProperty getBackupJar();
++
++	@TaskAction
++	public void write() throws IOException {
++		final Path jar = getJar().get().getAsFile().toPath().toAbsolutePath().normalize();
++
++		if (getPom().isPresent()) {
++			writePom(jar);
++		}
++
++		if (getBackupJar().isPresent()) {
++			writeBackupJar(jar);
++		}
++	}
++
++	/**
++	 * 写出 pom，并把「声明出来的输出」与「{@link LocalMavenHelper#savePom} 实际写入的位置」对齐校验.
++	 *
++	 * <p>内容不在这里生成：模板与替换都由 {@code savePom} 负责。本方法只做三件事——校验声明位置就是
++	 * 它会写入的位置、保证构件目录存在、确认写出的确实是本任务声明的那个文件。不校验的话，
++	 * 坐标式解析会在该位置长期读到「缺 pom」或「别处来的 pom」——后者更糟：解析成功但内容不是这一份。
++	 */
++	private void writePom(Path jar) throws IOException {
++		if (!getPomGroup().isPresent() || !getPomName().isPresent() || !getPomVersion().isPresent() || !getPomMavenRoot().isPresent()) {
++			throw new IllegalStateException("声明了 pom 输出 %s，但缺少生成它所需的坐标（pomGroup=%s, pomName=%s, pomVersion=%s, pomMavenRoot=%s）。"
++					.formatted(getPom().get().getAsFile(),
++							getPomGroup().getOrNull(), getPomName().getOrNull(), getPomVersion().getOrNull(), getPomMavenRoot().getOrNull()));
++		}
++
++		final Path pom = getPom().get().getAsFile().toPath().toAbsolutePath().normalize();
++		final LocalMavenHelper mavenHelper = new LocalMavenHelper(
++				getPomGroup().get(), getPomName().get(), getPomVersion().get(), null,
++				Path.of(getPomMavenRoot().get()));
++
++		// 用 LocalMavenHelper 自己的公开接口复算落位：group 的点号展开、name/version 的拼接仍只由它负责。
++		// 两侧都必须一致：与 savePom 的落位一致，才能保证写出的就是声明的那个文件；
++		// 与 jar 的落位一致（同一构件目录），才能保证 pom 与 jar 成对。
++		final Path expectedPom = RemapMinecraftTask.pomPathFor(
++				mavenHelper.root().resolve(mavenHelper.getRelativeArtifactPath(null)).toAbsolutePath().normalize());
++
++		if (!expectedPom.equals(pom) || !RemapMinecraftTask.pomPathFor(jar).equals(pom)) {
++			throw new IllegalStateException("声明的 pom 输出 %s 与 LocalMavenHelper 会写入的 pom %s 不是同一个文件"
++					.formatted(pom, expectedPom)
++					+ "（或与 jar %s 不同目录/不同名）。".formatted(jar)
++					+ "pom 的位置由 LocalMavenHelper 按 group/name/version 展开，本任务的 pom 输出必须与之一致，"
++					+ "否则坐标式依赖解析会缺 pom，或拿到不在构件目录里的那份。");
++		}
++
++		// savePom 不建目录：它把内容写进目标同目录的临时文件，目录不存在会直接失败
++		Files.createDirectories(pom.getParent());
++		mavenHelper.savePom();
++
++		if (Files.notExists(pom)) {
++			throw new IllegalStateException("savePom 之后本任务声明的 pom 输出 %s 仍不存在：说明声明的坐标/仓库根与实际落位不一致。"
++					.formatted(pom));
++		}
++	}
++
++	/**
++	 * 写出 jar 的逐字节副本（backup）.
++	 *
++	 * <p>顺序上是最后一步：backup 是配置期用来表示「产物齐了」的就绪标志，消费者
++	 * （{@code GenerateSourcesTask}）也按 {@code <jar>.backup} 找它，因此它必须在链与 pom 都落位之后才出现。
++	 */
++	private void writeBackupJar(Path jar) throws IOException {
++		final Path backup = getBackupJar().get().getAsFile().toPath().toAbsolutePath().normalize();
++
++		// 消费者按固定规则找这个文件，声明的位置必须与之一致：否则会写出一份没人读的副本，
++		// 而 genSources 会在真正的路径上找不到输入
++		if (!(jar.getFileName() + ".backup").equals(backup.getFileName().toString()) || !jar.getParent().equals(backup.getParent())) {
++			throw new IllegalStateException("声明的 backup 输出 %s 必须与 jar %s 同目录且名为 %s。"
++					.formatted(backup, jar, jar.getFileName() + ".backup"));
++		}
++
++		// 副本与正本同处共享 maven 仓库，必须原子落位，避免读方读到半写的 backup 而误判产物就绪
++		AtomicFiles.copy(jar, backup);
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/package-info.java b/src/main/java/net/fabricmc/loom/pipeline/package-info.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d4b6e1941470deb015ed6fcace9c3471374a8d73
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/pipeline/package-info.java
+@@ -0,0 +1,28 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++@NullMarked
++package net.fabricmc.loom.pipeline;
++
++import org.jspecify.annotations.NullMarked;

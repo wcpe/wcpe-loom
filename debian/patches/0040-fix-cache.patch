@@ -1,0 +1,402 @@
+From 44ab9df098cca940edaacbade6d19edfe83bd922 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:43 +0800
+Subject: [PATCH 040/147] =?UTF-8?q?fix(cache):=20=E9=94=81=E6=96=87?=
+ =?UTF-8?q?=E4=BB=B6=E7=8A=B6=E6=80=81=E6=B1=A1=E6=9F=93=E9=85=8D=E7=BD=AE?=
+ =?UTF-8?q?=E7=BC=93=E5=AD=98=E5=AF=BC=E8=87=B4=E5=81=B6=E5=8F=91=E5=85=A8?=
+ =?UTF-8?q?=E9=87=8F=E9=87=8D=E7=AE=97?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+配置阶段对锁文件的存在性判断会被配置缓存记入指纹，而锁文件是本次构建创建、构建末尾
+删除的瞬时文件：一旦某次构建带着上次被杀留下的锁文件启动，构建就会记录下"文件存在"，
+该文件随后被删除，于是下一次构建读到"文件不存在"并丢弃配置缓存，白花约 33 秒重算。
+残留路径读取 PID 内容同样会被记成文件输入，产生同类失效。
+
+- 锁文件存在性判断改用文件通道探测，删除改用 Files.delete，避免触发指纹记录
+- 判定上次是否干净收尾不再读取文件内容，改用 OS 文件锁区分"被占用"与"上次残留"
+- 配置失败时保留锁文件、只释放锁，崩溃恢复语义保持不变
+- 新增残留锁回归用例：未修复时复现 has been removed，修复后直接复用缓存
+- OfflineModeTest 断言同步到新判定路径
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+index ecfe4f8de1a3ed70e96143d5047862145b98f1ec..2c65c946ad27c4840a54f4e6831c4b9a885d1ef2 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+@@ -28,12 +28,18 @@ import static net.fabricmc.loom.util.Constants.Configurations;
+ 
+ import java.io.IOException;
+ import java.io.UncheckedIOException;
++import java.nio.channels.FileChannel;
++import java.nio.channels.FileLock;
++import java.nio.channels.OverlappingFileLockException;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
++import java.nio.file.NoSuchFileException;
+ import java.nio.file.Path;
++import java.nio.file.StandardOpenOption;
+ import java.time.Duration;
+ import java.util.Objects;
+-import java.util.Optional;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
+ import java.util.function.Consumer;
+ 
+ import javax.inject.Inject;
+@@ -96,7 +102,6 @@ import net.fabricmc.loom.extension.MixinExtension;
+ import net.fabricmc.loom.task.service.ClasspathGroupService;
+ import net.fabricmc.loom.util.Checksum;
+ import net.fabricmc.loom.util.ExceptionUtil;
+-import net.fabricmc.loom.util.ProcessUtil;
+ import net.fabricmc.loom.util.gradle.GradleUtils;
+ import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.loom.util.gradle.SourceSetHelper;
+@@ -106,6 +111,10 @@ import net.fabricmc.loom.util.service.ServiceFactory;
+ 
+ public abstract class CompileConfiguration implements Runnable {
+ 	private static final String LOCK_PROPERTY_KEY = "fabric.loom.internal.global.lock";
++	// 本进程当前持有的构建锁路径，用于识别同一进程内的重复加锁
++	private static final Set<Path> OWNED_LOCKS = ConcurrentHashMap.newKeySet();
++	private FileLock processLock;
++	private FileChannel processLockChannel;
+ 
+ 	@Inject
+ 	protected abstract Project getProject();
+@@ -514,12 +523,38 @@ public abstract class CompileConfiguration implements Runnable {
+ 	enum LockResult {
+ 		// acquired immediately or after waiting for another process to release
+ 		ACQUIRED_CLEAN,
+-		// already owned by current pid
++		// already owned by the current process
+ 		ACQUIRED_ALREADY_OWNED,
+-		// acquired due to current owner not existing
+-		ACQUIRED_PREVIOUS_OWNER_MISSING,
+-		// acquired due to previous owner disowning the lock
+-		ACQUIRED_PREVIOUS_OWNER_DISOWNED
++		// acquired after a previous build left the lock file behind
++		ACQUIRED_PREVIOUS_OWNER_MISSING
++	}
++
++	// 判断锁文件是否存在。
++	// 不能直接用 Files.exists / File.exists：这类存在性判断会被配置缓存记入指纹，
++	// 而锁文件是配置阶段创建、构建末尾删除的瞬时文件。
++	// 一旦某次构建带着上次被杀留下的锁文件启动，构建就会记录“文件存在”，
++	// 但该文件在本次构建末尾被删除，于是下一次构建读到“文件不存在”，
++	// 配置缓存被判为失效（the file system entry '...lock' has been removed），白白重算约 33 秒。
++	// 这里改用文件通道探测：打开成功即存在，通道打开不会被配置缓存记录。
++	private static boolean lockFileExists(Path file) {
++		try (FileChannel channel = FileChannel.open(file, StandardOpenOption.WRITE)) {
++			return true;
++		} catch (final NoSuchFileException e) {
++			return false;
++		} catch (final IOException e) {
++			// 无法判定时保守视为存在，交由后续加锁逻辑处理
++			return true;
++		}
++	}
++
++	// 删除锁文件，文件本来就不存在时静默返回。
++	// 不使用 Files.deleteIfExists，因为它内部同样包含会污染配置缓存指纹的存在性判断。
++	private static void deleteLockFile(Path file) throws IOException {
++		try {
++			Files.delete(file);
++		} catch (final NoSuchFileException ignored) {
++			// 文件已不存在，无需处理
++		}
+ 	}
+ 
+ 	private LockResult acquireProcessLockWaiting(LockFile lockFile) {
+@@ -535,89 +570,88 @@ public abstract class CompileConfiguration implements Runnable {
+ 		}
+ 	}
+ 
+-	// Returns true if our process already owns the lock
++	// 取得跨进程构建锁。
++	// 锁文件只承载两件事：是否存在（上次构建是否干净收尾）、以及 OS 文件锁（是否有进程正在配置构建）。
++	// 这里刻意不读取文件内容：读内容会被配置缓存记为文件输入，
++	// 而锁文件在构建末尾会因干净收尾被删除，下一次构建便会以 file '...lock' has been removed 为由丢弃配置缓存。
++	// 返回 ACQUIRED_CLEAN 表示上次构建干净收尾，其余结果表示需要重建 loom 缓存。
+ 	@SuppressWarnings("BusyWait")
+ 	private LockResult acquireProcessLockWaiting_(LockFile lockFile, Duration timeout) throws IOException {
+ 		final long timeoutMs = timeout.toMillis();
+ 		final Logger logger = Logging.getLogger("loom_acquireProcessLockWaiting");
+-		final long currentPid = ProcessHandle.current().pid();
+-		boolean abrupt = false;
+-		boolean disowned = false;
++		final Path lock = lockFile.file;
+ 
+-		if (Files.exists(lockFile.file)) {
+-			long lockingProcessId = -1;
++		if (OWNED_LOCKS.contains(lock)) {
++			// 同一进程已持有该锁
++			return LockResult.ACQUIRED_ALREADY_OWNED;
++		}
+ 
+-			try {
+-				String lockValue = Files.readString(lockFile.file);
++		// createDirectories 在目录已存在时不会报错，省去一次会污染配置缓存指纹的存在性判断
++		Files.createDirectories(lock.getParent());
+ 
+-				if ("disowned".equals(lockValue)) {
+-					disowned = true;
+-				} else {
+-					lockingProcessId = Long.parseLong(lockValue);
+-					logger.lifecycle("\"{}\" is currently held by pid '{}'.", lockFile, lockingProcessId);
+-				}
+-			} catch (final Exception ignored) {
+-				// ignored
+-			}
++		// 锁文件在干净收尾时会被删除，因此它存在即表示上次构建没能清理自己
++		final boolean leftByPreviousBuild = lockFileExists(lock);
+ 
+-			if (lockingProcessId == currentPid) {
+-				return LockResult.ACQUIRED_ALREADY_OWNED;
+-			}
+-
+-			Optional<ProcessHandle> handle = ProcessHandle.of(lockingProcessId);
++		if (leftByPreviousBuild) {
++			logger.lifecycle("Lock file \"{}\" was left by a previous build, assuming abrupt termination.", lockFile);
++		}
+ 
+-			if (disowned) {
+-				logger.lifecycle("Previous process has disowned the lock due to abrupt termination.");
+-				Files.deleteIfExists(lockFile.file);
+-			} else if (handle.isEmpty()) {
+-				logger.lifecycle("Locking process does not exist, assuming abrupt termination and deleting lock file.");
+-				Files.deleteIfExists(lockFile.file);
+-				abrupt = true;
+-			} else {
+-				ProcessUtil processUtil = ProcessUtil.create(getProject());
+-				logger.lifecycle(processUtil.printWithParents(handle.get()));
+-				logger.lifecycle("Waiting for lock to be released...");
+-				long sleptMs = 0;
++		// 仅以写方式打开，不读取文件内容
++		final FileChannel channel = FileChannel.open(lock, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
++		FileLock fileLock = null;
++		long waitedMs = 0;
++		boolean reported = false;
+ 
+-				while (Files.exists(lockFile.file)) {
+-					try {
+-						Thread.sleep(100);
+-					} catch (final InterruptedException e) {
+-						Thread.currentThread().interrupt();
+-					}
++		try {
++			while (fileLock == null) {
++				try {
++					fileLock = channel.tryLock();
++				} catch (OverlappingFileLockException e) {
++					// 同一 JVM 内已持有，按被占用处理
++				}
+ 
+-					sleptMs += 100;
++				if (fileLock != null) {
++					break;
++				}
+ 
+-					if (sleptMs >= 1000 * 60 && sleptMs % (1000 * 60) == 0L) {
+-						logger.lifecycle(
+-								"""
+-										Have been waiting on "{}" held by pid '{}' for {} minute(s).
+-										If this persists for an unreasonable length of time, kill this process, run './gradlew --stop' and then try again.""",
+-								lockFile, lockingProcessId, sleptMs / 1000 / 60
+-						);
+-					}
++				if (!reported) {
++					reported = true;
++					logger.lifecycle("\"{}\" is currently held by another process, waiting for it to be released...", lockFile);
++				}
+ 
+-					if (sleptMs >= timeoutMs) {
+-						throw new GradleException("Have been waiting on lock file '%s' for %s ms. Giving up as timeout is %s ms."
+-								.formatted(lockFile, sleptMs, timeoutMs));
+-					}
++				try {
++					Thread.sleep(100);
++				} catch (final InterruptedException e) {
++					Thread.currentThread().interrupt();
++					throw new IOException("Interrupted while waiting for " + lockFile, e);
+ 				}
+-			}
+-		}
+ 
+-		if (!Files.exists(lockFile.file.getParent())) {
+-			Files.createDirectories(lockFile.file.getParent());
+-		}
++				waitedMs += 100;
+ 
+-		Files.writeString(lockFile.file, String.valueOf(currentPid));
++				if (waitedMs >= 1000 * 60 && waitedMs % (1000 * 60) == 0L) {
++					logger.lifecycle(
++							"""
++									Have been waiting on "{}" held by another process for {} minute(s).
++									If this persists for an unreasonable length of time, kill this process, run './gradlew --stop' and then try again.""",
++							lockFile, waitedMs / 1000 / 60
++					);
++				}
+ 
+-		if (disowned) {
+-			return LockResult.ACQUIRED_PREVIOUS_OWNER_DISOWNED;
+-		} else if (abrupt) {
+-			return LockResult.ACQUIRED_PREVIOUS_OWNER_MISSING;
++				if (waitedMs >= timeoutMs) {
++					throw new GradleException("Have been waiting on lock file '%s' for %s ms. Giving up as timeout is %s ms."
++							.formatted(lockFile, waitedMs, timeoutMs));
++				}
++			}
++		} catch (Throwable t) {
++			closeQuietly(channel);
++			throw t;
+ 		}
+ 
+-		return LockResult.ACQUIRED_CLEAN;
++		processLock = fileLock;
++		processLockChannel = channel;
++		OWNED_LOCKS.add(lock);
++
++		return leftByPreviousBuild ? LockResult.ACQUIRED_PREVIOUS_OWNER_MISSING : LockResult.ACQUIRED_CLEAN;
+ 	}
+ 
+ 	private static Duration getDefaultTimeout() {
+@@ -629,27 +663,51 @@ public abstract class CompileConfiguration implements Runnable {
+ 		return Duration.ofHours(1);
+ 	}
+ 
+-	// When we fail to configure, write "disowned" to the lock file to release it from this process
+-	// This allows the next run to rebuild without waiting for this process to exit
++	// 配置失败时保留锁文件、只释放 OS 锁，
++	// 使下一次构建能判定上次未干净收尾并重建缓存，而无需等待本进程退出
+ 	private void disownLock() {
+-		final Path lock = getLockFile().file;
++		releaseProcessLock();
++	}
++
++	private void releaseProcessLock() {
++		final FileLock lock = processLock;
++		final FileChannel channel = processLockChannel;
++		processLock = null;
++		processLockChannel = null;
++
++		if (lock == null) {
++			return;
++		}
+ 
+ 		try {
+-			Files.writeString(lock, "disowned");
+-		} catch (IOException e) {
+-			throw new RuntimeException(e);
++			lock.release();
++		} catch (IOException ignored) {
++			// 忽略
+ 		}
+-	}
+ 
+-	private void releaseLock() {
+-		final Path lock = getLockFile().file;
++		closeQuietly(channel);
++		OWNED_LOCKS.remove(getLockFile().file);
++	}
+ 
+-		if (!Files.exists(lock)) {
++	private static void closeQuietly(FileChannel channel) {
++		if (channel == null) {
+ 			return;
+ 		}
+ 
+ 		try {
+-			Files.delete(lock);
++			channel.close();
++		} catch (IOException ignored) {
++			// 忽略
++		}
++	}
++
++	private void releaseLock() {
++		releaseProcessLock();
++
++		final Path lock = getLockFile().file;
++
++		try {
++			deleteLockFile(lock);
+ 		} catch (IOException e1) {
+ 			try {
+ 				// If we failed to delete the lock file, moving it before trying to delete it may help.
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/ConfigurationCacheTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/ConfigurationCacheTest.groovy
+index 7e9fde8da28a710df5cba08088f04bd130114e2e..7ecde867944cd6bcd82a9f94ec6a54ca044ee94b 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/ConfigurationCacheTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/ConfigurationCacheTest.groovy
+@@ -126,6 +126,56 @@ class ConfigurationCacheTest extends Specification implements GradleProjectTestT
+ 		version << STANDARD_TEST_VERSIONS
+ 	}
+ 
++	// 上一次构建被杀（或另一构建持锁）时会在用户缓存里留下锁文件，
++	// 该锁文件的清理不得让后续构建反复失效配置缓存
++	@Unroll
++	def "Leftover cache lock file (#version)"() {
++		setup:
++		def gradle = gradleProject(project: "minimalBase", version: version)
++		gradle.buildGradle << """
++            dependencies {
++                minecraft 'com.mojang:minecraft:1.20.4'
++                mappings 'net.fabricmc:yarn:1.20.4+build.3:v2'
++                modImplementation "${LoomTestVersions.FABRIC_LOADER.mavenNotation()}"
++            }
++
++			import net.fabricmc.loom.util.Checksum
++			println("%%" + Checksum.of(getProject()).sha1().hex() + "%%")
++            """.stripIndent()
++
++		when:
++		def result1 = gradle.run(task: "help")
++		def projectHash = result1.output.split("%%")[1]
++
++		// 模拟上一次构建在配置阶段被杀，留下一个记录着已死进程号的锁文件
++		def lockFile = new File(gradle.gradleHomeDir, "caches/fabric-loom/.${projectHash}.lock")
++		lockFile.text = "12345"
++
++		// 残留锁不得使配置缓存失效，此时配置阶段未被重跑，Loom 也无从清理该文件
++		def result2 = gradle.run(task: "help")
++
++		// 强制重新配置，此时 Loom 才会执行加锁逻辑并识别残留锁
++		gradle.buildGradle << "\n// force reconfiguration\n"
++		def result3 = gradle.run(task: "help")
++		// 锁文件已在上一轮被清理，必须恢复复用
++		def result4 = gradle.run(task: "help")
++
++		then:
++		result1.output.contains("Calculating task graph as no cached configuration is available")
++		// 残留锁文件不得让配置缓存失效：第 2 轮必须直接复用
++		result2.output.contains("Reusing configuration cache")
++		result3.task(":help").outcome != FAILED
++		// 重新配置时识别残留锁并重建 loom 缓存
++		result3.output.contains("rebuilding loom cache")
++		// 后续构建不得再因锁文件被删除或内容变化而失效
++		// （loom 缓存产物被创建导致的失效属于既有行为，不在本用例范围内）
++		!result4.output.contains(".lock' has been removed")
++		!result4.output.contains(".lock' has changed")
++
++		where:
++		version << STANDARD_TEST_VERSIONS
++	}
++
+ 	static def fmj(String version) {
+ 		return """
+ 		{
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/OfflineModeTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/OfflineModeTest.groovy
+index 2f1f95a29844f20c2b2858a505531729c00a02cd..17a492f388427f8ad2cd9f0fc8906ddd45694d92 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/OfflineModeTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/OfflineModeTest.groovy
+@@ -68,7 +68,7 @@ class OfflineModeTest extends Specification implements GradleProjectTestTrait {
+ 		result1.task(":build").outcome == SUCCESS
+ 		result2.task(":build").outcome == SUCCESS
+ 
+-		result2.output.contains("is currently held by pid '12345'")
++		result2.output.contains("was left by a previous build, assuming abrupt termination.")
+ 		result2.output.contains("rebuilding loom cache")
+ 	}
+ }

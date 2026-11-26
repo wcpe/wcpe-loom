@@ -1,0 +1,29 @@
+From ecf04c8342c1269989679bed90de467ca182fe8d Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:22 +0800
+Subject: [PATCH 004/147] =?UTF-8?q?fix(build):=20=E5=A4=8D=E5=90=88?=
+ =?UTF-8?q?=E6=9E=84=E5=BB=BA=E4=BF=9D=E7=95=99=E5=85=A8=E5=B1=80=E4=BE=9D?=
+ =?UTF-8?q?=E8=B5=96=E6=9B=BF=E6=8D=A2=E8=A7=84=E5=88=99=E5=B9=B6=E5=85=B1?=
+ =?UTF-8?q?=E4=BA=AB=E5=85=83=E6=95=B0=E6=8D=AE=E7=BC=93=E5=AD=98?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+复合构建（included build）场景下依赖替换规则丢失、元数据被重复解析；改为保留规则
+并跨子项目共享元数据缓存。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/RemappedProjectView.java b/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/RemappedProjectView.java
+index 33355beff04dc8cb70d1d1780ab89084ce0adfd5..787b66b7d2750ec445c82740cac7fecb691c0601 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/RemappedProjectView.java
++++ b/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/RemappedProjectView.java
+@@ -61,6 +61,7 @@ public interface RemappedProjectView extends ProjectView {
+ 			return settings -> {
+ 				final Configuration configuration = settings.getSourceConfiguration().get().copyRecursive();
+ 				configuration.setCanBeConsumed(false);
++				configuration.getResolutionStrategy().getUseGlobalDependencySubstitutionRules().set(true);
+ 				configuration.attributes(attributes -> attributes.attribute(Usage.USAGE_ATTRIBUTE, usage));
+ 				return configuration.resolve().stream().map(File::toPath);
+ 			};

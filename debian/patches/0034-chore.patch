@@ -1,0 +1,22 @@
+From a2fe2e5b97d2853f55172c3bc2137a75da0a079d Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:40 +0800
+Subject: [PATCH 034/147] =?UTF-8?q?chore:=20=E7=A7=BB=E9=99=A4=E8=AF=AF?=
+ =?UTF-8?q?=E5=8A=A0=E5=85=A5=E7=9A=84=E6=B5=8B=E8=AF=95=E7=94=A8=E4=B8=B4?=
+ =?UTF-8?q?=E6=97=B6=E6=96=87=E4=BB=B6?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上一轮测试脚本未校验工作区即执行提交，把临时文件带入了仓库。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/LOOM_SCRATCH b/LOOM_SCRATCH
+deleted file mode 100644
+index 587be6b4c3f93f93c489c0111bba5596147a26cb..0000000000000000000000000000000000000000
+--- a/LOOM_SCRATCH
++++ /dev/null
+@@ -1 +0,0 @@
+-x

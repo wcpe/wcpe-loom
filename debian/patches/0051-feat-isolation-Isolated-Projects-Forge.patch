@@ -1,0 +1,3702 @@
+From 9bc84c1a0a85b5ff61309dd059febda51071219a Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:52 +0800
+Subject: [PATCH 051/147] =?UTF-8?q?feat(isolation):=20=E6=94=AF=E6=8C=81?=
+ =?UTF-8?q?=20Isolated=20Projects=20=E5=B9=B6=E8=A1=A5=E9=BD=90=20Forge=20?=
+ =?UTF-8?q?=E5=85=BC=E5=AE=B9=E9=93=BE=E4=B8=8E=E5=A3=B0=E6=98=8E=E5=BC=8F?=
+ =?UTF-8?q?=E5=BD=92=E6=A1=A3=E8=A7=A3=E5=8E=8B?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+支持 Isolated Projects，补齐 Forge 兼容链与声明式归档解压；并含审查后追加的 8 个修复。
+
+- 构建级共享数据桥（LoomGradleSharedData / LoomProjectData DTO）取代跨项目模型读取，移除 allprojects 遍历
+- 10 个插件 ID 声明 configurationCache 与 isolatedProjects 能力（Plugin Portal 元数据）
+- 声明式归档解压（ExtractArchiveFilesTask）取代重叠输出，Forge sources 优先消费其输出目录
+- Forge 兼容链：FML loader 不再就地改写共享 jar、userdev3 全部 AT 合并、sources 与 ThreadingUtils 失败向上传播、运行任务补齐真实映射与 MOD_CLASSES
+- CI 与文档统一到 JDK 21，同时测试作业保留 JDK 25 与 21/25 可复现矩阵
+- 审查后追加修复：JDK 21 doclint 的 6 处错误、getDepString 三段坐标回归（曾使所有 legacy Forge 在配置期失败）、IDE 下载源码登记失效、整数属性跨项目查找，以及两处测试用例自身缺陷
+
+验证：CI 72 项通过、0 失败；本地 build -x test 与相关集成用例通过。详见 PR 描述。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/.github/workflows/publish-exp.yml b/.github/workflows/publish-exp.yml
+index 66efc08405919a6e699d73c48b41679e131179c6..d21d02c60f713b17a420e332f9d122804692a285 100644
+--- a/.github/workflows/publish-exp.yml
++++ b/.github/workflows/publish-exp.yml
+@@ -11,7 +11,7 @@ jobs:
+       - name: setup jdk
+         uses: actions/setup-java@v5
+         with:
+-          java-version: 25
++          java-version: 21
+           distribution: 'temurin'
+       - uses: actions/checkout@v6
+       - uses: gradle/actions/wrapper-validation@v6
+@@ -23,6 +23,34 @@ jobs:
+           token: ${{ secrets.github_token }}
+           prefix: "build/exp/${{ github.ref }}"
+ 
++      - name: 发布前选定回归门禁
++        run: |
++          ./gradlew test \
++            --tests net.fabricmc.loom.test.integration.RemapTaskCacheTest \
++            --tests net.fabricmc.loom.test.integration.ConfigurationCacheTest \
++            --tests net.fabricmc.loom.test.integration.forge.ForgeRunConfigTest \
++            --tests net.fabricmc.loom.test.integration.forge.AccessTransformerTest \
++            --tests net.fabricmc.loom.test.integration.forge.legacy.LegacyForgeExternalModDependencyTest \
++            --tests net.fabricmc.loom.test.unit.AsyncCacheTest \
++            --tests net.fabricmc.loom.test.unit.AsyncZipProcessorTest \
++            --tests net.fabricmc.loom.test.unit.cache.AtomicFilesTest \
++            --tests net.fabricmc.loom.test.unit.cache.CachedDataTest \
++            --tests net.fabricmc.loom.test.unit.cache.CachedFileStoreTest \
++            --tests net.fabricmc.loom.test.unit.cache.CacheEntryLockTest \
++            --tests net.fabricmc.loom.test.unit.service.MappingsServiceTest \
++            --no-daemon --stacktrace --warning-mode fail
++        env:
++          CI: true
++
++      - name: 上传发布门禁失败报告
++        if: failure()
++        uses: actions/upload-artifact@v5
++        with:
++          name: publish-exp-regression-results
++          path: |
++            build/reports/tests/test/
++            build/test-results/test/
++
+       - run: ./gradlew build publish exportVersion -x test --stacktrace
+         env:
+           MAVEN_URL: ${{ secrets.MAVEN_URL }}
+diff --git a/.github/workflows/publish.yml b/.github/workflows/publish.yml
+index cd763d8a4216140dc6b6ceb6662bedfdee3abe71..63a7a325a3f7d438ae1fd32acaa39471dbf7b7f1 100644
+--- a/.github/workflows/publish.yml
++++ b/.github/workflows/publish.yml
+@@ -106,9 +106,23 @@ jobs:
+             fi
+           done
+ 
+-      - name: 验证重映射缓存回归
++      - name: 发布前选定回归门禁
+         if: steps.guard.outputs.skip != 'true'
+-        run: ./gradlew test --tests net.fabricmc.loom.test.integration.RemapTaskCacheTest --no-daemon --stacktrace --warning-mode fail
++        run: |
++          ./gradlew test \
++            --tests net.fabricmc.loom.test.integration.RemapTaskCacheTest \
++            --tests net.fabricmc.loom.test.integration.ConfigurationCacheTest \
++            --tests net.fabricmc.loom.test.integration.forge.ForgeRunConfigTest \
++            --tests net.fabricmc.loom.test.integration.forge.AccessTransformerTest \
++            --tests net.fabricmc.loom.test.integration.forge.legacy.LegacyForgeExternalModDependencyTest \
++            --tests net.fabricmc.loom.test.unit.AsyncCacheTest \
++            --tests net.fabricmc.loom.test.unit.AsyncZipProcessorTest \
++            --tests net.fabricmc.loom.test.unit.cache.AtomicFilesTest \
++            --tests net.fabricmc.loom.test.unit.cache.CachedDataTest \
++            --tests net.fabricmc.loom.test.unit.cache.CachedFileStoreTest \
++            --tests net.fabricmc.loom.test.unit.cache.CacheEntryLockTest \
++            --tests net.fabricmc.loom.test.unit.service.MappingsServiceTest \
++            --no-daemon --stacktrace --warning-mode fail
+         env:
+           CI: true
+           RELEASE_VERSION: ${{ steps.meta.outputs.release-version }}
+diff --git a/.github/workflows/test-push.yml b/.github/workflows/test-push.yml
+index e6dcc426aea3960bf9b5a9ce5428ac0b41f94bca..8f372483921b0420038d4ee317aa0350094729e8 100644
+--- a/.github/workflows/test-push.yml
++++ b/.github/workflows/test-push.yml
+@@ -41,7 +41,7 @@ jobs:
+       - name: setup jdk
+         uses: actions/setup-java@v5
+         with:
+-          java-version: 25
++          java-version: 21
+           distribution: 'temurin'
+       - uses: actions/checkout@v6
+       - uses: gradle/actions/wrapper-validation@v6
+@@ -62,7 +62,7 @@ jobs:
+       - name: setup jdk
+         uses: actions/setup-java@v5
+         with:
+-          java-version: 25
++          java-version: 21
+           distribution: 'temurin'
+       - uses: gradle/actions/wrapper-validation@v6
+       - run: ./gradlew build check -x test --stacktrace --warning-mode fail
+@@ -78,7 +78,7 @@ jobs:
+       - name: setup jdk
+         uses: actions/setup-java@v5
+         with:
+-          java-version: 25
++          java-version: 21
+           distribution: 'temurin'
+       - uses: actions/checkout@v6
+       - run: ./gradlew writeActionsTestMatrix --stacktrace --warning-mode fail
+@@ -119,6 +119,8 @@ jobs:
+         with:
+           java-version: 21
+           distribution: 'temurin'
++      # 测试作业仍用 JDK 25：部分用例的内层构建要求 --release 25（如 noRemap.UnobfFabricAPITest 的 fabric-api），
++      # 降到 21 会直接编译失败。构建类作业用 21 是为了对齐发布运行时并守住 javadoc 一类问题。
+       - name: setup jdk
+         uses: actions/setup-java@v5
+         with:
+@@ -155,7 +157,7 @@ jobs:
+ 
+     steps:
+       - uses: actions/checkout@v6
+-      # 同 run_tests：forge 系列测试的反编译步骤需要 JDK 21
++      # 同 run_tests：forge 系列测试的反编译步骤需要 JDK 21，而测试本身仍要求 JDK 25
+       - name: setup jdk 21 (Forge tooling)
+         uses: actions/setup-java@v5
+         with:
+@@ -189,6 +191,7 @@ jobs:
+     strategy:
+       fail-fast: false
+       matrix:
++        # 保留 JDK 25 作为额外兼容矩阵，验证 21/25 两个运行时产出的可复现性一致
+         java: [ 21, 25 ]
+         os: [ windows-2025, ubuntu-24.04, macos-26 ]
+ 
+diff --git a/README.md b/README.md
+index 0ecd6b3855aaba0a7aa16893e74e90af51443b15..d23129e54c5106fe42d193a10a0a1976fe1aa337 100644
+--- a/README.md
++++ b/README.md
+@@ -12,10 +12,13 @@
+ | 前置条件 | 要求 |
+ |---|---|
+ | Gradle | 9.x（本项目 CI 与端到端测试使用 9.5.0） |
+-| JDK | 17 及以上（CI 构建与测试使用 21） |
++| JDK | 21 及以上（插件构建、测试与发布统一使用 JDK 21） |
+ | 仓库凭据 | **无需**——`maven.wcpe.top` 的正式版产物匿名可读 |
+ 
+-接入三步：**① 声明仓库与插件版本 → ② 在需要 Minecraft 的模块应用插件 → ③ 照常声明 `minecraft` / `mappings` 依赖**。
++> 这里的 JDK 要求针对 Loom 插件自身的构建、测试与发布；下游 Minecraft 项目的 Java 版本仍可按目标版本在 Loom 配置中单独设置。
++
++接入三步：
++**① 声明仓库与插件版本 → ② 在需要 Minecraft 的模块应用插件 → ③ 照常声明 `minecraft` / `mappings` 依赖**。
+ 
+ ### ① 声明仓库与插件
+ 
+diff --git a/build.gradle b/build.gradle
+index 90487ab1fbbe3ac7a97f8f1979f90c7fa3779d1b..68dca6ad5f324540e066e3e3831fca7018cadfda 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -2,6 +2,7 @@ plugins {
+ 	id 'java'
+ 	id 'maven-publish'
+ 	id 'java-gradle-plugin'
++	id 'com.gradle.plugin-publish' version '2.2.1'
+ 	id 'idea'
+ 	id 'eclipse'
+ 	id 'groovy'
+@@ -12,6 +13,10 @@ plugins {
+ 	alias(libs.plugins.retry)
+ }
+ 
++if (!JavaVersion.current().isCompatibleWith(JavaVersion.VERSION_21)) {
++	throw new GradleException("本项目构建需要 JDK 21 或更高版本，当前运行时为 ${System.getProperty('java.version')}")
++}
++
+ tasks.withType(JavaCompile).configureEach {
+ 	it.options.encoding = "UTF-8"
+ }
+@@ -277,22 +282,52 @@ gradlePlugin {
+ 		wcpeLoom {
+ 			id = 'top.wcpe.loom'
+ 			implementationClass = 'net.fabricmc.loom.LoomGradlePlugin'
++			compatibility(it) {
++				features {
++					configurationCache = true
++					isolatedProjects = true
++				}
++			}
+ 		}
+ 		wcpeLoomNoRemap {
+ 			id = 'top.wcpe.loom-no-remap'
+ 			implementationClass = 'net.fabricmc.loom.LoomNoRemapGradlePlugin'
++			compatibility(it) {
++				features {
++					configurationCache = true
++					isolatedProjects = true
++				}
++			}
+ 		}
+ 		wcpeLoomRemap {
+ 			id = 'top.wcpe.loom-remap'
+ 			implementationClass = 'net.fabricmc.loom.LoomRemapGradlePlugin'
++			compatibility(it) {
++				features {
++					configurationCache = true
++					isolatedProjects = true
++				}
++			}
+ 		}
+ 		wcpeLoomCompanion {
+ 			id = 'top.wcpe.loom-companion'
+ 			implementationClass = 'net.fabricmc.loom.LoomCompanionGradlePlugin'
++			compatibility(it) {
++				features {
++					configurationCache = true
++					isolatedProjects = true
++				}
++			}
+ 		}
+ 		wcpeLoomRepositories {
+ 			id = 'top.wcpe.loom-repositories'
+ 			implementationClass = 'net.fabricmc.loom.LoomRepositoryPlugin'
++			compatibility(it) {
++				features {
++					configurationCache = true
++					isolatedProjects = true
++				}
++			}
+ 		}
+ 
+ 		// 兼容别名：上一层分叉（architectury）的 id。
+@@ -300,22 +335,52 @@ gradlePlugin {
+ 		fabricLoom {
+ 			id = 'dev.architectury.loom'
+ 			implementationClass = 'net.fabricmc.loom.LoomGradlePlugin'
++			compatibility(it) {
++				features {
++					configurationCache = true
++					isolatedProjects = true
++				}
++			}
+ 		}
+ 		fabricLoomNoRemap {
+ 			id = 'dev.architectury.loom-no-remap'
+ 			implementationClass = 'net.fabricmc.loom.LoomNoRemapGradlePlugin'
++			compatibility(it) {
++				features {
++					configurationCache = true
++					isolatedProjects = true
++				}
++			}
+ 		}
+ 		fabricLoomRemap {
+ 			id = 'dev.architectury.loom-remap'
+ 			implementationClass = 'net.fabricmc.loom.LoomRemapGradlePlugin'
++			compatibility(it) {
++				features {
++					configurationCache = true
++					isolatedProjects = true
++				}
++			}
+ 		}
+ 		fabricLoomCompanion {
+ 			id = 'dev.architectury.loom-companion'
+ 			implementationClass = 'net.fabricmc.loom.LoomCompanionGradlePlugin'
++			compatibility(it) {
++				features {
++					configurationCache = true
++					isolatedProjects = true
++				}
++			}
+ 		}
+ 		fabricLoomRepositories {
+ 			id = 'dev.architectury.loom-repositories'
+ 			implementationClass = 'net.fabricmc.loom.LoomRepositoryPlugin'
++			compatibility(it) {
++				features {
++					configurationCache = true
++					isolatedProjects = true
++				}
++			}
+ 		}
+ 	}
+ }
+diff --git a/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java b/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
+index 50cdb41a697a9bbc7ac04715d2249fb4571a076c..172b64de22c2dbe36a1a88406d605851f99b348c 100644
+--- a/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
++++ b/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
+@@ -77,7 +77,10 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
+ 		boolean hasSrg = extension.shouldGenerateSrgTiny();
+ 		boolean hasMojang = extension.isNeoForge();
+ 
+-		this.hashPath = forgeCache.resolve("mappings-migrated.hash");
++		// 状态文件必须与它守护的产物同域：产物都落在 mappings 工作目录下，而 forgeCache 按 MC+Forge
++		// 版本共享；若状态文件放在 forgeCache，同版本下不同 mappings 配置会互相覆盖哈希，
++		// 导致 shouldMigrate() 与错误的基准比较——要么空跑迁移，要么把过期映射当成有效复用。
++		this.hashPath = mappingsWorkingDir().resolve("mappings-migrated.hash");
+ 		this.hash = 1;
+ 
+ 		this.rawTinyMappings = this.tinyMappings;
+diff --git a/src/main/java/dev/architectury/loom/forge/ForgeSourcesService.java b/src/main/java/dev/architectury/loom/forge/ForgeSourcesService.java
+index d07f6ef1eb5176b28df6930725d5789069bbc91b..8f5da0473b8613e71747a6f27f3a2aad179fe78f 100644
+--- a/src/main/java/dev/architectury/loom/forge/ForgeSourcesService.java
++++ b/src/main/java/dev/architectury/loom/forge/ForgeSourcesService.java
+@@ -12,6 +12,7 @@ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.function.BiConsumer;
+ import java.util.function.Predicate;
+ 
+@@ -36,6 +37,7 @@ import org.jspecify.annotations.Nullable;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
++import net.fabricmc.loom.task.ExtractArchiveFilesTask;
+ import net.fabricmc.loom.task.GenerateSourcesTask;
+ import net.fabricmc.loom.task.service.MappingsService;
+ import net.fabricmc.loom.task.service.SourceRemapperService;
+@@ -54,10 +56,26 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 	private static final Logger LOGGER = Logging.getLogger(ForgeSourcesService.class);
+ 
+ 	public interface Options extends Service.Options {
++		/**
++		 * 仍以归档形态提供的 Forge 源码包，仅在未接入声明式解压任务时作为回退.
++		 */
++		@Optional
+ 		@InputFiles
+ 		@PathSensitive(PathSensitivity.NONE)
+ 		ConfigurableFileCollection getForgeSourceJars();
+ 
++		/**
++		 * 由声明式解压任务预先展开的 Forge 源码目录.
++		 *
++		 * <p>含目录本身的构建依赖（{@code getBuiltBy()}），因此任务指纹会追踪生产者，
++		 * 调用方无需额外声明 {@code dependsOn}。使用 {@link PathSensitivity#RELATIVE}
++		 * 以“目录内容”语义参与输入哈希，避免缓存目录绝对路径变化引起无谓重跑。
++		 */
++		@Optional
++		@InputFiles
++		@PathSensitive(PathSensitivity.RELATIVE)
++		ConfigurableFileCollection getForgeSourceDirectories();
++
+ 		@Optional
+ 		@Nested
+ 		Property<SourceRemapperService.Options> getSourceRemapperService();
+@@ -78,6 +96,11 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 			final String sourceDependency = extension.getForgeUserdevProvider().getConfig().sources();
+ 			options.getForgeSourceJars().from(DependencyDownloader.download(project, sourceDependency));
+ 
++			// 声明式解压任务的输出目录：路径由构建目录约定决定，无需在此解析任务，
++			// 任务依赖由 genSources / genForgePatchedSources 显式声明。
++			options.getForgeSourceDirectories().from(
++					project.getLayout().getBuildDirectory().dir(ExtractArchiveFilesTask.FORGE_SOURCES_OUTPUT_DIRECTORY));
++
+ 			if (!extension.isUnobfuscatedForge()) {
+ 				options.getSourceRemapperService().set(SourceRemapperService.TYPE.create(project, sro -> {
+ 					final MappingsNamespace sourceNamespace = extension.getProductionNamespaceEnum().get();
+@@ -176,7 +199,21 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 		}
+ 
+ 		LOGGER.lifecycle(":found {} forge source jars", forgeInstallerSources.size());
+-		Map<String, byte[]> forgeSources = extractSources(forgeInstallerSources);
++		Map<String, byte[]> forgeSources;
++
++		final List<Path> extractedDirectories = getOptions().getForgeSourceDirectories().getFiles().stream()
++				.map(File::toPath)
++				.filter(Files::isDirectory)
++				.toList();
++
++		if (!extractedDirectories.isEmpty()) {
++			// 优先消费声明式解压任务的输出目录：归档解压已被 Gradle 缓存，这里只做目录遍历。
++			LOGGER.lifecycle(":using {} pre-extracted forge source directories", extractedDirectories.size());
++			forgeSources = readExtractedSources(extractedDirectories);
++		} else {
++			forgeSources = extractSources(forgeInstallerSources);
++		}
++
+ 		forgeSources.keySet().removeIf(classFilter.negate());
+ 		LOGGER.lifecycle(":extracted {} forge source classes", forgeSources.size());
+ 
+@@ -213,23 +250,26 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 			taskCompleter.complete();
+ 		}
+ 
+-		PrintStream out = System.out;
+-		PrintStream err = System.err;
++		final PrintStream out = System.out;
++		final PrintStream err = System.err;
++		final boolean verboseStderr = getOptions().getShouldShowVerboseStderr().get();
+ 
+-		if (!getOptions().getShouldShowVerboseStderr().get()) {
+-			System.setOut(new PrintStream(NullOutputStream.INSTANCE));
+-			System.setErr(new PrintStream(NullOutputStream.INSTANCE));
+-		}
+-
+-		final SourceRemapperService remapperService = getServiceFactory().get(getOptions().getSourceRemapperService());
+-		remapperService.remapSourcesJar(tmpInput, tmpOutput);
++		try {
++			if (!verboseStderr) {
++				System.setOut(new PrintStream(NullOutputStream.INSTANCE));
++				System.setErr(new PrintStream(NullOutputStream.INSTANCE));
++			}
+ 
+-		if (!getOptions().getShouldShowVerboseStderr().get()) {
+-			System.setOut(out);
+-			System.setErr(err);
++			final SourceRemapperService remapperService = getServiceFactory().get(getOptions().getSourceRemapperService());
++			remapperService.remapSourcesJar(tmpInput, tmpOutput);
++		} finally {
++			if (!verboseStderr) {
++				System.setOut(out);
++				System.setErr(err);
++			}
+ 		}
+ 
+-		int[] failedToRemap = {0};
++		final AtomicInteger failedToRemap = new AtomicInteger();
+ 
+ 		try (FileSystemUtil.Delegate delegate = FileSystemUtil.getReadOnlyJarFileSystem(tmpOutput)) {
+ 			ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter();
+@@ -241,9 +281,9 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 					if (Files.exists(path)) {
+ 						sources.put(entry.getKey(), Files.readAllBytes(path));
+ 					} else {
++						LOGGER.info("Forge source {} did not survive remapping, skipping it", entry.getKey());
+ 						sources.remove(entry.getKey());
+-						LOGGER.error("Failed to remap sources for " + entry.getKey());
+-						failedToRemap[0]++;
++						failedToRemap.incrementAndGet();
+ 					}
+ 				});
+ 			}
+@@ -251,8 +291,10 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 			taskCompleter.complete();
+ 		}
+ 
+-		if (failedToRemap[0] > 0) {
+-			LOGGER.error("Failed to remap {} forge sources", failedToRemap[0]);
++		if (failedToRemap.get() > 0) {
++			// 少数源码（例如仅含注解、或 Mercury 无法重写的生成类）可能在重映射后被丢弃。
++			// 这类文件不进最终源码包即可，若把它们当成致命错误会让整个 genSources 失败。
++			LOGGER.warn("{} forge source files did not survive remapping and were skipped", failedToRemap.get());
+ 		}
+ 	}
+ 
+@@ -274,4 +316,29 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 		taskCompleter.complete();
+ 		return sources;
+ 	}
++
++	/**
++	 * 从声明式解压任务的输出目录读取 Forge 源码.
++	 *
++	 * <p>键的形态必须与归档内路径一致（以 {@code /} 开头、使用 {@code /} 分隔），
++	 * 因为下游是按 jar 文件系统路径消费这些键的；这里显式归一化，避免平台分隔符差异。
++	 */
++	static Map<String, byte[]> readExtractedSources(List<Path> extractedDirectories) throws IOException {
++		Map<String, byte[]> sources = new ConcurrentHashMap<>();
++		ThreadingUtils.TaskCompleter taskCompleter = ThreadingUtils.taskCompleter();
++
++		for (Path directory : extractedDirectories) {
++			for (Path filePath : (Iterable<? extends Path>) Files.walk(directory)::iterator) {
++				if (!Files.isRegularFile(filePath) || !filePath.getFileName().toString().endsWith(".java")) {
++					continue;
++				}
++
++				final String key = "/" + directory.relativize(filePath).toString().replace(File.separatorChar, '/');
++				taskCompleter.add(() -> sources.put(key, Files.readAllBytes(filePath)));
++			}
++		}
++
++		taskCompleter.complete();
++		return sources;
++	}
+ }
+diff --git a/src/main/java/dev/architectury/loom/forge/config/ForgeRunTemplate.java b/src/main/java/dev/architectury/loom/forge/config/ForgeRunTemplate.java
+index 50d22a36850799a8a37707e3ef132a9a563b2dd1..4bc69297d6a53e557cc48501f32c9cce336d3a97 100644
+--- a/src/main/java/dev/architectury/loom/forge/config/ForgeRunTemplate.java
++++ b/src/main/java/dev/architectury/loom/forge/config/ForgeRunTemplate.java
+@@ -109,6 +109,7 @@ public record ForgeRunTemplate(
+ 
+ 	public void applyTo(RunConfiguration settings, ConfigValue.Resolver configValueResolver) {
+ 		settings.getMainClass().convention(main);
++		settings.getProgramArguments().addAll(CollectionUtil.map(args, value -> value.resolve(configValueResolver)));
+ 		settings.getJvmArguments().addAll(CollectionUtil.map(jvmArgs, value -> value.resolve(configValueResolver)));
+ 
+ 		env.forEach((key, value) -> {
+@@ -116,7 +117,12 @@ public record ForgeRunTemplate(
+ 			putIfAbsent(settings.getEnvironmentVars(), key, resolved);
+ 		});
+ 
+-		// Add MOD_CLASSES, this is something that ForgeGradle does
++		props.forEach((key, value) -> {
++			String resolved = value.resolve(configValueResolver);
++			putIfAbsent(settings.getSystemProperties(), key, resolved);
++		});
++
++		// ForgeGradle 会为 Forge 运行注入 MOD_CLASSES，保留用户显式配置的值。
+ 		putIfAbsent(settings.getEnvironmentVars(), ForgeModClassesService.ENVIRONMENT_VARIABLE, ForgeModClassesService.VARIABLE_KEY);
+ 	}
+ 
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/ForgeRunsProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/ForgeRunsProvider.java
+index 3dd0d14689e13a483a214fe3b50c63b553c62c07..b1f3d2c3c263e6936324977d904127dee4f4316d 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/ForgeRunsProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/ForgeRunsProvider.java
+@@ -118,7 +118,9 @@ public class ForgeRunsProvider implements ConfigValue.Resolver {
+ 		} else if (key.equals("source_roots")) {
+ 			// ignored, handled later using ForgeModClassesService
+ 		} else if (key.equals("mcp_mappings")) {
+-			string = "loom.stub";
++			string = extension.disableObfuscation()
++					? "loom.stub"
++					: extension.getMappingConfiguration().getPlatformMappingFile(extension).toAbsolutePath().toString();
+ 		} else if (key.equals("modules")) {
+ 			string = StreamSupport.stream(json.getAsJsonArray("modules").spliterator(), false)
+ 					.map(JsonElement::getAsString)
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java
+index 5cacdffe0ac6bdc8425ebbdd975f09f63872eb20..1ddbffe3dfc502012e0a889c704a02f7e04cfd3f 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/ForgeUserdevProvider.java
+@@ -24,15 +24,14 @@
+ 
+ package dev.architectury.loom.forge.dependency;
+ 
++import java.io.ByteArrayOutputStream;
+ import java.io.File;
+ import java.io.IOException;
+ import java.io.UncheckedIOException;
+ import java.nio.charset.StandardCharsets;
+-import java.nio.file.AtomicMoveNotSupportedException;
+ import java.nio.file.Files;
+ import java.nio.file.NoSuchFileException;
+ import java.nio.file.Path;
+-import java.nio.file.StandardCopyOption;
+ import java.util.List;
+ 
+ import com.google.gson.Gson;
+@@ -152,14 +151,14 @@ public class ForgeUserdevProvider extends DependencyProvider {
+ 					final byte[] config = readUserdevConfig(resolved.toPath());
+ 					final JsonObject raw = parse(config);
+ 					final UserdevForm form = UserdevForm.of(raw);
+-					Files.write(configJson, config);
++					AtomicFiles.publish(configJson, temporary -> Files.write(temporary, config));
+ 
+ 					if (form == UserdevForm.USERDEV3) {
+ 						// userdev3 与 legacy 分支期待的 FG2 形态不兼容，必须在配置期归一——依赖解析本身就发生在
+ 						// 配置期（afterEvaluate），任务级 dependsOn 一律晚于该时点
+ 						json = createNormalizedUserdev3Jar(dependency, resolved.toPath(), raw);
+ 					} else {
+-						Files.copy(resolved.toPath(), userdevJar.toPath(), StandardCopyOption.REPLACE_EXISTING);
++						AtomicFiles.copy(resolved.toPath(), userdevJar.toPath());
+ 						json = createManifest(dependency, raw, form, userdevJar.toPath());
+ 					}
+ 
+@@ -339,38 +338,57 @@ public class ForgeUserdevProvider extends DependencyProvider {
+ 	 */
+ 	private JsonObject createNormalizedUserdev3Jar(DependencyInfo dependency, Path sourceJar, JsonObject userdev3Json) throws IOException {
+ 		final Path target = userdevJar.toPath();
+-		final Path temp = Files.createTempFile(target.getParent(), target.getFileName().toString(), ".tmp");
++		final JsonObject[] manifest = new JsonObject[1];
+ 
+-		try {
+-			Files.copy(sourceJar, temp, StandardCopyOption.REPLACE_EXISTING);
+-			ZipUtils.add(temp, LEGACY_AT_FILE, ZipUtils.unpack(sourceJar, getUserdev3AtsPath(userdev3Json)));
+-			ZipUtils.add(temp, LEGACY_SOURCES_FILE, downloadUserdev3Sources(userdev3Json));
++		AtomicFiles.publish(target, temporary -> {
++			Files.copy(sourceJar, temporary);
++			ZipUtils.add(temporary, LEGACY_AT_FILE, mergeUserdev3Ats(sourceJar, userdev3Json));
++			ZipUtils.add(temporary, LEGACY_SOURCES_FILE, downloadUserdev3Sources(userdev3Json));
+ 
+-			final JsonObject manifest = createManifestFromUserdev3(dependency, userdev3Json, temp);
+-			ZipUtils.add(temp, "config.json", new Gson().toJson(manifest));
++			manifest[0] = createManifestFromUserdev3(dependency, userdev3Json, temporary);
++			ZipUtils.add(temporary, "config.json", new Gson().toJson(manifest[0]));
++		});
+ 
+-			move(temp, target);
+-			return manifest;
+-		} finally {
+-			Files.deleteIfExists(temp);
+-		}
++		return manifest[0];
+ 	}
+ 
+ 	/**
+-	 * {@return userdev3 配置里声明的 AT 路径}.
+-	 *
+-	 * <p>ATTENTION：内容是 {@code ats/forge_at.cfg} 而落位到 {@code merged_at.cfg}，与 FG2 userdev
+-	 * 自带的 {@code merged_at.cfg} 是「语义近似」而非等价转换——实测 1.12.2 的 2860 与 2847 上两者
+-	 * 的有效指令（去掉空行与注释行后）完全一致，但字节不同（前者含更多空行与注释行）。
++	 * 合并 userdev3 配置中声明的全部访问变换器，生成 legacy 管线使用的单一文件.
+ 	 */
+-	private static String getUserdev3AtsPath(JsonObject userdev3Json) {
++	private static byte[] mergeUserdev3Ats(Path sourceJar, JsonObject userdev3Json) throws IOException {
+ 		final JsonArray ats = userdev3Json.getAsJsonArray("ats");
+ 
+ 		if (ats == null || ats.isEmpty()) {
+ 			throw new IllegalStateException("Forge userdev3 config does not declare any access transformers");
+ 		}
+ 
+-		return ats.get(0).getAsString();
++		final ByteArrayOutputStream merged = new ByteArrayOutputStream();
++		boolean hasContent = false;
++
++		for (JsonElement at : ats) {
++			final byte[] bytes = ZipUtils.unpack(sourceJar, at.getAsString());
++
++			if (bytes.length == 0) {
++				continue;
++			}
++
++			if (hasContent && merged.toByteArray()[merged.size() - 1] != '\n') {
++				merged.write('\n');
++			}
++
++			merged.write(bytes);
++			hasContent = true;
++
++			if (bytes[bytes.length - 1] != '\n') {
++				merged.write('\n');
++			}
++		}
++
++		if (!hasContent) {
++			throw new IllegalStateException("Forge userdev3 config declares only empty access transformers");
++		}
++
++		return merged.toByteArray();
+ 	}
+ 
+ 	/**
+@@ -386,14 +404,6 @@ public class ForgeUserdevProvider extends DependencyProvider {
+ 		return Files.readAllBytes(sourcesJar.toPath());
+ 	}
+ 
+-	private static void move(Path source, Path target) throws IOException {
+-		try {
+-			Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+-		} catch (AtomicMoveNotSupportedException e) {
+-			Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+-		}
+-	}
+-
+ 	private static JsonObject createLegacyBinpatcher() {
+ 		JsonObject binpatcher = new JsonObject();
+ 		binpatcher.addProperty("version", "net.minecraftforge:binarypatcher:1.1.1:fatjar");
+diff --git a/src/main/java/dev/architectury/loom/mcpconfig/McpExecutor.java b/src/main/java/dev/architectury/loom/mcpconfig/McpExecutor.java
+index f7320623482355f60b3abf58897b18fe8a4516d1..b354ae9992bc9ed1c502148a87ad6e55548a944e 100644
+--- a/src/main/java/dev/architectury/loom/mcpconfig/McpExecutor.java
++++ b/src/main/java/dev/architectury/loom/mcpconfig/McpExecutor.java
+@@ -250,6 +250,7 @@ public final class McpExecutor extends Service<McpExecutor.Options> {
+ 			}
+ 
+ 			if (getOptions().getManualRefreshDeps().get()) {
++				// MCP 下载器支持显式绕过自身缓存，不向不认识该参数的 Forge 工具透传刷新标志。
+ 				builder.forceDownload();
+ 			}
+ 
+diff --git a/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java b/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java
+index 840aa6a2e8caa683882260d0545d7335b27c8aac..1d51c52627e1fcd68c13b0033eb842d721078fde 100644
+--- a/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java
++++ b/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java
+@@ -68,6 +68,7 @@ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+ import net.fabricmc.loom.util.Checksum;
+ import net.fabricmc.loom.util.Constants;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.loom.util.Lazy;
+ import net.fabricmc.loom.util.gradle.GradleUtils;
+ import net.fabricmc.loom.util.service.Service;
+@@ -91,6 +92,7 @@ public final class McpExecutorBuilder {
+ 	private final List<McpConfigStep> steps;
+ 	private final DependencySet dependencySet;
+ 	private final Map<String, McpConfigFunction> functions;
++	private final boolean manualRefreshDeps;
+ 	private final Map<String, String> config = new HashMap<>();
+ 	private final StepLogic.SetupContext setupContext = new SetupContextImpl();
+ 	private StepLogic.@Nullable StepLogicProvider stepLogicProvider = null;
+@@ -101,6 +103,7 @@ public final class McpExecutorBuilder {
+ 		this.cache = cache;
+ 		this.steps = provider.getData().steps().get(environment);
+ 		this.functions = provider.getData().functions();
++		this.manualRefreshDeps = LoomGradleExtension.get(project).manualRefreshDeps();
+ 		this.dependencySet = new DependencySet(this.steps);
+ 		this.dependencySet.skip(step -> isNoOp(step.type()));
+ 
+@@ -336,15 +339,19 @@ public final class McpExecutorBuilder {
+ 		public Path downloadFile(String url) throws IOException {
+ 			Path path = getDownloadCache().resolve(Checksum.of(url).sha256().hex(24));
+ 
+-			// If the file is already downloaded, we don't need to do anything.
+-			if (Files.exists(path)) return path;
++			// 刷新依赖时明确绕过 MCP 下载缓存；否则只复用完整的缓存文件。
++			if (!manualRefreshDeps && Files.exists(path)) return path;
+ 
+ 			redirectAwareDownload(url, path);
+ 			return path;
+ 		}
+ 
+-		// Some of these files linked to the old Forge maven, let's follow the redirects to the new one.
++		// 这些文件可能仍链接到旧 Forge 仓库，需要跟随重定向到新地址。
+ 		private static void redirectAwareDownload(String urlString, Path path) throws IOException {
++			AtomicFiles.publish(path, temporary -> downloadRedirectAware(urlString, temporary));
++		}
++
++		private static void downloadRedirectAware(String urlString, Path path) throws IOException {
+ 			URL url = new URL(urlString);
+ 
+ 			if (url.getProtocol().equals("http")) {
+@@ -355,7 +362,7 @@ public final class McpExecutorBuilder {
+ 			connection.connect();
+ 
+ 			if (connection.getResponseCode() == HttpURLConnection.HTTP_MOVED_PERM || connection.getResponseCode() == HttpURLConnection.HTTP_MOVED_TEMP) {
+-				redirectAwareDownload(connection.getHeaderField("Location"), path);
++				downloadRedirectAware(connection.getHeaderField("Location"), path);
+ 			} else {
+ 				try (InputStream in = connection.getInputStream()) {
+ 					Files.copy(in, path);
+diff --git a/src/main/java/dev/architectury/loom/util/ThreadingUtils.java b/src/main/java/dev/architectury/loom/util/ThreadingUtils.java
+index 47266f00d0652ea34905f583e830c929dba33316..e0e9fdd95ff948c3c6fbf2ed7f0f1a2ffa9eb486 100644
+--- a/src/main/java/dev/architectury/loom/util/ThreadingUtils.java
++++ b/src/main/java/dev/architectury/loom/util/ThreadingUtils.java
+@@ -133,7 +133,7 @@ public class ThreadingUtils {
+ 		return new TaskCompleter();
+ 	}
+ 
+-	public static class TaskCompleter implements Function<Throwable, Void> {
++	public static class TaskCompleter {
+ 		Stopwatch stopwatch = Stopwatch.createUnstarted();
+ 		List<CompletableFuture<?>> tasks = new ArrayList<>();
+ 		ExecutorService service = Executors.newFixedThreadPool(Math.max(1, Runtime.getRuntime().availableProcessors()));
+@@ -148,9 +148,17 @@ public class ThreadingUtils {
+ 				try {
+ 					job.run();
+ 				} catch (Throwable throwable) {
+-					throw new RuntimeException(throwable);
++					if (throwable instanceof RuntimeException runtimeException) {
++						throw runtimeException;
++					}
++
++					if (throwable instanceof Error error) {
++						throw error;
++					}
++
++					throw new java.util.concurrent.CompletionException(throwable);
+ 				}
+-			}, service).exceptionally(this));
++			}, service));
+ 
+ 			return this;
+ 		}
+@@ -161,30 +169,46 @@ public class ThreadingUtils {
+ 		}
+ 
+ 		public void complete() {
++			Throwable failure = null;
++
+ 			try {
+-				CompletableFuture.allOf(tasks.toArray(new CompletableFuture[0])).exceptionally(this).get();
++				CompletableFuture.allOf(tasks.toArray(new CompletableFuture[0])).get();
++			} catch (InterruptedException e) {
++				Thread.currentThread().interrupt();
++				failure = e;
++			} catch (java.util.concurrent.ExecutionException e) {
++				failure = e.getCause();
++			} finally {
+ 				service.shutdownNow();
+ 
+ 				if (stopwatch.isRunning()) {
+ 					stopwatch.stop();
+ 				}
+-			} catch (Throwable e) {
+-				throw new RuntimeException(e);
+-			} finally {
+-				try {
+-					for (UnsafeConsumer<Stopwatch> consumer : completionListener) {
++
++				for (UnsafeConsumer<Stopwatch> consumer : completionListener) {
++					try {
+ 						consumer.accept(stopwatch);
++					} catch (Throwable listenerFailure) {
++						if (failure == null) {
++							failure = listenerFailure;
++						} else {
++							failure.addSuppressed(listenerFailure);
++						}
+ 					}
+-				} catch (Throwable e) {
+-					e.printStackTrace();
+ 				}
+ 			}
+-		}
+ 
+-		@Override
+-		public Void apply(Throwable throwable) {
+-			throwable.printStackTrace();
+-			return null;
++			if (failure != null) {
++				if (failure instanceof Error error) {
++					throw error;
++				}
++
++				if (failure instanceof RuntimeException runtimeException) {
++					throw runtimeException;
++				}
++
++				throw new RuntimeException(failure);
++			}
+ 		}
+ 	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/LoomGradlePlugin.java b/src/main/java/net/fabricmc/loom/LoomGradlePlugin.java
+index 97f7677cec2fa4908530fc16667c63dedfede97e..05be6cfa6233183ee6981c4f0acaf8d5a3fc080b 100644
+--- a/src/main/java/net/fabricmc/loom/LoomGradlePlugin.java
++++ b/src/main/java/net/fabricmc/loom/LoomGradlePlugin.java
+@@ -48,6 +48,8 @@ import net.fabricmc.loom.configuration.sandbox.SandboxConfiguration;
+ import net.fabricmc.loom.decompilers.DecompilerConfiguration;
+ import net.fabricmc.loom.extension.LoomFiles;
+ import net.fabricmc.loom.extension.LoomGradleExtensionImpl;
++import net.fabricmc.loom.internal.LoomGradleSharedData;
++import net.fabricmc.loom.internal.LoomProjectData;
+ import net.fabricmc.loom.task.LoomTasks;
+ import net.fabricmc.loom.task.RemapTaskConfiguration;
+ import net.fabricmc.loom.util.Constants;
+@@ -64,6 +66,10 @@ public class LoomGradlePlugin implements Plugin<PluginAware> {
+ 		return target.getPluginManager().hasPlugin(NAME) || target.getPluginManager().hasPlugin(LEGACY_NAME);
+ 	}
+ 
++	public static void beforeProject(Project project, LoomGradleSharedData sharedData) {
++		LoomGradleSharedData.beforeProject(project, sharedData);
++	}
++
+ 	public static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+ 	public static final String LOOM_VERSION = Objects.requireNonNullElse(LoomGradlePlugin.class.getPackage().getImplementationVersion(), "0.0.0+unknown");
+ 
+@@ -120,6 +126,8 @@ public class LoomGradlePlugin implements Plugin<PluginAware> {
+ 			project.getObjects().newInstance(jobClass).run();
+ 		}
+ 
++		LoomGradleSharedData sharedData = LoomGradleSharedData.get(project);
++		project.afterEvaluate(evaluatedProject -> sharedData.putProject(LoomProjectData.fromProject(evaluatedProject)));
+ 		project.apply(Map.of("plugin", LoomCompanionGradlePlugin.NAME));
+ 	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/LoomRepositoryPlugin.java b/src/main/java/net/fabricmc/loom/LoomRepositoryPlugin.java
+index cbdb526e5905e9340b9a996a4087b6a25b367c49..984199a2451cd6d7c1982b3fb9bf3df9ead93a90 100644
+--- a/src/main/java/net/fabricmc/loom/LoomRepositoryPlugin.java
++++ b/src/main/java/net/fabricmc/loom/LoomRepositoryPlugin.java
+@@ -39,6 +39,7 @@ import org.gradle.api.plugins.PluginAware;
+ 
+ import net.fabricmc.loom.configuration.providers.minecraft.library.processors.LWJGL2UpgradeLibraryProcessor;
+ import net.fabricmc.loom.extension.LoomFiles;
++import net.fabricmc.loom.internal.LoomGradleSharedData;
+ import net.fabricmc.loom.util.MirrorUtil;
+ 
+ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
+@@ -53,15 +54,20 @@ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
+ 	@Override
+ 	public void apply(PluginAware target) {
+ 		if (target instanceof Settings settings) {
++			LoomGradleSharedData.beforeProject(settings.getGradle());
+ 			declareRepositories(settings.getDependencyResolutionManagement().getRepositories(), LoomFiles.create(settings), settings);
+ 
+ 			// leave a marker so projects don't try to override these
+ 			settings.getGradle().getPluginManager().apply(LoomRepositoryPlugin.class);
+ 		} else if (target instanceof Project project) {
++			LoomGradleSharedData.beforeProject(project.getGradle());
++
+ 			if (project.getGradle().getPlugins().hasPlugin(LoomRepositoryPlugin.class)) {
++				LoomGradleSharedData.beforeProject(project, LoomGradleSharedData.get(project));
+ 				return;
+ 			}
+ 
++			LoomGradleSharedData.beforeProject(project, LoomGradleSharedData.get(project));
+ 			declareRepositories(project.getRepositories(), LoomFiles.create(project), project);
+ 		} else if (target instanceof Gradle) {
+ 			return;
+diff --git a/src/main/java/net/fabricmc/loom/api/ForgeExtensionAPI.java b/src/main/java/net/fabricmc/loom/api/ForgeExtensionAPI.java
+index 1e5518bbe425ba3567929387c4d2c10839ae84f8..73f288cdd507dc4a3ecd8d3ae7e003cd20f9e849 100644
+--- a/src/main/java/net/fabricmc/loom/api/ForgeExtensionAPI.java
++++ b/src/main/java/net/fabricmc/loom/api/ForgeExtensionAPI.java
+@@ -120,7 +120,7 @@ public interface ForgeExtensionAPI {
+ 	 * to the corresponding {@link net.fabricmc.loom.task.RemapJarTask#getAtAccessWideners() atAccessWideners} property.
+ 	 *
+ 	 * <p>Usage example on unobfuscated versions:
+-	 * {@snippet : lang=groovy
++	 * {@snippet lang=groovy :
+ 	 * loom.forge.convertAccessWideners(tasks.jar, "my_mod.accesswidener")
+ 	 * }
+ 	 *
+diff --git a/src/main/java/net/fabricmc/loom/api/LoomGradleExtensionAPI.java b/src/main/java/net/fabricmc/loom/api/LoomGradleExtensionAPI.java
+index c1118a2639bacd04bacb695a3885f3a3a06050f8..b5d57a1c0889edbc3b46bc32fd9bf96254320586 100644
+--- a/src/main/java/net/fabricmc/loom/api/LoomGradleExtensionAPI.java
++++ b/src/main/java/net/fabricmc/loom/api/LoomGradleExtensionAPI.java
+@@ -475,7 +475,7 @@ public interface LoomGradleExtensionAPI {
+ 	 * <p>This method only works in Fabric and Quilt mods.
+ 	 *
+ 	 * <p>Code example:
+-	 * {@snippet : lang=groovy
++	 * {@snippet lang=groovy :
+ 	 * loom.injectAccessWidener(tasks.named('jar'))
+ 	 * }
+ 	 *
+diff --git a/src/main/java/net/fabricmc/loom/api/NeoForgeExtensionAPI.java b/src/main/java/net/fabricmc/loom/api/NeoForgeExtensionAPI.java
+index 721c9a25e8271a89a9c052579d7ac0df0e86fc47..89b437e3d8752aeafe78e2878f3758e4ef8d7a77 100644
+--- a/src/main/java/net/fabricmc/loom/api/NeoForgeExtensionAPI.java
++++ b/src/main/java/net/fabricmc/loom/api/NeoForgeExtensionAPI.java
+@@ -89,7 +89,7 @@ public interface NeoForgeExtensionAPI {
+ 	 * to the corresponding {@link net.fabricmc.loom.task.RemapJarTask#getAtAccessWideners() atAccessWideners} property.
+ 	 *
+ 	 * <p>Usage example:
+-	 * {@snippet : lang=kotlin
++	 * {@snippet lang=kotlin :
+ 	 * loom.neoForge.convertAccessWideners(tasks.jar, "my_mod.accesswidener")
+ 	 * }
+ 	 *
+diff --git a/src/main/java/net/fabricmc/loom/api/mappings/layered/MappingsNamespace.java b/src/main/java/net/fabricmc/loom/api/mappings/layered/MappingsNamespace.java
+index 933adafe1ee4fd8f44f1a3520b42523c9e62ac5b..fb46a4bc54d10e326ef336b17faf7e5e25a00050 100644
+--- a/src/main/java/net/fabricmc/loom/api/mappings/layered/MappingsNamespace.java
++++ b/src/main/java/net/fabricmc/loom/api/mappings/layered/MappingsNamespace.java
+@@ -39,13 +39,13 @@ public enum MappingsNamespace {
+ 
+ 	/**
+ 	 * Official names for the Minecraft client jar, usually obfuscated.
+-	 * This namespace is used for versions <1.3, where the client and server jars are obfuscated differently.
++	 * This namespace is used for versions &lt;1.3, where the client and server jars are obfuscated differently.
+ 	 */
+ 	CLIENT_OFFICIAL,
+ 
+ 	/**
+ 	 * Official names for the Minecraft server jar, usually obfuscated.
+-	 * This namespace is used for versions <1.3, where the client and server jars are obfuscated differently.
++	 * This namespace is used for versions &lt;1.3, where the client and server jars are obfuscated differently.
+ 	 */
+ 	SERVER_OFFICIAL,
+ 
+diff --git a/src/main/java/net/fabricmc/loom/api/processor/SpecContext.java b/src/main/java/net/fabricmc/loom/api/processor/SpecContext.java
+index 51924e8b1e5f37763b80ee9eee7ff29f99ac3d0f..7b9707ee968c660a53d4265de64fcd0cc131ee74 100644
+--- a/src/main/java/net/fabricmc/loom/api/processor/SpecContext.java
++++ b/src/main/java/net/fabricmc/loom/api/processor/SpecContext.java
+@@ -33,6 +33,7 @@ import org.gradle.api.plugins.JavaPlugin;
+ 
+ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.configuration.processors.speccontext.ProjectView;
++import net.fabricmc.loom.internal.LoomProjectData;
+ import net.fabricmc.loom.util.fmj.FabricModJson;
+ 
+ public interface SpecContext {
+@@ -59,16 +60,18 @@ public interface SpecContext {
+ 		return Stream.concat(modDependencies().stream(), localMods().stream()).toList();
+ 	}
+ 
+-	// Returns all of the loom projects that are depended on in the main sourceset
+-	// TODO make project isolation aware
+-	static Stream<Project> getDependentProjects(ProjectView projectView) {
+-		final Stream<Project> runtimeProjects = projectView.getLoomProjectDependencies(JavaPlugin.RUNTIME_CLASSPATH_CONFIGURATION_NAME);
+-		final Stream<Project> compileProjects = projectView.getLoomProjectDependencies(JavaPlugin.COMPILE_CLASSPATH_CONFIGURATION_NAME);
++	static Stream<LoomProjectData> getDependentProjectData(ProjectView projectView) {
++		final Stream<LoomProjectData> runtimeProjects = projectView.getLoomProjectDataDependencies(JavaPlugin.RUNTIME_CLASSPATH_CONFIGURATION_NAME);
++		final Stream<LoomProjectData> compileProjects = projectView.getLoomProjectDataDependencies(JavaPlugin.COMPILE_CLASSPATH_CONFIGURATION_NAME);
+ 
+ 		return Stream.concat(runtimeProjects, compileProjects)
+ 				.distinct();
+ 	}
+ 
++	static Stream<Project> getDependentProjects(ProjectView projectView) {
++		return Stream.empty();
++	}
++
+ 	// Sort to ensure stable caching
+ 	static List<FabricModJson> distinctSorted(List<FabricModJson> mods) {
+ 		return mods.stream()
+diff --git a/src/main/java/net/fabricmc/loom/configuration/DependencyInfo.java b/src/main/java/net/fabricmc/loom/configuration/DependencyInfo.java
+index 3ded75b145e59fe7cb4eae873056e96f6284d7ab..7813cb7d71d242beb6096b3721d9fc9a98533489 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/DependencyInfo.java
++++ b/src/main/java/net/fabricmc/loom/configuration/DependencyInfo.java
+@@ -25,14 +25,19 @@
+ package net.fabricmc.loom.configuration;
+ 
+ import java.io.File;
++import java.util.Comparator;
++import java.util.Objects;
+ import java.util.Optional;
+ import java.util.Set;
++import java.util.stream.Collectors;
+ 
+ import org.gradle.api.Project;
+ import org.gradle.api.artifacts.Configuration;
+ import org.gradle.api.artifacts.Dependency;
++import org.gradle.api.artifacts.DependencyArtifact;
+ import org.gradle.api.artifacts.DependencySet;
+ import org.gradle.api.artifacts.FileCollectionDependency;
++import org.gradle.api.artifacts.ModuleDependency;
+ import org.gradle.api.artifacts.ResolvedDependency;
+ import org.gradle.api.artifacts.component.ComponentIdentifier;
+ import org.gradle.api.artifacts.component.ModuleComponentIdentifier;
+@@ -80,6 +85,39 @@ public class DependencyInfo {
+ 		return dependency;
+ 	}
+ 
++	/**
++	 * 返回声明依赖的 classifier，供未解析依赖前的缓存键使用.
++	 */
++	public String getDeclaredClassifier() {
++		if (!(dependency instanceof ModuleDependency moduleDependency)) {
++			return "";
++		}
++
++		return moduleDependency.getArtifacts().stream()
++				.map(DependencyArtifact::getClassifier)
++				.filter(Objects::nonNull)
++				.sorted()
++				.collect(Collectors.joining(","));
++	}
++
++	/**
++	 * 返回声明依赖的 artifact 维度，避免不同扩展名或类型误用同一早缓存.
++	 */
++	public String getDeclaredArtifactDimensions() {
++		if (!(dependency instanceof ModuleDependency moduleDependency)) {
++			return "";
++		}
++
++		return moduleDependency.getArtifacts().stream()
++				.map(artifact -> String.join(",",
++						Objects.toString(artifact.getName(), ""),
++						Objects.toString(artifact.getType(), ""),
++						Objects.toString(artifact.getExtension(), ""),
++						Objects.toString(artifact.getClassifier(), "")))
++				.sorted(Comparator.naturalOrder())
++				.collect(Collectors.joining(";"));
++	}
++
+ 	public String getResolvedVersion() {
+ 		if (resolvedVersion != null) {
+ 			return resolvedVersion;
+@@ -141,10 +179,25 @@ public class DependencyInfo {
+ 		return getDepString();
+ 	}
+ 
++	/**
++	 * {@return 不含 classifier 的模块坐标（{@code group:name:version}）}.
++	 *
++	 * <p>此处刻意不附带声明 classifier。现有调用方都按「三段坐标 + 自行再追加一段 classifier」的位置
++	 * 语义使用本方法：{@code ForgeProvider} 追加 {@code :userdev}/{@code :installer}，
++	 * {@code ForgeUserdevProvider} 追加 {@code :universal}；{@code MappingConfiguration}
++	 * 的 {@code getMappingsClassifier} 也按 {@code split(":")} 的位置取 classifier。
++	 * 一旦这里带上 classifier，前者会拼出 Gradle 拒绝的非法 notation，后者会把 {@code -v2} 追加两次。
++	 * 需要 classifier 维度的场合请直接调用 {@link #getDeclaredClassifier()}。
++	 */
+ 	public String getDepString() {
+ 		return dependency.getGroup() + ":" + dependency.getName() + ":" + dependency.getVersion();
+ 	}
+ 
++	/**
++	 * {@return 不含 classifier 的解析后模块坐标（{@code group:name:resolvedVersion}）}.
++	 *
++	 * <p>与 {@link #getDepString()} 同理，不附带声明 classifier。
++	 */
+ 	public String getResolvedDepString() {
+ 		return dependency.getGroup() + ":" + dependency.getName() + ":" + getResolvedVersion();
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/LoomConfigurations.java b/src/main/java/net/fabricmc/loom/configuration/LoomConfigurations.java
+index c6ffefa76707ac28815da99243290beee70850ac..550ea3023ffadf6254ecc96f42326e315e10902f 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/LoomConfigurations.java
++++ b/src/main/java/net/fabricmc/loom/configuration/LoomConfigurations.java
+@@ -35,6 +35,8 @@ import org.gradle.api.attributes.Usage;
+ import org.gradle.api.plugins.JavaPlugin;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
++import net.fabricmc.loom.internal.LoomProjectData;
++import net.fabricmc.loom.task.ExportLoomProjectDataTask;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.LoomVersions;
+ import net.fabricmc.loom.util.gradle.GradleUtils;
+@@ -53,6 +55,8 @@ public abstract class LoomConfigurations implements Runnable {
+ 	@Override
+ 	public void run() {
+ 		final LoomGradleExtension extension = LoomGradleExtension.get(getProject());
++		register(LoomProjectData.DATA_ELEMENTS_CONFIGURATION, Role.CONSUMABLE);
++		getProject().getArtifacts().add(LoomProjectData.DATA_ELEMENTS_CONFIGURATION, getProject().getTasks().register("exportLoomProjectData", ExportLoomProjectDataTask.class));
+ 
+ 		register(Constants.Configurations.MOD_COMPILE_CLASSPATH, Role.RESOLVABLE);
+ 		registerNonTransitive(Constants.Configurations.MOD_COMPILE_CLASSPATH_MAPPED, Role.RESOLVABLE);
+diff --git a/src/main/java/net/fabricmc/loom/configuration/ide/RunConfigUtils.java b/src/main/java/net/fabricmc/loom/configuration/ide/RunConfigUtils.java
+index 70de9f33ee44650d7a44ce3330c181aa404cfca7..fd3747a435bc78a135f1a3272da493dea64c67f7 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/ide/RunConfigUtils.java
++++ b/src/main/java/net/fabricmc/loom/configuration/ide/RunConfigUtils.java
+@@ -108,7 +108,8 @@ public class RunConfigUtils {
+ 	 */
+ 	public static String formatRunDir(RunConfiguration runConfig, Project project, Function<File, String> absoluteFormatter, Function<String, String> relativeFormatter) {
+ 		File runDir = runConfig.getRunDirectory().getAsFile().get();
+-		File projectDir = project.getRootProject().getProjectDir();
++		// 走隔离项目视图读取根项目目录：直接调用 getRootProject().getProjectDir() 在隔离项目模式下属于跨项目访问。
++		File projectDir = project.getIsolated().getRootProject().getProjectDirectory().getAsFile();
+ 
+ 		if (runDir.toPath().startsWith(projectDir.toPath())) {
+ 			// Windows 上 Path.toString() 使用反斜杠，而 $PROJECT_DIR$ / ${workspace_loc} 这类 IDE 宏约定用正斜杠
+diff --git a/src/main/java/net/fabricmc/loom/configuration/ide/idea/DownloadSourcesHook.java b/src/main/java/net/fabricmc/loom/configuration/ide/idea/DownloadSourcesHook.java
+index e619bb691b1fed6f27d6ce917ce4dc016832cdf2..a2afb29924c00a126f5a7730c909f2ede8b4000f 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/ide/idea/DownloadSourcesHook.java
++++ b/src/main/java/net/fabricmc/loom/configuration/ide/idea/DownloadSourcesHook.java
+@@ -39,7 +39,6 @@ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
+-import net.fabricmc.loom.configuration.mods.dependency.LocalMavenHelper;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJar;
+ import net.fabricmc.loom.configuration.providers.minecraft.mapped.NamedMinecraftProvider;
+ 
+@@ -61,7 +60,54 @@ record DownloadSourcesHook(Project project, Task task) {
+ 		return false;
+ 	}
+ 
++	/**
++	 * 由每个 Loom 项目在自身配置阶段调用：把「源码坐标 → genSources 任务路径」登记到构建级注册表.
++	 *
++	 * <p>登记的是本项目自己的信息，不涉及跨项目访问，因此在隔离项目模式下也是安全的。
++	 *
++	 * @param project 当前正在配置的 Loom 项目
++	 */
++	static void register(Project project) {
++		if (!hasInitScript(project)) {
++			return;
++		}
++
++		final LoomGradleExtension extension = LoomGradleExtension.get(project);
++		final NamedMinecraftProvider<?> minecraftProvider;
++
++		try {
++			minecraftProvider = extension.getNamedMinecraftProvider();
++		} catch (RuntimeException e) {
++			// Minecraft 提供器尚未就绪（例如未启用混淆配置）时无需登记。
++			LOGGER.debug("Minecraft provider not ready in {}, skipping download sources registration", project.getPath());
++			return;
++		}
++
++		final List<MinecraftJar.Type> dependencyTypes = minecraftProvider.getDependencyTypes();
++
++		if (dependencyTypes.isEmpty()) {
++			return;
++		}
++
++		final var decompileConfiguration = extension.getMinecraftJarConfiguration().get().createDecompileConfiguration(project);
++		final IdeaDownloadSourcesRegistry registry = IdeaDownloadSourcesRegistry.get(project);
++
++		for (MinecraftJar.Type type : dependencyTypes) {
++			final String notation = minecraftProvider.getMavenHelper(type).withClassifier("sources").getNotation();
++			registry.register(notation, taskPath(project, decompileConfiguration.getTaskName(type)));
++		}
++	}
++
++	// 以任务路径字符串表达依赖：Gradle 在任务图阶段自行解析，无需读取其它项目的 TaskContainer。
++	private static String taskPath(Project project, String taskName) {
++		return project.getPath().equals(":") ? ":" + taskName : project.getPath() + ":" + taskName;
++	}
++
++	/**
++	 * 由根项目调用：为自己的 {@code ijDownloadSources} 任务添加对各子项目 genSources 任务的依赖.
++	 */
+ 	void tryHook() {
++		final IdeaDownloadSourcesRegistry registry = IdeaDownloadSourcesRegistry.get(project);
+ 		List<File> initScripts = project.getGradle().getStartParameter().getInitScripts();
+ 
+ 		for (File initScript : initScripts) {
+@@ -78,17 +124,18 @@ record DownloadSourcesHook(Project project, Task task) {
+ 					continue;
+ 				}
+ 
+-				final MinecraftJar.Type jarType = getJarType(notation);
++				final List<String> taskPaths = registry.taskPathsFor(notation);
+ 
+-				if (jarType == null) {
+-					LOGGER.debug("init script is trying to download sources for another Minecraft jar ({}) not used by this project ({})", notation, project.getPath());
++				if (taskPaths.isEmpty()) {
++					LOGGER.debug("init script is trying to download sources for another Minecraft jar ({}) not used by this build", notation);
+ 					continue;
+ 				}
+ 
+-				String sourcesTaskName = getGenSourcesTaskName(jarType);
+-				task.dependsOn(project.getTasks().named(sourcesTaskName));
++				for (String taskPath : taskPaths) {
++					task.dependsOn(taskPath);
++					LOGGER.info("Running genSources task: {} for {}", taskPath, notation);
++				}
+ 
+-				LOGGER.info("Running genSources task: {} in project: {} for {}", sourcesTaskName, project.getPath(), notation);
+ 				break;
+ 			} catch (IOException e) {
+ 				// Ignore
+@@ -112,32 +159,4 @@ record DownloadSourcesHook(Project project, Task task) {
+ 
+ 		return null;
+ 	}
+-
+-	private String getGenSourcesTaskName(MinecraftJar.Type jarType) {
+-		LoomGradleExtension extension = LoomGradleExtension.get(project);
+-		return extension.getMinecraftJarConfiguration().get()
+-				.createDecompileConfiguration(project)
+-				.getTaskName(jarType);
+-	}
+-
+-	// Return the jar type, or null when this jar isnt used by the project
+-	private MinecraftJar.@Nullable Type getJarType(String name) {
+-		final LoomGradleExtension extension = LoomGradleExtension.get(project);
+-		final NamedMinecraftProvider<?> minecraftProvider = extension.getNamedMinecraftProvider();
+-		final List<MinecraftJar.Type> dependencyTypes = minecraftProvider.getDependencyTypes();
+-
+-		if (dependencyTypes.isEmpty()) {
+-			throw new IllegalStateException();
+-		}
+-
+-		for (MinecraftJar.Type type : dependencyTypes) {
+-			final LocalMavenHelper mavenHelper = minecraftProvider.getMavenHelper(type).withClassifier("sources");
+-
+-			if (mavenHelper.getNotation().equals(name)) {
+-				return type;
+-			}
+-		}
+-
+-		return null;
+-	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/configuration/ide/idea/IdeaConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/ide/idea/IdeaConfiguration.java
+index de5f692475dc3a2975b9d5ccadb91ca9434f9db9..766e3254450b12b5694df0d416abef546b831e15 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/ide/idea/IdeaConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/ide/idea/IdeaConfiguration.java
+@@ -66,6 +66,17 @@ public abstract class IdeaConfiguration implements Runnable {
+ 	}
+ 
+ 	private void hookDownloadSources() {
++		// 每个 Loom 项目只登记自己可提供的源码任务；根项目再按任务路径字符串添加依赖。
++		// 这样避免了从根项目遍历 allprojects 的跨项目访问，隔离项目模式下同样可用。
++		//
++		// 登记必须推迟到本项目配置完成之后：Minecraft 提供器由 CompileConfiguration 在自己的
++		// afterEvaluate 中安装，而 SETUP_JOBS 里 CompileConfiguration 先于本类注册，两处的
++		// afterEvaluate 动作按注册顺序执行，因此这里登记时提供器一定已就绪。
++		// 若改回在插件 apply 期直接登记，提供器尚为空，getNamedMinecraftProvider() 抛出的 NPE
++		// 会被 register() 静默吞掉，登记表将永远为空，ijDownloadSources 也就挂不上任何
++		// genSources 任务（IDE 的「下载源码」因此失效）。
++		GradleUtils.afterSuccessfulEvaluation(getProject(), () -> DownloadSourcesHook.register(getProject()));
++
+ 		if (!GradleUtils.isRootProject(getProject())) {
+ 			return;
+ 		}
+@@ -76,13 +87,7 @@ public abstract class IdeaConfiguration implements Runnable {
+ 
+ 		getProject().getTasks().configureEach(task -> {
+ 			if (task.getName().startsWith(DownloadSourcesHook.INIT_SCRIPT_NAME)) {
+-				getProject().allprojects(subProject -> {
+-					if (!GradleUtils.isLoomProject(subProject)) {
+-						return;
+-					}
+-
+-					new DownloadSourcesHook(subProject, task).tryHook();
+-				});
++				new DownloadSourcesHook(getProject(), task).tryHook();
+ 			}
+ 		});
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/ide/idea/IdeaDownloadSourcesRegistry.java b/src/main/java/net/fabricmc/loom/configuration/ide/idea/IdeaDownloadSourcesRegistry.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..de630f3549823412e5e88a4f229481999e3b2b16
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/configuration/ide/idea/IdeaDownloadSourcesRegistry.java
+@@ -0,0 +1,81 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.configuration.ide.idea;
++
++import java.util.Collections;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++
++import org.gradle.api.Project;
++import org.gradle.api.invocation.Gradle;
++import org.gradle.api.plugins.ExtensionAware;
++import org.gradle.api.plugins.ExtensionContainer;
++
++/**
++ * 构建级注册表：收集「IDE 下载源码」所需的 genSources 任务路径.
++ *
++ * <p>隔离项目模式不允许从一个项目遍历或读取其它项目的模型，因此这里改为反向登记：
++ * 每个 Loom 项目只写入自己的数据（源码坐标 → 任务路径），根项目再按「任务路径字符串」添加依赖。
++ * 字符串依赖由 Gradle 在任务图阶段自行解析，不需要访问其它项目的 TaskContainer。
++ */
++public final class IdeaDownloadSourcesRegistry {
++	private static final String EXTENSION_NAME = "loomIdeaDownloadSources";
++
++	private final Map<String, Set<String>> taskPathsByNotation = new ConcurrentHashMap<>();
++
++	public static IdeaDownloadSourcesRegistry get(Project project) {
++		final Gradle gradle = project.getGradle();
++		final ExtensionContainer extensions = ((ExtensionAware) gradle).getExtensions();
++
++		if (extensions.findByName(EXTENSION_NAME) instanceof IdeaDownloadSourcesRegistry registry) {
++			return registry;
++		}
++
++		final IdeaDownloadSourcesRegistry registry = new IdeaDownloadSourcesRegistry();
++		extensions.add(IdeaDownloadSourcesRegistry.class, EXTENSION_NAME, registry);
++		return registry;
++	}
++
++	void register(String notation, String taskPath) {
++		taskPathsByNotation
++				.computeIfAbsent(notation, key -> Collections.synchronizedSet(new LinkedHashSet<>()))
++				.add(taskPath);
++	}
++
++	List<String> taskPathsFor(String notation) {
++		final Set<String> taskPaths = taskPathsByNotation.get(notation);
++
++		if (taskPaths == null) {
++			return List.of();
++		}
++
++		synchronized (taskPaths) {
++			return List.copyOf(taskPaths);
++		}
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/DeobfProjectView.java b/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/DeobfProjectView.java
+index e32143482a8a5110f7233e61c352c5b20ceb47fe..d4bbe70a64821e7ad8fc29aa245d20bdabb62b5b 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/DeobfProjectView.java
++++ b/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/DeobfProjectView.java
+@@ -31,10 +31,12 @@ import org.gradle.api.artifacts.Configuration;
+ import org.gradle.api.file.ConfigurableFileCollection;
+ import org.gradle.api.file.FileCollection;
+ 
++import net.fabricmc.loom.internal.LoomProjectData;
++
+ public interface DeobfProjectView extends ProjectView {
+ 	FileCollection getDependencies(DebofConfiguration debofConfiguration, DebofConfiguration.TargetSourceSet targetSourceSet);
+ 
+-	Stream<Project> getProjectDependencies(DebofConfiguration debofConfiguration);
++	Stream<LoomProjectData> getProjectDependencies(DebofConfiguration debofConfiguration);
+ 
+ 	FileCollection getFullClasspath();
+ 
+@@ -49,9 +51,9 @@ public interface DeobfProjectView extends ProjectView {
+ 		}
+ 
+ 		@Override
+-		public Stream<Project> getProjectDependencies(DebofConfiguration debofConfiguration) {
++		public Stream<LoomProjectData> getProjectDependencies(DebofConfiguration debofConfiguration) {
+ 			return debofConfiguration.getConfigurations(project).stream()
+-					.flatMap(configuration -> getLoomProjectDependencies(configuration.getName()));
++					.flatMap(configuration -> getLoomProjectDataDependencies(configuration.getName()));
+ 		}
+ 
+ 		@Override
+diff --git a/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/DeobfSpecContext.java b/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/DeobfSpecContext.java
+index 2f97215253a9b91f39e587a95b56824a8e1d5f45..eaf6d174458428e5d5abc658b74a1a5766d3d869 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/DeobfSpecContext.java
++++ b/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/DeobfSpecContext.java
+@@ -44,10 +44,10 @@ import org.gradle.api.file.FileCollection;
+ 
+ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.api.processor.SpecContext;
++import net.fabricmc.loom.internal.LoomProjectData;
+ import net.fabricmc.loom.util.AsyncCache;
+ import net.fabricmc.loom.util.fmj.FabricModJson;
+ import net.fabricmc.loom.util.fmj.FabricModJsonFactory;
+-import net.fabricmc.loom.util.fmj.FabricModJsonHelpers;
+ 
+ public record DeobfSpecContext(List<FabricModJson> modDependencies,
+ 								List<FabricModJson> localMods,
+@@ -106,8 +106,8 @@ public record DeobfSpecContext(List<FabricModJson> modDependencies,
+ 
+ 		// Add project dependencies
+ 		if (!projectView.disableProjectDependantMods()) {
+-			for (Project dependentProject : SpecContext.getDependentProjects(projectView).toList()) {
+-				allMods.addAll(fmjCache.getBlocking(dependentProject.getPath(), () -> FabricModJsonHelpers.getModsInProject(dependentProject)));
++			for (LoomProjectData dependentProject : SpecContext.getDependentProjectData(projectView).toList()) {
++				allMods.addAll(fmjCache.getBlocking(dependentProject.projectPath(), dependentProject::createMods));
+ 			}
+ 		}
+ 
+@@ -141,8 +141,8 @@ public record DeobfSpecContext(List<FabricModJson> modDependencies,
+ 
+ 		if (!projectView.disableProjectDependantMods()) {
+ 			// Add all the dependent projects
+-			for (Project dependentProject : SpecContext.getDependentProjects(projectView).toList()) {
+-				futures.add(fmjCache.get(dependentProject.getPath(), () -> FabricModJsonHelpers.getModsInProject(dependentProject)));
++			for (LoomProjectData dependentProject : SpecContext.getDependentProjectData(projectView).toList()) {
++				futures.add(fmjCache.get(dependentProject.projectPath(), dependentProject::createMods));
+ 			}
+ 		}
+ 
+@@ -190,8 +190,8 @@ public record DeobfSpecContext(List<FabricModJson> modDependencies,
+ 	private static List<FabricModJson> getCompileRuntimeProjectMods(DeobfProjectView projectView, AsyncCache<List<FabricModJson>> fmjCache) {
+ 		var mods = new ArrayList<FabricModJson>();
+ 
+-		for (Project dependentProject : getCompileRuntimeProjectDependencies(projectView).toList()) {
+-			List<FabricModJson> projectMods = fmjCache.getBlocking(dependentProject.getPath(), () -> FabricModJsonHelpers.getModsInProject(dependentProject));
++		for (LoomProjectData dependentProject : getCompileRuntimeProjectDependencies(projectView).toList()) {
++			List<FabricModJson> projectMods = fmjCache.getBlocking(dependentProject.projectPath(), dependentProject::createMods);
+ 
+ 			mods.addAll(projectMods);
+ 		}
+@@ -200,13 +200,13 @@ public record DeobfSpecContext(List<FabricModJson> modDependencies,
+ 	}
+ 
+ 	// Returns a list of Loom Projects found in both the runtime and compile classpath
+-	private static Stream<Project> getCompileRuntimeProjectDependencies(DeobfProjectView projectView) {
++	private static Stream<LoomProjectData> getCompileRuntimeProjectDependencies(DeobfProjectView projectView) {
+ 		if (projectView.disableProjectDependantMods()) {
+ 			return Stream.empty();
+ 		}
+ 
+-		final Stream<Project> runtimeProjects = projectView.getProjectDependencies(DebofConfiguration.RUNTIME);
+-		final List<Project> compileProjects = projectView.getProjectDependencies(DebofConfiguration.COMPILE).toList();
++		final Stream<LoomProjectData> runtimeProjects = projectView.getProjectDependencies(DebofConfiguration.RUNTIME);
++		final List<LoomProjectData> compileProjects = projectView.getProjectDependencies(DebofConfiguration.COMPILE).toList();
+ 
+ 		return runtimeProjects
+ 				.filter(compileProjects::contains); // Use the intersection of the two configurations.
+diff --git a/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/ProjectView.java b/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/ProjectView.java
+index 43ed093be6ed5d10e2dabf89ed7bbbeee1c98bbd..c7d77b1e285dd68aaa667bcd2edfb0d46864e75a 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/ProjectView.java
++++ b/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/ProjectView.java
+@@ -25,6 +25,7 @@
+ package net.fabricmc.loom.configuration.processors.speccontext;
+ 
+ import java.util.List;
++import java.util.Objects;
+ import java.util.stream.Stream;
+ 
+ import org.gradle.api.Project;
+@@ -33,6 +34,7 @@ import org.gradle.api.artifacts.ProjectDependency;
+ import org.gradle.api.attributes.Usage;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
++import net.fabricmc.loom.internal.LoomProjectData;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.fmj.FabricModJson;
+ import net.fabricmc.loom.util.fmj.FabricModJsonHelpers;
+@@ -40,8 +42,13 @@ import net.fabricmc.loom.util.gradle.GradleUtils;
+ 
+ // Used to abstract out the Gradle API usage to ease unit testing.
+ public interface ProjectView {
+-	//Returns a list of Loom Projects found in the specified Configuration
+-	Stream<Project> getLoomProjectDependencies(String name);
++	// 返回指定配置中的 Loom 项目数据
++	Stream<LoomProjectData> getLoomProjectDataDependencies(String name);
++
++	// 保留旧接口以兼容测试替身，但隔离模式不再返回跨项目 Project 对象
++	default Stream<Project> getLoomProjectDependencies(String name) {
++		return Stream.empty();
++	}
+ 
+ 	// Returns the mods defined in the current project
+ 	List<FabricModJson> getMods();
+@@ -75,13 +82,13 @@ public interface ProjectView {
+ 		}
+ 
+ 		@Override
+-		public Stream<Project> getLoomProjectDependencies(String name) {
++		public Stream<LoomProjectData> getLoomProjectDataDependencies(String name) {
+ 			final Configuration configuration = project.getConfigurations().getByName(name);
+ 			return configuration.getAllDependencies()
+ 					.withType(ProjectDependency.class)
+ 					.stream()
+-					.map((d) -> project.project(d.getPath()))
+-					.filter(GradleUtils::isLoomProject);
++					.map(dependency -> LoomProjectData.fromDependency(project, dependency))
++					.filter(Objects::nonNull);
+ 		}
+ 
+ 		@Override
+@@ -91,10 +98,7 @@ public interface ProjectView {
+ 
+ 		@Override
+ 		public boolean disableProjectDependantMods() {
+-			final LoomGradleExtension extension = LoomGradleExtension.get(project);
+-			// TODO provide a project isolated way of doing this.
+-			return extension.isProjectIsolationActive()
+-					|| GradleUtils.getBooleanProperty(project, Constants.Properties.DISABLE_PROJECT_DEPENDENT_MODS);
++			return GradleUtils.getBooleanProperty(project, Constants.Properties.DISABLE_PROJECT_DEPENDENT_MODS);
+ 		}
+ 
+ 		@Override
+diff --git a/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/RemappedSpecContext.java b/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/RemappedSpecContext.java
+index 00aec308c71d5044b7c8ce2680be610e7977fb95..c3bee4c3f28f6f202228b6a22d8c108d4e0327d7 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/RemappedSpecContext.java
++++ b/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/RemappedSpecContext.java
+@@ -46,10 +46,10 @@ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.api.RemapConfigurationSettings;
+ import net.fabricmc.loom.api.processor.SpecContext;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftSourceSets;
++import net.fabricmc.loom.internal.LoomProjectData;
+ import net.fabricmc.loom.util.AsyncCache;
+ import net.fabricmc.loom.util.fmj.FabricModJson;
+ import net.fabricmc.loom.util.fmj.FabricModJsonFactory;
+-import net.fabricmc.loom.util.fmj.FabricModJsonHelpers;
+ 
+ /**
+  * @param modDependencies External mods that are depended on
+@@ -94,8 +94,8 @@ public record RemappedSpecContext(
+ 
+ 		if (!projectView.disableProjectDependantMods()) {
+ 			// Add all the dependent projects
+-			for (Project dependentProject : SpecContext.getDependentProjects(projectView).toList()) {
+-				futures.add(fmjCache.get(dependentProject.getPath(), () -> FabricModJsonHelpers.getModsInProject(dependentProject)));
++			for (LoomProjectData dependentProject : SpecContext.getDependentProjectData(projectView).toList()) {
++				futures.add(fmjCache.get(dependentProject.projectPath(), dependentProject::createMods));
+ 			}
+ 		}
+ 
+@@ -106,10 +106,8 @@ public record RemappedSpecContext(
+ 	private static List<ModHolder> getCompileRuntimeMods(RemappedProjectView projectView, AsyncCache<List<FabricModJson>> fmjCache) {
+ 		var mods = new ArrayList<>(getCompileRuntimeModsFromRemapConfigs(projectView, fmjCache));
+ 
+-		for (Project dependentProject : getCompileRuntimeProjectDependencies(projectView).toList()) {
+-			List<FabricModJson> projectMods = fmjCache.getBlocking(dependentProject.getPath(), () -> {
+-				return FabricModJsonHelpers.getModsInProject(dependentProject);
+-			});
++		for (LoomProjectData dependentProject : getCompileRuntimeProjectDependencies(projectView).toList()) {
++			List<FabricModJson> projectMods = fmjCache.getBlocking(dependentProject.projectPath(), dependentProject::createMods);
+ 
+ 			for (FabricModJson mod : projectMods) {
+ 				mods.add(new ModHolder(mod));
+@@ -182,13 +180,13 @@ public record RemappedSpecContext(
+ 	}
+ 
+ 	// Returns a list of Loom Projects found in both the runtime and compile classpath
+-	private static Stream<Project> getCompileRuntimeProjectDependencies(ProjectView projectView) {
++	private static Stream<LoomProjectData> getCompileRuntimeProjectDependencies(ProjectView projectView) {
+ 		if (projectView.disableProjectDependantMods()) {
+ 			return Stream.empty();
+ 		}
+ 
+-		final Stream<Project> runtimeProjects = projectView.getLoomProjectDependencies(JavaPlugin.RUNTIME_CLASSPATH_CONFIGURATION_NAME);
+-		final List<Project> compileProjects = projectView.getLoomProjectDependencies(JavaPlugin.COMPILE_CLASSPATH_CONFIGURATION_NAME).toList();
++		final Stream<LoomProjectData> runtimeProjects = projectView.getLoomProjectDataDependencies(JavaPlugin.RUNTIME_CLASSPATH_CONFIGURATION_NAME);
++		final List<LoomProjectData> compileProjects = projectView.getLoomProjectDataDependencies(JavaPlugin.COMPILE_CLASSPATH_CONFIGURATION_NAME).toList();
+ 
+ 		return runtimeProjects
+ 				.filter(compileProjects::contains); // Use the intersection of the two configurations.
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+index 1399e37030bd8edb4975e4964f4ffae38662ffd6..19a985c89fb874ae5fe244580516f2a66f313506 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+@@ -72,6 +72,7 @@ import net.fabricmc.loom.configuration.providers.mappings.tiny.MappingsMerger;
+ import net.fabricmc.loom.configuration.providers.mappings.tiny.TinyJarInfo;
+ import net.fabricmc.loom.configuration.providers.mappings.unpick.UnpickMetadata;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
++import net.fabricmc.loom.util.Checksum;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.FileSystemUtil;
+ import net.fabricmc.loom.util.ZipUtils;
+@@ -112,9 +113,30 @@ public class MappingConfiguration {
+ 	 */
+ 	private static final Map<String, MappingConfiguration> SHARED_EARLY = new ConcurrentHashMap<>();
+ 
++	/**
++	 * 早缓存索引键：只由「声明信息」与平台维度构成，不触发依赖解析.
++	 *
++	 * <p>必须覆盖一切会影响最终 mappings 标识的维度，否则同构但不同变体的项目会互相命中：
++	 * 平台（Fabric/Quilt/Forge/NeoForge）、classifier 与 artifact 类型、是否使用中间映射、
++	 * 是否禁用混淆、以及 Forge 系的具体版本。键尾的版本号用于在维度变化时自然失效旧条目。
++	 */
+ 	private static String earlyKey(LoomGradleExtension extension, DependencyInfo dependency, MinecraftProvider minecraftProvider, String declaredVersion) {
+-		return extension.isForgeLike() + "|" + dependency.getDependency().getGroup() + "|"
+-				+ dependency.getDependency().getName() + "|" + declaredVersion + "|" + minecraftProvider.minecraftVersion();
++		final String forgeVersion = extension.isForgeLike()
++				? extension.getForgeProvider().getVersion().getCombined()
++				: "";
++		final String rawKey = String.join("\u0000",
++				"early-mappings-v2",
++				extension.getPlatform().get().id(),
++				dependency.getDependency().getGroup(),
++				dependency.getDependency().getName(),
++				declaredVersion,
++				dependency.getDeclaredClassifier(),
++				dependency.getDeclaredArtifactDimensions(),
++				minecraftProvider.minecraftVersion(),
++				Boolean.toString(extension.getUseIntermediateMappings().get()),
++				Boolean.toString(extension.disableObfuscation()),
++				forgeVersion);
++		return Checksum.of(rawKey).sha256().hex();
+ 	}
+ 
+ 	public final String mappingsIdentifier;
+diff --git a/src/main/java/net/fabricmc/loom/configuration/sandbox/SandboxConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/sandbox/SandboxConfiguration.java
+index c1fd9926771a16600101cf411828111ce3a9a9b9..82dd2dadd00a6b0ddfb0a113368506efc426e9c5 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/sandbox/SandboxConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/sandbox/SandboxConfiguration.java
+@@ -61,12 +61,7 @@ public abstract class SandboxConfiguration implements Runnable {
+ 	public void run() {
+ 		LoomGradleExtension extension = LoomGradleExtension.get(getProject());
+ 
+-		if (extension.isProjectIsolationActive()) {
+-			LOGGER.debug("Skipping sandbox configuration as project isolation is enabled.");
+-			return;
+-		}
+-
+-		if (getProject().findProperty(Constants.Properties.SANDBOX) == null) {
++		if (GradleUtils.getProperty(getProject(), Constants.Properties.SANDBOX) == null) {
+ 			LOGGER.debug("No fabric sandbox property set");
+ 			return;
+ 		}
+@@ -75,7 +70,7 @@ public abstract class SandboxConfiguration implements Runnable {
+ 	}
+ 
+ 	private void evaluate() {
+-		final String sandboxNotation = (String) Objects.requireNonNull(getProject().findProperty(Constants.Properties.SANDBOX));
++		final String sandboxNotation = Objects.toString(Objects.requireNonNull(GradleUtils.getProperty(getProject(), Constants.Properties.SANDBOX)));
+ 		final LoomGradleExtension extension = LoomGradleExtension.get(getProject());
+ 		final ExternalModuleDependency dependency = getDependencyFactory().create(sandboxNotation);
+ 		final Configuration configuration = getProject().getConfigurations().detachedConfiguration(dependency);
+diff --git a/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java b/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java
+index 17baf112181f36e6b55bfe1a91754a8a8acea46e..fcd8d52a32531823371347e0ec10cea306e513ec 100644
+--- a/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java
++++ b/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java
+@@ -65,6 +65,7 @@ import net.fabricmc.loom.configuration.providers.minecraft.mapped.IntermediaryMi
+ import net.fabricmc.loom.configuration.providers.minecraft.mapped.MojangMappedMinecraftProvider;
+ import net.fabricmc.loom.configuration.providers.minecraft.mapped.NamedMinecraftProvider;
+ import net.fabricmc.loom.configuration.providers.minecraft.mapped.SrgMinecraftProvider;
++import net.fabricmc.loom.internal.LoomGradleSharedData;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.Lazy;
+ import net.fabricmc.loom.util.ModPlatform;
+@@ -111,6 +112,7 @@ public abstract class LoomGradleExtensionImpl extends LoomGradleExtensionApiImpl
+ 	@Inject
+ 	public LoomGradleExtensionImpl(Project project, LoomFiles files) {
+ 		super(project, files);
++		LoomGradleSharedData.get(project);
+ 		this.project = project;
+ 		// Initiate with newInstance to allow gradle to decorate our extension
+ 		this.mixinApExtension = project.getObjects().newInstance(MixinExtensionImpl.class, project);
+diff --git a/src/main/java/net/fabricmc/loom/extension/MixinExtensionImpl.java b/src/main/java/net/fabricmc/loom/extension/MixinExtensionImpl.java
+index bf1c450578cefce43acd8d7f9599f3361a42b47d..780b80ec6f05bbdcb55c082e3e83a9c1d6547207 100644
+--- a/src/main/java/net/fabricmc/loom/extension/MixinExtensionImpl.java
++++ b/src/main/java/net/fabricmc/loom/extension/MixinExtensionImpl.java
+@@ -48,6 +48,8 @@ import org.gradle.api.tasks.TaskProvider;
+ import org.gradle.api.tasks.util.PatternSet;
+ import org.jetbrains.annotations.ApiStatus;
+ 
++import net.fabricmc.loom.util.gradle.GradleUtils;
++
+ public class MixinExtensionImpl extends MixinExtensionApiImpl implements MixinExtension {
+ 	private boolean isDefault;
+ 	private final Property<String> defaultRefmapName;
+@@ -75,7 +77,7 @@ public class MixinExtensionImpl extends MixinExtensionApiImpl implements MixinEx
+ 	private String getDefaultMixinRefmapName() {
+ 		String defaultRefmapName = project.getExtensions().getByType(BasePluginExtension.class).getArchivesName().get() + "-refmap.json";
+ 
+-		if (project.getRootProject() != project) {
++		if (!GradleUtils.isRootProject(project)) {
+ 			final String archivesName = project.getExtensions().getByType(BasePluginExtension.class).getArchivesName().get();
+ 			final String path = project.getPath().substring(1).replace(':', '_');
+ 			defaultRefmapName = "%s-%s-refmap.json".formatted(archivesName, path);
+diff --git a/src/main/java/net/fabricmc/loom/internal/LoomGradleSharedData.java b/src/main/java/net/fabricmc/loom/internal/LoomGradleSharedData.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9f40800a39afe45f7807505e31914fb19d6464f
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/internal/LoomGradleSharedData.java
+@@ -0,0 +1,97 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.internal;
++
++import java.io.Serializable;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++import org.gradle.api.Project;
++import org.gradle.api.invocation.Gradle;
++import org.gradle.api.plugins.ExtensionAware;
++import org.gradle.api.plugins.ExtensionContainer;
++
++/**
++ * 在项目隔离模式下传递只包含可序列化值的共享数据.
++ */
++public final class LoomGradleSharedData implements Serializable {
++	private static final long serialVersionUID = 1L;
++	public static final String EXTENSION_NAME = "loomSharedData";
++
++	private final String pluginVersion;
++	private final Map<String, LoomProjectData> projects = new LinkedHashMap<>();
++
++	public LoomGradleSharedData(String pluginVersion) {
++		this.pluginVersion = pluginVersion;
++	}
++
++	public String pluginVersion() {
++		return pluginVersion;
++	}
++
++	public synchronized void putProject(LoomProjectData data) {
++		projects.put(data.projectPath(), data);
++	}
++
++	public synchronized LoomProjectData getProject(String path) {
++		return projects.get(path);
++	}
++
++	public static void beforeProject(Gradle gradle) {
++		ExtensionContainer extensions = ((ExtensionAware) gradle).getExtensions();
++
++		if (extensions.findByName(EXTENSION_NAME) instanceof LoomGradleSharedData) {
++			return;
++		}
++
++		LoomGradleSharedData data = new LoomGradleSharedData(net.fabricmc.loom.LoomGradlePlugin.LOOM_VERSION);
++		extensions.add(LoomGradleSharedData.class, EXTENSION_NAME, data);
++	}
++
++	public static void beforeProject(Project project, LoomGradleSharedData data) {
++		if (project.getExtensions().findByName(EXTENSION_NAME) == null) {
++			project.getExtensions().add(LoomGradleSharedData.class, EXTENSION_NAME, data);
++		}
++	}
++
++	public static LoomGradleSharedData get(Project project) {
++		LoomGradleSharedData data = project.getExtensions().findByType(LoomGradleSharedData.class);
++
++		if (data != null) {
++			return data;
++		}
++
++		ExtensionContainer extensions = ((ExtensionAware) project.getGradle()).getExtensions();
++		data = extensions.findByType(LoomGradleSharedData.class);
++
++		if (data == null) {
++			beforeProject(project.getGradle());
++			data = extensions.getByType(LoomGradleSharedData.class);
++		}
++
++		beforeProject(project, data);
++		return data;
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/internal/LoomProjectData.java b/src/main/java/net/fabricmc/loom/internal/LoomProjectData.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..292d9f66fa5821237b886a9143242d2edc161b95
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/internal/LoomProjectData.java
+@@ -0,0 +1,311 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.internal;
++
++import java.io.IOException;
++import java.io.Serializable;
++import java.lang.reflect.Field;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++import com.google.gson.JsonElement;
++import com.google.gson.JsonObject;
++import org.gradle.api.Project;
++import org.gradle.api.artifacts.Configuration;
++import org.gradle.api.artifacts.ProjectDependency;
++import org.gradle.api.plugins.JavaPlugin;
++import org.gradle.api.tasks.SourceSet;
++import org.jspecify.annotations.Nullable;
++
++import net.fabricmc.loom.LoomGradleExtension;
++import net.fabricmc.loom.LoomGradlePlugin;
++import net.fabricmc.loom.build.mixin.AnnotationProcessorInvoker;
++import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration;
++import net.fabricmc.loom.util.Constants;
++import net.fabricmc.loom.util.fmj.FabricModJson;
++import net.fabricmc.loom.util.fmj.FabricModJsonFactory;
++import net.fabricmc.loom.util.fmj.FabricModJsonSource;
++import net.fabricmc.loom.util.fmj.FabricModJsonHelpers;
++import net.fabricmc.loom.util.gradle.SourceSetHelper;
++
++/**
++ * 跨项目传递的最小项目数据，只包含基础类型和可序列化集合.
++ */
++public final class LoomProjectData implements Serializable {
++	private static final long serialVersionUID = 1L;
++	public static final String DATA_ELEMENTS_CONFIGURATION = "loomProjectDataElements";
++
++	private final String projectPath;
++	private final List<ModData> mods;
++	private final String mappingId;
++	private final String productionNamespace;
++	private final boolean splitEnvironmentSourceSets;
++	private final List<String> mixinMappingFiles;
++
++	public LoomProjectData(String projectPath, List<ModData> mods, @Nullable String mappingId, @Nullable String productionNamespace,
++			boolean splitEnvironmentSourceSets, List<String> mixinMappingFiles) {
++		this.projectPath = projectPath;
++		this.mods = List.copyOf(mods);
++		this.mappingId = mappingId;
++		this.productionNamespace = productionNamespace;
++		this.splitEnvironmentSourceSets = splitEnvironmentSourceSets;
++		this.mixinMappingFiles = List.copyOf(mixinMappingFiles);
++	}
++
++	public String projectPath() {
++		return projectPath;
++	}
++
++	public List<ModData> mods() {
++		return mods;
++	}
++
++	@Nullable
++	public String mappingId() {
++		return mappingId;
++	}
++
++	@Nullable
++	public String productionNamespace() {
++		return productionNamespace;
++	}
++
++	public boolean splitEnvironmentSourceSets() {
++		return splitEnvironmentSourceSets;
++	}
++
++	public List<String> mixinMappingFiles() {
++		return mixinMappingFiles;
++	}
++
++	public List<FabricModJson> createMods() {
++		return mods.stream().map(ModData::createMod).toList();
++	}
++
++	public static LoomProjectData fromProject(Project project) {
++		LoomGradleExtension extension = LoomGradleExtension.get(project);
++		String mappingId = null;
++		String productionNamespace = null;
++
++		try {
++			if (!extension.disableObfuscation()) {
++				MappingConfiguration mappingConfiguration = extension.getMappingConfiguration();
++				mappingId = mappingConfiguration.mappingsIdentifier;
++			}
++		} catch (RuntimeException ignored) {
++			// 忽略：映射尚未就绪时退化为不带映射标识
++		}
++
++		try {
++			productionNamespace = extension.getProductionNamespaceEnum().get().toString();
++		} catch (RuntimeException ignored) {
++			// 忽略：生产命名空间未配置时退化为默认值
++		}
++
++		List<String> mixinMappingFiles = new ArrayList<>();
++
++		for (SourceSet sourceSet : SourceSetHelper.getSourceSets(project)) {
++			try {
++				mixinMappingFiles.add(AnnotationProcessorInvoker.getMixinMappingsForSourceSet(project, sourceSet).getAbsolutePath());
++			} catch (RuntimeException ignored) {
++				// 忽略：没有 Mixin AP 配置的源集不产出映射文件
++			}
++		}
++
++		return new LoomProjectData(
++				project.getPath(),
++				FabricModJsonHelpers.getModsInProject(project).stream().map(ModData::fromMod).toList(),
++				mappingId,
++				productionNamespace,
++				extension.areEnvironmentSourceSetsSplit(),
++				mixinMappingFiles
++		);
++	}
++
++	public static List<LoomProjectData> getDependencies(Project project) {
++		Map<String, LoomProjectData> result = new LinkedHashMap<>();
++
++		for (String configurationName : List.of(JavaPlugin.RUNTIME_CLASSPATH_CONFIGURATION_NAME, JavaPlugin.COMPILE_CLASSPATH_CONFIGURATION_NAME)) {
++			Configuration configuration = project.getConfigurations().findByName(configurationName);
++
++			if (configuration == null) {
++				continue;
++			}
++
++			for (ProjectDependency dependency : configuration.getAllDependencies().withType(ProjectDependency.class)) {
++				LoomProjectData data = fromDependency(project, dependency);
++
++				if (data != null) {
++					result.put(data.projectPath(), data);
++				}
++			}
++		}
++
++		return List.copyOf(result.values());
++	}
++
++	@Nullable
++	public static LoomProjectData fromDependency(Project project, ProjectDependency dependency) {
++		LoomGradleSharedData sharedData = LoomGradleSharedData.get(project);
++		LoomProjectData data = sharedData.getProject(dependency.getPath());
++
++		if (data != null) {
++			return data;
++		}
++
++		try {
++			Configuration configuration = project.getConfigurations().detachedConfiguration(
++					project.getDependencies().project(Map.of(
++						"path", dependency.getPath(),
++						"configuration", DATA_ELEMENTS_CONFIGURATION
++					)));
++			configuration.setTransitive(false);
++			return read(configuration.getSingleFile().toPath());
++		} catch (RuntimeException ignored) {
++			return null;
++		}
++	}
++
++	@Nullable
++	public static LoomProjectData read(Path path) {
++		try {
++			if (!Files.isRegularFile(path)) {
++				return null;
++			}
++
++			return LoomGradlePlugin.GSON.fromJson(Files.readString(path, StandardCharsets.UTF_8), LoomProjectData.class);
++		} catch (IOException | RuntimeException e) {
++			return null;
++		}
++	}
++
++	public void write(Path path) throws IOException {
++		Files.createDirectories(path.getParent());
++		Files.writeString(path, LoomGradlePlugin.GSON.toJson(this), StandardCharsets.UTF_8);
++	}
++
++	public record ModData(String json, Map<String, byte[]> resources) implements Serializable {
++		private static final long serialVersionUID = 1L;
++
++		private static final Field JSON_OBJECT;
++
++		static {
++			try {
++				JSON_OBJECT = FabricModJson.class.getDeclaredField("jsonObject");
++				JSON_OBJECT.setAccessible(true);
++			} catch (ReflectiveOperationException e) {
++				throw new ExceptionInInitializerError(e);
++			}
++		}
++
++		static ModData fromMod(FabricModJson mod) {
++			JsonObject jsonObject = null;
++
++			try {
++				jsonObject = ((JsonObject) JSON_OBJECT.get(mod)).deepCopy();
++			} catch (IllegalAccessException ignored) {
++				// 忽略：无法读取内部 JSON 时退化为一个仅含默认字段的模组数据
++			}
++
++			if (jsonObject == null) {
++				jsonObject = new JsonObject();
++			}
++
++			if (!jsonObject.has("schemaVersion")) {
++				jsonObject.addProperty("schemaVersion", 1);
++			}
++
++			addStringIfAbsent(jsonObject, "id", safeId(mod));
++			addStringIfAbsent(jsonObject, "version", safeVersion(mod));
++
++			Set<String> resourcePaths = new LinkedHashSet<>();
++			resourcePaths.addAll(mod.getMixinConfigurations());
++			resourcePaths.addAll(mod.getClassTweakers().keySet());
++			JsonElement javadoc = mod.getCustom(Constants.CustomModJsonKeys.PROVIDED_JAVADOC);
++
++			if (javadoc != null && javadoc.isJsonPrimitive()) {
++				resourcePaths.add(javadoc.getAsString());
++			}
++
++			Map<String, byte[]> resources = new LinkedHashMap<>();
++
++			for (String resourcePath : resourcePaths) {
++				try {
++					resources.put(resourcePath, mod.getSource().read(resourcePath));
++				} catch (IOException ignored) {
++					// 忽略：缺失的可选资源不参与跨项目数据交换
++				}
++			}
++
++			return new ModData(LoomGradlePlugin.GSON.toJson(jsonObject), resources);
++		}
++
++		private static void addStringIfAbsent(JsonObject jsonObject, String key, @Nullable String value) {
++			if (!jsonObject.has(key) && value != null) {
++				jsonObject.addProperty(key, value);
++			}
++		}
++
++		@Nullable
++		private static String safeId(FabricModJson mod) {
++			try {
++				return mod.getId();
++			} catch (RuntimeException e) {
++				return null;
++			}
++		}
++
++		@Nullable
++		private static String safeVersion(FabricModJson mod) {
++			try {
++				return mod.getModVersion();
++			} catch (RuntimeException e) {
++				return null;
++			}
++		}
++
++		FabricModJson createMod() {
++			JsonObject jsonObject = LoomGradlePlugin.GSON.fromJson(json, JsonObject.class);
++			Map<String, byte[]> copiedResources = new LinkedHashMap<>(resources);
++			FabricModJsonSource source = path -> {
++				byte[] bytes = copiedResources.get(path);
++
++				if (bytes == null) {
++					throw new IOException("找不到项目数据中的资源：" + path);
++				}
++
++				return bytes;
++			};
++			return FabricModJsonFactory.create(jsonObject, source);
++		}
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/internal/package-info.java b/src/main/java/net/fabricmc/loom/internal/package-info.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..64298bf46b8ac92afd63579e99bb5cd3d80bf1d5
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/internal/package-info.java
+@@ -0,0 +1,30 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++/**
++ * Loom 内部实现：隔离项目共享数据与项目数据交换对象.
++ *
++ * <p>本包不属于公开 API，可能随时变更。
++ */
++package net.fabricmc.loom.internal;
+diff --git a/src/main/java/net/fabricmc/loom/task/ExportLoomProjectDataTask.java b/src/main/java/net/fabricmc/loom/task/ExportLoomProjectDataTask.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a6b368bce644d493f14410bde59c80603d7579b4
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/task/ExportLoomProjectDataTask.java
+@@ -0,0 +1,50 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.task;
++
++import java.io.IOException;
++
++import org.gradle.api.DefaultTask;
++import org.gradle.api.file.RegularFileProperty;
++import org.gradle.api.tasks.CacheableTask;
++import org.gradle.api.tasks.OutputFile;
++import org.gradle.api.tasks.TaskAction;
++
++import net.fabricmc.loom.internal.LoomProjectData;
++
++@CacheableTask
++public abstract class ExportLoomProjectDataTask extends DefaultTask {
++	public ExportLoomProjectDataTask() {
++		getOutputFile().convention(getProject().getLayout().getBuildDirectory().file("loom/project-data.json"));
++	}
++
++	@OutputFile
++	public abstract RegularFileProperty getOutputFile();
++
++	@TaskAction
++	public void exportProjectData() throws IOException {
++		LoomProjectData.fromProject(getProject()).write(getOutputFile().get().getAsFile().toPath());
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/task/ExtractArchiveFilesTask.java b/src/main/java/net/fabricmc/loom/task/ExtractArchiveFilesTask.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3ded76b63b07da86d6bce09294608e053b520ab
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/task/ExtractArchiveFilesTask.java
+@@ -0,0 +1,162 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.task;
++
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++
++import javax.inject.Inject;
++
++import org.gradle.api.DefaultTask;
++import org.gradle.api.file.ArchiveOperations;
++import org.gradle.api.file.ConfigurableFileCollection;
++import org.gradle.api.file.DirectoryProperty;
++import org.gradle.api.file.FileSystemOperations;
++import org.gradle.api.provider.ListProperty;
++import org.gradle.api.tasks.CacheableTask;
++import org.gradle.api.tasks.Input;
++import org.gradle.api.tasks.InputFiles;
++import org.gradle.api.tasks.OutputDirectory;
++import org.gradle.api.tasks.PathSensitive;
++import org.gradle.api.tasks.PathSensitivity;
++import org.gradle.api.tasks.TaskAction;
++
++/**
++ * 把若干归档（jar/zip）解压到单一输出目录的声明式任务.
++ *
++ * <p>与手工解压相比，本任务：
++ * <ul>
++ *     <li>只声明一个 {@link OutputDirectory}，不产出与之重叠的 {@code @OutputFile}，避免任务输出重叠；
++ *     <li>使用 Gradle 的 {@link ArchiveOperations#zipTree} 与 {@link FileSystemOperations#sync}，
++ *         因此可被构建缓存与增量执行复用；
++ *     <li>归档只参与输入哈希而不参与相对路径计算（{@link PathSensitivity#NONE}），
++ *         这样同一份依赖在 Gradle 缓存目录中的绝对路径变化不会引起无谓重跑。
++ * </ul>
++ *
++ * <p>当所有输入归档都不含任何可选后缀文件时，会在输出目录写入一个空标记文件，
++ * 保证任务在“确实没有可解压内容”时也有稳定的输出，而不会产出空目录。
++ */
++@CacheableTask
++public abstract class ExtractArchiveFilesTask extends DefaultTask {
++	/**
++	 * 展开 Forge 安装器源码包的任务名.
++	 */
++	public static final String FORGE_SOURCES_TASK_NAME = "extractForgeSources";
++
++	/**
++	 * 上述任务的输出目录（相对于构建目录）.
++	 */
++	public static final String FORGE_SOURCES_OUTPUT_DIRECTORY = "loom/forgeSources";
++
++	/**
++	 * 无匹配条目时写入的标记文件名；该文件同时作为“同步已完成”的稳定输出.
++	 */
++	public static final String EMPTY_MARKER_FILE = ".loom-empty-archive";
++
++	/**
++	 * 待解压的归档集合.
++	 */
++	@InputFiles
++	@PathSensitive(PathSensitivity.NONE)
++	protected abstract ConfigurableFileCollection getArchives();
++
++	/**
++	 * 只保留这些后缀的条目；为空表示保留全部条目.
++	 */
++	@Input
++	protected abstract ListProperty<String> getIncludedSuffixes();
++
++	/**
++	 * 无匹配条目时写入的输出目录内标记文件名.
++	 */
++	@Input
++	protected abstract ListProperty<String> getEmptyMarkers();
++
++	/**
++	 * 只解压这些后缀的条目；配合 {@link #getIncludedSuffixes()} 的约定（空列表表示全部）.
++	 */
++	public void includeSuffixes(String... suffixes) {
++		getIncludedSuffixes().set(java.util.List.of(suffixes));
++	}
++
++	public void emptyMarker(String marker) {
++		getEmptyMarkers().set(java.util.List.of(marker));
++	}
++
++	@OutputDirectory
++	public abstract DirectoryProperty getOutputDirectory();
++
++	@Inject
++	protected abstract ArchiveOperations getArchiveOperations();
++
++	@Inject
++	protected abstract FileSystemOperations getFileSystemOperations();
++
++	public ExtractArchiveFilesTask() {
++		setGroup("loom");
++		setDescription("解压归档文件到输出目录，供后续任务复用");
++	}
++
++	@TaskAction
++	protected void run() throws IOException {
++		final Path outputDir = getOutputDirectory().get().getAsFile().toPath();
++		final java.util.List<String> suffixes = getIncludedSuffixes().get();
++		final Path emptyMarker = outputDir.resolve(getEmptyMarkers().get().getFirst());
++
++		Files.createDirectories(outputDir);
++
++		getFileSystemOperations().sync(spec -> {
++			spec.into(outputDir);
++
++			for (var archive : getArchives()) {
++				var tree = getArchiveOperations().zipTree(archive);
++
++				if (!suffixes.isEmpty()) {
++					tree = tree.matching(patternFilterable -> patternFilterable.include(suffixes));
++				}
++
++				spec.from(tree);
++			}
++		});
++
++		if (isEmptyDirectory(outputDir, emptyMarker)) {
++			Files.writeString(emptyMarker, "", StandardCharsets.UTF_8);
++		} else {
++			Files.deleteIfExists(emptyMarker);
++		}
++	}
++
++	private static boolean isEmptyDirectory(Path outputDir, Path emptyMarker) throws IOException {
++		try (var stream = Files.walk(outputDir)) {
++			return stream
++					.filter(path -> !path.equals(outputDir))
++					.filter(path -> !path.equals(emptyMarker))
++					.findAny()
++					.isEmpty();
++		}
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/task/GenerateForgePatchedSourcesTask.java b/src/main/java/net/fabricmc/loom/task/GenerateForgePatchedSourcesTask.java
+index b319fac1e3db4f71e46c3bb0a472842b78b9f5fc..78e4b8e321ad7774f7a936130a2ff502ddd30c3d 100644
+--- a/src/main/java/net/fabricmc/loom/task/GenerateForgePatchedSourcesTask.java
++++ b/src/main/java/net/fabricmc/loom/task/GenerateForgePatchedSourcesTask.java
+@@ -131,6 +131,13 @@ public abstract class GenerateForgePatchedSourcesTask extends AbstractLoomTask {
+ 		getOutputJar().fileProvider(getProject().provider(() -> GenerateSourcesTask.getJarFileWithSuffix(getRuntimeJar(), "-sources.jar")));
+ 		getForgeSourcesOptions().convention(ForgeSourcesService.createOptions(getProject()));
+ 
++		// 提前展开 Forge 源码包（声明式、可缓存），避免每次执行都手工遍历归档。
++		// 用 provider 延迟探测任务是否存在，避免在尚未注册时抛错。
++		dependsOn(getProject().getProviders().provider(() ->
++				getProject().getTasks().findByName(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME) == null
++						? java.util.List.of()
++						: java.util.List.of(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME)));
++
+ 		final TempFiles tempFiles = new TempFiles();
+ 		getTempFiles().value(tempFiles).finalizeValue();
+ 		final Path cache;
+diff --git a/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java b/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
+index 9abfb163b600da09f17751ef1fb29d11e2be4593..68a6b78db9a164ed18aee1f2025be9fcb621b960 100644
+--- a/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
++++ b/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
+@@ -255,6 +255,13 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
+ 
+ 		getForgeSourcesOptions().set(ForgeSourcesService.createOptions(getProject()));
+ 
++		// 提前展开 Forge 源码包（声明式、可缓存），避免每次执行都手工遍历归档。
++		// 用 provider 延迟探测任务是否存在，避免在尚未注册时抛错。
++		dependsOn(getProject().getProviders().provider(() ->
++				getProject().getTasks().findByName(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME) == null
++						? java.util.List.of()
++						: java.util.List.of(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME)));
++
+ 		mustRunAfter(getProject().getTasks().withType(AbstractRemapJarTask.class));
+ 	}
+ 
+diff --git a/src/main/java/net/fabricmc/loom/task/LoomTasks.java b/src/main/java/net/fabricmc/loom/task/LoomTasks.java
+index 148263dbe316063e44501344b0b154d0fce0b0dc..29e40a446c8c50d2acf48b982bda2421d026b0a9 100644
+--- a/src/main/java/net/fabricmc/loom/task/LoomTasks.java
++++ b/src/main/java/net/fabricmc/loom/task/LoomTasks.java
+@@ -62,6 +62,7 @@ public abstract class LoomTasks implements Runnable {
+ 	@Override
+ 	public void run() {
+ 		LoomGradleExtension extension = LoomGradleExtension.get(getProject());
++		getTasks().named("exportLoomProjectData", task -> task.setDescription("导出隔离项目所需的项目数据"));
+ 
+ 		if (!extension.disableObfuscation()) {
+ 			registerMigrateMappingsTasks();
+@@ -117,6 +118,7 @@ public abstract class LoomTasks implements Runnable {
+ 
+ 		registerIDETasks();
+ 		registerRunTasks();
++		registerForgeSourceExtractionTask(extension);
+ 
+ 		// Must be done in afterEvaluate to allow time for the build script to configure the jar config.
+ 		GradleUtils.afterSuccessfulEvaluation(getProject(), () -> {
+@@ -136,6 +138,35 @@ public abstract class LoomTasks implements Runnable {
+ 		});
+ 	}
+ 
++	/**
++	 * 注册声明式解压 Forge 安装器源码包的任务.
++	 *
++	 * <p>该任务把“归档 -> 输出目录”的转换交给 Gradle 建模：单一 {@code @OutputDirectory} 输出便于构建缓存复用，
++	 * 同时避免与其它任务产生重叠输出。平台不是 Forge-like，或 userdev 配置尚未就绪时直接跳过注册，
++	 * 由 {@code ForgeSourcesService} 回退到内联解压路径。
++	 */
++	private void registerForgeSourceExtractionTask(LoomGradleExtension extension) {
++		if (!extension.isForgeLike()) {
++			return;
++		}
++
++		getTasks().register(ExtractArchiveFilesTask.FORGE_SOURCES_TASK_NAME, ExtractArchiveFilesTask.class, task -> {
++			task.setDescription("展开 Forge 安装器源码包，供 genSources 复用");
++
++			// 只保留 Java 源码条目：源码包里的资源文件不参与后续重映射。
++			task.includeSuffixes("**/*.java");
++			task.emptyMarker(ExtractArchiveFilesTask.EMPTY_MARKER_FILE);
++
++			task.getOutputDirectory().convention(
++					getProject().getLayout().getBuildDirectory().dir(ExtractArchiveFilesTask.FORGE_SOURCES_OUTPUT_DIRECTORY));
++
++			task.getArchives().from(getProject().provider(() -> {
++				final String sources = extension.getForgeUserdevProvider().getConfig().sources();
++				return dev.architectury.loom.util.DependencyDownloader.download(getProject(), sources);
++			}));
++		});
++	}
++
+ 	private void registerMigrateMappingsTasks() {
+ 		SourceSetHelper.getSourceSets(getProject()).all(sourceSet -> {
+ 			if (SourceSetHelper.isMainSourceSet(sourceSet)) {
+diff --git a/src/main/java/net/fabricmc/loom/task/service/MixinAPMappingService.java b/src/main/java/net/fabricmc/loom/task/service/MixinAPMappingService.java
+index c9722f61c526ee2d7bd9a7bf30384986c630f9b4..27c3e8eb655c015a867697bbf9a7fdeebe53e13e 100644
+--- a/src/main/java/net/fabricmc/loom/task/service/MixinAPMappingService.java
++++ b/src/main/java/net/fabricmc/loom/task/service/MixinAPMappingService.java
+@@ -48,6 +48,7 @@ import org.slf4j.LoggerFactory;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.LoomNoRemapGradlePlugin;
++import net.fabricmc.loom.internal.LoomProjectData;
+ import net.fabricmc.loom.build.mixin.AnnotationProcessorInvoker;
+ import net.fabricmc.loom.util.TinyRemapperHelper;
+ import net.fabricmc.loom.util.gradle.GradleUtils;
+@@ -105,8 +106,13 @@ public class MixinAPMappingService extends Service<MixinAPMappingService.Options
+ 		};
+ 
+ 		if (thisExtension.isProjectIsolationActive()) {
+-			// TODO provide a project isolated way of remapping with dependency mixin mapping
+ 			processProject.accept(thisProject);
++
++			for (LoomProjectData projectData : LoomProjectData.getDependencies(thisProject)) {
++				if (mappingId.equals(projectData.mappingId())) {
++					processProjectData(thisProject, projectData, from, to, providers);
++				}
++			}
+ 		} else {
+ 			GradleUtils.allLoomProjects(thisProject.getGradle(), project -> {
+ 				if (LoomNoRemapGradlePlugin.isApplied(project)) {
+@@ -128,6 +134,18 @@ public class MixinAPMappingService extends Service<MixinAPMappingService.Options
+ 		return thisProject.provider(() -> providers.stream().map(Provider::get).toList());
+ 	}
+ 
++	private static void processProjectData(Project project, LoomProjectData projectData, Provider<String> from, Provider<String> to, List<Provider<Options>> providers) {
++		for (String mappingFile : projectData.mixinMappingFiles()) {
++			Path path = Path.of(mappingFile);
++			providers.add(TYPE.create(project, options -> {
++				options.getCompileOutputs().from(path);
++				options.getMixinMappingFileName().set(path.getFileName().toString());
++				options.getFrom().set(from);
++				options.getTo().set(to);
++			}));
++		}
++	}
++
+ 	@Nullable
+ 	public static Provider<Options> createOptions(Project project, SourceSet sourceSet, Provider<String> from, Provider<String> to) {
+ 		final File mixinMappings = AnnotationProcessorInvoker.getMixinMappingsForSourceSet(project, sourceSet);
+diff --git a/src/main/java/net/fabricmc/loom/util/AsyncCache.java b/src/main/java/net/fabricmc/loom/util/AsyncCache.java
+index b6780a8003b131ea06405ff290b3c19f0e6c404a..5eb937d6cdffe27c4d37321a3a4a5f70ae812e73 100644
+--- a/src/main/java/net/fabricmc/loom/util/AsyncCache.java
++++ b/src/main/java/net/fabricmc/loom/util/AsyncCache.java
+@@ -27,9 +27,9 @@ package net.fabricmc.loom.util;
+ import java.util.Collection;
+ import java.util.List;
+ import java.util.Map;
++import java.util.concurrent.ArrayBlockingQueue;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.concurrent.CompletionException;
+-import java.util.concurrent.ArrayBlockingQueue;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.Executor;
+ import java.util.concurrent.ThreadPoolExecutor;
+@@ -65,7 +65,30 @@ public class AsyncCache<T> {
+ 	private final Map<Object, CompletableFuture<T>> cache = new ConcurrentHashMap<>();
+ 
+ 	public CompletableFuture<T> get(Object cacheKey, Supplier<T> supplier) {
+-		return cache.computeIfAbsent(cacheKey, $ -> CompletableFuture.supplyAsync(supplier, EXECUTOR));
++		final CompletableFuture<T> cached = cache.get(cacheKey);
++
++		if (cached != null) {
++			return cached;
++		}
++
++		final CompletableFuture<T> future = new CompletableFuture<>();
++		final CompletableFuture<T> existing = cache.putIfAbsent(cacheKey, future);
++
++		if (existing != null) {
++			return existing;
++		}
++
++		// 先放入缓存再执行供应器，确保同步失败时也能安全移除失败 Future。
++		EXECUTOR.execute(() -> {
++			try {
++				future.complete(supplier.get());
++			} catch (Throwable t) {
++				future.completeExceptionally(t);
++				cache.remove(cacheKey, future);
++			}
++		});
++
++		return future;
+ 	}
+ 
+ 	public T getBlocking(Object cacheKey, Supplier<T> supplier) {
+diff --git a/src/main/java/net/fabricmc/loom/util/Constants.java b/src/main/java/net/fabricmc/loom/util/Constants.java
+index c7a0ced7e6c0a5c5b9ad9d9637c10803d18baea8..a95cc8acb0b01cb9b24bac32542b4108bfc284fe 100644
+--- a/src/main/java/net/fabricmc/loom/util/Constants.java
++++ b/src/main/java/net/fabricmc/loom/util/Constants.java
+@@ -93,7 +93,7 @@ public class Constants {
+ 		public static final String FORGE_DEPENDENCIES = "forgeDependencies";
+ 		/**
+ 		 * "Extra" runtime dependencies on Forge. Contains the Minecraft resources
+-		 * and {@linkplain Dependencies#FORGE_RUNTIME the Architectury Loom runtime}.
++		 * and {@link #FORGE_RUNTIME_LIBRARY the Architectury Loom runtime}.
+ 		 */
+ 		public static final String FORGE_EXTRA = "forgeExtra";
+ 		/**
+diff --git a/src/main/java/net/fabricmc/loom/util/ZipUtils.java b/src/main/java/net/fabricmc/loom/util/ZipUtils.java
+index c510d89ec746e5766a06f7b72b936405412207cf..85a521297a208bbfb5c833a94cc57c8bee3655bc 100644
+--- a/src/main/java/net/fabricmc/loom/util/ZipUtils.java
++++ b/src/main/java/net/fabricmc/loom/util/ZipUtils.java
+@@ -84,6 +84,9 @@ public class ZipUtils {
+ 	}
+ 
+ 	public static void unpackAll(Path zip, Path output) throws IOException {
++		Files.createDirectories(output);
++		final Path outputRoot = output.toAbsolutePath().normalize();
++
+ 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getReadOnlyJarFileSystem(zip);
+ 				Stream<Path> walk = Files.walk(fs.getRoot())) {
+ 			Iterator<Path> iterator = walk.iterator();
+@@ -91,14 +94,34 @@ public class ZipUtils {
+ 			while (iterator.hasNext()) {
+ 				Path fsPath = iterator.next();
+ 				if (!Files.isRegularFile(fsPath)) continue;
+-				Path dstPath = output.resolve(fs.getRoot().relativize(fsPath).toString());
+-				Path dstPathParent = dstPath.getParent();
+-				if (dstPathParent != null) Files.createDirectories(dstPathParent);
++				Path relative = fs.getRoot().relativize(fsPath);
++				Path dstPath = resolveSafeExtractionPath(outputRoot, relative);
+ 				Files.copy(fsPath, dstPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+ 			}
+ 		}
+ 	}
+ 
++	private static Path resolveSafeExtractionPath(Path outputRoot, Path relative) throws IOException {
++		final Path realRoot = outputRoot.toRealPath();
++		final Path destination = realRoot.resolve(relative.toString()).normalize();
++
++		if (!destination.startsWith(realRoot)) {
++			throw new IOException("Archive entry escapes extraction directory: " + relative);
++		}
++
++		final Path parent = destination.getParent();
++
++		if (parent != null) {
++			Files.createDirectories(parent);
++
++			if (!parent.toRealPath().startsWith(realRoot)) {
++				throw new IOException("Archive entry uses a symbolic link outside extraction directory: " + relative);
++			}
++		}
++
++		return destination;
++	}
++
+ 	public static byte @Nullable [] unpackNullable(Path zip, String path) throws IOException {
+ 		try {
+ 			return unpack(zip, path);
+diff --git a/src/main/java/net/fabricmc/loom/util/gradle/GradleUtils.java b/src/main/java/net/fabricmc/loom/util/gradle/GradleUtils.java
+index 01aec655e77dbf191f60690dba7dc0872d4af2a5..41be1647596bc630333ab1bba003429df1175800 100644
+--- a/src/main/java/net/fabricmc/loom/util/gradle/GradleUtils.java
++++ b/src/main/java/net/fabricmc/loom/util/gradle/GradleUtils.java
+@@ -31,6 +31,7 @@ import org.gradle.api.Project;
+ import org.gradle.api.file.RegularFileProperty;
+ import org.gradle.api.invocation.Gradle;
+ import org.gradle.api.provider.Provider;
++import org.jspecify.annotations.Nullable;
+ 
+ import net.fabricmc.loom.LoomCompanionGradlePlugin;
+ import net.fabricmc.loom.LoomGradleExtension;
+@@ -72,8 +73,7 @@ public final class GradleUtils {
+ 		LoomGradleExtension extension = LoomGradleExtension.get(project);
+ 
+ 		if (extension.isProjectIsolationActive()) {
+-			// TODO write a custom property parser for isolated projects
+-			return project.provider(() -> false);
++			return project.getProviders().gradleProperty(key).map(Boolean::parseBoolean);
+ 		}
+ 
+ 		// Works around https://github.com/gradle/gradle/issues/23572
+@@ -93,6 +93,21 @@ public final class GradleUtils {
+ 	}
+ 
+ 	public static Provider<Integer> getIntegerPropertyProvider(Project project, String key) {
++		LoomGradleExtension extension = LoomGradleExtension.get(project);
++
++		if (extension.isProjectIsolationActive()) {
++			// Project.findProperty 在属性未定义时会沿项目层级向父项目查找，隔离项目下会被判定为
++			// 跨项目访问（cannot dynamically look up a property in the parent project）。
++			// 与 getBooleanPropertyProvider / getProperty 保持一致，改用 gradleProperty。
++			return project.getProviders().gradleProperty(key).map(value -> {
++				try {
++					return Integer.parseInt(value);
++				} catch (final NumberFormatException ex) {
++					throw new IllegalArgumentException("Property " + key + " must be an integer", ex);
++				}
++			});
++		}
++
+ 		return project.provider(() -> {
+ 			final Object value = project.findProperty(key);
+ 
+@@ -116,12 +131,12 @@ public final class GradleUtils {
+ 		return getBooleanPropertyProvider(project, key).getOrElse(defaultValue);
+ 	}
+ 
++	@Nullable
+ 	public static Object getProperty(Project project, String key) {
+ 		LoomGradleExtension extension = LoomGradleExtension.get(project);
+ 
+ 		if (extension.isProjectIsolationActive()) {
+-			// TODO write a custom property parser for isolated projects
+-			return null;
++			return project.getProviders().gradleProperty(key).getOrNull();
+ 		}
+ 
+ 		return project.findProperty(key);
+@@ -135,7 +150,13 @@ public final class GradleUtils {
+ 		return property.getAsFile().get();
+ 	}
+ 
++	/**
++	 * {@return 当前项目是否为根项目}.
++	 *
++	 * <p>通过项目隔离视图比较路径，而不是直接比较 {@code getRootProject()} 的对象引用：
++	 * 隔离项目模式下跨项目模型访问会触发校验错误，而 {@code IsolatedProject} 只暴露路径等标识信息。
++	 */
+ 	public static boolean isRootProject(Project project) {
+-		return project.getRootProject() == project;
++		return project.getPath().equals(project.getIsolated().getRootProject().getPath());
+ 	}
+ }
+diff --git a/src/test/groovy/net/fabricmc/loom/configuration/ide/idea/IdeaDownloadSourcesRegistryTest.groovy b/src/test/groovy/net/fabricmc/loom/configuration/ide/idea/IdeaDownloadSourcesRegistryTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..0ef50c2a376493ee56dd392f22266a7e135232b1
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/configuration/ide/idea/IdeaDownloadSourcesRegistryTest.groovy
+@@ -0,0 +1,120 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.configuration.ide.idea
++
++import org.gradle.testfixtures.ProjectBuilder
++import spock.lang.Specification
++
++/**
++ * 覆盖「IDE 下载源码钩子」在隔离项目模式下的构建级登记表。
++ *
++ * <p>测试与被测类同包，因为 {@code register} / {@code taskPathsFor} 是包级私有：这里的可见性正是
++ * 「只有 Loom 内部（同一包）才能写登记表」的约束，不应为了测试放宽。
++ */
++class IdeaDownloadSourcesRegistryTest extends Specification {
++	// 形如 net.minecraft:<jar 名>:<MC 版本>-<mappings 标识>:sources，版本部分由 mappings 决定。
++	private static final String MERGED_SOURCES = "net.minecraft:minecraft-merged:1.20.4-official:sources"
++	private static final String SERVER_SOURCES = "net.minecraft:minecraft-server:1.20.4-official:sources"
++	private static final String CLIENT_SOURCES = "net.minecraft:minecraft-client:1.20.4-official:sources"
++
++	def "同一坐标会收集所有项目登记的任务路径"() {
++		given:
++		def registry = new IdeaDownloadSourcesRegistry()
++
++		when: "根项目与两个子项目都用了同一份 Minecraft 坐标"
++		registry.register(MERGED_SOURCES, ":genSources")
++		registry.register(MERGED_SOURCES, ":one:genSources")
++		registry.register(MERGED_SOURCES, ":two:genSources")
++
++		then:
++		registry.taskPathsFor(MERGED_SOURCES) == [
++			":genSources",
++			":one:genSources",
++			":two:genSources"
++		]
++	}
++
++	def "重复登记同一任务路径只保留一份"() {
++		given:
++		def registry = new IdeaDownloadSourcesRegistry()
++
++		when: "同一个项目/同一坐标被重复登记"
++		registry.register(MERGED_SOURCES, ":genSources")
++		registry.register(MERGED_SOURCES, ":genSources")
++
++		then:
++		registry.taskPathsFor(MERGED_SOURCES) == [":genSources"]
++	}
++
++	def "不同坐标之间的登记互相隔离"() {
++		given:
++		def registry = new IdeaDownloadSourcesRegistry()
++
++		when:
++		registry.register(MERGED_SOURCES, ":genSources")
++		registry.register(SERVER_SOURCES, ":genSourcesWithSources")
++
++		then:
++		registry.taskPathsFor(MERGED_SOURCES) == [":genSources"]
++		registry.taskPathsFor(SERVER_SOURCES) == [":genSourcesWithSources"]
++
++		and: "没有被任何项目登记过的坐标查不到任务路径"
++		registry.taskPathsFor(CLIENT_SOURCES).isEmpty()
++	}
++
++	def "同一构建内的所有项目共享同一份登记表"() {
++		given: "登记表挂在 Gradle 作用域上，因此子项目写的条目根项目也能看到"
++		def rootProject = ProjectBuilder.builder().withName("root").build()
++		def subProject = ProjectBuilder.builder().withName("sub").withParent(rootProject).build()
++
++		when:
++		def fromRoot = IdeaDownloadSourcesRegistry.get(rootProject)
++		def fromSub = IdeaDownloadSourcesRegistry.get(subProject)
++
++		then:
++		fromRoot.is(fromSub)
++
++		and:
++		fromSub.register(MERGED_SOURCES, ":sub:genSources")
++		fromRoot.taskPathsFor(MERGED_SOURCES) == [":sub:genSources"]
++	}
++
++	def "不同构建之间不共享登记表"() {
++		given:
++		def firstBuildProject = ProjectBuilder.builder().withName("first").build()
++		def secondBuildProject = ProjectBuilder.builder().withName("second").build()
++
++		when:
++		def firstRegistry = IdeaDownloadSourcesRegistry.get(firstBuildProject)
++		def secondRegistry = IdeaDownloadSourcesRegistry.get(secondBuildProject)
++
++		then:
++		!firstRegistry.is(secondRegistry)
++
++		and: "一个构建里的登记不会泄漏到另一个构建"
++		firstRegistry.register(MERGED_SOURCES, ":genSources")
++		secondRegistry.taskPathsFor(MERGED_SOURCES).isEmpty()
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/IdeaDownloadSourcesHookTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/IdeaDownloadSourcesHookTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..0babc18a77980ec57b75b19c8381805fbd37010a
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/IdeaDownloadSourcesHookTest.groovy
+@@ -0,0 +1,173 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration
++
++import java.util.regex.Pattern
++
++import spock.lang.Specification
++
++import net.fabricmc.loom.test.util.GradleProjectTestTrait
++
++import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
++
++/**
++ * 覆盖「IDE 下载源码钩子」在隔离项目（Isolated Projects）模式下的行为.
++ *
++ * <p>根 + one + two 三个项目都应用了 Loom 且使用同一份 Minecraft（1.20.4 + officialMojangMappings），
++ * 因此三个项目会为同一个源码坐标各登记一次自己的 genSources 任务；根项目的 ijDownloadSources 任务
++ * 必须把所有这三个任务挂上，且整个过程不能有跨项目访问。
++ */
++class IdeaDownloadSourcesHookTest extends Specification implements GradleProjectTestTrait {
++	private static final String INIT_SCRIPT_NAME = "ijDownloadSources.gradle"
++	private static final String PROBE_TASK_NAME = "printLoomSourcesNotation"
++	private static final Pattern NOTATION_PATTERN = Pattern.compile("LOOM_SOURCES_NOTATION=(\\S+)")
++	private static final String REGISTRY_MARKER = "LOOM_SOURCES_REGISTRY="
++
++	def "隔离项目模式下下载源码钩子只用任务路径字符串装配任务图"() {
++		setup:
++		// 夹具的根项目用 apply plugin 的旧写法引入 Loom，需要 buildSrc 把 Loom 放到脚本类路径上。
++		def gradle = gradleProject(project: "multiProjectDirectLoom", version: "9.5.0")
++		gradle.buildSrc("loomClasspath")
++		// 源码坐标的版本部分含 mappings 标识，无法硬编码，因此在夹具根项目注入探针任务取回真实坐标。
++		gradle.buildGradle << probeTask()
++
++		when: "第一步：没有 IDE init script 时钩子必须是惰性的"
++		def withoutInitScript = gradle.run(task: PROBE_TASK_NAME, isloatedProjects: true)
++
++		then:
++		withoutInitScript.task(":$PROBE_TASK_NAME").outcome == SUCCESS
++		withoutInitScript.output.contains(REGISTRY_MARKER + "<absent>")
++
++		when: "第二步：带上 IDE 生成的下载源码 init script 再跑一次"
++		def notation = parseNotation(withoutInitScript.output)
++		def initScript = writeInitScript(gradle.projectDir, notation)
++		def result = gradle.run(
++				tasks: [
++					":ijDownloadSources",
++					":$PROBE_TASK_NAME"
++				],
++				isloatedProjects: true,
++				args: [
++					"--init-script",
++					initScript.absolutePath
++				])
++
++		then: "三个 Loom 项目都用自己的任务路径登记了这份坐标，没有跨项目读取"
++		notation.startsWith("net.minecraft:minecraft-merged:1.20.4")
++		notation.endsWith(":sources")
++		registeredTaskPaths(result.output, notation) == ([
++			":genSources",
++			":one:genSources",
++			":two:genSources"
++		] as Set)
++
++		and: "IDE 的钩子任务执行成功，且任务图里确实挂上了三个项目的 genSources 任务"
++		result.task(":ijDownloadSources").outcome == SUCCESS
++		result.task(":genSources").outcome == SUCCESS
++		result.task(":one:genSources").outcome == SUCCESS
++		result.task(":two:genSources").outcome == SUCCESS
++	}
++
++	// 探针任务：打印 Loom 为 IDE 下载源码准备的坐标，以及构建级登记表里该坐标已登记的任务路径。
++	// 全部走动态调用，不依赖构建脚本能编译到 Loom 的类。
++	//
++	// 读取时机是这里的关键：登记表由各项目在配置期逐条写入，只有当所有项目都配置完成后它才是终态，
++	// 所以不能在根项目 build.gradle 求值时读；而任务的执行动作又不得触碰 project / gradle，
++	// 因为该用例以 --configuration-cache 运行。任务「实现」（realize）正好落在两者之间：
++	// 注册任务的配置动作在任务图计算阶段执行，此时配置已全部结束、登记表已是终态，且仍属于配置期。
++	// 于是把读到的内容固化成纯字符串列表交给闭包字段，执行期只负责逐行打印。
++	private static String probeTask() {
++		return """
++tasks.register("$PROBE_TASK_NAME") {
++	def lines = collectLoomSourcesProbeLines()
++
++	doLast {
++		lines.each { println it }
++	}
++}
++
++// 由探针任务在实现时（配置期）调用。只返回纯字符串，闭包不会因此持有任何 Gradle 模型对象，
++// 配置缓存可以安全地把它连同任务动作一起序列化。
++def collectLoomSourcesProbeLines() {
++	def lines = []
++	def extension = project.extensions.getByName("loom")
++	def provider = extension.getNamedMinecraftProvider()
++	provider.getDependencyTypes().each { type ->
++		lines << "LOOM_SOURCES_NOTATION=" + provider.getMavenHelper(type).withClassifier("sources").getNotation()
++	}
++
++	def registry = gradle.extensions.findByName("loomIdeaDownloadSources")
++
++	if (registry == null) {
++		lines << "LOOM_SOURCES_REGISTRY=<absent>"
++	} else {
++		def field = registry.getClass().getDeclaredField("taskPathsByNotation")
++		field.setAccessible(true)
++		field.get(registry).each { key, value -> lines << "LOOM_SOURCES_REGISTRY=" + key + " -> " + value }
++	}
++
++	return lines
++}
++"""
++	}
++
++	// 与 IDE 生成的 init script 保持一致：脚本里必须出现 IjDownloadTask 与 dependencyNotation = '<坐标>'，
++	// Loom 正是通过解析脚本文本来判断要下载哪份源码。
++	private static File writeInitScript(File projectDir, String notation) {
++		File initScript = new File(projectDir, INIT_SCRIPT_NAME)
++		initScript.text = """// 模拟 IDE（IntelliJ）生成的「下载 Minecraft 源码」init script
++abstract class IjDownloadTask extends DefaultTask {
++	@Internal
++	String dependencyNotation
++}
++
++gradle.rootProject { target ->
++	target.tasks.register("ijDownloadSources", IjDownloadTask) {
++		dependencyNotation = '${notation}'
++		doLast {
++			println "ijDownloadSources: " + dependencyNotation
++		}
++	}
++}
++"""
++		return initScript
++	}
++
++	private static String parseNotation(String output) {
++		def matcher = NOTATION_PATTERN.matcher(output)
++		return matcher.find() ? matcher.group(1) : null
++	}
++
++	private static Set<String> registeredTaskPaths(String output, String notation) {
++		def prefix = REGISTRY_MARKER + notation + " -> ["
++		def line = output.readLines().find { it.startsWith(prefix) }
++
++		if (line == null) {
++			return [] as Set
++		}
++
++		return line.substring(prefix.length(), line.length() - 1).split(", ").toList().toSet()
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/forge/ForgeExtractSourcesTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/forge/ForgeExtractSourcesTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..466506a49867b48aab754666ed2135941284258f
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/forge/ForgeExtractSourcesTest.groovy
+@@ -0,0 +1,89 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration.forge
++
++import spock.lang.Specification
++
++import net.fabricmc.loom.test.util.GradleProjectTestTrait
++
++import static net.fabricmc.loom.test.LoomTestConstants.DEFAULT_GRADLE
++import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
++import static org.gradle.testkit.runner.TaskOutcome.UP_TO_DATE
++
++/**
++ * 验证 Forge 源码包由声明式解压任务产出，并且在输入不变时可复用（增量/构建缓存）。
++ */
++class ForgeExtractSourcesTest extends Specification implements GradleProjectTestTrait {
++	def "extractForgeSources 是可复用的声明式任务"() {
++		setup:
++		def gradle = gradleProject(project: "forge/simple", version: DEFAULT_GRADLE)
++		gradle.buildGradle.text = gradle.buildGradle.text
++				.replace('@MCVERSION@', '1.18.1')
++				.replace('@FORGEVERSION@', '39.0.63')
++				.replace('@MAPPINGS@', 'loom.officialMojangMappings()')
++				.replace('@REPOSITORIES@', '')
++				.replace('@PACKAGE@', 'net.minecraftforge:forge')
++				.replace('@JAVA_VERSION@', '17')
++
++		when:
++		def result = gradle.run(task: "extractForgeSources", configurationCache: false, args: jdk21Args())
++
++		then: "首次执行展开源码包"
++		result.task(":extractForgeSources").outcome == SUCCESS
++
++		and: "输出目录内确实包含 .java 源码"
++		def outputDir = new File(gradle.projectDir, "build/loom/forgeSources")
++		outputDir.directory
++		collectJavaFiles(outputDir).size() > 0
++
++		when: "输入不变时再次执行"
++		def second = gradle.run(task: "extractForgeSources", configurationCache: false, args: jdk21Args())
++
++		then: "任务被判定为最新，不再重复解压"
++		second.task(":extractForgeSources").outcome == UP_TO_DATE
++	}
++
++	private static List<File> collectJavaFiles(File dir) {
++		def result = []
++		dir.eachFileRecurse { file ->
++			if (file.isFile() && file.name.endsWith(".java")) {
++				result << file
++			}
++		}
++		return result
++	}
++
++	private static List<String> jdk21Args() {
++		def jdk21 = System.getenv('JAVA_HOME_21_X64') ?: System.getenv('JAVA_HOME_21_ARM64')
++
++		if (jdk21 == null) {
++			return []
++		}
++
++		return [
++			"-Dorg.gradle.java.home=${jdk21}".toString()
++		]
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/forge/ForgeIsolatedProjectsTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/forge/ForgeIsolatedProjectsTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e077327e6f10e19b0f2d76ba90748be453a9c00
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/forge/ForgeIsolatedProjectsTest.groovy
+@@ -0,0 +1,181 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration.forge
++
++import spock.lang.Specification
++
++import net.fabricmc.loom.test.util.GradleProjectTestTrait
++
++import static net.fabricmc.loom.test.LoomTestConstants.DEFAULT_GRADLE
++import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
++
++/**
++ * Forge / NeoForge 场景在隔离项目模式（Isolated Projects）下的回归测试。
++ *
++ * <p>Loom 在隔离项目模式下不再跨项目读取 {@code Project} 与 {@code LoomGradleExtension}，
++ * 而是读取可序列化的 {@code LoomProjectData} DTO。这里用真实 Forge 工程覆盖两条路径：
++ * <ul>
++ *     <li>单项目：确认 Forge 自身的项目内逻辑在隔离模式下不被破坏；</li>
++ *     <li>多子项目：{@code mod} 子项目通过 {@code modImplementation project(":common")} 依赖另一个
++ *     Loom 子项目，这是与 {@code ProjectView} / {@code LoomProjectData} 最直接相关的场景。</li>
++ * </ul>
++ * 之所以必须覆盖多子项目：单项目夹具的 runtime/compile classpath 里没有任何
++ * {@code ProjectDependency}，{@code LoomProjectData.getDependencies} 根本不会被触发，
++ * 因此单项目用例无法覆盖 DTO 读取路径。
++ *
++ * <p>Fabric 侧的同类覆盖见 {@code MultiProjectDirectPluginTest}，Forge 侧此前没有任何隔离项目覆盖。
++ */
++class ForgeIsolatedProjectsTest extends Specification implements GradleProjectTestTrait {
++	// 与 ForgeTest 使用同一组版本，便于复用测试 gradle home 里已有的 Minecraft / Forge 缓存。
++	private static final String MC_VERSION = "1.20.1"
++	private static final String FORGE_VERSION = "47.2.1"
++
++	def "single forge project configures and builds with isolated projects"() {
++		setup:
++		def gradle = gradleProject(project: "forge/simple", version: DEFAULT_GRADLE)
++		gradle.buildGradle.text = gradle.buildGradle.text
++				.replace('@MCVERSION@', MC_VERSION)
++				.replace('@FORGEVERSION@', FORGE_VERSION)
++				.replace('@MAPPINGS@', 'loom.officialMojangMappings()')
++				.replace('@REPOSITORIES@', '')
++				.replace('@PACKAGE@', 'net.minecraftforge:forge')
++				.replace('@JAVA_VERSION@', '17')
++
++		when:
++		// 排除 remapSourcesJar：它只涉及 Minecraft 源码反编译，与隔离项目无关，但会显著拖慢用例。
++		def result = gradle.run(
++				task: "build",
++				args: ["-x", "remapSourcesJar"],
++				isloatedProjects: true,
++				configureOnDemand: true)
++
++		then:
++		assertIsolatedProjectsActive(result.output)
++		result.task(":build").outcome == SUCCESS
++		result.task(":remapJar").outcome == SUCCESS
++		findIsolatedProjectsViolations(result.output).isEmpty()
++	}
++
++	def "multi project forge build does not cross project access with isolated projects"() {
++		setup:
++		def gradle = gradleProject(project: "forge/multiProjectIsolated", version: DEFAULT_GRADLE)
++		replacePlaceholders(gradle)
++
++		when: "先在只有 :common 的结构里产出它的 jar"
++		// Loom 在配置期就要读依赖项目 jar 的元数据
++		// （ModConfigurationRemapper → ArtifactMetadata → 打开 jar 文件系统），读的是 build/libs/ 下
++		// remapJar 的产物（jar 任务被 RemapTaskConfiguration 改到 build/devlibs/）。该文件由执行期产出，
++		// 而只要 :mod 参与配置就会读到尚不存在的文件——configure-on-demand 也挡不住（实测构建
++		// :common:remapJar 时 :mod 仍会被配置）。因此这里临时把 :mod 从 settings 中摘掉，先单独产出
++		// :common 的 remapJar，再恢复完整结构。该限制是 Loom 既有的架构行为，与隔离项目无关。
++		def settingsFile = new File(gradle.projectDir, "settings.gradle")
++		def originalSettings = settingsFile.text
++		settingsFile.text = originalSettings.readLines()
++				.findAll { !it.contains('include "mod"') }
++				.join("\n")
++
++		def commonResult = gradle.run(
++				tasks: [":common:remapJar"],
++				isloatedProjects: true,
++				configureOnDemand: true)
++
++		settingsFile.text = originalSettings
++
++		and: "再构建 :mod，令其在配置期读取 :common 的 jar 元数据"
++		// configure-on-demand 让 :common 只在真正被需要时才配置，
++		// 把 LoomProjectData 的跨项目读取推到最真实的场景下。
++		def result = gradle.run(
++				tasks: [":mod:build"],
++				isloatedProjects: true,
++				configureOnDemand: true)
++
++		then:
++		assertIsolatedProjectsActive(commonResult.output)
++		assertIsolatedProjectsActive(result.output)
++		commonResult.task(":common:remapJar").outcome == SUCCESS
++		// :mod:remapJar 能跑通本身即证明跨项目依赖被真正解析过：:mod 的配置期会去读 :common 的
++		// remapJar 产物元数据（缺失时报 NoSuchFileException），重映射又需要 :common 的 remapped jar。
++		// 不再断言 :common:remapJar 的任务结果——第二次运行时它是 UP-TO-DATE，配置缓存下
++		// BuildResult.task() 对其返回 null，断言会假失败。
++		result.task(":mod:build").outcome == SUCCESS
++		result.task(":mod:remapJar").outcome == SUCCESS
++		findIsolatedProjectsViolations(commonResult.output).isEmpty()
++		findIsolatedProjectsViolations(result.output).isEmpty()
++	}
++
++	private static void replacePlaceholders(GradleProjectTestTrait.GradleProject gradle) {
++		def replacements = [
++			'@MCVERSION@': MC_VERSION,
++			'@FORGEVERSION@': FORGE_VERSION,
++		]
++
++		gradle.projectDir.eachFileRecurse { file ->
++			if (!file.isFile() || !file.name.endsWith('.gradle')) {
++				return
++			}
++
++			def text = file.text
++			replacements.each { placeholder, value -> text = text.replace(placeholder, value) }
++			file.text = text
++		}
++	}
++
++	/**
++	 * 断言本次构建确实开启了隔离项目模式。
++	 *
++	 * <p>如果 Gradle 不再识别该开关（例如启动参数改名或拼写变化），用例必须立刻失败，
++	 * 而不是因为“隔离模式其实没打开”而静默通过。
++	 */
++	private static void assertIsolatedProjectsActive(String output) {
++		assert output.contains("Isolated Projects is an incubating feature") :
++		"本次构建没有启用隔离项目模式，隔离回归验证无效"
++	}
++
++	/**
++	 * 收集输出中所有“隔离项目 / 配置缓存违规”的证据行。
++	 *
++	 * <p>开启 {@code -Dorg.gradle.unsafe.isolated-projects=true} 后，Gradle 会把跨项目模型访问
++	 * 作为 configuration cache 的 problem 上报，并在存储缓存阶段让构建失败，输出形如：
++	 * <pre>
++	 * 1 problem was found storing the configuration cache.
++	 * - Build file 'mod/build.gradle': line 23: Project ':mod' cannot access 'Project.configurations'
++	 *   functionality on another project ':common'
++	 * </pre>
++	 * 这里只匹配 Gradle 违规上报特有的措辞，避免把普通构建失败信息误判为违规。
++	 */
++	private static List<String> findIsolatedProjectsViolations(String output) {
++		def markers = [
++			"Configuration cache problems found in this build",
++			"problem was found storing the configuration cache",
++			"problems were found storing the configuration cache",
++			"functionality on another project",
++			"cannot access 'Project",
++		]
++
++		return output.readLines().findAll { line ->
++			markers.any { marker -> line.contains(marker) }
++		}
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/forge/ForgeRunConfigTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/forge/ForgeRunConfigTest.groovy
+index 3ba7c306ba8b4948f88ca4381160c985613302a5..c3d568823481b600963ca7bfa0e120e69d4701eb 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/forge/ForgeRunConfigTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/forge/ForgeRunConfigTest.groovy
+@@ -24,8 +24,6 @@
+ 
+ package net.fabricmc.loom.test.integration.forge
+ 
+-import java.util.stream.Collectors
+-
+ import spock.lang.Specification
+ import spock.lang.Unroll
+ 
+@@ -50,22 +48,22 @@ class ForgeRunConfigTest extends Specification implements GradleProjectTestTrait
+ 			loom.runs.each {
+ 				def finalised = net.fabricmc.loom.configuration.ide.DefaultRunConfigurationSettings.finialise(it, project)
+ 				def mainClass = finalised.mainClass.get()
+-				file('main_classes.txt') << "\$it.name\\t\$mainClass\\n"
++				def modClasses = finalised.environmentVars.get().get('MOD_CLASSES')
++				file('main_classes.txt') << "\$it.name\\t\$mainClass\\t\$modClasses\\n"
+ 			}
+ 		}
+ 		""".stripIndent()
+ 
+ 		when:
+ 		def result = gradle.run(task: "build")
+-		def mainClasses = new File(gradle.projectDir, 'main_classes.txt')
+-				.readLines()
+-				.stream()
+-				.map { it.split('\t') }
+-				.collect(Collectors.toMap({ it[0] }) { it[1] })
++		def runValues = new File(gradle.projectDir, 'main_classes.txt').readLines().collect { it.split('\\t') }
++		def mainClasses = runValues.collectEntries { [(it[0]): it[1]] }
++		def modClasses = runValues.collectEntries { [(it[0]): it[2]] }
+ 
+ 		then:
+ 		result.task(":build").outcome == SUCCESS
+ 		mainClasses == [client: mainClass, server: mainClass]
++		modClasses == [client: '{source_roots}', server: '{source_roots}']
+ 
+ 		where:
+ 		mcVersion | forgeVersion | javaVersion | mainClass
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/AsyncCacheTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/AsyncCacheTest.groovy
+index a921590175e72e15f8d592bdc0f90bae248b697d..073eaffa6e37ec64c4b37d87cce0a013c8ae03bc 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/AsyncCacheTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/AsyncCacheTest.groovy
+@@ -42,4 +42,28 @@ class AsyncCacheTest extends Specification {
+ 		def e = thrown(RuntimeException)
+ 		e.message == "Test exception"
+ 	}
++
++	def "retries after failed future"() {
++		given:
++		def cache = new AsyncCache()
++		def attempts = 0
++
++		when:
++		cache.getBlocking("testKey") {
++			attempts++
++			throw new RuntimeException("first failure")
++		}
++		then:
++		thrown(RuntimeException)
++
++		when:
++		def result = cache.getBlocking("testKey") {
++			attempts++
++			"success"
++		}
++
++		then:
++		result == "success"
++		attempts == 2
++	}
+ }
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/LoomProjectDataTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/LoomProjectDataTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e2776b71584fd692654dac96852b3af519b0ded
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/LoomProjectDataTest.groovy
+@@ -0,0 +1,57 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit
++
++import spock.lang.Specification
++
++import net.fabricmc.loom.internal.LoomGradleSharedData
++import net.fabricmc.loom.internal.LoomProjectData
++
++class LoomProjectDataTest extends Specification {
++	def "项目数据桥可通过 Java 序列化传递并还原模组元数据"() {
++		given:
++		def modData = new LoomProjectData.ModData(
++				'{"schemaVersion":1,"id":"example","version":"1.0.0","mixins":["example.mixins.json"]}',
++				['example.mixins.json': 'mixin-data'.bytes]
++				)
++		def data = new LoomProjectData(':example', [modData], 'mappings', 'named', true, ['build/mixin.refmap.json'])
++		def sharedData = new LoomGradleSharedData('test')
++		sharedData.putProject(data)
++
++		when:
++		def bytes = new ByteArrayOutputStream()
++		new ObjectOutputStream(bytes).withCloseable { it.writeObject(sharedData) }
++		def restored = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray())).withCloseable { it.readObject() }
++
++		then:
++		restored instanceof LoomGradleSharedData
++		def restoredData = restored.getProject(':example')
++		restoredData.projectPath() == ':example'
++		restoredData.mappingId() == 'mappings'
++		restoredData.splitEnvironmentSourceSets()
++		restoredData.createMods().first().id == 'example'
++		restoredData.createMods().first().getMixinConfigurations() == ['example.mixins.json']
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/ThreadingUtilsTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/ThreadingUtilsTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..1cd572ed55ef5f29a5b53b0207e212e4f271c762
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/ThreadingUtilsTest.groovy
+@@ -0,0 +1,43 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit
++
++import dev.architectury.loom.util.ThreadingUtils
++import spock.lang.Specification
++
++class ThreadingUtilsTest extends Specification {
++	def "task failures propagate from the completer"() {
++		given:
++		def completer = ThreadingUtils.taskCompleter()
++		completer.add { throw new IllegalStateException('expected failure') }
++
++		when:
++		completer.complete()
++
++		then:
++		def error = thrown(IllegalStateException)
++		error.message == 'expected failure'
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/ZipUtilsTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/ZipUtilsTest.groovy
+index 480d668d7d1e2e508d4e663c3f2842d959bd022f..c602a2ed8f2e7165db0f1f9a3225d613de2656e8 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/ZipUtilsTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/ZipUtilsTest.groovy
+@@ -27,6 +27,8 @@ package net.fabricmc.loom.test.unit
+ import java.nio.charset.StandardCharsets
+ import java.nio.file.Files
+ import java.time.ZoneId
++import java.util.zip.ZipEntry
++import java.util.zip.ZipOutputStream
+ 
+ import com.google.gson.JsonObject
+ import org.gradle.api.tasks.bundling.ZipEntryCompression
+@@ -129,6 +131,26 @@ class ZipUtilsTest extends Specification {
+ 		outputFile.text == "This is a test of unpacking all"
+ 	}
+ 
++	def "unpack all rejects path traversal"() {
++		given:
++		def output = Files.createTempDirectory("loom-zip-output")
++		def zip = Files.createTempFile("loom-zip-slip", ".zip")
++		def escaped = output.parent.resolve("loom-zip-slip-${UUID.randomUUID()}.txt")
++
++		ZipOutputStream stream = new ZipOutputStream(Files.newOutputStream(zip))
++		stream.putNextEntry(new ZipEntry("../${escaped.fileName}"))
++		stream.write("should not escape".bytes)
++		stream.closeEntry()
++		stream.close()
++
++		when:
++		ZipUtils.unpackAll(zip, output)
++
++		then:
++		thrown(IOException)
++		!Files.exists(escaped)
++	}
++
+ 	def "is zip"() {
+ 		setup:
+ 		// Create zip
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeUserdevProviderTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeUserdevProviderTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..d57e37ec5f835186e9ddcf567e887b8282415aa9
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeUserdevProviderTest.groovy
+@@ -0,0 +1,70 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.forge
++
++import java.nio.charset.StandardCharsets
++import java.nio.file.Files
++import java.nio.file.Path
++import java.util.zip.ZipEntry
++import java.util.zip.ZipOutputStream
++
++import com.google.gson.JsonArray
++import com.google.gson.JsonObject
++import dev.architectury.loom.forge.dependency.ForgeUserdevProvider
++import spock.lang.Specification
++import spock.lang.TempDir
++
++class ForgeUserdevProviderTest extends Specification {
++	@TempDir
++	Path temp
++
++	def "merges every userdev3 access transformer"() {
++		given:
++		Path userdev = temp.resolve('userdev.jar')
++		new ZipOutputStream(Files.newOutputStream(userdev)).withCloseable { zip ->
++			addEntry(zip, 'ats/first.cfg', 'public-f net.minecraft.First one\n')
++			addEntry(zip, 'ats/second.cfg', 'protected net.minecraft.Second two')
++		}
++		JsonArray ats = new JsonArray()
++		ats.add('ats/first.cfg')
++		ats.add('ats/second.cfg')
++		JsonObject config = new JsonObject()
++		config.add('ats', ats)
++
++		when:
++		def method = ForgeUserdevProvider.getDeclaredMethod('mergeUserdev3Ats', Path, JsonObject)
++		method.accessible = true
++		byte[] result = method.invoke(null, userdev, config)
++
++		then:
++		new String(result, StandardCharsets.UTF_8) == 'public-f net.minecraft.First one\nprotected net.minecraft.Second two\n'
++	}
++
++	private static void addEntry(ZipOutputStream zip, String name, String content) {
++		zip.putNextEntry(new ZipEntry(name))
++		zip.write(content.getBytes(StandardCharsets.UTF_8))
++		zip.closeEntry()
++	}
++}
+diff --git a/src/test/resources/projects/forge/multiProjectIsolated/build.gradle b/src/test/resources/projects/forge/multiProjectIsolated/build.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..93661aa7899eecaa31bf66c55f7bf95c0817179b
+--- /dev/null
++++ b/src/test/resources/projects/forge/multiProjectIsolated/build.gradle
+@@ -0,0 +1,2 @@
++// 根项目只作为多项目容器，不应用 Loom，
++// 这样 mod 子项目读取 common 子项目的 Loom 数据只能走跨项目路径。
+diff --git a/src/test/resources/projects/forge/multiProjectIsolated/common/build.gradle b/src/test/resources/projects/forge/multiProjectIsolated/common/build.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..d38d2ff49ca6a33bcf8bbf223dec77a21407f3fa
+--- /dev/null
++++ b/src/test/resources/projects/forge/multiProjectIsolated/common/build.gradle
+@@ -0,0 +1,25 @@
++plugins {
++	id 'dev.architectury.loom'
++}
++
++java {
++	sourceCompatibility = JavaVersion.VERSION_17
++	targetCompatibility = JavaVersion.VERSION_17
++}
++
++tasks.withType(JavaCompile).configureEach {
++	it.options.release = 17
++}
++
++base {
++	archivesName = "common"
++}
++
++version = project.mod_version
++group = project.maven_group
++
++dependencies {
++	minecraft "com.mojang:minecraft:@MCVERSION@"
++	mappings loom.officialMojangMappings()
++	forge "net.minecraftforge:forge:@MCVERSION@-@FORGEVERSION@"
++}
+diff --git a/src/test/resources/projects/forge/multiProjectIsolated/gradle.properties b/src/test/resources/projects/forge/multiProjectIsolated/gradle.properties
+new file mode 100644
+index 0000000000000000000000000000000000000000..14e1a3b03ccc7f972bca522ea9129424de0ed5fa
+--- /dev/null
++++ b/src/test/resources/projects/forge/multiProjectIsolated/gradle.properties
+@@ -0,0 +1,10 @@
++# 该夹具用于验证 Forge 多子项目在隔离项目模式下的行为：
++# common 子项目产出 LoomProjectData，mod 子项目通过项目依赖跨项目读取它。
++org.gradle.jvmargs=-Xmx1G
++
++# Mod Properties
++mod_version=1.0.0
++maven_group=com.example
++
++# 平台必须是 Forge，否则 Loom 会走 Fabric 流程
++loom.platform=forge
+diff --git a/src/test/resources/projects/forge/multiProjectIsolated/mod/build.gradle b/src/test/resources/projects/forge/multiProjectIsolated/mod/build.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..ebb3617e1431f56b08face218a7303d77ea2f1a4
+--- /dev/null
++++ b/src/test/resources/projects/forge/multiProjectIsolated/mod/build.gradle
+@@ -0,0 +1,31 @@
++plugins {
++	id 'dev.architectury.loom'
++}
++
++java {
++	sourceCompatibility = JavaVersion.VERSION_17
++	targetCompatibility = JavaVersion.VERSION_17
++}
++
++tasks.withType(JavaCompile).configureEach {
++	it.options.release = 17
++}
++
++base {
++	archivesName = "mod"
++}
++
++version = project.mod_version
++group = project.maven_group
++
++dependencies {
++	minecraft "com.mojang:minecraft:@MCVERSION@"
++	mappings loom.officialMojangMappings()
++	forge "net.minecraftforge:forge:@MCVERSION@-@FORGEVERSION@"
++
++	// 关键点：依赖另一个 Loom 子项目。
++	// 在隔离项目模式下，对这个依赖的 Loom 元数据读取必须通过可序列化的
++	// LoomProjectData DTO（loomProjectDataElements 配置 + exportLoomProjectData 任务），
++	// 而不能直接访问 common 子项目的 Project / LoomGradleExtension。
++	modImplementation project(":common")
++}
+diff --git a/src/test/resources/projects/forge/multiProjectIsolated/settings.gradle b/src/test/resources/projects/forge/multiProjectIsolated/settings.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..1ae0d26788618c2484b8ffaeccbf90a9d7da9b06
+--- /dev/null
++++ b/src/test/resources/projects/forge/multiProjectIsolated/settings.gradle
+@@ -0,0 +1,4 @@
++rootProject.name = "forge-multi-project-isolated"
++
++include "common"
++include "mod"

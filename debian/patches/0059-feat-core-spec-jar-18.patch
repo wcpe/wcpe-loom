@@ -1,0 +1,1043 @@
+From ae06d84017be921dddf826cecc1c0d6656b3336b Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:59 +0800
+Subject: [PATCH 059/147] =?UTF-8?q?feat(core,spec):=20=E5=BC=95=E5=85=A5?=
+ =?UTF-8?q?=E6=89=A7=E8=A1=8C=E6=9C=9F=20jar=20=E6=93=8D=E4=BD=9C=E7=9A=84?=
+ =?UTF-8?q?=E6=8A=BD=E8=B1=A1=E4=B8=8E=E6=B4=BE=E7=94=9F=E6=95=B0=E6=8D=AE?=
+ =?UTF-8?q?=E7=BC=93=E5=AD=98=20(#18)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* fix(sources): SourceRemapper 不再静默丢弃 MC classpath，重映射器构造脱离 Project
+
+两处问题：
+
+1. SourceRemapper 组装 classpath 时会把不存在的路径一并过滤掉，而过滤粒度过粗，
+   连 MC 的 classpath 一起丢掉，导致源码重映射在缺少 MC 类型的上下文里进行。
+   实测同一输入下 17 个条目里有 6 个产出内容不同——且不报错，属静默损坏。
+   修正过滤语义：只跳过确实不存在的路径，目录照常加入。
+
+2. TinyRemapperHelper 的构造入口依赖 Project 去读 extension（knownIndyBsms 等），
+   使执行期无法在没有 Project 的情况下构造重映射器。改为由调用方传入，
+   去掉该依赖，Fabric 与 Forge（含内部类映射）两个分支都加了用例覆盖。
+
+新增 SourceRemapperTest 与 TinyRemapperHelperTest 共 6 条用例：
+classpath 过滤语义、空 classpath 仍可构造、两条不依赖 Project 的构造路径、
+未开启 record 修复时不改变构造结果、knownIndyBsms 由参数传入而非读 extension。
+
+本分支已验证可独立 compileJava，上述 6 条用例全部 PASSED。
+
+* feat(core,spec): 引入执行期 jar 操作的抽象与派生数据缓存
+
+core/：把「重映射 MC jar」「重映射 mod jar」「mod jar 后处理」三件事的输入契约
+与执行逻辑从配置期 provider 中抽出来，使其不依赖 Project 与 SourceSet，可在执行期
+由任务重建。这是后续把这两条线的产物生产搬进 Gradle 任务的前提。
+
+spec/：EnvironmentSpec 声明各环境需要哪些映射/迁移步骤，SpecStore 提供按
+「命名空间 + 身份 + 维度」寻址的纯派生数据缓存。缓存只存解析结果，丢失仅意味着
+多解析一次，不参与任何产物就绪标记。
+
+SpecStore 的身份沿用输入文件的大小与修改时间：清单被刷新后身份自然变化，
+不会读到过期条目——该自失效语义是有意的。
+
+新增 SpecStoreTest 9 条用例覆盖命中/未命中、命名空间与维度隔离、空内容哨兵、
+同名覆盖、维度值含路径分隔符、以及 inputIdentity 对文件大小/修改时间的敏感与
+对不存在文件返回空。
+
+本分支基于 #16（TinyRemapperHelper 的不依赖 Project 构造重载）之上，已验证可编译
+且上述 9 条用例 PASSED。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/core/MinecraftJarRemap.java b/src/main/java/net/fabricmc/loom/core/MinecraftJarRemap.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9780dd5129c44b22d8d88cf2a44ce7c5a750d4df
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/core/MinecraftJarRemap.java
+@@ -0,0 +1,218 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.core;
++
++import java.io.IOException;
++import java.nio.file.Path;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.function.Consumer;
++
++import dev.architectury.loom.forge.RemapObjectHolderVisitor;
++import org.jspecify.annotations.Nullable;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import net.fabricmc.loom.configuration.providers.mappings.extras.annotations.AnnotationsData;
++import net.fabricmc.loom.configuration.providers.minecraft.AnnotationsApplyVisitor;
++import net.fabricmc.loom.configuration.providers.minecraft.SignatureFixerApplyVisitor;
++import net.fabricmc.loom.util.TinyRemapperHelper;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.tinyremapper.extension.mixin.MixinExtension;
++import net.fabricmc.tinyremapper.OutputConsumerPath;
++import net.fabricmc.tinyremapper.TinyRemapper;
++import net.fabricmc.mappingio.tree.MemoryMappingTree;
++
++/**
++ * L4 计算核心：把一个 jar 从源命名空间重映射到目标命名空间.
++ *
++ * <p>这是从 {@code AbstractMappedMinecraftProvider.remapJar} 抽出的计算部分。抽取的判据是
++ * 「是否触碰项目模型」：本类**不认识** {@code Project}、{@code LoomGradleExtension}
++ * 或任何 Gradle 类型，全部输入由调用方备妥。
++ *
++ * <p>调用方仍需负责两件依赖项目模型的事，它们刻意留在上层：
++ * <ul>
++ *   <li>{@code AnnotationsData.getRemappedAnnotations} 与
++ *       {@code SignatureFixerApplyVisitor.getRemappedSignatures} 需要 mappings service，
++ *       而 service 的构造依赖 {@code Project}。它们的结果作为参数传入。</li>
++ *   <li>产物落位后的 maven pom 写出属于仓库维护，不属于重映射计算。</li>
++ * </ul>
++ *
++ * <h2>为什么参数这么多是合理的</h2>
++ * 这些参数原本藏在 {@code LoomGradleExtension} 的各个字段里，调用方需要「知道去哪拿」。
++ * 显式列出后，它们变成可序列化、可在执行期装配的值——这正是本操作能被任务包裹、
++ * 从而脱离配置期执行的前提。参数多不是设计缺陷，而是把隐式依赖显式化的结果。
++ *
++ * <h2>原子性契约（必须保持）</h2>
++ * 输出经由 {@link AtomicFiles#publish} 落位：先写同目录唯一临时文件，全部加工（含
++ * Forge/NeoForge 的 object holder 改写）都在临时文件上完成，最后原子替换。
++ * 发布出去的必须是终态——否则共享仓库里的 jar 会有一段「已落位但未加工完」的中间态
++ * 被读方看到，而内容校验只能发现截断、发现不了「完整但没加工完」。
++ */
++public final class MinecraftJarRemap {
++	private static final Logger LOGGER = LoggerFactory.getLogger(MinecraftJarRemap.class);
++
++	private MinecraftJarRemap() {
++	}
++
++	/**
++	 * 执行一次 jar 重映射.
++	 *
++	 * @param options 全部输入，见 {@link Options}
++	 * @throws IOException 读写失败
++	 */
++	public static void run(Options options) throws IOException {
++		final Set<String> innerClassNames = options.innerClassNames();
++		final AnnotationsData annotations = options.annotations();
++		final Map<String, String> signatures = options.signatures();
++
++		final Consumer<TinyRemapper.Builder> configure = builder -> {
++			if (annotations != null) {
++				builder.extraPostApplyVisitor(new AnnotationsApplyVisitor(annotations));
++			}
++
++			builder.extraPostApplyVisitor(new SignatureFixerApplyVisitor(signatures));
++
++			if (options.injectMixinExtension()) {
++				builder.extension(new MixinExtension(inputTag -> true));
++			}
++
++			if (options.extraRemapperConfig() != null) {
++				options.extraRemapperConfig().accept(builder);
++			}
++		};
++
++		// remapper 可由调用方提供（此时其配置已包含注解/签名/扩展，本类的 configure 不再适用），
++		// 否则由本类按显式参数自行构建。前者服务于「由 TinyRemapperService 统一装配」的场景，
++		// 后者服务于纯计算场景。
++		final boolean externallyBuilt = options.prebuiltRemapper() != null;
++
++		if (!externallyBuilt && options.mappings() == null) {
++			throw new IllegalArgumentException("mappings is required when no prebuilt remapper is supplied");
++		}
++
++		final TinyRemapper remapper = externallyBuilt
++				? options.prebuiltRemapper()
++				: TinyRemapperHelper.getTinyRemapper(
++						options.mappings(),
++						options.fromNamespace(),
++						options.toNamespace(),
++						options.fixRecords(),
++						options.validateTargetNamespace(),
++						configure,
++						innerClassNames,
++						options.isForgeLike(),
++						options.knownIndyBsms()
++				);
++
++		try {
++			AtomicFiles.publish(options.outputJar(), tmpJar -> {
++				try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(tmpJar).build()) {
++					outputConsumer.addNonClassFiles(options.inputJar());
++
++					for (Path path : options.remapClasspath()) {
++						remapper.readClassPath(path);
++					}
++
++					remapper.readInputs(options.inputJar());
++					remapper.apply(outputConsumer);
++				}
++
++				// object holder 的类名字符串同样要在落位前改写，理由见类注释的原子性契约
++				if (options.objectHolderClassName() != null
++						&& options.objectHolderSourceNamespace() != null
++						&& options.objectHolderTargetNamespace() != null) {
++					RemapObjectHolderVisitor.remapObjectHolder(
++							tmpJar,
++							options.objectHolderClassName(),
++							options.mappings(),
++							options.objectHolderSourceNamespace(),
++							options.objectHolderTargetNamespace()
++					);
++				}
++			});
++		} catch (Exception e) {
++			LOGGER.error("Failed to remap {} to namespace {}", options.inputJar(), options.toNamespace(), e);
++			throw new RuntimeException("Failed to remap JAR " + options.inputJar(), e);
++		} finally {
++			if (!externallyBuilt) {
++				remapper.finish();
++			}
++		}
++	}
++
++	/**
++	 * 一次重映射所需的全部输入.
++	 *
++	 * @param prebuiltRemapper 已装配好的重映射器；为空时由本类按其余参数自行构建
++	 * @param inputJar 待重映射的 jar
++	 * @param outputJar 产物位置
++	 * @param remapClasspath 重映射 classpath（不含 inputJar 本身）
++	 * @param mappings 已解析的映射树；仅自建 remapper 或需要 object holder 改写时必需
++	 * @param fromNamespace 源命名空间
++	 * @param toNamespace 目标命名空间
++	 * @param isForgeLike 是否 Forge/NeoForge 系（影响冲突忽略策略与内部类映射）
++	 * @param injectMixinExtension 是否注入 mixin 扩展（仅 NeoForge）
++	 * @param fixRecords 是否修复 record 组件（Java 16+ 目标需要）
++	 * @param validateTargetNamespace 是否校验目标命名空间存在
++	 * @param innerClassNames Forge 系内部类重映射所需的类名集合
++	 * @param knownIndyBsms 已知的 indy BSM 集合
++	 * @param annotations 已算好的注解重映射数据；无则为空
++	 * @param signatures 已算好的签名修复表
++	 * @param objectHolderClassName 需要做 object holder 改写的类名；不需要则为空
++	 * @param objectHolderSourceNamespace object holder 改写所用的源命名空间；不需要则为空
++	 * @param objectHolderTargetNamespace object holder 改写所用的目标命名空间；不需要则为空
++	 * @param extraRemapperConfig 子类追加的 remapper 配置（例如 split jar 的策略）
++	 */
++	public record Options(
++			@Nullable TinyRemapper prebuiltRemapper,
++			Path inputJar,
++			Path outputJar,
++			List<Path> remapClasspath,
++			@Nullable MemoryMappingTree mappings,
++			String fromNamespace,
++			String toNamespace,
++			boolean isForgeLike,
++			boolean injectMixinExtension,
++			boolean fixRecords,
++			boolean validateTargetNamespace,
++			Set<String> innerClassNames,
++			Set<String> knownIndyBsms,
++			@Nullable AnnotationsData annotations,
++			Map<String, String> signatures,
++			@Nullable String objectHolderClassName,
++			@Nullable String objectHolderSourceNamespace,
++			@Nullable String objectHolderTargetNamespace,
++			@Nullable Consumer<TinyRemapper.Builder> extraRemapperConfig
++	) {
++		public Options {
++			remapClasspath = List.copyOf(remapClasspath);
++			innerClassNames = Set.copyOf(innerClassNames);
++			knownIndyBsms = Set.copyOf(knownIndyBsms);
++			signatures = Map.copyOf(signatures);
++		}
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/core/ModJarPostProcess.java b/src/main/java/net/fabricmc/loom/core/ModJarPostProcess.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..4518daa33ca5c28c964889fb416f2e8617506433
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/core/ModJarPostProcess.java
+@@ -0,0 +1,105 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.core;
++
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.nio.file.Path;
++import java.util.Map;
++import java.util.jar.Manifest;
++
++import dev.architectury.loom.neoforge.NeoForgeModDependencies;
++import org.jspecify.annotations.Nullable;
++
++import net.fabricmc.loom.util.Constants;
++import net.fabricmc.loom.util.Pair;
++import net.fabricmc.loom.util.ZipUtils;
++import net.fabricmc.mappingio.tree.MemoryMappingTree;
++
++/**
++ * L4 计算核心：重映射后、与项目无关的 mod jar 后处理步骤.
++ *
++ * <p>这些步骤原本内联在 {@code ModProcessor.remapJars} 的收尾循环里，与若干**依赖项目模型**
++ * 的步骤交错：Forge 的 AT 类名重映射、CoreMod 改写、以及把产物写入本地 maven 仓库都需要
++ * {@code Project}。把纯步骤抽出来，是为了让「任务化」时能复用同一份实现，而不必连带搬走
++ * 那些搬不动的部分。
++ *
++ * <h2>为什么是四个独立方法而不是一个 apply()</h2>
++ * 原本的执行顺序里夹着一处扩展钩子
++ * （{@code ModProcessorExtension.finalise}，位于 AW 替换与去嵌套之间）。
++ * 若把它们合成一次调用，钩子就会被挤到前面或后面，改变既有行为。
++ * 拆成独立步骤后，调用方保留原有的交错顺序，抽取本身不引入时序变化。
++ */
++public final class ModJarPostProcess {
++	private ModJarPostProcess() {
++	}
++
++	/**
++	 * 把重映射后的 access widener 写回 jar.
++	 *
++	 * <p>{@code accessWidener} 为「已重映射的字节 + jar 内路径」；为空表示该 mod 不含 AW。
++	 */
++	public static void replaceAccessWidener(Path jar, @Nullable Pair<byte[], String> accessWidener) throws IOException {
++		if (accessWidener != null) {
++			ZipUtils.replace(jar, accessWidener.right(), accessWidener.left());
++		}
++	}
++
++	/**
++	 * 去掉嵌套 jar 的元数据.
++	 *
++	 * <p>开发环境中这些嵌套 jar 不该由 loader 加载，否则会被当作重复的模组。
++	 */
++	public static void stripNestedJars(Path jar) throws IOException {
++		ZipUtils.deleteIfExists(jar, "META-INF/jarjar/metadata.json");
++	}
++
++	/**
++	 * 在 manifest 中记录本产物所处的映射命名空间.
++	 *
++	 * @param targetNamespace 产物落位的命名空间
++	 */
++	public static void writeMappingNamespace(Path jar, String targetNamespace) throws IOException {
++		ZipUtils.transform(jar, Map.of(Constants.Manifest.PATH, bytes -> {
++			final var manifest = new Manifest(new ByteArrayInputStream(bytes));
++
++			manifest.getMainAttributes().putValue(Constants.Manifest.MAPPING_NAMESPACE, targetNamespace);
++
++			final var out = new ByteArrayOutputStream();
++			manifest.write(out);
++			return out.toByteArray();
++		}));
++	}
++
++	/**
++	 * 全量重映射 NeoForge 的 access transformer.
++	 *
++	 * <p>仅 NeoForge 需要：Forge 只在类名层面映射，其余留到运行时按 srg → named 处理。
++	 */
++	public static void remapNeoForgeAts(Path jar, MemoryMappingTree mappings, String productionNamespace, String targetNamespace) throws IOException {
++		NeoForgeModDependencies.remapAts(jar, mappings, productionNamespace, targetNamespace);
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/core/ModJarRemap.java b/src/main/java/net/fabricmc/loom/core/ModJarRemap.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c1797475f59605c79498db37f8c4bf4e98b2e94a
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/core/ModJarRemap.java
+@@ -0,0 +1,111 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.core;
++
++import java.io.IOException;
++import java.util.Set;
++
++import org.jspecify.annotations.Nullable;
++
++import net.fabricmc.loom.util.TinyRemapperHelper;
++import net.fabricmc.loom.util.TinyRemapperLoggerAdapter;
++import net.fabricmc.mappingio.tree.MemoryMappingTree;
++import net.fabricmc.tinyremapper.TinyRemapper;
++import net.fabricmc.tinyremapper.TinyRemapper.AnalyzeVisitorProvider;
++
++/**
++ * L4 计算核心：构建用于 mod jar 重映射的 {@link TinyRemapper}.
++ *
++ * <h2>为什么需要这个类</h2>
++ * 本仓库里同时存在**三条** remapper 构造路径，各自的配置并不相同：
++ *
++ * <table>
++ *   <caption>三条构造路径</caption>
++ *   <tr><th>用途</th><th>构造点</th><th>特征</th></tr>
++ *   <tr><td>Minecraft jar</td><td>{@link TinyRemapperHelper#getTinyRemapper}</td>
++ *       <td>{@code renameInvalidLocals(true)} + {@code invalidLvNamePattern} +
++ *           {@code inferNameFromSameLvIndex(true)} + {@code ignoreConflicts} +
++ *           {@code rebuildSourceFilenames}；针对混淆 jar 的 LVT 特性</td></tr>
++ *   <tr><td>mod jar</td><td>本类</td>
++ *       <td>{@code renameInvalidLocals(false)}；不启用上述 LVT 处理</td></tr>
++ *   <tr><td>任务型重映射</td><td>{@code TinyRemapperService}</td>
++ *       <td>不设置上述任何一项，走 {@code MappingsService} 的映射提供者</td></tr>
++ * </table>
++ *
++ * <p>三者**有意不同**，不能统一——把 MC jar 的 LVT 设置套到 mod jar 上会改变产物。
++ * 但也正因为如此，「任务化」时极易拿错配置：{@code RemapMinecraftTask} 的等价性
++ * 验证就是这样抓到过一次回归（任务用了 service 的构造，产出与配置期逐字节不同）。
++ *
++ * <p>本类的职责是把 mod jar 这条路径的构造**固定在一个地方**，
++ * 让 {@code ModProcessor} 与将来的任务实现共用它，从而不可能各自漂移。
++ */
++public final class ModJarRemap {
++	private ModJarRemap() {
++	}
++
++	/**
++	 * 构建 mod jar 重映射器.
++	 *
++	 * @param mappings 已解析的映射树；必须与调用方其余环节用的是同一份
++	 * @param knownIndyBsms 已知的 indy BSM 集合（含各 mod 元数据里声明的）
++	 * @param productionNamespace 源命名空间（通常是项目的生产命名空间）
++	 * @param targetNamespace 目标命名空间（mod 重映射固定为 named）
++	 * @param analyzeVisitor 额外的 analyze visitor；无则为空
++	 * @param extensions 追加配置（kotlin 扩展、mod processor 扩展、remapper 扩展）
++	 *                   由调用方按既有顺序应用，顺序影响 visitor 链结果
++	 * @return 已配置但尚未 {@code build()} 的 builder，便于调用方读取环境或追加配置
++	 */
++	/**
++	 * 追加 remapper 配置的回调.
++	 *
++	 * <p>允许抛出 {@link IOException}：既有实现里有若干构造步骤（例如 kotlin classloader、
++	 * mod processor 扩展）本身会抛受检异常。用普通 {@code Consumer} 会迫使调用方把它包成
++	 * 非受检异常，改变原有的异常传播语义。
++	 */
++	@FunctionalInterface
++	public interface Extensions {
++		void accept(TinyRemapper.Builder builder) throws IOException;
++	}
++
++	public static TinyRemapper.Builder createRemapper(
++			MemoryMappingTree mappings,
++			Set<String> knownIndyBsms,
++			String productionNamespace,
++			String targetNamespace,
++			@Nullable AnalyzeVisitorProvider analyzeVisitor,
++			Extensions extensions) throws IOException {
++		TinyRemapper.Builder builder = TinyRemapper.newRemapper(TinyRemapperLoggerAdapter.INSTANCE)
++				.withKnownIndyBsm(knownIndyBsms)
++				.withMappings(TinyRemapperHelper.create(mappings, productionNamespace, targetNamespace, true, true))
++				.renameInvalidLocals(false);
++
++		if (analyzeVisitor != null) {
++			builder.extraAnalyzeVisitor(analyzeVisitor);
++		}
++
++		extensions.accept(builder);
++		return builder;
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/core/package-info.java b/src/main/java/net/fabricmc/loom/core/package-info.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..653262ac64bbbdc01dbe26cbf5f0a4e8e067c9f3
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/core/package-info.java
+@@ -0,0 +1,28 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++@NullMarked
++package net.fabricmc.loom.core;
++
++import org.jspecify.annotations.NullMarked;
+diff --git a/src/main/java/net/fabricmc/loom/spec/EnvironmentSpec.java b/src/main/java/net/fabricmc/loom/spec/EnvironmentSpec.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..38b2bf4e6bb8561d19161f656ed7ef2958d24f25
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/spec/EnvironmentSpec.java
+@@ -0,0 +1,154 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.spec;
++
++import java.io.Serializable;
++import java.util.List;
++import java.util.Objects;
++import java.util.Optional;
++
++import org.jspecify.annotations.Nullable;
++
++import net.fabricmc.loom.configuration.providers.minecraft.MinecraftVersionMeta;
++
++/**
++ * 环境规格：配置期唯一被读的「小数据」.
++ *
++ * <p>本类型是把环境供给从配置期搬到执行期的**接缝**。当前配置期存在的环是：
++ *
++ * <pre>
++ *   配置本项目 → 需要 mapped MC jar（mod 重映射的 classpath）
++ *              → jar 需任务产出 → 任务需所有项目配置完成 → 回到起点
++ * </pre>
++ *
++ * <p>破环的办法不是「让配置期更快地生产 jar」，而是把「依赖图需要的」与「产物需要的」分开：
++ * 前者只需要**配方**，后者才是重活。本类型承载前者。
++ *
++ * <h2>为什么 mappings 是配方而不是产物</h2>
++ * {@link #mappings} 描述「用哪套基础映射、什么迁移规则、目标命名空间」，而不是算好的映射文件。
++ * 所以它不需要任何产物存在就能构造——这正是环被切断的地方。
++ *
++ * <h2>不可序列化的部分</h2>
++ * {@code versionMeta} 是已解析的版本元数据对象。它由版本清单与 {@code minecraft_info.json}
++ * 派生，二者都通过 {@link SpecStore} 按内容身份缓存，因此重复构造的成本是一次 JSON 反序列化，
++ * 而不是「网络 + 全文解析」。这也是本类型可以安全地被配置缓存序列化的前提。
++ *
++ * <h2>边界</h2>
++ * 本类型**不含**产物路径、不含任务引用、不含 {@code Project}。产物由 L3 流水线的任务声明，
++ * 通过 {@code Provider} 接线给下游，配置期不触碰文件系统。
++ */
++public record EnvironmentSpec(
++		String minecraftVersion,
++		MinecraftVersionMeta versionMeta,
++		LoaderSpec loader,
++		MappingDefinition mappings,
++		List<PipelineStep> pipeline
++) implements Serializable {
++	public EnvironmentSpec {
++		Objects.requireNonNull(minecraftVersion, "minecraftVersion");
++		Objects.requireNonNull(versionMeta, "versionMeta");
++		Objects.requireNonNull(loader, "loader");
++		Objects.requireNonNull(mappings, "mappings");
++		pipeline = List.copyOf(pipeline);
++	}
++
++	/**
++	 * 加载器规格.
++	 *
++	 * @param platform 平台标识（fabric / forge / neoforge / quilt）
++	 * @param version 加载器版本；无加载器概念的平台为空
++	 */
++	public record LoaderSpec(String platform, @Nullable String version) implements Serializable {
++		public LoaderSpec {
++			Objects.requireNonNull(platform, "platform");
++		}
++	}
++
++	/**
++	 * 映射配方：**怎么算**，而不是**算出来的东西**.
++	 *
++	 * @param baseCoordinates 基础映射的坐标（用户声明，例如 {@code net.fabricmc:yarn:1.20.1+build.10:v2}）
++	 * @param targetNamespace 产物要落在哪个命名空间（{@code named} / {@code intermediary} / {@code srg} …）
++	 * @param migrateForPlatform 是否需要在基础映射之上做平台特有的迁移
++	 *                          （Forge 需要：迁移依赖补丁后的中间产物，属于 L3 的独立节点）
++	 */
++	public record MappingDefinition(
++			@Nullable String baseCoordinates,
++			String targetNamespace,
++			boolean migrateForPlatform
++	) implements Serializable {
++		public MappingDefinition {
++			Objects.requireNonNull(targetNamespace, "targetNamespace");
++		}
++	}
++
++	/**
++	 * 流水线步骤：平台差异的表达处.
++	 *
++	 * <p>把「Fabric 直接 remap」与「Forge 先补丁、再迁移映射、再 remap」的差异收敛成
++	 * 一份可序列化的步骤列表，而不是散落在各 provider 的 {@code if (isForgeLike())} 里。
++	 */
++	public enum PipelineStep {
++		/** 下载 vanilla 制品. */
++		DOWNLOAD_VANILLA,
++		/** 合并客户端与服务端 jar（仅需要合并的版本配置）. */
++		MERGE_MINECRAFT,
++		/** 对 vanilla 应用加载器补丁（Forge / NeoForge）. */
++		APPLY_LOADER_PATCHES,
++		/** 在基础映射之上做平台特有的映射迁移（仅 Forge 系，且依赖上一步的产物）. */
++		MIGRATE_MAPPINGS,
++		/** 重映射到目标命名空间. */
++		REMAP_MINECRAFT,
++		/** 应用项目级处理（AW / AT / 接口注入）. */
++		PROCESS_PROJECT_JAR,
++	}
++
++	/**
++	 * {@return 该平台是否需要在重映射之前先做映射迁移}.
++	 *
++	 * <p>Forge 系的最终映射依赖「打补丁后的中间产物」，因此迁移是一个独立的流水线节点，
++	 * 它的输入是 {@link PipelineStep#APPLY_LOADER_PATCHES} 的输出——这是 DAG，不是环。
++	 */
++	public boolean needsMappingMigration() {
++		return pipeline.contains(PipelineStep.MIGRATE_MAPPINGS);
++	}
++
++	/**
++	 * {@return 流水线中最后一个产出可被依赖的 jar 的步骤}.
++	 *
++	 * <p>供 L1 接线时判断「应当把哪个步骤的输出挂进 configuration」。
++	 */
++	public Optional<PipelineStep> finalJarStep() {
++		if (pipeline.contains(PipelineStep.PROCESS_PROJECT_JAR)) {
++			return Optional.of(PipelineStep.PROCESS_PROJECT_JAR);
++		}
++
++		if (pipeline.contains(PipelineStep.REMAP_MINECRAFT)) {
++			return Optional.of(PipelineStep.REMAP_MINECRAFT);
++		}
++
++		return Optional.empty();
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/spec/SpecStore.java b/src/main/java/net/fabricmc/loom/spec/SpecStore.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d04a193dd7bba1fbe126994673cfa1d655124a5
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/spec/SpecStore.java
+@@ -0,0 +1,150 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.spec;
++
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.NoSuchFileException;
++import java.nio.file.Path;
++import java.nio.file.StandardOpenOption;
++import java.nio.file.attribute.BasicFileAttributes;
++import java.util.Locale;
++import java.util.Optional;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import net.fabricmc.loom.util.cache.AtomicFiles;
++
++/**
++ * L2 规格层的持久化存储.
++ *
++ * <p>配置期只允许读「小数据」，但读不等于可以反复解析：Mojang 的版本清单是全版本清单
++ * （数百 KB ～ MB），而每次配置只需要其中一条；{@code minecraft_info.json} 每次配置都要
++ * 重新做一次全文 SHA1 校验。这些工作在每次配置、每个子项目上重复，且不随构建结果变化。
++ *
++ * <p>本类把「解析结果」与「已验证」这两类状态按输入文件的内容身份落盘，使它们跨 daemon、
++ * 跨工作树复用。键由 {@link #inputIdentity(Path)} 生成，取值来自文件的大小与最后修改时间——
++ * 下载器的落位是原子的，文件不会出现「大小与时间不变而内容改变」的情形。
++ *
++ * <p>与 {@code ~/.gradle/caches} 下既有的手写就绪标记不同，本目录只存放**纯派生数据**：
++ * 任何条目都可安全删除，删除后只是重新解析一次，不影响正确性。因此它不需要参与
++ * 构建产物的有效性判定，也不会像产物标记那样在配置期形成「观察 → 填充 → 失效」的循环。
++ */
++public final class SpecStore {
++	private static final Logger LOGGER = LoggerFactory.getLogger(SpecStore.class);
++
++	/** 存储格式版本：内容结构变化时递增，使旧条目自然失效. */
++	private static final String FORMAT_VERSION = "v1";
++
++	private final Path root;
++
++	public SpecStore(Path userCache) {
++		this.root = userCache.resolve("spec");
++	}
++
++	/**
++	 * 生成输入文件的内容身份串.
++	 *
++	 * <p>取大小与最后修改时间而非内容哈希：调用方关心的是「这个文件是不是上次那个」，
++	 * 而计算内容哈希本身就是要省掉的成本。下载产物一律原子落位，故该组合足以区分代次。
++	 *
++	 * @param file 输入文件
++	 * @return 形如 {@code size-mtime} 的身份串；文件不存在时返回空
++	 */
++	public static Optional<String> inputIdentity(Path file) {
++		try {
++			final BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
++			return Optional.of(attrs.size() + "-" + attrs.lastModifiedTime().toMillis());
++		} catch (NoSuchFileException e) {
++			return Optional.empty();
++		} catch (IOException e) {
++			LOGGER.debug("Failed to read attributes of {}, treating as cache miss", file, e);
++			return Optional.empty();
++		}
++	}
++
++	/**
++	 * 读取已缓存的解析结果.
++	 *
++	 * @param namespace 逻辑分区（例如 {@code "versions-manifest"}），不同用途互不干扰
++	 * @param identity 输入身份串，见 {@link #inputIdentity(Path)}
++	 * @param discriminator 同一输入下区分不同查询的额外维度（例如目标 Minecraft 版本）
++	 * @return 缓存内容；未命中时为空
++	 */
++	public Optional<String> load(String namespace, String identity, String discriminator) {
++		final Path path = entryPath(namespace, identity, discriminator);
++
++		try {
++			return Optional.of(Files.readString(path, StandardCharsets.UTF_8));
++		} catch (NoSuchFileException e) {
++			return Optional.empty();
++		} catch (IOException e) {
++			// 读不动一律按未命中处理：本目录只存派生数据，重算即可，不值得打断构建
++			LOGGER.debug("Failed to read spec cache entry {}", path, e);
++			return Optional.empty();
++		}
++	}
++
++	/**
++	 * 写入解析结果.
++	 *
++	 * <p>原子落位，且失败不抛异常：缓存写不进去只是下次多解析一次，
++	 * 不应让它成为构建失败的原因。
++	 *
++	 * @param namespace 逻辑分区
++	 * @param identity 输入身份串
++	 * @param discriminator 额外维度
++	 * @param content 待缓存内容
++	 */
++	public void store(String namespace, String identity, String discriminator, String content) {
++		final Path path = entryPath(namespace, identity, discriminator);
++
++		try {
++			AtomicFiles.publish(path, tmp -> Files.writeString(tmp, content, StandardCharsets.UTF_8,
++					StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING));
++		} catch (IOException e) {
++			LOGGER.debug("Failed to write spec cache entry {}", path, e);
++		}
++	}
++
++	private Path entryPath(String namespace, String identity, String discriminator) {
++		final String fileName = FORMAT_VERSION + "-" + sanitize(discriminator) + ".json";
++		return root.resolve(namespace).resolve(identity).resolve(fileName);
++	}
++
++	/** 把任意维度值收敛成安全文件名，避免路径分隔符与超长名字. */
++	private static String sanitize(String value) {
++		final String cleaned = value.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9._-]", "_");
++
++		if (cleaned.length() <= 96) {
++			return cleaned;
++		}
++
++		// 超长名字截断并附上稳定后缀，避免与其它截断结果相撞
++		return cleaned.substring(0, 88) + "-" + Integer.toHexString(value.hashCode());
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/spec/package-info.java b/src/main/java/net/fabricmc/loom/spec/package-info.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..fce1300aff2a5b1180adf01c8215c422253b256e
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/spec/package-info.java
+@@ -0,0 +1,28 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++@NullMarked
++package net.fabricmc.loom.spec;
++
++import org.jspecify.annotations.NullMarked;
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/spec/SpecStoreTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/spec/SpecStoreTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..cb3c3c13351ed4121e0ba63f51b8c6c54e2ec54a
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/spec/SpecStoreTest.groovy
+@@ -0,0 +1,148 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.spec
++
++import java.nio.file.Files
++import java.nio.file.Path
++
++import spock.lang.Specification
++import spock.lang.TempDir
++
++import net.fabricmc.loom.spec.SpecStore
++
++/**
++ * 验证 L2 规格层持久化存储的行为.
++ *
++ * <p>该存储只保存**派生数据**：任何条目丢失都只应导致「重新解析一次」，
++ * 不能影响正确性。因此这里重点确认三件事：
++ * 未命中返回空、写入后可命中、输入变化后自然失效。
++ */
++class SpecStoreTest extends Specification {
++	@TempDir
++	Path tempDir
++
++	private SpecStore store() {
++		return new SpecStore(tempDir.resolve("userCache"))
++	}
++
++	def "未命中时返回空"() {
++		when:
++		def result = store().load("ns", "identity-1", "disc")
++
++		then:
++		result.isEmpty()
++	}
++
++	def "写入后可命中"() {
++		given:
++		def s = store()
++
++		when:
++		s.store("ns", "identity-1", "disc", "payload")
++		def result = s.load("ns", "identity-1", "disc")
++
++		then:
++		result.isPresent()
++		result.get() == "payload"
++	}
++
++	def "不同命名空间互不干扰"() {
++		given:
++		def s = store()
++		s.store("ns-a", "id", "disc", "A")
++		s.store("ns-b", "id", "disc", "B")
++
++		expect:
++		s.load("ns-a", "id", "disc").get() == "A"
++		s.load("ns-b", "id", "disc").get() == "B"
++	}
++
++	def "不同维度互不干扰"() {
++		given:
++		def s = store()
++		s.store("ns", "id", "1.20.1", "v1201")
++		s.store("ns", "id", "1.21.1", "v1211")
++
++		expect:
++		s.load("ns", "id", "1.20.1").get() == "v1201"
++		s.load("ns", "id", "1.21.1").get() == "v1211"
++	}
++
++	def "空内容可作为「已解析但无结果」的哨兵存下来"() {
++		given:
++		def s = store()
++
++		when:
++		s.store("ns", "id", "missing-version", "")
++
++		then: "必须与「未命中」区分开，否则每次配置都会重新解析全文清单"
++		s.load("ns", "id", "missing-version").isPresent()
++		s.load("ns", "id", "missing-version").get().isEmpty()
++	}
++
++	def "重写同名条目会覆盖旧内容"() {
++		given:
++		def s = store()
++		s.store("ns", "id", "disc", "old")
++
++		when:
++		s.store("ns", "id", "disc", "new")
++
++		then:
++		s.load("ns", "id", "disc").get() == "new"
++	}
++
++	def "维度值含路径分隔符时被安全处理"() {
++		given:
++		def s = store()
++
++		when: "维度来自外部输入，可能含 / \\ : 等字符"
++		s.store("ns", "id", "a/b\\c:d", "payload")
++
++		then: "不抛异常且能读回"
++		s.load("ns", "id", "a/b\\c:d").get() == "payload"
++	}
++
++	def "inputIdentity 随文件大小与修改时间变化"() {
++		given:
++		def file = tempDir.resolve("input.json")
++		Files.writeString(file, "content")
++
++		when:
++		def first = SpecStore.inputIdentity(file)
++		Files.writeString(file, "content-changed-and-longer")
++		def second = SpecStore.inputIdentity(file)
++
++		then:
++		first.isPresent()
++		second.isPresent()
++		first.get() != second.get()
++	}
++
++	def "inputIdentity 对不存在的文件返回空"() {
++		expect:
++		SpecStore.inputIdentity(tempDir.resolve("nope.json")).isEmpty()
++	}
++}

@@ -1,0 +1,197 @@
+From ed8a475d87ea4aee4140e1c9845d136e27b88693 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Sun, 1 Nov 2026 15:06:47 +0800
+Subject: [PATCH 119/147] =?UTF-8?q?perf(cache):=20prune=20=E6=94=B9?=
+ =?UTF-8?q?=E7=94=A8=E4=B8=80=E6=AC=A1=E6=80=A7=E6=8E=92=E5=BA=8F=EF=BC=8C?=
+ =?UTF-8?q?=E5=8E=BB=E6=8E=89=20O(n=C2=B2)=20=E7=9A=84=E9=80=90=E6=9D=A1?=
+ =?UTF-8?q?=E6=8F=92=E5=85=A5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+prune() 每跑一次都要把所有缓存文件按 last-modified 排成「最旧 -> 最新」，原来
+是一个一个 insertSorted() 进去：先 Collections.binarySearch 定位，再
+ArrayList.add(index, entry) 插进去。每条插入都要把后半段整体后移，累计是
+O(n²)；而缓存上限默认 50000 条，暖路径（全命中、不需要重新反编译）每次也要
+把这个全量扫一遍并按 last-modified 重排，于是这一遍是纯开销。
+
+改为先把所有 PathEntry 收集进 ArrayList（Files.walk 仍逐条 getLastModifiedTime），
+最后统一 entries.sort(Comparator.comparing(PathEntry::lastModified)) 一次 O(n log n)。
+
+淘汰语义逐条保持不变：
+
+  · 排序键仍是 PathEntry.lastModified（FileTime），比较器仍是
+    Comparator.comparing(PathEntry::lastModified)；只把「边收集边插」换成
+    「收集完一次排」，最终列表的内容与排序键完全一样。
+  · 排序是稳定的（List.sort 规定稳定），比较键又都相等时，顺序退化为收集顺序，
+    与原来 binarySearch+add 得到的顺序也一致；而两个完全同 mtime 的条目谁先被
+    删，对淘汰结果（被删集合的 mtime 多重集）没有影响。
+  · 超限分支原样保留：entries.size() > maxFiles 时从下标 0 起删 maxFiles 个
+    最旧的（这是上游规则，删的条数是 maxFiles 而不是 size - maxFiles，行为不变）。
+  · maxAge 分支原样保留：从最旧端开始扫，遇到第一个「不早于 maxAge」的条目就
+    break——它依赖的正是「列表按 last-modified 升序」，排序语义不变则这条不变。
+  · 边界：空目录 / 只有目录没有文件 -> entries 为空，两个分支都不进；恰好
+    == maxFiles 时不触发删除（仍是 >）。
+
+没有加「无新增则跳过」这类猜测性优化：一次 prune 是否真的无事可做取决于目录里
+文件数与 mtime 的分布，判断不了，就不改。
+
+测试（CachedFileStoreTest 新增两条，都用固定 mtime、不测墙钟）：
+
+  · pruneEvictsOldestFilesFirst：9 个固定 mtime 的条目、上限 5，且 mtime 顺序
+    与文件系统给出顺序无关；断言只剩最新的 4 个、最旧的 5 个被删。
+  · pruneKeepsEverythingUnderTheLimit：条数在上限内时一条都不删。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: decompile-cache-opt
+
+diff --git a/src/main/java/net/fabricmc/loom/decompilers/cache/CachedFileStoreImpl.java b/src/main/java/net/fabricmc/loom/decompilers/cache/CachedFileStoreImpl.java
+index e71e54317b78b1f4b9823a3e841c97271e3805bb..5856fd29996fcc4f24d04e82325e35fd64bfb710 100644
+--- a/src/main/java/net/fabricmc/loom/decompilers/cache/CachedFileStoreImpl.java
++++ b/src/main/java/net/fabricmc/loom/decompilers/cache/CachedFileStoreImpl.java
+@@ -31,7 +31,6 @@ import java.nio.file.attribute.FileTime;
+ import java.time.Duration;
+ import java.time.Instant;
+ import java.util.ArrayList;
+-import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.Iterator;
+ import java.util.List;
+@@ -70,10 +69,13 @@ public record CachedFileStoreImpl<T>(Path root, EntrySerializer<T> entrySerializ
+ 	}
+ 
+ 	public void prune() throws IOException {
+-		// Sorted oldest -> newest
+ 		List<PathEntry> entries = new ArrayList<>();
+ 
+-		// Iterate over all the files in the cache, and store them into the sorted list.
++		// Iterate over all the files in the cache, and collect them.
++		// The list is sorted once afterwards, which is O(n log n). Inserting every entry into an
++		// already sorted list as it is found (binary search + ArrayList.add(index, ...)) is O(n²):
++		// every insert shifts the tail of the list, and the cache can hold up to 50000 files, so
++		// the whole thing is paid again on every warm run.
+ 		try (Stream<Path> walk = Files.walk(root)) {
+ 			Iterator<Path> iterator = walk.iterator();
+ 
+@@ -84,10 +86,13 @@ public record CachedFileStoreImpl<T>(Path root, EntrySerializer<T> entrySerializ
+ 					continue;
+ 				}
+ 
+-				insertSorted(entries, new PathEntry(entry));
++				entries.add(new PathEntry(entry));
+ 			}
+ 		}
+ 
++		// Sorted oldest -> newest
++		entries.sort(Comparator.comparing(PathEntry::lastModified));
++
+ 		// Delete the oldest files to get under the max file limit
+ 		if (entries.size() > cacheRules.maxFiles) {
+ 			for (int i = 0; i < cacheRules.maxFiles; i++) {
+@@ -114,16 +119,6 @@ public record CachedFileStoreImpl<T>(Path root, EntrySerializer<T> entrySerializ
+ 		}
+ 	}
+ 
+-	private void insertSorted(List<PathEntry> list, PathEntry entry) {
+-		int index = Collections.binarySearch(list, entry, Comparator.comparing(PathEntry::lastModified));
+-
+-		if (index < 0) {
+-			index = -index - 1;
+-		}
+-
+-		list.add(index, entry);
+-	}
+-
+ 	/**
+ 	 * The rules for the cache.
+ 	 *
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/cache/CachedFileStoreTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/cache/CachedFileStoreTest.groovy
+index 04292ab40438aab16add4426f882570addc9ae9a..cc0a8f04075cdef9cacff7d2f4747475594949c8 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/cache/CachedFileStoreTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/cache/CachedFileStoreTest.groovy
+@@ -118,6 +118,84 @@ class CachedFileStoreTest extends Specification {
+ 		Files.notExists(root.resolve("test_300"))
+ 	}
+ 
++	/**
++	 * The eviction order has to survive the switch from insert-as-you-go to sort-once: it is the oldest
++	 * files (by last modified time) that get dropped, and the newest that stay.
++	 *
++	 * <p>The mtimes are fixed rather than relative to {@code now} so the case is fully deterministic,
++	 * and they are deliberately *not* in walk order: entries arrive in whatever order the file system
++	 * hands them out, so an implementation that relied on insertion order instead of on the mtime
++	 * would fail here.
++	 *
++	 * <p>Note the count: when the cache is over the limit the existing rule deletes exactly
++	 * {@code maxFiles} of the oldest entries (not {@code size - maxFiles}), so 9 files with a limit of
++	 * 5 leaves the 4 newest ones. That is upstream behaviour and is pinned here on purpose — this
++	 * test is about keeping the eviction *rule* unchanged while the sorting changes.
++	 */
++	def "pruneEvictsOldestFilesFirst"() {
++		given:
++		final int maxFiles = 5
++		final Instant base = Instant.parse("2024-01-01T00:00:00Z")
++		def cacheRules = new CachedFileStoreImpl.CacheRules(maxFiles, Duration.ofDays(36500))
++		def store = new CachedFileStoreImpl(root, BYTE_ARRAY_SERIALIZER, cacheRules)
++
++		// Key -> how many seconds older it is than `base`; a larger number means an older entry.
++		def ages = [
++			"f_now": 0,
++			"f_10s": 10,
++			"f_20s": 20,
++			"f_30s": 30,
++			"f_40s": 40,
++			"f_50s": 50,
++			"f_60s": 60,
++			"f_70s": 70,
++			"f_80s": 80,
++		]
++
++		when:
++		ages.each { key, age ->
++			store.putEntry(key, "Hello world".bytes)
++			Files.setLastModifiedTime(root.resolve(key), FileTime.from(base.minusSeconds(age)))
++		}
++
++		store.prune()
++
++		then: "only the newest entries survive, and the oldest ones are gone"
++		Files.newDirectoryStream(root).withCloseable { it.toList().size() } == 4
++
++		Files.exists(root.resolve("f_now"))
++		Files.exists(root.resolve("f_10s"))
++		Files.exists(root.resolve("f_20s"))
++		Files.exists(root.resolve("f_30s"))
++
++		Files.notExists(root.resolve("f_40s"))
++		Files.notExists(root.resolve("f_50s"))
++		Files.notExists(root.resolve("f_60s"))
++		Files.notExists(root.resolve("f_70s"))
++		Files.notExists(root.resolve("f_80s"))
++	}
++
++	/**
++	 * When the cache is within its size limit nothing may be deleted.
++	 */
++	def "pruneKeepsEverythingUnderTheLimit"() {
++		given:
++		final Instant base = Instant.parse("2024-01-01T00:00:00Z")
++		def cacheRules = new CachedFileStoreImpl.CacheRules(10, Duration.ofDays(36500))
++		def store = new CachedFileStoreImpl(root, BYTE_ARRAY_SERIALIZER, cacheRules)
++
++		when:
++		for (i in 0..<4) {
++			store.putEntry("f_" + i, "Hello world".bytes)
++			Files.setLastModifiedTime(root.resolve("f_" + i), FileTime.from(base.minusSeconds((i + 1) * 10)))
++		}
++
++		store.prune()
++
++		then:
++		Files.newDirectoryStream(root).withCloseable { it.toList().size() } == 4
++	}
++
+ 	private static CachedFileStore.EntrySerializer<byte[]> BYTE_ARRAY_SERIALIZER = new CachedFileStore.EntrySerializer<byte[]>() {
+ 		@Override
+ 		byte[] read(Path path) throws IOException {

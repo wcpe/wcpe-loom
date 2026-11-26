@@ -1,0 +1,218 @@
+From f56b65d0eb7deda6226f8bad4f2b62809023d6d7 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Mon, 5 Oct 2026 10:21:50 +0800
+Subject: [PATCH 073/147] =?UTF-8?q?perf(mc):=20innerClassNames=20=E6=94=B9?=
+ =?UTF-8?q?=E7=94=B1=E9=87=8D=E6=98=A0=E5=B0=84=E4=BB=BB=E5=8A=A1=E6=89=A7?=
+ =?UTF-8?q?=E8=A1=8C=E6=9C=9F=E4=BB=8E=E8=BE=93=E5=85=A5=20jar=20=E7=8E=B0?=
+ =?UTF-8?q?=E7=AE=97?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Forge 系原本在配置期同步读输入 jar 取内部类名集合，这是 Forge 无法投影到执行期任务的阻塞之一。
+该集合是 inputJar 的纯函数，故改为由任务在执行期从 (inputJar, forgeLike) 现算，非 Forge 系取空集；
+属性改判 @Internal（这一对判据本身已是本任务输入，up-to-date 与缓存键判别力不变）。
+
+要点：**不能**用接线侧的惰性 provider 来登记「怎么算」。SetProperty 是 Gradle 托管属性，配置缓存
+写入任务状态时会求值并序列化它，于是读 jar 落在配置缓存序列化期——那仍是配置期，而输入 jar 的
+产出任务此时尚未运行，冷缓存下直接抛 NoSuchFileException，让整次配置缓存写入失败。只有让该值
+不经过任何任务属性，读取才真正推迟到执行期。
+
+判空用 getOrElse + 空集判据而非 isPresent()：「存在但为空」与「无值」在本任务语义里等同，都表示
+没有显式覆盖、走现算；只看 isPresent() 会让空集短路现算，Forge 系拿到空集、内部类不被重映射，
+产物与配置期路径静默不同。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
+index 62f51e05568f6711db8e1fa302d659a317519411..65fa67c3583558f2d478ebe5d9c6e20be06f6267 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
+@@ -623,8 +623,11 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 	 *       的同名字段，{@code fromNamespace} ← {@code sourceNamespace}</li>
+ 	 *   <li>{@code toNamespace} ← {@link #getTargetNamespace()}（取 {@code toString()}，
+ 	 *       与 {@code remapJar} 交给 L4 的字符串一致）</li>
+-	 *   <li>{@code fixRecords} / {@code validateTargetNamespace} / {@code innerClassNames} /
+-	 *       {@code objectHolder*} ← 与 {@code remapJar} 逐项同判据</li>
++	 *   <li>{@code fixRecords} / {@code validateTargetNamespace} / {@code objectHolder*} ←
++	 *       与 {@code remapJar} 逐项同判据</li>
++	 *   <li>{@code innerClassNames} ← 判据同 {@code remapJar}（Forge 系才算，否则空集）：它是输入 jar 的纯函数，
++	 *       由任务在执行期从 ({@code inputJar}, {@code forgeLike}) 现算，**不经任何任务属性**
++	 *       （理由见 {@code RemapMinecraftTask.resolveInnerClassNames} 的说明）</li>
+ 	 *   <li>{@code mappingsServiceOptions} ←
+ 	 *       {@code MappingConfiguration.getMappingsServiceOptions(project, MappingOption.forPlatform(extension))}，
+ 	 *       与配置期 {@code getMappingsService} 取的是同一份映射来源（换来源会产出不等价的 jar）</li>
+@@ -699,10 +702,9 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 		// Arch: 中间映射被关闭时不校验目标命名空间（与 remapJar 同一判据，见 fabric-loom#1576）
+ 		final boolean validateTargetNamespace = !(getTargetNamespace() == MappingsNamespace.INTERMEDIARY && !extension.getUseIntermediateMappings().get());
+ 
+-		// Forge 系才需要内部类名集合；这一步要读输入 jar，配置期只能同步做
+-		final Set<String> innerClassNames = extension.isForgeLike()
+-				? InnerClassRemapper.readClassNames(remappedJars.inputJar())
+-				: Set.of();
++		// 这里刻意不再算内部类名集合：它要读输入 jar，而输入 jar 在生产链迁移完成后由执行期任务产出，
++		// 配置期读到的是「不存在」或「上一代」的文件。改由 RemapMinecraftTask 在执行期从
++		// (inputJar, forgeLike) 现算，见 RemapMinecraftTask.resolveInnerClassNames 的说明。
+ 
+ 		final String objectHolderClassName;
+ 		final String objectHolderSourceNamespace;
+@@ -754,7 +756,10 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 		identity.put("fixRecords", Boolean.toString(fixRecords));
+ 		identity.put("forgeLike", Boolean.toString(extension.isForgeLike()));
+ 		identity.put("validateTargetNamespace", Boolean.toString(validateTargetNamespace));
+-		identity.put("innerClassNames", fingerprintValues(innerClassNames));
++		// innerClassNames 没有指纹项：它不再是配置期读出来的值，而是 (inputJar, forgeLike) 的纯函数，
++		// 由 RemapMinecraftTask 在执行期现算（见 resolveInnerClassNames）。这两个判据都已经在上面
++		// ——inputJar 的路径与 forgeLike 的布尔值——同一对取值必然算出同一个集合，故指纹的判别力不变；
++		// 记一个常量反而会让人误以为它参与了判定。
+ 		identity.put("knownIndyBsms", fingerprintValues(extension.getKnownIndyBsms().get()));
+ 		identity.put("signatureFixes", fingerprintEntries(remappedSignatures));
+ 		identity.put("annotationsJson", remappedAnnotations == null ? "" : remappedAnnotations.toJson().toString());
+@@ -802,7 +807,10 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 					task.getFixRecords().set(fixRecords);
+ 					task.getForgeLike().set(extension.isForgeLike());
+ 					task.getValidateTargetNamespace().set(validateTargetNamespace);
+-					task.getInnerClassNames().set(innerClassNames);
++					// 内部类名集合刻意不在这里设置：它是 (inputJar, forgeLike) 的纯函数，由任务在执行期
++					// 现算（RemapMinecraftTask.resolveInnerClassNames）。此处曾用惰性 provider 登记「怎么算」，
++					// 但 SetProperty 是托管属性、配置缓存写入任务状态时会求值并序列化它，于是读 jar 落在
++					// 配置缓存序列化期——那时输入 jar 的产出任务还没跑，冷缓存下直接让整次配置缓存写入失败。
+ 					task.getKnownIndyBsms().set(extension.getKnownIndyBsms());
+ 					task.getSignatureFixes().set(remappedSignatures);
+ 					// object holder 改写只在「官方命名空间」下需要，其目标命名空间是字面量 named，
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/RemapMinecraftTask.java b/src/main/java/net/fabricmc/loom/pipeline/RemapMinecraftTask.java
+index 8ba0cf2729f43e8fb2c78ec10040cfd1a0850660..fde1da6627bcf98fb97f6f805f844aa307ed3804 100644
+--- a/src/main/java/net/fabricmc/loom/pipeline/RemapMinecraftTask.java
++++ b/src/main/java/net/fabricmc/loom/pipeline/RemapMinecraftTask.java
+@@ -32,6 +32,7 @@ import java.util.Map;
+ import java.util.Set;
+ import java.util.function.Consumer;
+ 
++import dev.architectury.loom.forge.InnerClassRemapper;
+ import org.gradle.api.DefaultTask;
+ import org.gradle.api.file.ConfigurableFileCollection;
+ import org.gradle.api.file.RegularFileProperty;
+@@ -242,8 +243,31 @@ public abstract class RemapMinecraftTask extends DefaultTask {
+ 	@Input
+ 	public abstract Property<Boolean> getValidateTargetNamespace();
+ 
+-	/** Forge 系内部类重映射所需的类名集合. */
+-	@Input
++	/**
++	 * Forge 系内部类重映射所需的类名集合：显式覆盖项，接线侧通常留空.
++	 *
++	 * <h4>缺省由本任务在执行期现算</h4>
++	 * 未设置时，本任务在 {@code remap()} 里由 {@link #getInputJar()} 与 {@link #getForgeLike()} 现算：
++	 * Forge 系取 {@code InnerClassRemapper.readClassNames(inputJar)}，非 Forge 系取空集。接线侧
++	 * （{@code AbstractMappedMinecraftProvider.registerRemapTask}）因此**不设置本属性**。
++	 *
++	 * <h4>为什么不能由接线侧挂惰性 provider</h4>
++	 * 曾经的做法是接线侧 set 一个 {@code inputJar.zip(forgeLike, …)} 惰性 provider，意图是「配置期不打开
++	 * 输入 jar」。但 {@link SetProperty} 是 Gradle 托管属性，**配置缓存写入任务状态时会求值并序列化它**：
++	 * 读 jar 于是从配置期挪到了配置缓存序列化期——那仍然是配置期，而且此时输入 jar 的产出任务尚未运行，
++	 * 冷缓存下直接抛 {@code NoSuchFileException}，使整次配置缓存写入失败（Forge 全链用例在 CI 上正是这样
++	 * 成片失败的）。只有让该值**不经过任何任务属性**，读取才真正推迟到执行期。
++	 *
++	 * <h4>改判 {@code @Internal} 不降低判别力</h4>
++	 * 本集合是（{@link #getInputJar()} 的内容、{@link #getForgeLike()}）的纯函数，而这一对判据本身已是本任务
++	 * 的输入（前者是内容哈希的 {@code @InputFile}，后者是 {@code @Input}）：同一对取值必然算出同一个集合。
++	 * 故它无须再登记为输入，up-to-date 判定与构建缓存键的判别力不变。
++	 *
++	 * <h4>显式设置仍然有效</h4>
++	 * 不经接线侧、直接注册本任务的场景（例如与配置期做对照的探针）可显式设置本属性以覆盖现算结果。
++	 * 所设的值会照常参与配置缓存序列化，因此必须是普通值，不得是读文件的惰性 provider。
++	 */
++	@Internal
+ 	public abstract SetProperty<String> getInnerClassNames();
+ 
+ 	/** 已知的 indy BSM 集合. */
+@@ -401,7 +425,7 @@ public abstract class RemapMinecraftTask extends DefaultTask {
+ 					getInjectMixinExtension().get(),
+ 					getFixRecords().get(),
+ 					getValidateTargetNamespace().get(),
+-					Set.copyOf(getInnerClassNames().get()),
++					resolveInnerClassNames(),
+ 					Set.copyOf(getKnownIndyBsms().get()),
+ 					readAnnotations(),
+ 					Map.copyOf(getSignatureFixes().getOrElse(Map.of())),
+@@ -413,6 +437,35 @@ public abstract class RemapMinecraftTask extends DefaultTask {
+ 		}
+ 	}
+ 
++	/**
++	 * {@return 内部类名集合：{@link #getInnerClassNames()} 显式给出的优先，否则按输入现算}.
++	 *
++	 * <p>现算分支即改造前接线侧（{@code AbstractMappedMinecraftProvider}）那条惰性 provider 登记的函数关系，
++	 * 只是求值点从「配置缓存序列化任务状态时」挪到了「任务动作执行时」——后者输入 jar 的产出任务已经跑完，
++	 * 前者没有。两条路径的取值规则逐字相同：Forge 系（{@link #getForgeLike()} 为真）取输入 jar 里名字带
++	 * {@code $} 的 {@code .class} 条目名，非 Forge 系取空集（非 Forge 系下游也不消费它）。
++	 *
++	 * <p>显式设置优先是为了保留「直接注册本任务」的调用方（与配置期做对照的探针）覆盖取值的能力；
++	 * 接线侧不设置本属性，走现算分支。
++	 */
++	private Set<String> resolveInnerClassNames() {
++		// 用 getOrElse + 空集判据而不是 isPresent()：本属性不再由接线侧设置，属性「存在但为空」
++		// （例如被赋了一个解析为空的 provider）与「完全没有值」在本任务的语义里是同一件事——
++		// 都表示「没有显式覆盖，走现算」。只看 isPresent() 会让前者短路掉现算，Forge 系于是拿到
++		// 空集、内部类不被重映射，产物与配置期路径静默不同（SrgMojangMappedRemapEquivalenceTest 抓到过）。
++		Set<String> explicit = getInnerClassNames().getOrElse(Set.of());
++
++		if (!explicit.isEmpty()) {
++			return Set.copyOf(explicit);
++		}
++
++		if (!getForgeLike().get()) {
++			return Set.of();
++		}
++
++		return InnerClassRemapper.readClassNames(getInputJar().get().getAsFile().toPath());
++	}
++
+ 	/**
+ 	 * 写出 pom，并把「声明出来的输出」与「{@link LocalMavenHelper#savePom} 实际写入的位置」对齐校验.
+ 	 *
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/SrgMojangMappedRemapEquivalenceTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/SrgMojangMappedRemapEquivalenceTest.groovy
+index 9b4f1aa85bc2d73bcb79b0e8cf5bdfd474ec4e42..6d7072953c0a6a6d046467f01c8d692cf9a4f63e 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/SrgMojangMappedRemapEquivalenceTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/SrgMojangMappedRemapEquivalenceTest.groovy
+@@ -76,8 +76,10 @@ import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
+  * <ul>
+  *   <li>{@code getTargetNamespace()} 是 {@code srg} / {@code mojang} 而不是 {@code named}，
+  *       {@code getRemappedJars()} 的源命名空间同为 {@code official}；</li>
+- *   <li>{@code innerClassNames} **非空**：{@code isForgeLike()} 为真时配置期会读一遍输入 jar 取出内部类
+- *       名集合（fabric 的 Named 那条是空集）；</li>
++ *   <li>{@code innerClassNames} **非空**：{@code isForgeLike()} 为真时它是输入 jar 的一列内部类名。
++ *       接线侧登记的是**算法**而不是配置期算好的值（它要读输入 jar，而输入 jar 在生产链迁移后由执行期任务
++ *       产出），故该输入在执行期才求值；本探针在配置期读它只是为了钉住「这个夹具确实有内部类」，
++ *       那次读取不构成对被测实现求值时机的断言（fabric 的 Named 那条两者都是空集）；</li>
+  *   <li>{@code objectHolder*} **非空**：{@code isForgeLikeAndOfficial()} 为真（本夹具的 mcp/neoform 配置
+  *       都是 {@code official: true}），object holder 改写的类名与源命名空间都参与产物内容；</li>
+  *   <li>{@code injectMixinExtension} = {@code isNeoForge()}：Forge 为 false、NeoForge 为 true。
+@@ -409,7 +411,25 @@ project.afterEvaluate {
+ 	lines << 'TASK_COPY_ONLY=' + realTask.getCopyOnly().get()
+ 	lines << 'TASK_FIX_RECORDS=' + realTask.getFixRecords().get()
+ 	lines << 'TASK_VALIDATE_TARGET_NAMESPACE=' + realTask.getValidateTargetNamespace().get()
+-	lines << 'TASK_INNER_CLASS_COUNT=' + realTask.getInnerClassNames().get().size()
++	// 内部类名集合不再是一个「配置期接线的输入」：它由任务在执行期从 (inputJar, forgeLike) 现算
++	// （见 RemapMinecraftTask.resolveInnerClassNames）。接线侧若给它挂惰性 provider，配置缓存写入
++	// 任务状态时会求值它，冷缓存下输入 jar 尚不存在，整次配置缓存写入直接失败；而若让它吞掉缺失
++	// 返回空集，序列化下来的就是与 jar 内容脱钩的陈旧值。故只能在执行期现算。
++	// 探针于是在配置期按同一条函数关系自行现算被断言的那个量——断言守的仍是同一件事：
++	// Forge 系的输入 jar 确实含内部类，Named 那条（forgeLike=false）不含。
++	def innerClassCount = 0
++
++	if (realTask.getForgeLike().get()) {
++		def taskInputJar = realTask.getInputJar().get().asFile
++
++		if (taskInputJar.isFile()) {
++			innerClassCount = dev.architectury.loom.forge.InnerClassRemapper
++					.readClassNames(taskInputJar.toPath())
++					.size()
++		}
++	}
++
++	lines << 'TASK_INNER_CLASS_COUNT=' + innerClassCount
+ 	lines << 'TASK_SIGNATURE_FIX_COUNT=' + realTask.getSignatureFixes().get().size()
+ 	lines << 'TASK_ANNOTATIONS_PRESENT=' + realTask.getAnnotationsJson().isPresent()
+ 	lines << 'TASK_OBJECT_HOLDER_CLASS=' + (realTask.getObjectHolderClassName().isPresent() ? realTask.getObjectHolderClassName().get() : '')

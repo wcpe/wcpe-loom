@@ -1,0 +1,104 @@
+From 018eb5d1285a71754f956588acc13e17b08456c1 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Sat, 3 Oct 2026 01:49:09 +0800
+Subject: [PATCH 071/147] =?UTF-8?q?fix(mc):=20=E5=88=86=E5=B1=82=E6=98=A0?=
+ =?UTF-8?q?=E5=B0=84=E6=8C=89=E5=9D=90=E6=A0=87=E8=AE=A4=E5=AE=9A=E4=B8=BA?=
+ =?UTF-8?q?=20tiny=20v2=EF=BC=8C=E5=90=A6=E5=88=99=E6=8A=95=E5=BD=B1?=
+ =?UTF-8?q?=E5=AF=B9=E7=9C=9F=E5=AE=9E=E5=B7=A5=E7=A8=8B=E5=85=A8=E5=A4=B1?=
+ =?UTF-8?q?=E6=95=88?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+消费方验收（AllinCore，266 模块）暴露：整棵树的 vanilla jar 全部回退到配置期生产，
+理由是「映射依赖未声明为 tiny v2」。
+
+根因：projectionBlocker 的判据只看依赖声明的 classifier，而分层映射的坐标是
+loom:mappings:<版本>-mc.<mcVersion>——**没有 classifier**。而 loom.officialMojangMappings()
+等公开入口全部经 LayeredMappingsFactory 产出分层映射，于是绝大多数真实工程被判成
+「可能不是 v2」而整批回退，本批迁移对它们等于白做（集成测试夹具用的映射形态恰好不在
+这条路上，所以此前 23/23 全绿也没暴露）。
+
+修法：分层映射恒由 LayeredMappingsFactory 以 Tiny2FileWriter 写出，即**必为 tiny v2**，
+按坐标单独认定即可。判据收在工厂里（isLayeredMappingsDependency），避免调用方硬编码
+loom:mappings 这对字面量。
+
+验证：
+- 消费方 AllinCore：日志由「保持配置期生产：映射依赖未声明为 tiny v2」转为
+  「jar 生产由执行期任务承担：[downloadMinecraftClientJar, downloadMinecraftServerJar,
+  extractMinecraftServerJar, mergeMinecraftJars]」，assemble 全绿（1063 任务）
+- loom 集成测试：pipeline.* + MCJarConfigTest 共 21 用例，20 绿；SplitModDependencyProducerTest
+  因 TestKit daemon 被 GC thrashing 杀掉而失败，定向复跑 PASSED（环境性，非代码缺陷）
+- compileJava + checkstyleMain 通过
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/LayeredMappingsFactory.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/LayeredMappingsFactory.java
+index 515decf5e41a61fe72ff3c4bb02da78fe580d830..ed283b7e67ee00751ebcea5ef60183e6dd02a69e 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/LayeredMappingsFactory.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/LayeredMappingsFactory.java
+@@ -66,6 +66,17 @@ public record LayeredMappingsFactory(LayeredMappingSpec spec) {
+ 	private static final String MODULE = "mappings";
+ 	private static final Logger LOGGER = LoggerFactory.getLogger(LayeredMappingsFactory.class);
+ 
++	/**
++	 * {@return 该坐标是否为本工厂产出的分层映射依赖}.
++	 *
++	 * <p>本工厂恒以 {@link Tiny2FileWriter} 写出映射，故分层映射**必为 tiny v2**。判据需要这一点：
++	 * 分层映射的坐标没有 classifier，只看 classifier 会把它误判成「可能不是 v2」而整批回退——
++	 * 而 {@code loom.officialMojangMappings()} 等全部走分层映射，漏掉它等于让绝大多数真实工程白退。
++	 */
++	public static boolean isLayeredMappingsDependency(String group, String name) {
++		return GROUP.equals(group) && MODULE.equals(name);
++	}
++
+ 	/*
+ 	As we no longer have SelfResolvingDependency we now always create the mappings file after evaluation.
+ 	This works in a similar way to how remapped mods are handled.
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
+index 9c08bf40da1b19937e88b1e13eef5e3039637de3..386231497432765fb03aa3db67c12e8a8e31dc14 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
+@@ -49,6 +49,7 @@ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.configuration.ConfigContext;
+ import net.fabricmc.loom.configuration.DependencyInfo;
+ import net.fabricmc.loom.configuration.providers.BundleMetadata;
++import net.fabricmc.loom.configuration.providers.mappings.LayeredMappingsFactory;
+ import net.fabricmc.loom.configuration.providers.minecraft.verify.MinecraftJarVerification;
+ import net.fabricmc.loom.configuration.providers.minecraft.verify.SignatureVerificationFailure;
+ import net.fabricmc.loom.pipeline.DownloadArtifactTask;
+@@ -198,9 +199,18 @@ public abstract class MinecraftProvider {
+ 	 *
+ 	 * <p>配置期读到 V1 映射时，{@code MappingConfiguration.storeMappings} 会打开 merged jar 补字段名，
+ 	 * 因此「这次用的到底是 V1 还是 V2」必须在投影**之前**就有答案。映射 jar 的内容要等解析、抽取之后
+-	 * 才知道（那时产物早已按任务路径声明），所以这里用声明处的 classifier 作为判据：`...:v2` 是 tiny v2
+-	 * 变体，其余（无 classifier、未知层、非模块依赖）一律保守地当作「可能不是 v2」，退回配置期生产。
+-	 * 判据偏保守只影响「迁移覆盖范围」，不影响行为——判错的代价是这次构建仍按改造前的路径跑。
++	 * 才知道（那时产物早已按任务路径声明），所以这里只看声明处能拿到的信息：
++	 *
++	 * <ul>
++	 *   <li><b>分层映射</b>（{@code loom:mappings:…}，见
++	 *       {@link net.fabricmc.loom.configuration.providers.mappings.LayeredMappingsFactory}）恒为
++	 *       tiny v2，但其坐标没有 classifier，必须按坐标单独认——{@code officialMojangMappings()} 等
++	 *       全部走这条路，漏掉它会让绝大多数真实工程整批回退。</li>
++	 *   <li><b>{@code …:v2} classifier</b>是 tiny v2 变体，认。</li>
++	 *   <li>其余（无 classifier、未知层、非模块依赖）保守地当作「可能不是 v2」，退回配置期生产。</li>
++	 * </ul>
++	 *
++	 * <p>判据偏保守只影响「迁移覆盖范围」，不影响行为——判错的代价是这次构建仍按改造前的路径跑。
+ 	 */
+ 	private boolean mappingsAreDeclaredV2() {
+ 		final Configuration mappings = getProject().getConfigurations().findByName(Constants.Configurations.MAPPINGS);
+@@ -211,6 +221,11 @@ public abstract class MinecraftProvider {
+ 		}
+ 
+ 		final Dependency dependency = mappings.getDependencies().iterator().next();
++
++		if (LayeredMappingsFactory.isLayeredMappingsDependency(dependency.getGroup(), dependency.getName())) {
++			return true;
++		}
++
+ 		return "v2".equals(DependencyInfo.create(getProject(), dependency, mappings).getDeclaredClassifier());
+ 	}
+ 

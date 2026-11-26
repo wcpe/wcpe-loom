@@ -1,0 +1,58 @@
+From 46f561882fa5bf73b198c35c1980e5e0d0bcfb3b Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Mon, 2 Nov 2026 01:20:01 +0800
+Subject: [PATCH 126/147] =?UTF-8?q?fix(repo):=20=E5=9B=9E=E9=80=80?=
+ =?UTF-8?q?=E4=BB=93=E5=BA=93=E6=94=B9=E5=9B=9E=E5=90=AF=E7=94=A8=20Gradle?=
+ =?UTF-8?q?=20Module=20Metadata?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+a7de7888 把 Mojang 仓库上的 artifactUrls 回退改造成独立仓库
+MojangArtifactFallback（指向 Maven Central，插在 mavenCentral 之前），但
+metadataSources 只保留了 mavenPom + artifact，漏掉 gradleMetadata。
+
+artifactUrls 只影响构件文件查找、不影响 metadata 来源；换成独立仓库后它成了
+完整的 metadata 源并排在 mavenCentral 之前，于是 Central 上的制品都从这个不读
+.module 的仓库解析。
+
+后果是只声明在 Gradle Module Metadata 里的 capability 变体永远选不到。实测
+kotlin-test:2.3.20 报「Unable to find a variant ... with the requested capability
+'org.jetbrains.kotlin:kotlin-test-framework-junit5'」，凡用 kotlin("test") 的工程
+从 wcpe-v1.17.16 起一律构建失败（1.17.13~1.17.15 正常）。
+
+修复：给该仓库补上 sources.gradleMetadata()。保留 ignoreGradleMetadataRedirection
+——它只忽略 POM 声明的 GMM 重定向，不影响 GMM 本身；且该仓库只补 Central 上的
+构件、与 Mojang 制品无关，不存在「Mojang 制品被 GMM 重定向」的风险。
+
+验证：在 AllinCore 工程上跑 :fabric-action:build --dry-run，修复前 rc=1
+（kotlin-test capability 报错），修复后 rc=0；另用 init script 以等价
+metadataSources 做过反向验证（16 个项目的该仓库都被补到）。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: repo-fallback-gradle-metadata
+
+diff --git a/src/main/java/net/fabricmc/loom/LoomRepositoryPlugin.java b/src/main/java/net/fabricmc/loom/LoomRepositoryPlugin.java
+index 317d2862171155992b87389f35c49dc18c0d7694..6414a5ab44dc43100d8197a3deff414ebede8606 100644
+--- a/src/main/java/net/fabricmc/loom/LoomRepositoryPlugin.java
++++ b/src/main/java/net/fabricmc/loom/LoomRepositoryPlugin.java
+@@ -140,10 +140,16 @@ public class LoomRepositoryPlugin implements Plugin<PluginAware> {
+ 			repo.setName("MojangArtifactFallback");
+ 			repo.setUrl(ArtifactRepositoryContainer.MAVEN_CENTRAL_URL);
+ 
+-			// 与 Mojang 仓库保持同一套 metadataSources：回退只负责补上缺失的构件文件，
+-			// 不引入 Gradle module metadata（避免 Mojang 制品被 GMM 重定向）。
++			// 回退仓库指向 Maven Central，**必须**启用 Gradle Module Metadata：关掉它会让
++			// Central 上依赖 GMM capability 的制品选不到变体（典型：Kotlin 2.3 的 kotlin-test
++			// 的 kotlin-test-framework-junit5 变体只声明在 .module 里，POM 中没有），报
++			// 「Unable to find a variant ... with the requested capability」。
++			//
++			// 它只补 Central 上的构件，与 Mojang 制品无关，因此不存在「Mojang 制品被 GMM
++			// 重定向」的风险——那正是上面 Mojang 仓库自身关掉 GMM 所要防的。
+ 			repo.metadataSources(sources -> {
+ 				sources.mavenPom();
++				sources.gradleMetadata();
+ 				sources.artifact();
+ 				sources.ignoreGradleMetadataRedirection();
+ 			});

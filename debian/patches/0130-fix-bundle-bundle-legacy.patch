@@ -1,0 +1,541 @@
+From e3c1befff11558fc2716bdc010e627bee0fb5686 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Wed, 11 Nov 2026 07:59:39 +0800
+Subject: [PATCH 130/147] =?UTF-8?q?fix(bundle):=20=E6=9C=8D=E5=8A=A1?=
+ =?UTF-8?q?=E7=AB=AF=20bundle=20=E5=85=83=E6=95=B0=E6=8D=AE=E7=BC=93?=
+ =?UTF-8?q?=E5=AD=98=E6=A0=A1=E9=AA=8C=E7=BB=93=E6=9E=84=EF=BC=8C=E5=8C=BA?=
+ =?UTF-8?q?=E5=88=86=E6=8D=9F=E5=9D=8F=E4=B8=8E=20legacy?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`BundleMetadata.isCached` 与 `fromJarCached` 是两条入口，对同一份损坏缓存可能给出
+不同结论：前者只做 `GSON.fromJson` 不校验结果，一个能解析成 null 或字段为空的条目
+会被当成有效缓存，导致调用方跳过打开 jar，直接按空元数据处理。
+
+改动：
+
+- 抽出 `loadCached` 供两条入口共用，保证可用性判定与实际读取不会分岔。
+- 只有**精确空字符串**才是已确认的 legacy 结论（不读 jar）；JSON null、纯空白、
+  mainClass 为空、libraries / versions 条目字段缺漏，一律视为缓存损坏并回退读 jar，
+  本轮顺带覆盖成正确内容。
+- 新增 `validEntries` 做逐条结构校验；用 `CachedMetadata` 包装实例表达
+  「缓存可用」，其中 metadata 为空则是有效的 legacy。
+
+配置期调用改为经新增的 `BundleMetadataValueSource`：与清单那条同理，把文件访问
+全部关在 `obtain()` 内，避免派生缓存从未命中到创建、以及 jar 抽取本身进入配置指纹。
+`MinecraftProvider` 的两处调用点（`isServerBundleMetadataCached` /
+`readServerBundleMetadata`）相应改道，同时去掉了 `SpecStore` 的全限定名写法。
+
+测试：BundleMetadataCacheTest 4 个用例，含损坏/结构无效应重读 jar、精确空串才是
+legacy、以及真实元数据与制品身份变化必须重配。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: bundle-metadata-cache-validate
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/BundleMetadata.java b/src/main/java/net/fabricmc/loom/configuration/providers/BundleMetadata.java
+index c601193e6a658ac618520ff4d8a703a347935155..4197783a1c83c57c79aabc3cef5cc10999529d9f 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/BundleMetadata.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/BundleMetadata.java
+@@ -87,8 +87,8 @@ public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String
+ 	 * 不需要碰磁盘。于是把结果按 {@code sha1} 缓存后，后续构建可以完全跳过「打开服务端 jar
+ 	 * 读内部清单」这一步，配置期也就不再观察该 jar。这是把服务端下载搬到执行期的**先决条件**。
+ 	 *
+-	 * <p>首次构建仍须真实读取（此时无缓存），并因此付出一次配置期文件观察；
+-	 * 之后稳定命中。
++	 * <p>本方法是原始缓存解析器；配置期调用须经 {@link BundleMetadataValueSource}，
++	 * 将缓存查询、重算与写回一起隔离，只观察可用状态和有效元数据。
+ 	 *
+ 	 * @param store L2 规格存储
+ 	 * @param jar 服务端 jar
+@@ -101,19 +101,10 @@ public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String
+ 			return fromJar(jar);
+ 		}
+ 
+-		final Optional<String> cached = store.load(NAMESPACE_BUNDLE_METADATA, artifactSha1, "server-bundle");
++		final Optional<CachedMetadata> cached = loadCached(store, artifactSha1);
+ 
+ 		if (cached.isPresent()) {
+-			// 空内容表示「上次已判定为旧版 jar（无 bundle）」，是结论而非缺失
+-			if (cached.get().isEmpty()) {
+-				return null;
+-			}
+-
+-			try {
+-				return LoomGradlePlugin.GSON.fromJson(cached.get(), BundleMetadata.class);
+-			} catch (RuntimeException e) {
+-				LOGGER.debug("Corrupt bundle metadata cache for sha1 {}, re-reading jar", artifactSha1, e);
+-			}
++			return cached.get().metadata();
+ 		}
+ 
+ 		final BundleMetadata metadata = fromJar(jar);
+@@ -146,36 +137,59 @@ public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String
+ 	/**
+ 	 * {@return 该制品是否已有 bundle 元数据缓存}.
+ 	 *
+-	 * <p>命中判定只看缓存条目是否存在：条目里的空内容表示「上次已判定为旧版 jar（无 bundle）」，
+-	 * 那是**结论**而不是缺失，同样算命中。本方法不打开 jar，因此可以安全地在配置期用于判定
+-	 * 「元数据是否已可无 jar 读取地拿到」——这正是 {@code MinecraftProvider} 决定能否把下载搬到
+-	 * 执行期任务的判据（见 {@link #fromJarCached}）。
++	 * <p>缓存必须包含有效元数据；精确空字符串表示已确认的 legacy。损坏条目按未命中处理。
++	 * 本方法不打开 jar；配置期须经 {@link BundleMetadataValueSource} 观察该语义结果，
++	 * 不直接把派生 JSON 的排版等维护信息记录为配置输入。
+ 	 *
+ 	 * @param store L2 规格存储
+ 	 * @param artifactSha1 该制品在 version json 中声明的 sha1，作为缓存身份；为空时必然未命中
+ 	 */
+ 	public static boolean isCached(SpecStore store, @Nullable String artifactSha1) {
++		return loadCached(store, artifactSha1).isPresent();
++	}
++
++	// 同时供可用性判定和实际读取使用，避免两条入口对损坏缓存作出不同结论。
++	static Optional<CachedMetadata> loadCached(SpecStore store, @Nullable String artifactSha1) {
+ 		if (artifactSha1 == null) {
+-			return false;
++			return Optional.empty();
+ 		}
+ 
+ 		final Optional<String> cached = store.load(NAMESPACE_BUNDLE_METADATA, artifactSha1, "server-bundle");
+ 
+-		if (cached.isEmpty() || cached.get().isEmpty()) {
+-			// 未命中，或命中「已判定为非 bundler」的结论——两者都不需要打开 jar
+-			return cached.isPresent();
++		if (cached.isEmpty()) {
++			return Optional.empty();
++		}
++
++		if (cached.get().isEmpty()) {
++			// 只有精确空字符串才是已确认的 legacy；JSON null 与纯空白都属于损坏缓存。
++			return Optional.of(new CachedMetadata(null));
+ 		}
+ 
+ 		try {
+-			LoomGradlePlugin.GSON.fromJson(cached.get(), BundleMetadata.class);
+-			return true;
++			final BundleMetadata metadata = LoomGradlePlugin.GSON.fromJson(cached.get(), BundleMetadata.class);
++
++			if (metadata == null || metadata.mainClass() == null || metadata.mainClass().isBlank()
++					|| !validEntries(metadata.libraries()) || !validEntries(metadata.versions())) {
++				return Optional.empty();
++			}
++
++			return Optional.of(new CachedMetadata(metadata));
+ 		} catch (RuntimeException e) {
+-			// 条目损坏：缓存不可用，让调用方回退到「读 jar」的那条路径（它会顺带覆盖成正确内容）
+ 			LOGGER.debug("Corrupt bundle metadata cache for sha1 {}, treating as cache miss", artifactSha1, e);
+-			return false;
++			return Optional.empty();
+ 		}
+ 	}
+ 
++	private static boolean validEntries(@Nullable List<Entry> entries) {
++		return entries != null && entries.stream().allMatch(entry -> entry != null
++				&& entry.sha1() != null && !entry.sha1().isBlank()
++				&& entry.name() != null && !entry.name().isBlank()
++				&& entry.path() != null && !entry.path().isBlank());
++	}
++
++	// 包装实例表示缓存可用；其中 metadata 为空则是有效的 legacy 结论。
++	record CachedMetadata(@Nullable BundleMetadata metadata) { }
++
+ 	/**
+ 	 * 从 bootstrap jar 中抽取一个内嵌条目到目标位置.
+ 	 *
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/BundleMetadataValueSource.java b/src/main/java/net/fabricmc/loom/configuration/providers/BundleMetadataValueSource.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..88c0ba298239a4aa0e15abc8b79a47eec142f4e9
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/BundleMetadataValueSource.java
+@@ -0,0 +1,104 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.configuration.providers;
++
++import java.io.IOException;
++import java.io.UncheckedIOException;
++import java.nio.file.Path;
++
++import org.gradle.api.file.DirectoryProperty;
++import org.gradle.api.file.RegularFileProperty;
++import org.gradle.api.provider.Property;
++import org.gradle.api.provider.Provider;
++import org.gradle.api.provider.ProviderFactory;
++import org.gradle.api.provider.ValueSource;
++import org.gradle.api.provider.ValueSourceParameters;
++import org.jspecify.annotations.Nullable;
++
++import net.fabricmc.loom.LoomGradlePlugin;
++import net.fabricmc.loom.spec.SpecStore;
++
++/**
++ * 服务端 bundle 缓存的配置输入边界，只暴露可用状态与解析结果.
++ *
++ * <p>未命中返回空值，精确空字符串表示 legacy，bundler 返回规范化的 record JSON。
++ * 缓存排版与读后修复不会单独形成配置输入；冷暖可用状态改变仍须重配，以保持任务投影正确。
++ */
++public abstract class BundleMetadataValueSource implements ValueSource<String, BundleMetadataValueSource.Parameters> {
++	public static boolean isCached(ProviderFactory providers, Path userCache, @Nullable String artifactSha1) {
++		return create(providers, userCache, null, artifactSha1, false).isPresent();
++	}
++
++	public static @Nullable BundleMetadata fromJarCached(ProviderFactory providers, Path userCache, Path jar, @Nullable String artifactSha1) {
++		final String value = create(providers, userCache, jar, artifactSha1, true).get();
++		return value.isEmpty() ? null : LoomGradlePlugin.GSON.fromJson(value, BundleMetadata.class);
++	}
++
++	private static Provider<String> create(ProviderFactory providers, Path userCache, @Nullable Path jar, @Nullable String artifactSha1, boolean resolveMissing) {
++		return providers.of(BundleMetadataValueSource.class, spec -> {
++			final Parameters parameters = spec.getParameters();
++			parameters.getUserCache().set(userCache.toFile());
++			parameters.getArtifactSha1().set(artifactSha1);
++			parameters.getResolveMissing().set(resolveMissing);
++
++			if (jar != null) {
++				parameters.getServerJar().set(jar.toFile());
++			}
++		});
++	}
++
++	@Override
++	public @Nullable String obtain() {
++		final Parameters parameters = getParameters();
++		final var store = new SpecStore(parameters.getUserCache().get().getAsFile().toPath());
++		final String sha1 = parameters.getArtifactSha1().getOrNull();
++		final BundleMetadata metadata;
++
++		if (parameters.getResolveMissing().get()) {
++			try {
++				metadata = BundleMetadata.fromJarCached(store, parameters.getServerJar().get().getAsFile().toPath(), sha1);
++			} catch (IOException e) {
++				throw new UncheckedIOException("读取服务端 bundle 元数据失败", e);
++			}
++		} else {
++			final var cached = BundleMetadata.loadCached(store, sha1);
++
++			if (cached.isEmpty()) {
++				return null;
++			}
++
++			metadata = cached.get().metadata();
++		}
++
++		return metadata == null ? "" : LoomGradlePlugin.GSON.toJson(metadata);
++	}
++
++	public interface Parameters extends ValueSourceParameters {
++		DirectoryProperty getUserCache();
++		RegularFileProperty getServerJar();
++		Property<String> getArtifactSha1();
++		Property<Boolean> getResolveMissing();
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
+index 689d1181dd4b86dc64f7479aa7e51592f10cffa9..1f7277a14ba007c2b851c7ebf03f3d87fd8276b3 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
+@@ -50,6 +50,7 @@ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.configuration.ConfigContext;
+ import net.fabricmc.loom.configuration.DependencyInfo;
+ import net.fabricmc.loom.configuration.providers.BundleMetadata;
++import net.fabricmc.loom.configuration.providers.BundleMetadataValueSource;
+ import net.fabricmc.loom.configuration.providers.mappings.LayeredMappingsFactory;
+ import net.fabricmc.loom.configuration.providers.minecraft.verify.MinecraftJarVerification;
+ import net.fabricmc.loom.configuration.providers.minecraft.verify.SignatureVerificationFailure;
+@@ -369,8 +370,8 @@ public abstract class MinecraftProvider {
+ 	private boolean isServerBundleMetadataCached() {
+ 		final MinecraftVersionMeta.Download serverDownload = getVersionInfo().download("server");
+ 		final String sha1 = serverDownload != null ? serverDownload.sha1() : null;
+-		final var store = new net.fabricmc.loom.spec.SpecStore(getExtension().getFiles().getUserCache().toPath());
+-		return BundleMetadata.isCached(store, sha1);
++		return BundleMetadataValueSource.isCached(
++				getProject().getProviders(), getExtension().getFiles().getUserCache().toPath(), sha1);
+ 	}
+ 
+ 	/**
+@@ -689,8 +690,8 @@ public abstract class MinecraftProvider {
+ 	private BundleMetadata readServerBundleMetadata() throws IOException {
+ 		final MinecraftVersionMeta.Download serverDownload = getVersionInfo().download("server");
+ 		final String sha1 = serverDownload != null ? serverDownload.sha1() : null;
+-		final var store = new net.fabricmc.loom.spec.SpecStore(getExtension().getFiles().getUserCache().toPath());
+-		return BundleMetadata.fromJarCached(store, minecraftServerJar.toPath(), sha1);
++		return BundleMetadataValueSource.fromJarCached(
++				getProject().getProviders(), getExtension().getFiles().getUserCache().toPath(), minecraftServerJar.toPath(), sha1);
+ 	}
+ 
+ 	// 下载/抽取产物的跨进程锁 key：按「产物批次 + 版本」分片。
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/BundleMetadataCacheTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/BundleMetadataCacheTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..849337f4700038e2971d295b733374a8dc486b6b
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/BundleMetadataCacheTest.groovy
+@@ -0,0 +1,246 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration
++
++import java.nio.charset.StandardCharsets
++import java.nio.file.Files
++import java.nio.file.Path
++import java.security.MessageDigest
++import java.util.jar.JarEntry
++import java.util.jar.JarOutputStream
++
++import groovy.json.JsonOutput
++import groovy.json.JsonSlurper
++import org.gradle.testkit.runner.BuildResult
++import org.gradle.testkit.runner.GradleRunner
++import spock.lang.Specification
++import spock.lang.TempDir
++
++/**
++ * 服务端 bundle 的派生缓存只应暴露可用状态与解析结果，不暴露 JSON 排版等维护状态.
++ *
++ * <p>使用本地微型 jar，不应用 Minecraft 产物管线；冷暖切换改变任务投影时允许一次合法重配.
++ */
++class BundleMetadataCacheTest extends Specification {
++	private static final String CONFIGURED = "BUNDLE_CONFIGURED"
++	private static final String MAIN = "example.BundleMain"
++	private static final String LIBRARY = "example:library:1.0"
++	private static final String INNER_HASH = "0123456789012345678901234567890123456789"
++
++	@TempDir
++	Path projectDir
++
++	def setup() {
++		writeBundledJar(MAIN, LIBRARY)
++		writeProject()
++	}
++
++	def "暖缓存只改变JSON排版和对象键顺序仍复用配置缓存"() {
++		given:
++		warmCache()
++		def entry = cacheEntry()
++		def cached = new JsonSlurper().parseText(Files.readString(entry))
++		def reformatted = JsonOutput.prettyPrint(JsonOutput.toJson([
++			mainClass: cached.mainClass,
++			versions: cached.versions,
++			libraries: cached.libraries
++		]))
++
++		when:
++		Files.writeString(entry, reformatted)
++		def result = runBuild()
++
++		then:
++		reused(result)
++		result.output.contains("BUNDLE_SUMMARY=${MAIN}|${LIBRARY}|1.20.1")
++	}
++
++	def "损坏或结构无效的bundle缓存应重新读取jar而不是误作legacy：#description"() {
++		given:
++		def entry = cacheEntry()
++		Files.createDirectories(entry.parent)
++		Files.writeString(entry, content)
++
++		when:
++		def result = runBuild()
++
++		then:
++		result.output.contains("BUNDLE_AVAILABLE=false")
++		result.output.contains("BUNDLE_SUMMARY=${MAIN}|${LIBRARY}|1.20.1")
++		def repaired = new JsonSlurper().parseText(Files.readString(entry))
++		repaired.mainClass == MAIN
++		repaired.libraries*.name == [LIBRARY]
++		repaired.versions*.name == ["1.20.1"]
++
++		where:
++		description | content
++		"语法损坏" | "{broken"
++		"JSON null" | "null"
++		"仅有空白" | " \n\t "
++		"字段缺失" | "{}"
++	}
++
++	def "精确空字符串是有效legacy结论且暖缓存不再读取jar"() {
++		given:
++		writeLegacyJar()
++
++		when:
++		def first = runBuild()
++		def second = runBuild()
++
++		then:
++		first.output.contains("BUNDLE_SUMMARY=legacy")
++		second.output.contains("BUNDLE_AVAILABLE=true")
++		Files.readString(cacheEntry()).isEmpty()
++
++		when:
++		def stable = runBuild()
++
++		then:
++		reused(stable)
++		stable.output.contains("BUNDLE_SUMMARY=legacy")
++
++		when: "已有明确的legacy结论不依赖jar是否仍在磁盘上"
++		Files.delete(projectDir.resolve("server.jar"))
++		def afterDeletion = runBuild()
++
++		then:
++		reused(afterDeletion)
++		afterDeletion.output.contains("BUNDLE_SUMMARY=legacy")
++	}
++
++	def "真实bundle元数据和制品身份变化必须重配并消费新值"() {
++		given:
++		warmCache()
++
++		when:
++		writeBundledJar("example.ChangedMain", "example:library:2.0")
++		def changed = runBuild()
++
++		then:
++		!changed.output.contains("Configuration cache entry reused")
++		changed.output.contains(CONFIGURED)
++		changed.output.contains("BUNDLE_SUMMARY=example.ChangedMain|example:library:2.0|1.20.1")
++
++		when: "冷条目填充后允许任务投影由回退路径切换至缓存路径，再检查稳定复用"
++		runBuild()
++		def stable = runBuild()
++
++		then:
++		reused(stable)
++		stable.output.contains("BUNDLE_SUMMARY=example.ChangedMain|example:library:2.0|1.20.1")
++	}
++
++	private void warmCache() {
++		// 旧入口的首轮填充会使是否可投影改变；复用断言从明确的暖态开始。
++		runBuild()
++		runBuild()
++		assert reused(runBuild())
++	}
++
++	private void writeProject() {
++		Files.writeString(projectDir.resolve("settings.gradle"), "rootProject.name = 'bundle-cache-test'\n")
++		Files.writeString(projectDir.resolve("build.gradle"), """
++			plugins {
++				id 'top.wcpe.loom-repositories'
++			}
++
++			import net.fabricmc.loom.configuration.providers.BundleMetadataValueSource
++
++			def artifactSha1 = providers.fileContents(layout.projectDirectory.file('server.sha1')).asText.get().trim()
++			def userCache = file('artifacts').toPath()
++			def available = BundleMetadataValueSource.isCached(providers, userCache, artifactSha1)
++			def projection = tasks.register(available ? 'cachedProjection' : 'eagerProjection')
++			def bundle = BundleMetadataValueSource.fromJarCached(providers, userCache, file('server.jar').toPath(), artifactSha1)
++			def snapshot = bundle == null ? 'legacy' : bundle.mainClass() + '|' +
++				bundle.libraries().collect { it.name() }.join(',') + '|' + bundle.versions().collect { it.name() }.join(',')
++			println '${CONFIGURED}'
++			println 'BUNDLE_AVAILABLE=' + available
++
++			abstract class BundleProbe extends DefaultTask {
++				@Input
++				abstract Property<String> getSnapshot()
++
++				@TaskAction
++				void probe() {
++					println 'BUNDLE_SUMMARY=' + snapshot.get()
++				}
++			}
++
++			tasks.register('bundleProbe', BundleProbe) {
++				dependsOn(projection)
++				getSnapshot().set(snapshot)
++			}
++			""".stripIndent())
++	}
++
++	private void writeBundledJar(String mainClass, String library) {
++		writeJar([
++			"META-INF/libraries.list": "${INNER_HASH}\t${library}\tlibrary.jar\n".toString(),
++			"META-INF/versions.list": "${INNER_HASH}\t1.20.1\tserver.jar\n".toString(),
++			"META-INF/main-class": mainClass + "\n"
++		])
++	}
++
++	private void writeLegacyJar() {
++		writeJar(["legacy.txt": "旧版服务端，没有bundle清单\n"])
++	}
++
++	private void writeJar(Map<String, String> entries) {
++		def jar = projectDir.resolve("server.jar")
++		new JarOutputStream(Files.newOutputStream(jar)).withCloseable { stream ->
++			entries.each { name, content ->
++				def entry = new JarEntry(name)
++				entry.time = 0L
++				stream.putNextEntry(entry)
++				stream.write(content.getBytes(StandardCharsets.UTF_8))
++				stream.closeEntry()
++			}
++		}
++		def sha1 = MessageDigest.getInstance("SHA-1").digest(Files.readAllBytes(jar)).encodeHex().toString()
++		Files.writeString(projectDir.resolve("server.sha1"), sha1 + "\n")
++	}
++
++	private Path cacheEntry() {
++		def sha1 = Files.readString(projectDir.resolve("server.sha1")).trim()
++		return projectDir.resolve("artifacts/spec/bundle-metadata/${sha1}/v1-server-bundle.json")
++	}
++
++	private BuildResult runBuild() {
++		return GradleRunner.create()
++				.withProjectDir(projectDir.toFile())
++				.withPluginClasspath()
++				.withGradleVersion("9.5.0")
++				.withArguments("bundleProbe", "--configuration-cache", "--configuration-cache-problems=fail",
++				"--console=plain", "--stacktrace", "--gradle-user-home", projectDir.resolve("gradle-home").toString())
++				.build()
++	}
++
++	private static boolean reused(BuildResult result) {
++		assert result.output.contains("Configuration cache entry reused")
++		assert !result.output.contains(CONFIGURED)
++		return true
++	}
++}

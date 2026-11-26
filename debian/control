@@ -1,0 +1,8 @@
+Source: wcpe-loom
+Section: java
+Priority: optional
+Maintainer: Verification Fixture <fixture@example.invalid>
+
+Package: wcpe-loom
+Architecture: all
+Description: Internal source-format verification projection

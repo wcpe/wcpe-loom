@@ -1,0 +1,280 @@
+From 6e97971c37ac3063267b26845e471e73e1549c8c Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Fri, 23 Oct 2026 20:52:52 +0800
+Subject: [PATCH 098/147] =?UTF-8?q?fix(cache):=20exportLoomProjectData=20?=
+ =?UTF-8?q?=E4=B8=8D=E5=86=8D=E5=9C=A8=E6=89=A7=E8=A1=8C=E6=9C=9F=E8=AE=BF?=
+ =?UTF-8?q?=E9=97=AE=20Project?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+该任务的 @TaskAction 直接调用 LoomProjectData.fromProject(getProject())，
+开启配置缓存后必然失败：
+
+  InvalidUserCodeException: Invocation of 'Task.project' by task
+  ':lib:exportLoomProjectData' at execution time is unsupported with
+  the configuration cache.
+
+问题一直没被发现，是因为该任务只在多项目构建解析 loomProjectDataElements
+时才被调度，而既有的配置缓存用例都是单项目，覆盖不到它。
+
+改法：把整个 LoomProjectData 在配置期算好，作为唯一 @Input 登记，执行期
+只做写文件。顺带修掉一个缓存正确性问题——原先只把 mod 的 JSON 字符串登记
+为输入，而 DTO 里每个 mod 还带着 resources（mixin 配置、AT/AW、javadoc、
+原始元数据文件的字节内容），依赖方靠它重建模组视图。这些字节变化不会让旧
+任务失效，构建缓存可能还原出「JSON 新、资源旧」的错配数据。直接登记
+Serializable 的 DTO 让缓存键覆盖全部内容，项目身份本来也在 DTO 里，因此
+不再需要单独的 projectPath 输入。
+
+新增 ExportLoomProjectDataTest：显式请求该任务，并用
+--configuration-cache-problems=fail 把配置缓存问题升级成失败（否则只是
+警告，用例会静默通过）。已实测还原旧代码时两个场景均按上述异常失败。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/task/ExportLoomProjectDataTask.java b/src/main/java/net/fabricmc/loom/task/ExportLoomProjectDataTask.java
+index ff5eb13ebf3e6e4005cf8433f0c274c2834028bb..ebaa922f81f1b1a6f394a60ad4630fc272788f20 100644
+--- a/src/main/java/net/fabricmc/loom/task/ExportLoomProjectDataTask.java
++++ b/src/main/java/net/fabricmc/loom/task/ExportLoomProjectDataTask.java
+@@ -28,15 +28,12 @@ import java.io.IOException;
+ 
+ import org.gradle.api.DefaultTask;
+ import org.gradle.api.file.RegularFileProperty;
+-import org.gradle.api.provider.ListProperty;
+ import org.gradle.api.provider.Property;
+ import org.gradle.api.tasks.CacheableTask;
+ import org.gradle.api.tasks.Input;
+-import org.gradle.api.tasks.Optional;
+ import org.gradle.api.tasks.OutputFile;
+ import org.gradle.api.tasks.TaskAction;
+ 
+-import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.internal.LoomProjectData;
+ 
+ /**
+@@ -44,81 +41,50 @@ import net.fabricmc.loom.internal.LoomProjectData;
+  *
+  * <p>输出通过 {@code loomProjectDataElements} 可消费配置暴露：消费方可以解析该配置（触发本任务），
+  * 也可以直接读文件，所以它必须随项目身份与内容一起失效。本类保留 {@link CacheableTask}，
+- * 同时把 {@link LoomProjectData#fromProject(org.gradle.api.Project)} 真正依赖的内容逐项声明为输入，
+- * 原因有两点：
++ * 并把 {@link LoomProjectData#fromProject(org.gradle.api.Project)} 的**完整结果**登记为唯一输入，
++ * 原因有三点：
+  *
+  * <ul>
+  *     <li>不声明输入时，Gradle 只按「输出是否存在」判定 UP-TO-DATE：改了 mod 元数据或映射标识之后文件不刷新，
+  *         日常被内存共享表掩盖，只在回退路径与外部消费方那里暴露成过期数据；
+  *     <li>构建缓存键里没有项目身份时，多个项目（甚至不同项目路径的工作副本）会算出同一个键，
+- *         共享缓存可能把别的项目的 {@code project-data.json} 还原到本项目。
++ *         共享缓存可能把别的项目的 {@code project-data.json} 还原到本项目；
++ *     <li>DTO 里的每个 mod 还带着 {@code resources}（mixin 配置、AT/AW、javadoc、原始元数据文件的**字节内容**），
++ *         依赖方靠它重建模组视图。早期只把 JSON 字符串登记成输入，这些字节变化不会让本任务失效，
++ *         构建缓存可能还原出「JSON 是新的、资源是旧的」的错配数据。
+  * </ul>
+  *
+- * <p>所有输入都用 {@link org.gradle.api.provider.Provider} 惰性求值：配置期只登记「怎么取」，
+- * 读取映射配置、mod 元数据与 Mixin AP 输出都发生在执行期，不会在配置阶段强制求值。
++ * <p><b>执行期不得访问 {@link org.gradle.api.Project}</b>：整个 DTO 在配置期由
++ * {@link #getProjectData()} 的 convention 求值并序列化，{@link #exportProjectData()} 只做写文件。
++ * 早期的实现在 {@code @TaskAction} 里调用 {@code fromProject(getProject())}，开启配置缓存后
++ * 会抛 {@code InvalidUserCodeException}——本任务曾因此完全无法在配置缓存下运行。
+  */
+ @CacheableTask
+ public abstract class ExportLoomProjectDataTask extends DefaultTask {
+ 	public ExportLoomProjectDataTask() {
+ 		getOutputFile().convention(getProject().getLayout().getBuildDirectory().file("loom/project-data.json"));
+ 
+-		getProjectPath().convention(getProject().getPath());
+-		getMappingId().convention(getProject().provider(() -> LoomProjectData.readMappingId(getProject())));
+-		getProductionNamespace().convention(getProject().provider(() -> LoomProjectData.readProductionNamespace(getProject())));
+-		getSplitEnvironmentSourceSets().convention(getProject().provider(() -> LoomGradleExtension.get(getProject()).areEnvironmentSourceSetsSplit()));
+-		getModJson().convention(getProject().provider(() -> LoomProjectData.readModJson(getProject())));
+-		getMixinMappingFiles().convention(getProject().provider(() -> LoomProjectData.readMixinMappingFiles(getProject())));
++		// 在配置期把 DTO 完整算出来：Provider 的求值发生在配置阶段收尾，
++		// 此时读映射配置、mod 元数据与 Mixin AP 输出都是合法的；执行期只剩反序列化与写盘。
++		getProjectData().convention(getProject().provider(() -> LoomProjectData.fromProject(getProject())));
+ 	}
+ 
+ 	/**
+-	 * 项目路径，作为数据身份参与缓存键，避免共享缓存在不同项目之间复用同一份数据.
+-	 */
+-	@Input
+-	public abstract Property<String> getProjectPath();
+-
+-	/**
+-	 * 映射标识，与 {@link LoomProjectData#fromProject(org.gradle.api.Project)} 写入 DTO 的值同源.
+-	 *
+-	 * <p>映射尚未就绪或未启用混淆时该属性为空（用 {@code @Optional} 表达，而不是伪造一个占位值）。
+-	 */
+-	@Input
+-	@Optional
+-	public abstract Property<String> getMappingId();
+-
+-	/**
+-	 * 生产命名空间，与 DTO 里写入的值同源；未配置时为空.
+-	 */
+-	@Input
+-	@Optional
+-	public abstract Property<String> getProductionNamespace();
+-
+-	/**
+-	 * 是否拆分环境源集，与 DTO 里写入的值同源.
+-	 */
+-	@Input
+-	public abstract Property<Boolean> getSplitEnvironmentSourceSets();
+-
+-	/**
+-	 * 项目内全部 mod 的元数据 JSON，与 DTO 中的 mod 列表一一对应.
+-	 */
+-	@Input
+-	public abstract ListProperty<String> getModJson();
+-
+-	/**
+-	 * Mixin AP 映射文件的路径列表.
++	 * 要导出的跨项目数据，作为唯一输入参与指纹与构建缓存键.
+ 	 *
+-	 * <p>只登记路径而不是文件内容：DTO 里保存的也是路径，依赖方直接按路径读取生产者项目的文件，
+-	 * 文件内容不属于导出内容。反过来，把它们声明成 {@code @InputFiles} 会让本任务输入命中
+-	 * {@code compileJava} 的输出，从而引入未声明的隐式任务依赖（Gradle 会因此禁用执行优化）。
++	 * <p>直接登记 {@link LoomProjectData}（而非拆成若干字符串）：它实现了 {@link java.io.Serializable}，
++	 * 既能让配置缓存正确存取，也能让缓存键覆盖 mod 资源字节，避免「JSON 新、资源旧」的错配。
++	 * 项目身份（{@code projectPath}）本来就在 DTO 里，因此不必再单独声明输入。
+ 	 */
+ 	@Input
+-	public abstract ListProperty<String> getMixinMappingFiles();
++	public abstract Property<LoomProjectData> getProjectData();
+ 
+ 	@OutputFile
+ 	public abstract RegularFileProperty getOutputFile();
+ 
+ 	@TaskAction
+ 	public void exportProjectData() throws IOException {
+-		LoomProjectData.fromProject(getProject()).write(getOutputFile().get().getAsFile().toPath());
++		// 只读输入属性：执行期访问 Project 会被 Gradle 直接拒绝（配置缓存下抛 InvalidUserCodeException）。
++		getProjectData().get().write(getOutputFile().get().getAsFile().toPath());
+ 	}
+ }
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/ExportLoomProjectDataTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/ExportLoomProjectDataTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..878f1b6f2d665b59b4001a765bc189f4f3e03dd2
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/ExportLoomProjectDataTest.groovy
+@@ -0,0 +1,108 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration
++
++import spock.lang.Specification
++
++import net.fabricmc.loom.test.util.GradleProjectTestTrait
++
++import static net.fabricmc.loom.test.LoomTestConstants.DEFAULT_GRADLE
++import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
++import static org.gradle.testkit.runner.TaskOutcome.UP_TO_DATE
++
++/**
++ * 守护 {@code exportLoomProjectData} 在配置缓存下可运行、且输入覆盖导出内容.
++ *
++ * <p>该任务曾把 {@code LoomProjectData.fromProject(getProject())} 直接写在 {@code @TaskAction} 里，
++ * 执行期访问 {@code Project} 在配置缓存下会抛 {@code InvalidUserCodeException}；同时它只把 mod 的
++ * JSON 字符串登记为输入，而 DTO 里每个 mod 还带着 mixin 配置/AT-AW/javadoc/原始元数据文件的
++ * <b>字节内容</b>，因此改这些资源不会让任务失效，构建缓存可能还原出「JSON 新、资源旧」的错配数据。
++ *
++ * <p>这两个问题都不会在单项目构建里暴露：只有解析 {@code loomProjectDataElements}（多项目消费方）
++ * 才会调度该任务。所以本用例显式请求它，并用 {@code --configuration-cache-problems=fail}
++ * 把任何配置缓存问题升级成构建失败——否则问题只是警告，用例会静默通过。
++ */
++class ExportLoomProjectDataTest extends Specification implements GradleProjectTestTrait {
++	private static final String TASK = ":lib:exportLoomProjectData"
++	private static final String DATA_FILE = "lib/build/loom/project-data.json"
++
++	def "exportLoomProjectData runs under the configuration cache twice"() {
++		setup:
++		def gradle = gradleProject(project: "projectDataColdStart", version: DEFAULT_GRADLE)
++
++		when: "首次运行：必须能存下配置缓存条目并真正产出数据文件"
++		def first = gradle.run(tasks: [TASK], args: CONFIG_CACHE_STRICT)
++
++		then: "配置缓存问题一律致命，任务成功产出文件"
++		first.task(TASK).outcome == SUCCESS
++		dataFile(gradle).exists()
++		first.output.contains("Configuration cache entry stored")
++
++		when: "第二次运行：必须复用配置缓存条目，且任务判定为最新"
++		def second = gradle.run(tasks: [TASK], args: CONFIG_CACHE_STRICT)
++
++		then: "复用条目意味着执行期确实没有触碰 Project（否则存储阶段就会失败）"
++		second.task(TASK).outcome == UP_TO_DATE
++		second.output.contains("Reusing configuration cache")
++	}
++
++	def "exported data is invalidated when the project data changes"() {
++		setup:
++		def gradle = gradleProject(project: "projectDataColdStart", version: DEFAULT_GRADLE)
++		def file = dataFile(gradle)
++
++		when: "先产出一份数据"
++		def first = gradle.run(tasks: [TASK], args: CONFIG_CACHE_STRICT)
++
++		then: "导出的是完整 DTO（含项目身份），依赖方据此区分不同项目的同名数据"
++		first.task(TASK).outcome == SUCCESS
++		file.exists()
++		def exported = file.text
++		exported.contains("\"projectPath\"")
++		exported.contains("\":lib\"")
++
++		when: "改掉直接影响 DTO 的映射依赖后重跑（版本号不在 DTO 里，改它不会影响导出内容）"
++		def buildFile = new File(gradle.projectDir, "lib/build.gradle")
++		buildFile.text = buildFile.text.replace(
++				'mappings "net.fabricmc:yarn:1.20.4+build.3:v2"',
++				'mappings "net.fabricmc:yarn:1.20.4+build.1:v2"')
++		def second = gradle.run(tasks: [TASK], args: CONFIG_CACHE_STRICT)
++
++		then: "映射标识是导出内容的一部分，任务必须重跑并写出不同的数据"
++		second.task(TASK).outcome == SUCCESS
++		file.text != exported
++		file.text.contains("build.1")
++	}
++
++	/** 配置缓存问题即失败；不这样设定时问题只是警告，用例会静默通过。 */
++	private static final List<String> CONFIG_CACHE_STRICT = [
++			"--configuration-cache",
++			"--configuration-cache-problems=fail",
++	]
++
++	private static File dataFile(GradleProjectTestTrait.GradleProject gradle) {
++		return new File(gradle.projectDir, DATA_FILE)
++	}
++}
+diff --git a/src/test/resources/projects/projectDataColdStart/gradle.properties b/src/test/resources/projects/projectDataColdStart/gradle.properties
+new file mode 100644
+index 0000000000000000000000000000000000000000..fdf7fa8641b3081a1b6a9a38e31478faf8841b1f
+--- /dev/null
++++ b/src/test/resources/projects/projectDataColdStart/gradle.properties
+@@ -0,0 +1,3 @@
++# 逐字节比对 walkFileSystem 走的是真实 MC 产物，堆不足时内层 daemon 会以
++# DaemonStoppedException 而非断言失败的形式挂掉，掩盖真正的问题。
++org.gradle.jvmargs=-Xmx2G

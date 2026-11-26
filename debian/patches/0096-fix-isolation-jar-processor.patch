@@ -1,0 +1,491 @@
+From 59d2104c994fc95917efbcaa1ee1575add21f06f Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Fri, 23 Oct 2026 11:25:15 +0800
+Subject: [PATCH 096/147] =?UTF-8?q?fix(isolation):=20=E8=AE=A9=20jar=20pro?=
+ =?UTF-8?q?cessor=20=E5=93=88=E5=B8=8C=E4=B8=8D=E5=86=8D=E9=9A=8F=E9=85=8D?=
+ =?UTF-8?q?=E7=BD=AE=E9=A1=BA=E5=BA=8F=E6=BC=82=E7=A7=BB?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+processed jar 的路径由 MinecraftJarProcessorManager.getJarHash() 决定，而该哈希来自各
+processor spec 的 hashCode——其中包含依赖项目的数据（例如 InterfaceInjectionProcessor
+会把 context.modDependenciesCompileRuntime() 的条目放进 Spec）。而该数据的可得性此前
+取决于配置顺序：构建级内存共享表由生产者项目自己的 afterEvaluate 写入，消费者是否命中
+全看求值先后。后果是冷启动 / 热构建 / --parallel 可能算出不同哈希 → processed jar 落到
+不同路径、共享缓存反复失效。
+
+修复分两种模式：
+
+- 非隔离：在配置期读取依赖数据之前强制该依赖项目先完成求值（落在 ProjectView 的读取入口，
+  且仅在该路径确实要消费数据时触发）。生产者登记因此一定早于本次读取，哈希恒含依赖数据。
+  已核实 Gradle 9.5 下 evaluationDependsOn 可用且未弃用；成环时 Gradle 会报出参与循环的
+  两个项目与触发位置，可诊断，故不自建环检测。
+- 隔离模式：跨项目求值被 Isolated Projects 语义禁止，无法用同样手段补救。这里刻意**不**强行
+  让依赖数据「永不使用」——那会让 IP 用户从「有时生效」变成「永不生效」，是功能回退。改为按
+  (项目, 依赖) 去重打一条默认可见的 warn，说明该可得性取决于配置顺序、这是已知限制而非配置
+  错误。去重集合用实例级而非静态：Loom 的类加载器会被复用的 daemon 带进后续构建，静态集合
+  会让第二次构建静默不再告警。
+
+限制同时写进 ProjectView / DeobfProjectView / SpecContext 的 Javadoc：彻底解决需要把
+mapped/processed jar 的产出从配置期搬进任务，属架构级改动。
+
+一处语义后果：非隔离模式下共享表恒命中、导出的数据文件不再被读取，因此「坏数据文件让消费方
+构建失败」这条端到端断言不可再触发。该性质改由 LoomProjectDataTest 在 LoomProjectData.read
+层面守住；在仍会读文件的地方（隔离模式、独立构建）依旧显式失败。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/api/processor/SpecContext.java b/src/main/java/net/fabricmc/loom/api/processor/SpecContext.java
+index 93e4444584d48d23d09ad8c1c6d16a1f427e7619..e8f56e81132af01b83e37966b7135ecdbdcedd7d 100644
+--- a/src/main/java/net/fabricmc/loom/api/processor/SpecContext.java
++++ b/src/main/java/net/fabricmc/loom/api/processor/SpecContext.java
+@@ -82,6 +82,21 @@ public interface SpecContext {
+ 	 * <p>去重依赖 {@link LoomProjectData#equals(Object)} 按项目路径判等：同一项目经内存共享表与
+ 	 * 导出文件两条路径可能得到两个实例，只有路径判等才能把它们视作同一个项目。
+ 	 *
++	 * <p>这些数据会参与 jar processor spec 的 {@code hashCode}，从而决定 processed jar 的路径与共享
++	 * 缓存命中，所以「配置期拿到哪些依赖项目的数据」必须是确定的：
++	 *
++	 * <ul>
++	 *     <li><b>非隔离模式</b>：读取前会强制每个依赖项目先完成求值
++	 *         （见 {@link ProjectView#getLoomProjectDataDependencies(String)}），依赖项目在
++	 *         {@code afterEvaluate} 里登记的数据因此必定先于本次读取，结果与配置顺序、{@code --parallel}
++	 *         无关；
++	 *     <li><b>隔离模式（Isolated Projects）</b>：Gradle 禁止跨项目求值，上面的保证无法兑现，
++	 *         依赖项目的数据是否可得取决于它是否恰好已被配置完，Loom 只能对确实缺失的情况输出一条
++	 *         按（项目，依赖）去重的告警，无法让结果变确定；
++	 *     <li>彻底消除这种不确定性需要把 mapped/processed jar 的产出从配置期搬进任务，属于架构级改动，
++	 *         不在当前版本范围内。
++	 * </ul>
++	 *
+ 	 * @param projectView 当前项目的视图
+ 	 * @return 依赖项目的数据流
+ 	 */
+diff --git a/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/DeobfProjectView.java b/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/DeobfProjectView.java
+index d4bbe70a64821e7ad8fc29aa245d20bdabb62b5b..22e330ec4154bd9d2d6e8252306e23c23c3028fb 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/DeobfProjectView.java
++++ b/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/DeobfProjectView.java
+@@ -36,6 +36,17 @@ import net.fabricmc.loom.internal.LoomProjectData;
+ public interface DeobfProjectView extends ProjectView {
+ 	FileCollection getDependencies(DebofConfiguration debofConfiguration, DebofConfiguration.TargetSourceSet targetSourceSet);
+ 
++	/**
++	 * 返回给定 deobf 配置上的依赖项目数据.
++	 *
++	 * <p>这里刻意不重复实现「读取前强制依赖项目求值」：它们全部经由
++	 * {@link #getLoomProjectDataDependencies(String)} 读取，非隔离模式下的强制求值、以及隔离模式下
++	 * 数据缺失时的去重告警，都在那一个入口完成，语义与限制见该方法的说明。deobf 配置（{@code runtimeClasspath}
++	 * 等）就是本项目的 classpath 配置，因此两条路径没有别的读法。
++	 *
++	 * @param debofConfiguration 目标 deobf 配置
++	 * @return 该配置上的依赖项目数据流
++	 */
+ 	Stream<LoomProjectData> getProjectDependencies(DebofConfiguration debofConfiguration);
+ 
+ 	FileCollection getFullClasspath();
+@@ -52,6 +63,7 @@ public interface DeobfProjectView extends ProjectView {
+ 
+ 		@Override
+ 		public Stream<LoomProjectData> getProjectDependencies(DebofConfiguration debofConfiguration) {
++			// 单点入口：强制求值与缺失告警都在 getLoomProjectDataDependencies 里，见其 Javadoc。
+ 			return debofConfiguration.getConfigurations(project).stream()
+ 					.flatMap(configuration -> getLoomProjectDataDependencies(configuration.getName()));
+ 		}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/ProjectView.java b/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/ProjectView.java
+index bf5ea824806b65bfc78a619ab99b636715062478..fef577ad8465ea93db8980ab6af0fe776e8fc5e9 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/ProjectView.java
++++ b/src/main/java/net/fabricmc/loom/configuration/processors/speccontext/ProjectView.java
+@@ -24,13 +24,18 @@
+ 
+ package net.fabricmc.loom.configuration.processors.speccontext;
+ 
++import java.util.HashSet;
+ import java.util.List;
++import java.util.Optional;
++import java.util.Set;
+ import java.util.stream.Stream;
+ 
+ import org.gradle.api.Project;
+ import org.gradle.api.artifacts.Configuration;
+ import org.gradle.api.artifacts.ProjectDependency;
+ import org.gradle.api.attributes.Usage;
++import org.gradle.api.logging.Logger;
++import org.gradle.api.logging.Logging;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.internal.LoomProjectData;
+@@ -44,6 +49,25 @@ public interface ProjectView {
+ 	/**
+ 	 * 返回指定配置中依赖项目的跨项目数据.
+ 	 *
++	 * <p>这些数据会被打进 jar processor 的 spec 并参与其 {@code hashCode}，因此它决定了
++	 * processed jar 的路径与共享缓存的命中。数据有两个来源：构建级内存共享表
++	 * （由依赖项目自身的 {@code afterEvaluate} 写入）与依赖项目导出的数据文件。后者由依赖项目的
++	 * 任务在执行期产出，配置期（冷启动）必然不存在，所以配置期能否读到数据只取决于前者，
++	 * 也就是只取决于依赖项目是否已经完成求值。
++	 *
++	 * <p><b>非隔离模式</b>：本方法在读取前用 {@link Project#evaluationDependsOn(String)} 强制每个
++	 * 依赖项目先完成求值，把「依赖项目的 {@code afterEvaluate} 先于本次读取」钉死，从而共享表必定
++	 * 命中、哈希恒定包含依赖数据，与配置顺序、是否 {@code --parallel} 无关。只有当确实会消费这些
++	 * 数据（{@link #disableProjectDependantMods()} 为 false）时才强制求值，不给不需要它的构建增加
++	 * 配置开销。若两个 Loom 项目互相声明项目依赖，强制求值会让 Gradle 抛出循环求值异常
++	 * （{@code CircularReferenceException}，消息里会点名参与循环的项目）；Loom 不做环检测，交给
++	 * Gradle 报告。
++	 *
++	 * <p><b>隔离模式（Isolated Projects）</b>：跨项目求值被 Gradle 禁止，无法用上面的手段补救，
++	 * 依赖项目的数据要么恰好因配置顺序已可得，要么缺失——本方法不改变这一点，只在数据确实缺失时
++	 * 输出一条按（当前项目，依赖项目）去重的告警（见 {@code AbstractProjectView} 的实现说明）。
++	 * 彻底消除该不确定性需要把 mapped/processed jar 的产出从配置期搬进任务，属于架构级改动。
++	 *
+ 	 * @param name 配置名（通常是 {@code runtimeClasspath} / {@code compileClasspath}）
+ 	 * @return 依赖项目的数据流；不是 Loom 项目的依赖不会出现在其中
+ 	 */
+@@ -88,9 +112,21 @@ public interface ProjectView {
+ 	}
+ 
+ 	abstract class AbstractProjectView implements ProjectView {
++		private static final Logger LOGGER = Logging.getLogger(ProjectView.class);
++
+ 		protected final Project project;
+ 		protected final LoomGradleExtension extension;
+ 
++		/**
++		 * 已经就「依赖项目数据缺失」告警过的依赖项目路径.
++		 *
++		 * <p>同一依赖项目会同时出现在 runtime 与 compile 两条 classpath 上，存在多个依赖时也会各自
++		 * 走到这里，因此必须去重，否则一次配置就会刷出多条内容相同的告警。去重范围限定在本视图实例
++		 * （即本项目的本次配置）内，不用静态状态：静态状态会被复用的 daemon 带进后续构建，导致告警
++		 * 静默消失。
++		 */
++		private final Set<String> warnedMissingDependencyData = new HashSet<>();
++
+ 		protected AbstractProjectView(Project project) {
+ 			this.project = project;
+ 			this.extension = LoomGradleExtension.get(project);
+@@ -99,12 +135,91 @@ public interface ProjectView {
+ 		@Override
+ 		public Stream<LoomProjectData> getLoomProjectDataDependencies(String name) {
+ 			final Configuration configuration = project.getConfigurations().getByName(name);
++			// 只有在确实会消费依赖项目数据时才做强制求值：调用方在 disableProjectDependantMods 为真时
++			// 根本不使用返回值，为此强制求值只会平白增加配置开销（甚至把本来不需要的项目拉进配置）。
++			final boolean readDependencyData = !disableProjectDependantMods();
++
+ 			return configuration.getAllDependencies()
+ 					.withType(ProjectDependency.class)
+ 					.stream()
+-					// 不是 Loom 项目时 fromDependency 返回空；数据文件存在却读不出来时会抛异常，
+-					// 不再像以前那样被 filter 静默丢掉（那会让依赖方的 mod/mixin 映射悄悄消失）。
+-					.flatMap(dependency -> LoomProjectData.fromDependency(project, dependency).stream());
++					.flatMap(dependency -> getLoomProjectData(dependency, readDependencyData).stream());
++		}
++
++		/**
++		 * 读取单个依赖项目的跨项目数据，必要时先让该依赖项目完成求值.
++		 *
++		 * <p>不是 Loom 项目时 {@code fromDependency} 返回空；数据文件存在却读不出来时它会抛异常，
++		 * 不再像以前那样被 filter 静默丢掉（那会让依赖方的 mod/mixin 映射悄悄消失）。
++		 *
++		 * @param dependency 待查询的项目依赖
++		 * @param readDependencyData 本次读取是否真的会被消费，见 {@link #getLoomProjectDataDependencies(String)}
++		 * @return 依赖项目的跨项目数据；空表示该依赖不是 Loom 项目，或数据在配置期不可得
++		 */
++		private Optional<LoomProjectData> getLoomProjectData(ProjectDependency dependency, boolean readDependencyData) {
++			if (readDependencyData) {
++				ensureDependencyEvaluated(dependency);
++			}
++
++			final Optional<LoomProjectData> data = LoomProjectData.fromDependency(project, dependency);
++
++			if (data.isEmpty() && readDependencyData && extension.isProjectIsolationActive()) {
++				// 隔离模式下无法强制求值，缺失只能告警；不在读取无意义（disableProjectDependantMods）
++				// 的场景告警，否则会为没有消费方的项目制造噪音。
++				warnMissingDependencyDataOnce(dependency);
++			}
++
++			return data;
++		}
++
++		/**
++		 * 非隔离模式下强制依赖项目先完成求值，使其 {@code afterEvaluate} 里的数据登记先于本次读取.
++		 *
++		 * <p>这是本项目对「配置期依赖数据必须确定」的全部保证，语义与限制见
++		 * {@link #getLoomProjectDataDependencies(String)}。
++		 *
++		 * @param dependency 待求值的项目依赖
++		 */
++		private void ensureDependencyEvaluated(ProjectDependency dependency) {
++			if (extension.isProjectIsolationActive()) {
++				// Isolated Projects 下跨项目求值被禁止，调用它会被 Gradle 判为非法访问而直接把构建打挂；
++				// 这里只能退化为「不做保证」，由 getLoomProjectData 的告警兜底。
++				return;
++			}
++
++			final String path = dependency.getPath();
++
++			if (project.findProject(path) == null) {
++				// 依赖替换、复合构建等场景下，项目的路径可能根本不在本构建里，此时
++				// evaluationDependsOn 会抛 UnknownProjectException。这里只是「尽力而为」的加固，
++				// 找不到项目时维持原有行为（交给数据文件回退路径），不把一个可选优化升级成失败。
++				return;
++			}
++
++			// 互相依赖的两个项目会在这里让 Gradle 抛出循环求值异常；Loom 不做环检测，交给 Gradle 报告。
++			project.evaluationDependsOn(path);
++		}
++
++		/**
++		 * 在隔离模式下依赖项目数据确实缺失时，按（当前项目，依赖项目）去重地输出一条默认可见的告警.
++		 *
++		 * <p>缺失会让依赖项目的 access widener / access transformer / mixin 等数据不参与本次产物，
++		 * 且是否可得取决于项目配置顺序，因此普通 {@code warn} 级别输出，让用户知道这是已知限制。
++		 *
++		 * @param dependency 缺少数据的项目依赖
++		 */
++		private void warnMissingDependencyDataOnce(ProjectDependency dependency) {
++			if (!warnedMissingDependencyData.add(dependency.getPath())) {
++				return;
++			}
++
++			// 注意消息正文里不能再出现 {}，否则会被日志器当成参数占位符。
++			LOGGER.warn("Isolated Projects 已启用，且依赖项目 {} 的跨项目数据在配置期不可得（内存共享表未命中，"
++					+ "导出的数据文件也不存在）：该项目的 access widener / access transformer / mixin 等数据"
++					+ "可能不会应用于 {} 本次构建的产物。这是 Isolated Projects 禁止跨项目求值导致的已知限制，"
++					+ "不是你的配置错误；该数据是否可得取决于项目配置顺序，所以同一工作树上的结果可能不稳定。"
++					+ "需要确定行为时请关闭 Isolated Projects（不要启用 org.gradle.unsafe.isolated-projects），"
++					+ "或先单独构建一次依赖项目、让它把数据文件产出到磁盘。",
++					dependency.getPath(), project.getPath());
+ 		}
+ 
+ 		@Override
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/ProjectDataColdStartTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/ProjectDataColdStartTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e20e5c88968e28bc2503ebbbeb7b7eddba77faf
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/ProjectDataColdStartTest.groovy
+@@ -0,0 +1,138 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration
++
++import spock.lang.Specification
++
++import net.fabricmc.loom.test.util.GradleProjectTestTrait
++
++import static net.fabricmc.loom.test.LoomTestConstants.DEFAULT_GRADLE
++import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
++
++/**
++ * 覆盖「依赖项目的跨项目数据尚未产出」这一冷启动常态，以及配置期读取该数据的确定性。
++ *
++ * <p>配置一个依赖了 Loom 项目的项目时，Loom 会去读依赖项目的跨项目数据。数据有两个来源：
++ * 构建级内存共享表（由依赖项目自身的 {@code afterEvaluate} 写入）与依赖项目导出的
++ * {@code build/loom/project-data.json}。后者只能由依赖项目自己的 {@code exportLoomProjectData}
++ * 任务在执行期产出：冷启动（依赖项目从未构建过）时文件必然不存在。这属于配置期常态，绝不能
++ * 升级成失败——否则消费方的配置期就会直接炸掉，构建根本无法启动。
++ *
++ * <p>触发条件是 {@code runtimeClasspath} / {@code compileClasspath} 上必须保留一个
++ * {@code ProjectDependency}，夹具因此刻意使用<b>普通</b> {@code implementation project(":lib")}：
++ * {@code modImplementation project(":lib")} 会被 Loom 的 mod 重映射换成普通文件依赖，
++ * classpath 上不再有 {@code ProjectDependency}，跨项目数据链路就不会被走到。夹具还把
++ * {@code :app} 写在 {@code :lib} 之前：默认的广度优先求值会让消费方先被配置，因此「先强制依赖
++ * 项目求值再读数据」这条改动一旦失效，下面的配置顺序断言就会失败。
++ *
++ * <p>三类行为必须互不混淆：
++ * <ul>
++ *     <li>文件不存在：正常返回空数据，构建照常启动；</li>
++ *     <li>非隔离模式：读取前强制依赖项目求值，数据一律来自内存共享表，磁盘上那份可能损坏或过期的
++ *     导出文件不再参与本次构建；</li>
++ *     <li>文件存在却读不出来（例如被写坏）：在仍然会读文件的地方（隔离模式、独立构建）依旧显式
++ *     失败，不能被伪装成「还没有数据」。<b>注意</b>：非隔离模式已经不再读该文件，因此这条断言由
++ *     {@code LoomProjectDataTest} 在 {@code LoomProjectData.read} 层面守住。</li>
++ * </ul>
++ */
++class ProjectDataColdStartTest extends Specification implements GradleProjectTestTrait {
++	/** 由依赖项目 {@code :lib} 的 exportLoomProjectData 任务产出，位于其 build 目录下。 */
++	private static final String DEPENDENCY_DATA_FILE = "lib/build/loom/project-data.json"
++
++	/** 夹具里 {@code :lib} 求值完成时打出的探针，出现即表示它的 afterEvaluate（含数据登记）已经跑完。 */
++	private static final String DEPENDENCY_EVALUATED_PROBE = "coldstart-probe lib-evaluated"
++
++	/** 夹具里 {@code :app} 自身 afterEvaluate 打出的探针，晚于 Loom 读取依赖项目数据。 */
++	private static final String CONSUMER_CONFIGURED_PROBE = "coldstart-probe app-config-finished"
++
++	def "consumer project configures and builds when the dependency has not exported its data yet"() {
++		setup:
++		def gradle = gradleProject(project: "projectDataColdStart", version: DEFAULT_GRADLE)
++
++		and: "冷启动前提：两个子项目都没有 build 目录，跨项目数据文件从未产出过"
++		deleteBuildDirectories(gradle)
++		assert !dependencyDataFile(gradle).exists()
++		assert !new File(gradle.projectDir, "app/build").exists()
++
++		when: "只请求消费方 :app 的任务，依赖项目的 exportLoomProjectData 因此不会被调度"
++		def result = gradle.run(tasks: [":app:build"])
++
++		then: "依赖项目的数据尚未产出属于配置期常态，构建必须能启动并跑完"
++		result.task(":app:build").outcome == SUCCESS
++
++		and: "整个过程都没有产出该文件，证明构建确实是在「数据文件不存在」的前提下成功的"
++		!dependencyDataFile(gradle).exists()
++	}
++
++	def "consumer reads dependency data only after the dependency project has been evaluated"() {
++		setup:
++		def gradle = gradleProject(project: "projectDataColdStart", version: DEFAULT_GRADLE)
++		deleteBuildDirectories(gradle)
++
++		when: "冷启动下只请求消费方 :app 的任务：:lib 排在 :app 之后，不强制求值就不会先被配置"
++		def result = gradle.run(tasks: [":app:build"])
++
++		then: "构建成功，且 :lib 的求值（含其 afterEvaluate 里的数据登记）先于 :app 读取依赖数据"
++		result.task(":app:build").outcome == SUCCESS
++		result.output.contains(DEPENDENCY_EVALUATED_PROBE)
++		result.output.contains(CONSUMER_CONFIGURED_PROBE)
++		result.output.indexOf(DEPENDENCY_EVALUATED_PROBE) < result.output.indexOf(CONSUMER_CONFIGURED_PROBE)
++
++		and: "数据文件始终不存在，因此 :lib 的数据只可能来自内存共享表——这正是确定性哈希的前提"
++		!dependencyDataFile(gradle).exists()
++	}
++
++	def "a data file that exists but cannot be parsed no longer affects the consumer build"() {
++		setup:
++		def gradle = gradleProject(project: "projectDataColdStart", version: DEFAULT_GRADLE)
++		def dataFile = dependencyDataFile(gradle)
++		dataFile.parentFile.mkdirs()
++		dataFile.text = "{ \"projectPath\": \":lib\" 这不是合法的项目数据"
++
++		when: "非隔离模式下 :app 会先强制 :lib 求值，数据来自内存共享表，这份坏文件根本不会被读到"
++		def result = gradle.run(tasks: [":app:build"])
++
++		then: "构建必须成功：数据已经在内存里，磁盘上的导出文件不是本次构建的数据来源"
++		result.task(":app:build").outcome == SUCCESS
++
++		and: "文件保持原样，证明它确实没有被读取、改写或「静默当成没有数据」"
++		dataFile.text == "{ \"projectPath\": \":lib\" 这不是合法的项目数据"
++	}
++
++	/**
++	 * 显式清掉两个子项目的构建产物。
++	 *
++	 * <p>用例本身依赖临时目录的新鲜度，但那是实现细节；把它做成显式步骤后，即使夹具目录被复用
++	 * （例如改用 {@code sharedFiles: true}），用例也不会在「其实是热启动」的情况下静默通过。
++	 */
++	private static void deleteBuildDirectories(GradleProjectTestTrait.GradleProject gradle) {
++		new File(gradle.projectDir, "app/build").deleteDir()
++		new File(gradle.projectDir, "lib/build").deleteDir()
++	}
++
++	private static File dependencyDataFile(GradleProjectTestTrait.GradleProject gradle) {
++		return new File(gradle.projectDir, DEPENDENCY_DATA_FILE)
++	}
++}
+diff --git a/src/test/resources/projects/projectDataColdStart/app/build.gradle b/src/test/resources/projects/projectDataColdStart/app/build.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9fcc95a44f436b638d6d74e30b079780f237645
+--- /dev/null
++++ b/src/test/resources/projects/projectDataColdStart/app/build.gradle
+@@ -0,0 +1,28 @@
++plugins {
++	id "java"
++	id "dev.architectury.loom"
++}
++
++version = "1.0.0"
++
++base {
++	archivesName = "coldapp"
++}
++
++dependencies {
++	minecraft "com.mojang:minecraft:1.20.4"
++	mappings "net.fabricmc:yarn:1.20.4+build.3:v2"
++	modImplementation "net.fabricmc:fabric-loader:0.19.2"
++
++	// 关键：必须是普通 implementation，而不是 modImplementation。
++	// mod 重映射会把 ProjectDependency 从 runtime/compile classpath 上换成普通文件依赖，
++	// Loom 的跨项目数据链路（ProjectView.getLoomProjectDataDependencies）根本不会被触发。
++	implementation project(":lib")
++}
++
++// 配置顺序探针（ProjectDataColdStartTest 断言用）：build 脚本自己的 afterEvaluate 注册晚于
++// Loom 插件注册的那一个，而 Loom 正是在自己的 afterEvaluate 里读取依赖项目数据的，
++// 因此这条日志出现时，本次构建对 :lib 数据的读取已经结束。
++afterEvaluate {
++	logger.lifecycle("coldstart-probe app-config-finished")
++}
+diff --git a/src/test/resources/projects/projectDataColdStart/build.gradle b/src/test/resources/projects/projectDataColdStart/build.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..28a7381f32e7b89c7a17be20c8618839ee21ef29
+--- /dev/null
++++ b/src/test/resources/projects/projectDataColdStart/build.gradle
+@@ -0,0 +1,5 @@
++// 根项目刻意不应用 Loom：本用例只关注 :app 与 :lib 之间的跨项目数据链路，
++// 根项目参与进来只会引入与本缺陷无关的配置工作。
++plugins {
++	id "base"
++}
+diff --git a/src/test/resources/projects/projectDataColdStart/lib/build.gradle b/src/test/resources/projects/projectDataColdStart/lib/build.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..8da078a66bdf4d3af2f22b76c7fbcf1d03191530
+--- /dev/null
++++ b/src/test/resources/projects/projectDataColdStart/lib/build.gradle
+@@ -0,0 +1,22 @@
++plugins {
++	id "java"
++	id "dev.architectury.loom"
++}
++
++version = "1.0.0"
++
++base {
++	archivesName = "coldlib"
++}
++
++dependencies {
++	minecraft "com.mojang:minecraft:1.20.4"
++	mappings "net.fabricmc:yarn:1.20.4+build.3:v2"
++	modImplementation "net.fabricmc:fabric-loader:0.19.2"
++}
++
++// 配置顺序探针（ProjectDataColdStartTest 断言用）：Loom 往构建级共享表登记项目数据的
++// afterEvaluate 注册得更早，因此这条日志出现时本项目的数据已经登记完毕。
++afterEvaluate {
++	logger.lifecycle("coldstart-probe lib-evaluated")
++}
+diff --git a/src/test/resources/projects/projectDataColdStart/settings.gradle b/src/test/resources/projects/projectDataColdStart/settings.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..2e0123bd733a8347d9dfb633f79f96b13fc08fa1
+--- /dev/null
++++ b/src/test/resources/projects/projectDataColdStart/settings.gradle
+@@ -0,0 +1,7 @@
++rootProject.name = "project-data-cold-start"
++
++// 顺序即配置顺序：消费方 :app 必须排在生产者 :lib 之前。
++// 这样冷启动时 :app 会先进入 afterEvaluate，Loom 的内存共享表（LoomGradleSharedData）里
++// 还没有 :lib，只能回退去读 :lib 导出的 build/loom/project-data.json。
++include "app"
++include "lib"

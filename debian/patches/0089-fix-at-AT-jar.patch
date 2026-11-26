@@ -1,0 +1,1138 @@
+From 48a2a399a2547859dbd86482708d2beaff9c481c Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 22 Oct 2026 23:03:40 +0800
+Subject: [PATCH 089/147] =?UTF-8?q?fix(at):=20AT=20=E8=A7=84=E5=88=99?=
+ =?UTF-8?q?=E6=8C=89=E7=9B=AE=E6=A0=87=20jar=20=E7=9A=84=E5=91=BD=E5=90=8D?=
+ =?UTF-8?q?=E7=A9=BA=E9=97=B4=E6=AD=A3=E7=A1=AE=E7=BF=BB=E8=AF=91?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Forge 的 AccessTransformer 规则原本按 srg 名书写，而实际生效的 jar 可能是
+notch 或 named 命名空间，导致规则匹配不上、AT 静默失效（表现为字段/方法可见性
+没变，且不报错）。
+
+改动要点：
+- AccessTransformerRuleTranslator 增加「源/目标命名空间」参数，按实际 jar 的
+  命名空间翻译规则，而不是硬编码 srg。
+- JarClassHierarchy 的继承链查询按 jar 实际命名空间回退，修现代车道漏翻译。
+- 成员名在整棵映射树里都不存在时跳过该规则，不再阻断构建——这类规则通常是
+  上游笔误或已废弃条目，拦下来对用户没有价值。
+- accessTransformForgeJar 补上映射产出的任务依赖，避免产物未落位就开跑。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/dev/architectury/loom/forge/AccessTransformerRuleTranslator.java b/src/main/java/dev/architectury/loom/forge/AccessTransformerRuleTranslator.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..1707a1f10e9ea9997da83f71f989172705f42df2
+--- /dev/null
++++ b/src/main/java/dev/architectury/loom/forge/AccessTransformerRuleTranslator.java
+@@ -0,0 +1,520 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package dev.architectury.loom.forge;
++
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.Deque;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
++import org.jspecify.annotations.Nullable;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import net.fabricmc.mappingio.tree.MappingTree;
++import net.fabricmc.mappingio.tree.MappingTreeView;
++
++/**
++ * 把 Forge 的 access transformer 规则翻译到「目标 jar 所在的命名空间」.
++ *
++ * <h2>为什么必须翻译</h2>
++ * legacy Forge 的 {@code forge_at.cfg} 用的是 <b>SRG 命名空间</b>：类名是 MCP 名
++ * （{@code net.minecraft.util.ObjectIntIdentityMap}），成员名是 SRG 名
++ * （{@code field_148749_a}）。而 AT 工具（{@code TransformerProcessor}）是纯 ASM 重写器，
++ * 它按<b>字面量</b>匹配类名与成员名，自身不做任何名称翻译。
++ *
++ * <p>本仓库 legacy 链路上 AT 作用的对象是 {@code merged-patched.jar}，其内容是 <b>official（notch）名</b>
++ * （{@code fd.class} 的字段 {@code a}）。把 SRG 形态的规则直接喂给 AT 工具，规则一条都匹配不上：
++ * AT 工具不报错、产物照常生成，表现为「AT 静默失效」，最终在运行期炸成
++ * {@code IllegalAccessError}（如 Forge 读 {@code ObjectIntIdentityMap.identityMap}）。
++ *
++ * <p>因此必须在 AT 执行前把规则翻译到目标 jar 的命名空间。翻译是纯查表，无副作用。
++ *
++ * <h2>规则形态</h2>
++ * 每行形如 {@code <access> <类名> [成员名 [描述符]]}，{@code #} 之后是注释。翻译只改类名与成员名：
++ * <ul>
++ *   <li>类名：按 {@code 源命名空间 → 目标命名空间} 查类映射；</li>
++ *   <li>成员名：在该类的成员表里按名字（方法的签名一并参与）查映射；</li>
++ *   <li>描述符、修饰符关键字原样保留。</li>
++ * </ul>
++ *
++ * <h2>失败即报错</h2>
++ * 与「静默跳过」相反，本类对无法翻译的规则<b>直接抛异常</b>，并汇总全部失败行。
++ * AT 失效在生产上极难诊断（症状出现在运行期的 {@code IllegalAccessError}，与构建毫无关联），
++ * 因此宁可让构建在翻译阶段失败并列出具体规则，也不允许它带着残缺的 AT 继续产出 jar。
++ */
++public final class AccessTransformerRuleTranslator {
++	private static final Logger LOGGER = LoggerFactory.getLogger(AccessTransformerRuleTranslator.class);
++
++	private AccessTransformerRuleTranslator() {
++	}
++
++	/**
++	 * 一次翻译所需的全部输入.
++	 *
++	 * @param rules 原始 AT 规则行（含注释行与空行，原样传入）
++	 * @param mappings 映射树
++	 * @param sourceNamespace 规则当前的命名空间（legacy Forge 为 {@code srg}）
++	 * @param targetNamespace 目标 jar 所在的命名空间（notch jar 为 {@code official}）
++	 * @param hierarchy 类继承关系；为 {@code null} 时不做继承回退（只有直接成员能翻译）
++	 */
++	public record Input(List<String> rules, MappingTree mappings, String sourceNamespace, String targetNamespace,
++			@Nullable ClassHierarchy hierarchy) {
++	}
++
++	/**
++	 * 类继承关系的查询入口.
++	 *
++	 * <p>AT 允许把规则写在子类上、而成员实际声明在父类（如
++	 * {@code EntityPlayerSP} 的 {@code func_184816_a} 声明在 {@code EntityPlayer}）。
++	 * 这种情况必须沿父类型上溯找到真正的声明类，并把规则改写到该类——
++	 * 映射表按「声明类」收录成员，直接拿子类去查必然查不到。
++	 *
++	 * <p>实现由调用方提供：翻译器只做纯查表，不关心继承数据从哪个 jar 读出。
++	 */
++	public interface ClassHierarchy {
++		/**
++		 * {@return 该类的直接父类型（父类与接口）} 名称用斜杠形式（{@code net/minecraft/...}）；
++		 * 无父类型时返回空列表。
++		 */
++		List<String> parentsOf(String className);
++	}
++
++	/**
++	 * 翻译全部规则.
++	 *
++	 * <p>注释行、空行原样保留（保持产物可读且便于与原始 AT 对照），只有规则行会被改写。
++	 *
++	 * @param input 翻译输入
++	 * @return 翻译后的规则行，与输入行数一一对应
++	 * @throws AccessTransformerTranslationException 存在无法翻译的规则行时
++	 */
++	public static List<String> translate(Input input) {
++		final List<String> output = new ArrayList<>(input.rules().size());
++		final List<String> failures = new ArrayList<>();
++		final List<String> skipped = new ArrayList<>();
++
++		for (String line : input.rules()) {
++			final String rule = stripComment(line).trim();
++
++			if (rule.isEmpty()) {
++				// 空行与纯注释行原样保留，避免产物与原始 AT 的行号错位
++				output.add(line);
++				continue;
++			}
++
++			if (line.trim().startsWith("#")) {
++				output.add(line);
++				continue;
++			}
++
++			final String translated = translateRule(rule, input, failures, skipped);
++
++			if (translated != null) {
++				output.add(translated);
++			}
++		}
++
++		if (!skipped.isEmpty()) {
++			// 用 warn 而不是 info：默认控制台级别是 LIFECYCLE，info 不可见，
++			// 「有规则被跳过」必须默认可见，否则等于静默丢 AT。
++			LOGGER.warn("有 {} 条 access transformer 规则指向此版本不存在的成员，已跳过（不影响构建，但该行的 AT 不会生效）：", skipped.size());
++
++			for (String message : skipped) {
++				LOGGER.warn("  {}", message);
++			}
++		}
++
++		if (!failures.isEmpty()) {
++			throw new AccessTransformerTranslationException(failures);
++		}
++
++		return output;
++	}
++
++	/**
++	 * 翻译单条规则.
++	 *
++	 * @return 翻译结果；无法翻译时记入 {@code failures} 并返回 {@code null}
++	 */
++	private static @Nullable String translateRule(String rule, Input input, List<String> failures, List<String> skipped) {
++		// 规则以空白切分：<access> <class> [member [descriptor]]
++		final String[] parts = rule.split("\\s+");
++
++		if (parts.length < 2) {
++			failures.add("无法解析的 AT 规则（至少需要 <access> <class>）: " + rule);
++			return null;
++		}
++
++		final String access = parts[0];
++		final String sourceClass = parts[1];
++
++		// 类名在 AT 里写点号形态，映射树用斜杠形态
++		final String mappedClass = mapClass(sourceClass.replace('.', '/'), input);
++
++		if (mappedClass == null) {
++			failures.add("类无法翻译（%s 里找不到 %s）: %s"
++					.formatted(input.sourceNamespace(), sourceClass, rule));
++			return null;
++		}
++
++		final StringBuilder result = new StringBuilder();
++		result.append(access).append(' ').append(mappedClass.replace('/', '.'));
++
++		if (parts.length >= 3) {
++			// 成员名与描述符之间没有空白：方法写 func_149752_b(F)Lnet/minecraft/block/Block;
++			final String memberSpec = parts[2];
++			final int parenIdx = memberSpec.indexOf('(');
++			final String member = parenIdx >= 0 ? memberSpec.substring(0, parenIdx) : memberSpec;
++			final String descriptor = parenIdx >= 0 ? memberSpec.substring(parenIdx) : null;
++
++			// 通配符（* 或 *()）表达「全部成员」，无需也无法翻译，原样保留
++			if (member.indexOf('*') >= 0) {
++				result.append(' ').append(memberSpec);
++				return result.toString();
++			}
++
++			// <init>/<clinit> 是构造器与静态初始化块，映射树里没有它们的条目（名字本就不参与混淆），
++			// 只需翻译描述符即可；当成普通成员去查会永远查不到
++			if (member.startsWith("<")) {
++				result.append(' ').append(member);
++				result.append(descriptor == null ? "" : translateDescriptorTo(descriptor, input, input.targetNamespace()));
++				return result.toString();
++			}
++
++			// 成员可能声明在父类上（AT 允许把规则写在子类上），
++			// 因此解析结果同时给出「真正声明它的类」和该成员的目标名
++			final ResolvedMember resolved = resolveMember(sourceClass.replace('.', '/'), member, descriptor, input);
++
++			if (resolved == null) {
++				// 区分「翻译缺陷」与「上游坏条目」：成员名在整个映射树里一次都没出现过时，
++				// 这条规则指向的名字在此版本根本不存在，任何映射都译不出来，强行译出也作用不到
++				// 任何东西。这类降级为警告并原样跳过；其余失败照旧报错（见方法注释里的实测来源）。
++				if (memberNameAbsentEverywhere(member, input)) {
++					skipped.add("规则指向的成员在此版本不存在，已跳过（%s 的 %s 在 %s 里从未出现）: %s"
++							.formatted(sourceClass, member, input.sourceNamespace(), rule));
++					return null;
++				}
++
++				failures.add("成员无法翻译（%s 的 %s 在 %s → %s 里找不到，继承链上也未找到）: %s".formatted(
++						sourceClass, member, input.sourceNamespace(), input.targetNamespace(), rule));
++				return null;
++			}
++
++			// 规则改写到声明类：AT 只对声明处生效，写在子类上对父类声明无效
++			if (!resolved.ownerNotch().equals(mappedClass)) {
++				result.setLength(0);
++				result.append(access).append(' ').append(resolved.ownerNotch().replace('/', '.'));
++			}
++
++			result.append(' ').append(resolved.memberName());
++
++			if (descriptor != null) {
++				// 描述符里的类型名同样来自 SRG 命名空间（如 Lnet/minecraft/block/Block;），
++				// 只翻译成员名而不翻译描述符，带描述符的规则仍匹配不上目标 jar
++				result.append(translateDescriptorTo(descriptor, input, input.targetNamespace()));
++			}
++		}
++
++		return result.toString();
++	}
++
++	/** 成员解析结果：声明它的类（目标命名空间）与该成员在目标命名空间里的名字. */
++	private record ResolvedMember(String ownerNotch, String memberName) {
++	}
++
++	/**
++	 * 解析成员的声明位置与目标名，必要时沿父类型上溯.
++	 *
++	 * <p>先在本类查；查不到再按广度优先遍历父类型（含接口），
++	 * 因此「规则写在子类、成员声明在祖先」的写法也能落到正确的位置。
++	 *
++	 * @param sourceClass 规则里写的类（源命名空间、斜杠形式）
++	 * @return 解析结果；本类与整条继承链都没有该成员时返回 {@code null}
++	 */
++	private static @Nullable ResolvedMember resolveMember(String sourceClass, String member, @Nullable String descriptor, Input input) {
++		final Deque<String> queue = new ArrayDeque<>();
++		final Set<String> visited = new HashSet<>();
++		queue.add(sourceClass);
++
++		while (!queue.isEmpty()) {
++			final String current = queue.poll();
++
++			if (!visited.add(current)) {
++				continue;
++			}
++
++			final String mappedMember = mapMember(current, member, descriptor, input);
++
++			if (mappedMember != null) {
++				final String notch = mapClassBetween(current, input.sourceNamespace(), input.targetNamespace(), input);
++				return notch == null ? null : new ResolvedMember(notch, mappedMember);
++			}
++
++			if (input.hierarchy() == null) {
++				continue;
++			}
++
++			// 继承关系由 jar 提供，而 jar 的类名用哪个命名空间**随车道而变**：
++			//   · legacy Forge（1.12.2）：AT 作用对象是 notch jar，类名在 official 命名空间；
++			//   · 现代 Forge/NeoForge：AT 作用对象是 patched intermediate jar，类名已是 srg 名
++			//     （1.17+ 起 srg 命名空间的类名沿用 mojang 名，只有成员是 m_/f_ 形式）。
++			// 因此不能写死成某一个命名空间：先按目标命名空间查，查不到再按源命名空间查。
++			// 只按目标命名空间查会让现代车道的继承链永远为空，进而漏掉「规则写在子类、
++			// 成员声明在祖先」的那部分规则（实测 1.21.1 有 8 条，如 LocalPlayer 的 m_8088_
++			// 实际声明在 Entity 上）。
++			for (String candidateNs : new String[] { input.targetNamespace(), input.sourceNamespace() }) {
++				final String candidate = mapClassBetween(current, input.sourceNamespace(), candidateNs, input);
++
++				if (candidate == null) {
++					continue;
++				}
++
++				final List<String> parentNotches = input.hierarchy().parentsOf(candidate);
++
++				if (parentNotches.isEmpty()) {
++					continue;
++				}
++
++				for (String parentNotch : parentNotches) {
++					final String parentSource = mapClassBetween(parentNotch, candidateNs, input.sourceNamespace(), input);
++
++					if (parentSource != null) {
++						queue.add(parentSource);
++					}
++				}
++
++				break;
++			}
++		}
++
++		return null;
++	}
++
++	/**
++	 * {@return 该成员名在整个映射树里是否一次都没出现过}.
++	 *
++	 * <p>用来区分两类「成员无法翻译」：
++	 * <ul>
++	 *   <li>成员名在映射里存在、只是不在当前类及其祖先上——可能是继承链信息不全，
++	 *       属需要排查的翻译缺陷，仍应报错；</li>
++	 *   <li>成员名在整棵树里一次都没有——规则指向的名字在此版本根本不存在，
++	 *       任何映射都无法翻译成功。这类是上游 AT 文件的坏条目：即便强行译出，
++	 *       AT 也作用不到任何东西。</li>
++	 * </ul>
++	 *
++	 * <p>实测来源：NeoForge 20.2.93 的 accesstransformer.cfg 里
++	 * {@code BlockEntityRenderDispatcher fontRenderer} 一行，`fontRenderer` 是注释文字被误写成了
++	 * 成员名；该字段的正确名一直是 {@code font}（对照 1.20.1 同一条规则写的是 srg 名
++	 * {@code f_112253_}，其 named 列即 {@code font}）。
++	 *
++	 * <p>只遍历方法名与字段名，不碰描述符：描述符不一致本身不会让名字消失，
++	 * 而放宽到「描述符不符也算不存在」会把真正的翻译缺陷一起吞掉。
++	 */
++	private static boolean memberNameAbsentEverywhere(String member, Input input) {
++		final int sourceId = namespaceId(input, input.sourceNamespace());
++
++		if (sourceId == MappingTreeView.NULL_NAMESPACE_ID) {
++			return false;
++		}
++
++		for (MappingTreeView.ClassMappingView classMapping : input.mappings().getClasses()) {
++			for (MappingTreeView.MethodMappingView method : classMapping.getMethods()) {
++				if (member.equals(method.getName(input.sourceNamespace()))) {
++					return false;
++				}
++			}
++
++			for (MappingTreeView.FieldMappingView field : classMapping.getFields()) {
++				if (member.equals(field.getName(input.sourceNamespace()))) {
++					return false;
++				}
++			}
++		}
++
++		return true;
++	}
++
++	/** {@return 目标命名空间下的类名；找不到时返回 {@code null}} */
++	private static @Nullable String mapClass(String sourceClass, Input input) {
++		final int sourceId = namespaceId(input, input.sourceNamespace());
++
++		if (sourceId == MappingTreeView.NULL_NAMESPACE_ID) {
++			return null;
++		}
++
++		final MappingTreeView.ClassMappingView classMapping = input.mappings().getClass(sourceClass, sourceId);
++
++		if (classMapping == null) {
++			return null;
++		}
++
++		return classMapping.getName(input.targetNamespace());
++	}
++
++	/** {@return 命名空间在映射树里的下标；不存在时返回 {@link MappingTreeView#NULL_NAMESPACE_ID}} */
++	private static int namespaceId(Input input, String namespace) {
++		return input.mappings().getNamespaceId(namespace);
++	}
++
++	/**
++	 * {@return 目标命名空间下的成员名；找不到时返回 {@code null}}
++	 *
++	 * <p>方法与字段分开查：带描述符时按「名字 + 描述符」定位方法，否则在字段里查。
++	 * 1.12.2 的 AT 规则在成员名后可能带方法描述符（如 {@code func_12345_a ()V}）。
++	 */
++	private static @Nullable String mapMember(String sourceClass, String member, @Nullable String descriptor, Input input) {
++		final int sourceId = namespaceId(input, input.sourceNamespace());
++
++		if (sourceId == MappingTreeView.NULL_NAMESPACE_ID) {
++			return null;
++		}
++
++		final MappingTreeView.ClassMappingView classMapping = input.mappings().getClass(sourceClass, sourceId);
++
++		if (classMapping == null) {
++			return null;
++		}
++
++		if (descriptor != null) {
++			// 映射树的描述符只有一个形态：源命名空间 + 斜杠（getSrcDesc() 形如 (F)Laow;），
++			// 而 AT 的描述符是点号写法，因此统一成斜杠后再比对
++			final String sourceDesc = translateDescriptorTo(descriptor, input, input.mappings().getSrcNamespace())
++					.replace('.', '/');
++
++			for (MappingTreeView.MethodMappingView method : classMapping.getMethods()) {
++				if (!member.equals(method.getName(input.sourceNamespace()))) {
++					continue;
++				}
++
++				if (!sourceDesc.equals(method.getSrcDesc())) {
++					continue;
++				}
++
++				return method.getName(input.targetNamespace());
++			}
++		}
++
++		for (MappingTreeView.FieldMappingView field : classMapping.getFields()) {
++			if (member.equals(field.getName(input.sourceNamespace()))) {
++				return field.getName(input.targetNamespace());
++			}
++		}
++
++		// 无描述符的方法规则（如整体放开某个方法名）也要能翻译
++		if (descriptor == null) {
++			for (MappingTreeView.MethodMappingView method : classMapping.getMethods()) {
++				if (member.equals(method.getName(input.sourceNamespace()))) {
++					return method.getName(input.targetNamespace());
++				}
++			}
++		}
++
++		return null;
++	}
++
++	/**
++	 * {@return 把描述符里的类型名从「AT 所在命名空间」翻译到指定命名空间}
++	 *
++	 * <p>AT 描述符里的类型名与规则同级，都是 SRG 命名空间（1.12.2 下类名等同 MCP 名）。
++	 * 映射树里的描述符则写在源命名空间（official）。两者要对上，必须先统一命名空间。
++	 */
++	private static String translateDescriptorTo(String descriptor, Input input, String targetNamespace) {
++		final StringBuilder result = new StringBuilder(descriptor.length());
++		int i = 0;
++
++		while (i < descriptor.length()) {
++			final char c = descriptor.charAt(i);
++
++			if (c != 'L') {
++				result.append(c);
++				i++;
++				continue;
++			}
++
++			final int end = descriptor.indexOf(';', i);
++
++			if (end < 0) {
++				// 不合法的描述符：原样保留，交给 AT 工具自己报错
++				result.append(descriptor, i, descriptor.length());
++				break;
++			}
++
++			final String type = descriptor.substring(i + 1, end);
++			// AT 文件里的描述符用点号写类名（Lnet.minecraft.block.Block;），
++			// 而映射树一律用斜杠，两种写法都要认
++			final String mapped = mapClassBetween(type.replace('.', '/'), input.sourceNamespace(), targetNamespace, input);
++			// 输出沿用输入的分隔符风格，避免把 AT 改写成工具不认的形态
++			final String rendered = mapped != null ? (type.indexOf('.') >= 0 ? mapped.replace('/', '.') : mapped) : type;
++			result.append('L').append(rendered).append(';');
++			i = end + 1;
++		}
++
++		return result.toString();
++	}
++
++	/** {@return 在任意两个命名空间之间翻译类名；找不到时返回 {@code null}} */
++	private static @Nullable String mapClassBetween(String className, String from, String to, Input input) {
++		final int fromId = namespaceId(input, from);
++
++		if (fromId == MappingTreeView.NULL_NAMESPACE_ID) {
++			return null;
++		}
++
++		final MappingTreeView.ClassMappingView classMapping = input.mappings().getClass(className, fromId);
++		return classMapping == null ? null : classMapping.getName(to);
++	}
++
++	/** {@return 去掉 {@code #} 注释后的内容}；AT 的注释可以出现在行尾 */
++	private static String stripComment(String line) {
++		final int hash = line.indexOf('#');
++		return hash >= 0 ? line.substring(0, hash) : line;
++	}
++
++	/** AT 规则翻译失败；{@code failures} 汇总全部失败行，而不是只报第一条. */
++	public static final class AccessTransformerTranslationException extends RuntimeException {
++		private final List<String> failures;
++
++		AccessTransformerTranslationException(List<String> failures) {
++			super(buildMessage(failures));
++			this.failures = List.copyOf(failures);
++		}
++
++		public List<String> getFailures() {
++			return failures;
++		}
++
++		private static String buildMessage(List<String> failures) {
++			final StringBuilder message = new StringBuilder();
++			message.append("有 ").append(failures.size()).append(" 条 access transformer 规则无法翻译到目标命名空间：");
++			failures.forEach(failure -> message.append(System.lineSeparator()).append("  - ").append(failure));
++			message.append(System.lineSeparator())
++					.append("AT 规则若被静默丢弃，症状会推迟到运行期的 IllegalAccessError，因此这里直接失败。");
++			return message.toString();
++		}
++	}
++}
+diff --git a/src/main/java/dev/architectury/loom/forge/JarClassHierarchy.java b/src/main/java/dev/architectury/loom/forge/JarClassHierarchy.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9178cc20ef2f460bf39db71a2514b244f33a007a
+--- /dev/null
++++ b/src/main/java/dev/architectury/loom/forge/JarClassHierarchy.java
+@@ -0,0 +1,124 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package dev.architectury.loom.forge;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipFile;
++
++import org.objectweb.asm.ClassReader;
++
++/**
++ * 从 jar 里读出类继承关系，供 {@link AccessTransformerRuleTranslator} 做继承回退.
++ *
++ * <p>AT 允许把规则写在子类上、而成员声明在父类；翻译时必须沿继承链找到声明类。
++ * 映射表只按「声明类」收录成员，这个索引补的正是映射表没有的那部分信息。
++ *
++ * <h2>为什么从 jar 读而不是从映射读</h2>
++ * tiny 映射不含父类关系，只含类与成员的名字对应。继承关系必须以字节码为准，
++ * 因此这里直接读待处理 jar 的 class 头部（只取 this/super/interfaces，不碰指令体）。
++ *
++ * <p>名称一律保持 jar 里的原始形态（notch 名、斜杠分隔），与映射树的 official 列一致，
++ * 命名空间换算交给翻译器，本类不做任何名称翻译。
++ */
++public final class JarClassHierarchy implements AccessTransformerRuleTranslator.ClassHierarchy {
++	private static final List<String> NO_PARENTS = List.of();
++
++	/** 类名（notch、斜杠）→ 直接父类型（父类在前，接口在后）. */
++	private final Map<String, List<String>> parents;
++
++	private JarClassHierarchy(Map<String, List<String>> parents) {
++		this.parents = parents;
++	}
++
++	/**
++	 * 读取若干 jar 的继承关系.
++	 *
++	 * <p>多个 jar 合并成一张表：MC 的 client/server/merged jar 与 forge jar 会分头提供一部分类，
++	 * 继承链可能跨越它们。同名类以先出现者为准（与「同一份产物只该有一个定义」一致）。
++	 *
++	 * @param jars 待扫描的 jar；不存在或无法打开的直接跳过
++	 * @return 继承关系索引
++	 * @throws IOException 读 jar 失败（文件存在但内容损坏）
++	 */
++	public static JarClassHierarchy read(Iterable<Path> jars) throws IOException {
++		final Map<String, List<String>> parents = new HashMap<>();
++
++		for (Path jar : jars) {
++			if (jar == null || !java.nio.file.Files.isRegularFile(jar)) {
++				continue;
++			}
++
++			try (ZipFile zip = new ZipFile(jar.toFile())) {
++				final var entries = zip.entries();
++
++				while (entries.hasMoreElements()) {
++					final ZipEntry entry = entries.nextElement();
++					final String name = entry.getName();
++
++					if (!name.endsWith(".class") || name.startsWith("META-INF/")) {
++						continue;
++					}
++
++					try (InputStream in = zip.getInputStream(entry)) {
++						readClass(in, parents);
++					} catch (RuntimeException e) {
++						// 单个类的头部解析失败不该让整个索引失败：该类最多没有父类型
++					}
++				}
++			}
++		}
++
++		return new JarClassHierarchy(parents);
++	}
++
++	/** 读一个 class 的头部，把它的父类型记进表. */
++	private static void readClass(InputStream in, Map<String, List<String>> parents) throws IOException {
++		final ClassReader reader = new ClassReader(in);
++		final String self = reader.getClassName();
++		final String superName = reader.getSuperName();
++		final String[] interfaces = reader.getInterfaces();
++		final List<String> result = new ArrayList<>(1 + interfaces.length);
++
++		if (superName != null) {
++			result.add(superName);
++		}
++
++		Collections.addAll(result, interfaces);
++		parents.putIfAbsent(self, List.copyOf(result));
++	}
++
++	@Override
++	public List<String> parentsOf(String className) {
++		return parents.getOrDefault(className, NO_PARENTS);
++	}
++}
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+index 8c8268cefc89e99e35ed8b910446393013cd7abf..3bf2cf0f83d42e81a6236184e783981dc14f2781 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+@@ -54,9 +54,11 @@ import java.util.stream.Stream;
+ 
+ import de.oceanlabs.mcp.mcinjector.adaptors.ParameterAnnotationFixer;
+ import dev.architectury.loom.accesstransformer.AccessTransformerService;
++import dev.architectury.loom.forge.AccessTransformerRuleTranslator;
+ import dev.architectury.loom.forge.CoreModClassRemapper;
+ import dev.architectury.loom.forge.ForgeMigratedMappingConfiguration;
+ import dev.architectury.loom.forge.InnerClassRemapper;
++import dev.architectury.loom.forge.JarClassHierarchy;
+ import dev.architectury.loom.forge.config.UserdevConfig;
+ import dev.architectury.loom.forge.dependency.DependencyProvider;
+ import dev.architectury.loom.forge.dependency.ForgeProvider;
+@@ -64,6 +66,7 @@ import dev.architectury.loom.forge.dependency.ForgeUserdevProvider;
+ import dev.architectury.loom.forge.dependency.PatchProvider;
+ import dev.architectury.loom.forge.tool.ForgeExternalToolService;
+ import dev.architectury.loom.mappings.MappingOption;
++import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import dev.architectury.loom.mcpconfig.McpConfigProvider;
+ import dev.architectury.loom.mcpconfig.McpExecutor;
+ import dev.architectury.loom.mcpconfig.McpExecutorBuilder;
+@@ -141,6 +144,18 @@ public class MinecraftPatchedProvider {
+ 	private Path minecraftPatchedIntermediateJar;
+ 	// Step 3: Access Transform
+ 	private Path minecraftPatchedIntermediateAtJar;
++	/**
++	 * 中间产物的命名空间标识，同时决定 AT 规则的源命名空间.
++	 *
++	 * <p>它与产物文件名用的是同一个值（构造器里算出的 {@code intermediateId}）：
++	 * Forge 是 {@code srg}，NeoForge 是 {@code mojang}（unobfuscated 时 {@code official}）。
++	 *
++	 * <p>AT 规则的书写命名空间随平台而变，实测两版 Forge 的 userdev AT 文件对同一个方法写法不同：
++	 * Forge 1.21.1 写 {@code m_10595_}（srg），NeoForge 1.20.2 写 {@code register}（mojang）。
++	 * 故 AT 的源命名空间必须取本值，不能硬编码成 srg——硬编码会让 NeoForge 车道的 508 条规则
++	 * 全部因「类找不到」而失败（NeoForge 的映射树里根本没有 srg 列）。
++	 */
++	private String intermediateNamespace;
+ 	// Step 4: Remap Patched AT & Forge to official
+ 	private Path minecraftPatchedJar;
+ 	private Path minecraftClientExtra;
+@@ -184,6 +199,7 @@ public class MinecraftPatchedProvider {
+ 		final String intermediateId = getExtension().isNeoForge()
+ 				? (getExtension().isUnobfuscatedForge() ? "official" : "mojang")
+ 				: "srg";
++		intermediateNamespace = intermediateId;
+ 		minecraftIntermediateJar = forgeWorkingDir.resolve("minecraft-" + type.id + "-" + intermediateId + ".jar");
+ 		minecraftPatchedIntermediateJar = forgeWorkingDir.resolve("minecraft-" + type.id + "-" + intermediateId + "-patched.jar");
+ 		minecraftPatchedIntermediateAtJar = forgeWorkingDir.resolve("minecraft-" + type.id + "-" + intermediateId + "-at-patched.jar");
+@@ -435,6 +451,21 @@ public class MinecraftPatchedProvider {
+ 				return null;
+ 			});
+ 
++			// AT 规则在 SRG 命名空间，而本链路的 AT 作用对象是 notch jar（见 AccessTransformerRuleTranslator）
++			task.getMappings().set(mappingsFile(project).toFile());
++			// 映射文件在投影形态下由迁移任务在执行期产出（manipulateForgeMappings），
++			// 而上面只按路径声明成 @InputFile——不带任务依赖。缺这条接线时 Gradle 会直接拒绝构建：
++			// 「accessTransformForgeJar uses this output of task manipulateForgeMappings without
++			// declaring an explicit or implicit dependency」。接线方式与同类消费方一致（见下方
++			// registerPatchedJarTask 里 migrateForgeJar 那处）。
++			extension.getMappingConfiguration().addMappingsProducerDependency(task);
++			// AT 规则的书写命名空间随平台而变（见 intermediateNamespace 的字段注释）：
++			// Forge 的 userdev AT 用 srg 成员名，NeoForge 的用 mojang 名。原实现硬编码 SRG，
++			// 在 NeoForge 车道上必然全部失败——它的映射树里没有 srg 列，任何类名都查不到
++			// （实测 508 条「类无法翻译」）。源命名空间取自产物文件名同源的 intermediateNamespace。
++			task.getAtSourceNamespace().set(intermediateNamespace);
++			task.getAtTargetNamespace().set(MappingsNamespace.OFFICIAL.toString());
++
+ 			dependsOnProducer(task, patchedProducer);
+ 		}));
+ 
+@@ -666,6 +697,17 @@ public class MinecraftPatchedProvider {
+ 	 * （{@code getMinecraftJarsCollection(OFFICIAL)}、mapped provider 的重映射任务）正是从这里拿到
+ 	 * 「我的输入由哪个任务产出」的任务依赖。
+ 	 */
++	/**
++	 * {@return AT 规则翻译要用的映射文件}
++	 *
++	 * <p>与 {@code buildRemapper} / {@link #getMappingTree} 取映射用的是同一个 {@link MappingOption}，
++	 * 保证「翻译 AT 用的映射」与「重映射 MC jar 用的映射」是同一份数据，不会出现两边命名空间不一致。
++	 */
++	private Path mappingsFile(Project project) {
++		final LoomGradleExtension extension = getExtension();
++		return extension.getMappingConfiguration().getMappingsPath(MappingOption.forPlatform(extension));
++	}
++
+ 	private void registerPatchedJarTask() {
+ 		final Path patchedJar = minecraftPatchedJar.toAbsolutePath().normalize();
+ 		final Path clientExtra = providesClientJar() ? minecraftClientExtra.toAbsolutePath().normalize() : null;
+@@ -1278,7 +1320,13 @@ public class MinecraftPatchedProvider {
+ 		}
+ 	}
+ 
+-	private MemoryMappingTree getMappingTree(ServiceFactory serviceFactory) {
++	/**
++	 * {@return 本工程的映射树}.
++	 *
++	 * <p>对子类开放：legacy Forge（1.8-1.16）的 forge.jar 修补需要按 srg→named 重映射，
++	 * 与这里产出 {@code minecraftPatchedAtJar} 用的是同一棵映射树。
++	 */
++	protected MemoryMappingTree getMappingTree(ServiceFactory serviceFactory) {
+ 		final MappingOption mappingOption = MappingOption.forPlatform(getExtension());
+ 		TinyMappingsService mappingsService = getExtension().getMappingConfiguration().getMappingsService(project, serviceFactory, mappingOption);
+ 		return mappingsService.getMappingTree();
+@@ -1461,12 +1509,54 @@ public class MinecraftPatchedProvider {
+ 		logger.lifecycle(":access transforming minecraft");
+ 
+ 		try (var tempFiles = new TempFiles(); var serviceFactory = new ScopedServiceFactory()) {
+-			runAccessTransformer(createAccessTransformerOptions(tempFiles), input, target, serviceFactory);
++			runAccessTransformer(createTranslatedAccessTransformerOptions(tempFiles, input, serviceFactory), input, target, serviceFactory);
+ 		}
+ 
+ 		logger.lifecycle(":access transformed minecraft in " + stopwatch.stop());
+ 	}
+ 
++	/**
++	 * {@return 把 AT 规则翻译到 {@code input} 命名空间之后的 AT 工具选项}.
++	 *
++	 * <p>legacy Forge 的 {@code forge_at.cfg} 用 SRG 命名空间（MCP 类名 + srg 成员名），而本链路 AT
++	 * 作用的对象是 notch jar。AT 工具按字面量匹配、自身不做名称翻译，直接喂原始规则会一条都匹配不上
++	 * 且不报错（表现为 AT 静默失效，症状推迟到运行期的 {@code IllegalAccessError}）。
++	 * 因此这里先把规则翻译到 {@code input} 所在命名空间，再交给工具。
++	 *
++	 * <p>继承关系取自 {@code input} 自身：AT 允许把规则写在子类上而成员声明在父类，
++	 * 上溯必须以字节码里的真实继承为准。
++	 */
++	private Provider<AccessTransformerService.Options> createTranslatedAccessTransformerOptions(TempFiles tempFiles, Path input,
++			ServiceFactory serviceFactory) {
++		return createAccessTransformerOptions(tempFiles).map(options -> {
++			try {
++				final MemoryMappingTree mappings = getMappingTree(serviceFactory);
++				final JarClassHierarchy hierarchy = JarClassHierarchy.read(List.of(input));
++				final List<File> translated = new ArrayList<>();
++
++				for (File atFile : options.getAccessTransformers().getFiles()) {
++					final List<String> result = AccessTransformerRuleTranslator.translate(
++							new AccessTransformerRuleTranslator.Input(
++									Files.readAllLines(atFile.toPath()),
++									mappings,
++									MappingsNamespace.SRG.toString(),
++									MappingsNamespace.OFFICIAL.toString(),
++									hierarchy));
++
++					final Path tmpFile = tempFiles.file("at-translated", ".cfg");
++					Files.write(tmpFile, result);
++					translated.add(tmpFile.toFile());
++				}
++
++				logger.lifecycle(":translated " + translated.size() + " AT file(s) to the official namespace");
++				options.getAccessTransformers().setFrom(translated);
++				return options;
++			} catch (IOException e) {
++				throw new UncheckedIOException(e);
++			}
++		});
++	}
++
+ 	/**
+ 	 * {@return AT 工具的声明式选项（工具 classpath、主类与待应用的 AT 文件）}.
+ 	 *
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/AccessTransformForgeJarTask.java b/src/main/java/net/fabricmc/loom/pipeline/AccessTransformForgeJarTask.java
+index ecf31222abb01623f14e270e0d6704d7e177060e..5ce48e0f7fd5e06fa4f2bcec19703fe09d528a13 100644
+--- a/src/main/java/net/fabricmc/loom/pipeline/AccessTransformForgeJarTask.java
++++ b/src/main/java/net/fabricmc/loom/pipeline/AccessTransformForgeJarTask.java
+@@ -24,14 +24,19 @@
+ 
+ package net.fabricmc.loom.pipeline;
+ 
++import java.io.BufferedReader;
+ import java.io.File;
++import java.io.IOException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.util.ArrayList;
+ import java.util.List;
+ 
+ import javax.inject.Inject;
+ 
+ import dev.architectury.loom.accesstransformer.AccessTransformerService;
++import dev.architectury.loom.forge.AccessTransformerRuleTranslator;
++import dev.architectury.loom.forge.JarClassHierarchy;
+ import dev.architectury.loom.forge.config.UserdevConfig;
+ import dev.architectury.loom.util.TempFiles;
+ import org.gradle.api.DefaultTask;
+@@ -53,6 +58,9 @@ import org.jspecify.annotations.Nullable;
+ 
+ import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.loom.util.service.ScopedServiceFactory;
++import net.fabricmc.mappingio.MappingReader;
++import net.fabricmc.mappingio.format.MappingFormat;
++import net.fabricmc.mappingio.tree.MemoryMappingTree;
+ 
+ /**
+  * L3 流水线：对打补丁后的中间 Minecraft jar 执行 Forge 的 access transform
+@@ -124,6 +132,24 @@ public abstract class AccessTransformForgeJarTask extends DefaultTask {
+ 	@OutputFile
+ 	public abstract RegularFileProperty getOutputJar();
+ 
++	/**
++	 * 输入：映射文件，用于把 AT 规则翻译到目标 jar 的命名空间.
++	 *
++	 * <p>声明成文件而非映射树：映射树不可序列化，配置缓存在此只记录文件路径与内容哈希，
++	 * 树本身在执行期按需重建（见 {@link #readMappings()}）。
++	 */
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getMappings();
++
++	/** 规则当前的命名空间（legacy Forge 为 {@code srg}）. */
++	@Input
++	public abstract Property<String> getAtSourceNamespace();
++
++	/** 目标 jar 所在的命名空间（notch jar 为 {@code official}）. */
++	@Input
++	public abstract Property<String> getAtTargetNamespace();
++
+ 	/** 执行期实例化服务选项用（{@code Project} 在执行期不可用，见类注释）. */
+ 	@Inject
+ 	public abstract ObjectFactory getObjects();
+@@ -134,8 +160,11 @@ public abstract class AccessTransformForgeJarTask extends DefaultTask {
+ 		final Path output = getOutputJar().get().getAsFile().toPath();
+ 
+ 		try (var tempFiles = new TempFiles(); var serviceFactory = new ScopedServiceFactory()) {
+-			final List<String> atFiles = AccessTransformerService.extractLoaderAts(
++			List<String> atFiles = AccessTransformerService.extractLoaderAts(
+ 					getForgeUserdevJar().get().getAsFile().toPath(), atLocation(), tempFiles);
++			// AT 规则来自 forge_at.cfg（SRG 命名空间），而作用对象是本仓库的 notch jar：
++			// 不翻译的话 AT 工具按字面量一条都匹配不上，且不会报错（表现为 AT 静默失效）。
++			atFiles = translateAtFiles(atFiles, tempFiles);
+ 			final AccessTransformerService service = serviceFactory.get(
+ 					AccessTransformerService.createOptions(getObjects(), atTool(), atFiles));
+ 
+@@ -147,6 +176,50 @@ public abstract class AccessTransformForgeJarTask extends DefaultTask {
+ 		}
+ 	}
+ 
++	/**
++	 * {@return 翻译到目标命名空间后的 AT 文件路径} 每条输入对应一个同序输出.
++	 *
++	 * <p>翻译结果写进本任务的临时目录：它是 (AT 内容, 映射) 的纯函数，
++	 * 而这两者都是任务的 {@code @Input}，因此翻译不需要独立的任务级缓存。
++	 */
++	private List<String> translateAtFiles(List<String> atFiles, TempFiles tempFiles) throws IOException {
++		final MemoryMappingTree mappings = readMappings();
++		// 继承索引来自本次 AT 的作用对象（notch jar）：AT 规则可能写在子类上而成员声明在父类，
++		// 上溯需要字节码里的真实继承关系，映射表不提供
++		final JarClassHierarchy hierarchy = JarClassHierarchy.read(List.of(
++				getPatchedIntermediateJar().get().getAsFile().toPath()));
++		final List<String> translated = new ArrayList<>(atFiles.size());
++
++		for (String atFile : atFiles) {
++			final List<String> rules = Files.readAllLines(Path.of(atFile));
++			final List<String> result = AccessTransformerRuleTranslator.translate(
++					new AccessTransformerRuleTranslator.Input(
++							rules,
++							mappings,
++							getAtSourceNamespace().get(),
++							getAtTargetNamespace().get(),
++							hierarchy));
++
++			final Path tmpFile = tempFiles.file("at-translated", ".cfg");
++			Files.write(tmpFile, result);
++			translated.add(tmpFile.toAbsolutePath().toString());
++		}
++
++		return translated;
++	}
++
++	/** {@return 从任务输入的映射文件读出的映射树}. */
++	private MemoryMappingTree readMappings() throws IOException {
++		final MemoryMappingTree mappings = new MemoryMappingTree();
++		final Path path = getMappings().get().getAsFile().toPath();
++
++		try (BufferedReader reader = Files.newBufferedReader(path)) {
++			MappingReader.read(reader, MappingFormat.TINY_2_FILE, mappings);
++		}
++
++		return mappings;
++	}
++
+ 	/** {@return 本次的 AT 文件位置声明} 与配置期读的 {@code UserdevConfig.ats} 逐项同源. */
+ 	private UserdevConfig.AccessTransformerLocation atLocation() {
+ 		if (getAtDirectory().isPresent()) {
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/architectury/AccessTransformerRuleTranslatorTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/architectury/AccessTransformerRuleTranslatorTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..be6f908115227cb7fa58e4b61e84dbca9d71868c
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/architectury/AccessTransformerRuleTranslatorTest.groovy
+@@ -0,0 +1,166 @@
++package net.fabricmc.loom.test.unit.architectury
++
++import dev.architectury.loom.forge.AccessTransformerRuleTranslator
++import net.fabricmc.mappingio.format.MappingFormat
++import net.fabricmc.mappingio.MappingReader
++import net.fabricmc.mappingio.tree.MemoryMappingTree
++import spock.lang.Specification
++import spock.lang.TempDir
++
++import java.nio.file.Files
++import java.nio.file.Path
++
++/**
++ * AT 规则名称空间翻译的契约测试.
++ *
++ * <p>被钉住的核心事实：legacy Forge 的 {@code forge_at.cfg} 用「MCP 类名 + SRG 成员名」，
++ * 而本仓库 AT 作用的 jar 是 official（notch）名。不翻译的话 AT 工具按字面量一条都匹配不上，
++ * 且不会报错——症状推迟到运行期的 {@code IllegalAccessError}，因此这里必须钉死翻译结果。
++ */
++class AccessTransformerRuleTranslatorTest extends Specification {
++	@TempDir
++	Path tempDir
++
++	/**
++	 * 映射夹具：复刻 mappings-srg.tiny 的相关结构.
++	 *
++	 * 只保留一个类 {@code fd}（srg 名 net/minecraft/util/ObjectIntIdentityMap）及其两个字段，
++	 * 数值与 Forge 1.12.2 的真实映射一致，见 mappings-srg.tiny 第 2695 行起。
++	 */
++	private MemoryMappingTree mappings() {
++		Path tiny = tempDir.resolve("mappings.tiny")
++		Files.writeString(tiny, """tiny\t2\t0\tofficial\tsrg\tintermediary\tnamed
++c\tfd\tnet/minecraft/util/ObjectIntIdentityMap\tnet/minecraft/class_2112\tnet/minecraft/util/ObjectIntIdentityMap
++\tf\tLjava/util/IdentityHashMap;\ta\tfield_148749_a\tfield_8818\tidentityMap
++\tf\tLjava/util/List;\tb\tfield_148748_b\tfield_8819\tobjectList
++\tm\t()I\ta\tfunc_186804_a\tmethod_7679\tsize
++""")
++
++		final MemoryMappingTree tree = new MemoryMappingTree()
++		Files.newBufferedReader(tiny).withCloseable { reader ->
++			MappingReader.read(reader, MappingFormat.TINY_2_FILE, tree)
++		}
++		return tree
++	}
++
++	private List<String> translate(List<String> rules) {
++		return AccessTransformerRuleTranslator.translate(
++				new AccessTransformerRuleTranslator.Input(rules, mappings(), "srg", "official", null))
++	}
++
++	def "字段规则翻译成 notch 名"() {
++		when:
++		def result = translate(["protected net.minecraft.util.ObjectIntIdentityMap field_148749_a # internal map"])
++
++		then: "类名变 fd、字段名变 a，注释被去掉"
++		result == ["protected fd a"]
++	}
++
++	def "注释与空行原样保留"() {
++		when:
++		def result = translate([
++				"# a comment line",
++				"",
++				"public net.minecraft.util.ObjectIntIdentityMap field_148748_b"
++		])
++
++		then: "非规则行不动，规则行才翻译"
++		result == [
++				"# a comment line",
++				"",
++				"public fd b"
++		]
++	}
++
++	def "整类规则翻译成 notch 名"() {
++		when:
++		def result = translate(["public net.minecraft.util.ObjectIntIdentityMap"])
++
++		then:
++		result == ["public fd"]
++	}
++
++	def "方法描述符原样保留"() {
++		when: "真实 forge_at.cfg 的写法：成员名与描述符之间没有空白"
++		def result = translate(["public net.minecraft.util.ObjectIntIdentityMap func_186804_a()I"])
++
++		then: "方法名翻译，描述符不动"
++		result == ["public fd a()I"]
++	}
++
++	def "无法翻译的规则必须让构建失败而不是静默丢弃"() {
++		when: "类名在映射里根本不存在"
++		translate(["protected net.minecraft.util.DoesNotExist field_1"])
++
++		then: "抛异常，并指出具体规则"
++		def e = thrown(AccessTransformerRuleTranslator.AccessTransformerTranslationException)
++		e.failures.size() == 1
++		e.failures[0].contains("net.minecraft.util.DoesNotExist")
++	}
++
++	def "成员缺失也要失败"() {
++		when: "类存在但字段名不在该类下"
++		translate(["protected net.minecraft.util.ObjectIntIdentityMap field_999999_x"])
++
++		then:
++		def e = thrown(AccessTransformerRuleTranslator.AccessTransformerTranslationException)
++		e.failures[0].contains("field_999999_x")
++	}
++
++	def "成员声明在父类时改写规则到父类"() {
++		given: "一个子类 Sub 继承 Base，方法只声明在 Base 上"
++		def tree = new MemoryMappingTree()
++		Files.writeString(tempDir.resolve("hier.tiny"), """tiny\t2\t0\tofficial\tsrg\tintermediary\tnamed
++c\tbse\tnet/minecraft/Base\tnet/minecraft/class_1\tnet/minecraft/Base
++\tm\t()V\ta\tfunc_100_a\tmethod_1\tdoThing
++c\tsub\tnet/minecraft/Sub\tnet/minecraft/class_2\tnet/minecraft/Sub
++""")
++		Files.newBufferedReader(tempDir.resolve("hier.tiny")).withCloseable { reader ->
++			MappingReader.read(reader, MappingFormat.TINY_2_FILE, tree)
++		}
++
++		and: "继承关系：Sub(notch=sub) 的父类是 Base(notch=bse)"
++		def hierarchy = new AccessTransformerRuleTranslator.ClassHierarchy() {
++			@Override
++			List<String> parentsOf(String className) {
++				return className == "sub" ? ["bse"] : []
++			}
++		}
++
++		when: "AT 规则写在子类上（无空格描述符，与真实 AT 一致）"
++		def result = AccessTransformerRuleTranslator.translate(
++				new AccessTransformerRuleTranslator.Input(
++						["public net.minecraft.Sub func_100_a()V"], tree, "srg", "official", hierarchy))
++
++		then: "规则被改写到声明它的父类，成员名翻译成 notch 名"
++		result == ["public bse a()V"]
++	}
++
++	def "继承链上找不到成员仍然失败"() {
++		given:
++		def tree = new MemoryMappingTree()
++		Files.writeString(tempDir.resolve("hier2.tiny"), """tiny\t2\t0\tofficial\tsrg\tintermediary\tnamed
++c\tbse\tnet/minecraft/Base\tnet/minecraft/class_1\tnet/minecraft/Base
++c\tsub\tnet/minecraft/Sub\tnet/minecraft/class_2\tnet/minecraft/Sub
++""")
++		Files.newBufferedReader(tempDir.resolve("hier2.tiny")).withCloseable { reader ->
++			MappingReader.read(reader, MappingFormat.TINY_2_FILE, tree)
++		}
++
++		def hierarchy = new AccessTransformerRuleTranslator.ClassHierarchy() {
++			@Override
++			List<String> parentsOf(String className) {
++				return className == "sub" ? ["bse"] : []
++			}
++		}
++
++		when:
++		AccessTransformerRuleTranslator.translate(
++				new AccessTransformerRuleTranslator.Input(
++						["public net.minecraft.Sub func_999_nope()V"], tree, "srg", "official", hierarchy))
++
++		then:
++		def e = thrown(AccessTransformerRuleTranslator.AccessTransformerTranslationException)
++		e.failures[0].contains("继承链上也未找到")
++	}
++}

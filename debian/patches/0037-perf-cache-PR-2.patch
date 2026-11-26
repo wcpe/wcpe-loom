@@ -1,0 +1,428 @@
+From fd225dea16d3554b762fa9ce584450045c246e41 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:41 +0800
+Subject: [PATCH 037/147] =?UTF-8?q?perf(cache):=20=E8=A1=A5=E9=BD=90?=
+ =?UTF-8?q?=E4=BE=9B=E7=BB=99=E9=93=BE=E6=97=A0=E9=94=81=E5=BF=AB=E8=B7=AF?=
+ =?UTF-8?q?=E5=BE=84=20&=20=E5=8F=91=E5=B8=83=E4=BD=93=E7=B3=BB=E6=94=B9?=
+ =?UTF-8?q?=20PR=20=E6=A8=A1=E5=BC=8F=20(#2)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* perf(cache): 补齐 mapped jar 与 patched jar 供给的无锁快路径
+
+问题：forge-patched 与 minecraft-provision 两处锁在缓存全满时也整段进锁，
+暖缓存下多项目并行配置同一版本仍要排队抢锁，锁退化为纯串行开销。
+
+改动：
+
+- MinecraftPatchedProvider 及 legacy 子类：provide 在锁外先行只读判定
+  （产物存在 + Loom 补丁版本最新），齐备则不取锁直接返回；remapJar 在
+  dirty=false 时仅注册依赖（纯内存），不取锁。manifest 读取遇到半截损坏
+  产物时按需要工作处理，进锁内走完整判定兜底。
+- CompileConfiguration.provideMappedMinecraftJars：minecraft-provision
+  事务锁前增加锁外暖判定——intermediary/named/srg/mojmap 四组 mapped
+  jar 全部 isUpToDate 时，本次供给不含任何共享缓存写入，整段事务无锁
+  执行；任一不齐仍走原锁内路径（锁内二次确认保持不变）。
+- AbstractMappedMinecraftProvider 新增 public isUpToDate，供外部在锁外
+  做只读判定（实现为 shouldRefreshOutputs 取反）。
+
+锁语义不变：锁只保护「读-判-写」复合动作中的写入段；产物原子落位保证
+「文件存在 ⟺ 内容完整」，读方无锁 exists 即安全。
+
+验证：compileJava、checkstyleMain 通过；全量单元测试 742 项全绿；
+forge 集成测试 13 类 44 项全绿。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+* ci(release): Release Notes 改为自动生成并按类别分组
+
+方案 A：版本改动经由 PR 合入默认分支，发布时用 gh release create
+--generate-notes 自动生成 What's Changed（逐 PR 列出作者与编号）、
+New Contributors 与 Full Changelog，替代手写 CHANGELOG 提取。
+
+- publish.yml release job：softprops action 改为 gh CLI + --generate-notes；
+  检出改 fetch-depth=0，否则对比不到上一版 tag 导致清单缺失。
+- 新增 .github/release.yml：按 label 分组（性能/缺陷/新功能/Forge/重构/文档/
+  测试），dependabot 等机器人作者不进贡献者区。
+
+diff --git a/.github/release.yml b/.github/release.yml
+new file mode 100644
+index 0000000000000000000000000000000000000000..013869aecf07527492a823a04862efea36e02a25
+--- /dev/null
++++ b/.github/release.yml
+@@ -0,0 +1,44 @@
++# GitHub 自动生成 Release Notes 的分组配置（gh release create --generate-notes 读取）。
++# 前提：版本的改动经由 PR 合入默认分支；直推提交不会进入 What's Changed。
++# 命中越靠前的 category 优先级越高；不带 label 的 PR 落入「其他变更」。
++changelog:
++  exclude:
++    labels:
++      - skip-changelog
++    authors:
++      - dependabot
++      - github-actions
++  categories:
++    - title: ⚡ 性能与并发
++      labels:
++        - performance
++        - perf
++        - concurrency
++    - title: 🐛 缺陷修复
++      labels:
++        - bug
++        - fix
++    - title: ✨ 新功能
++      labels:
++        - enhancement
++        - feature
++        - feat
++    - title: 🔨 Forge / NeoForge 支持
++      labels:
++        - forge
++        - neoforge
++        - legacy
++    - title: 🧹 重构
++      labels:
++        - refactor
++        - cleanup
++    - title: 📄 文档
++      labels:
++        - documentation
++        - docs
++    - title: 🧪 测试
++      labels:
++        - test
++        - tests
++    - title: 其他变更
++      labels: []
+diff --git a/.github/workflows/publish.yml b/.github/workflows/publish.yml
+index 0c4eb0b0c3698d56ab285b56ea3269a2829e9240..2ffad9228dff87f1aed44d1d2662e571250e6b6e 100644
+--- a/.github/workflows/publish.yml
++++ b/.github/workflows/publish.yml
+@@ -98,32 +98,20 @@ jobs:
+     steps:
+       - name: 检出代码
+         uses: actions/checkout@v5
++        with:
++          # 生成 Release Notes 需要完整历史：--generate-notes 要对比上一版 tag，
++          # fetch-depth=1 拿不到上一版 tag 会导致 What's Changed / Contributors 缺失
++          fetch-depth: 0
+ 
+-      - name: 提取 CHANGELOG
+-        id: changelog
+-        shell: bash
++      - name: 创建 GitHub Release（自动生成贡献者与变更清单）
++        env:
++          GH_TOKEN: ${{ github.token }}
++          TAG_NAME: ${{ github.ref_name }}
++        # --generate-notes 由 GitHub 按 .github/release.yml 的分组配置自动生成
++        # What's Changed（逐 PR 列出作者与编号）、New Contributors 与 Full Changelog；
++        # 要求该版本的改动经由 PR 合入默认分支（直接 push 的提交不会单独列出）。
+         run: |
+-          VERSION="${{ needs.build.outputs.release-version }}"
+-          BODY=""
+-          # 本线暂无 CHANGELOG.md，缺失时回退为占位说明，不让发布失败
+-          if [ -f CHANGELOG.md ]; then
+-            BODY=$(awk -v ver="$VERSION" '
+-              /^## / { if (found) exit; if ($2 == ver) found=1; next }
+-              found { print }
+-            ' CHANGELOG.md)
+-          fi
+-          if [ -z "$BODY" ]; then
+-            BODY="发布版本 $VERSION"
+-          fi
+-          echo "body<<EOF" >> "$GITHUB_OUTPUT"
+-          echo "$BODY" >> "$GITHUB_OUTPUT"
+-          echo "EOF" >> "$GITHUB_OUTPUT"
+-
+-      - name: 创建 GitHub Release
+-        uses: softprops/action-gh-release@v2
+-        with:
+-          tag_name: ${{ github.ref_name }}
+-          name: wcpe-loom ${{ github.ref_name }}
+-          body: ${{ steps.changelog.outputs.body }}
+-          draft: false
+-          prerelease: false
++          gh release create "$TAG_NAME" \
++            --repo "$GITHUB_REPOSITORY" \
++            --title "wcpe-loom $TAG_NAME" \
++            --generate-notes
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
+index ba4106dd2a6f88a419aca5ea6ef5590b8ba4b1f4..364e839b9cc48ec99252d2513e6fa1f0b07c215c 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftLegacyPatchedProvider.java
+@@ -89,19 +89,25 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 
+ 	@Override
+ 	public void provide() throws Exception {
+-		withPatchedLock(() -> {
+-			String forgeVersion = getExtension().getForgeProvider().getVersion().getCombined();
+-			Path forgeWorkingDir = ForgeProvider.getForgeCache(project);
+-			String patchId = "forge-" + forgeVersion + "-";
++		String forgeVersion = getExtension().getForgeProvider().getVersion().getCombined();
++		Path forgeWorkingDir = ForgeProvider.getForgeCache(project);
++		String patchId = "forge-" + forgeVersion + "-";
++
++		minecraftProvider.setJarPrefix(patchId);
+ 
+-			minecraftProvider.setJarPrefix(patchId);
++		minecraftClientPatchedJar = forgeWorkingDir.resolve("client-patched.jar");
++		minecraftServerPatchedJar = forgeWorkingDir.resolve("server-patched.jar");
++		minecraftMergedPatchedJar = forgeWorkingDir.resolve("merged-patched.jar");
++		minecraftPatchedAtJar = forgeWorkingDir.resolve(type.id + "-at-patched.jar");
++		forgeJar = forgeWorkingDir.resolve("forge.jar");
+ 
+-			minecraftClientPatchedJar = forgeWorkingDir.resolve("client-patched.jar");
+-			minecraftServerPatchedJar = forgeWorkingDir.resolve("server-patched.jar");
+-			minecraftMergedPatchedJar = forgeWorkingDir.resolve("merged-patched.jar");
+-			minecraftPatchedAtJar = forgeWorkingDir.resolve(type.id + "-at-patched.jar");
+-			forgeJar = forgeWorkingDir.resolve("forge.jar");
++		// 无锁快路径：产物齐备且补丁版本最新时，本次仅做内存配置，不触碰共享缓存，不取锁
++		if (!needsWork()) {
++			dirty = false;
++			return;
++		}
+ 
++		withPatchedLock(() -> {
+ 			// 锁内判定：等锁期间其它进程可能已完成生产，checkCache 的 notExists 判定即为二次确认
+ 			checkCache();
+ 
+@@ -110,6 +116,24 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 		});
+ 	}
+ 
++	/**
++	 * {@return 是否需要重建 legacy patched jar}.
++	 *
++	 * <p>产物缺失或 Loom 补丁版本过期即需要工作。manifest 读取遇到损坏文件（多进程并发下的
++	 * 半截产物）时按需要工作处理，进入锁内走完整判定。
++	 */
++	private boolean needsWork() {
++		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(Files::notExists)) {
++			return true;
++		}
++
++		try {
++			return !isPatchedJarUpToDate(minecraftPatchedAtJar) || !isPatchedJarUpToDate(forgeJar);
++		} catch (IOException e) {
++			return true;
++		}
++	}
++
+ 	protected void cleanAllCache() throws IOException {
+ 		for (Path path : getGlobalCaches()) {
+ 			Files.deleteIfExists(path);
+@@ -135,8 +159,17 @@ public class MinecraftLegacyPatchedProvider extends MinecraftPatchedProvider {
+ 
+ 	@Override
+ 	public void remapJar(ServiceFactory serviceFactory) throws Exception {
+-		// 锁内判定：等锁期间其它进程可能已完成生产，notExists 判定即为二次确认
++		// 无锁快路径：provide 已判定产物齐备（needsWork=false → dirty=false）时，本方法的全链
++		// notExists 判定都会短路，无需取锁；仅当 provide 判定需要工作（dirty 或产物缺失）才进锁
++		if (Stream.of(forgeJar, minecraftClientPatchedJar, minecraftServerPatchedJar).allMatch(Files::exists)
++				&& (type != Type.MERGED || Files.exists(minecraftMergedPatchedJar))
++				&& Files.exists(minecraftPatchedAtJar)) {
++			dirty = false;
++			return;
++		}
++
+ 		withPatchedLock(() -> {
++			// 锁内判定：等锁期间其它进程可能已完成生产，notExists 判定即为二次确认
+ 			if (Files.notExists(forgeJar)) {
+ 				dirty = true;
+ 				patchForge();
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+index d2f2222d9f6ebe45c7fd469e0d2d142537e70456..286f8c7e19382b984d94468159dac1763472434a 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+@@ -216,9 +216,34 @@ public class MinecraftPatchedProvider {
+ 
+ 	public void provide() throws Exception {
+ 		initPatchedFiles();
++
++		// 无锁快路径：产物齐备且补丁版本最新时，本次仅做内存配置，不触碰共享缓存，不取锁
++		if (!needsWork()) {
++			this.dirty = false;
++			return;
++		}
++
+ 		withPatchedLock(this::providePatched);
+ 	}
+ 
++	/**
++	 * {@return 是否需要重建 patched jar}.
++	 *
++	 * <p>产物缺失或 Loom 补丁版本过期即需要工作。manifest 读取遇到损坏文件（多进程并发下
++	 * 的半截产物）时按需要工作处理，进入锁内走完整判定。
++	 */
++	private boolean needsWork() {
++		if (getExtension().refreshDeps() || Stream.of(getGlobalCaches()).anyMatch(Files::notExists)) {
++			return true;
++		}
++
++		try {
++			return !isPatchedJarUpToDate(minecraftPatchedJar);
++		} catch (IOException e) {
++			return true;
++		}
++	}
++
+ 	private Void providePatched() throws Exception {
+ 		// 锁内判定：等锁期间其它进程可能已完成生产，checkCache 与 notExists 均为幂等二次确认
+ 		checkCache();
+@@ -244,6 +269,12 @@ public class MinecraftPatchedProvider {
+ 	}
+ 
+ 	public void remapJar(ServiceFactory serviceFactory) throws Exception {
++		// 无锁快路径：provide 已判定无需重建（dirty=false）时，此处仅注册依赖（纯内存操作），不取锁
++		if (!dirty) {
++			registerExtraDependencies();
++			return;
++		}
++
+ 		withPatchedLock(() -> remapPatchedJarWithDirty(serviceFactory));
+ 	}
+ 
+@@ -261,6 +292,11 @@ public class MinecraftPatchedProvider {
+ 			}
+ 		}
+ 
++		registerExtraDependencies();
++		return null;
++	}
++
++	private void registerExtraDependencies() {
+ 		if (getExtension().isUnobfuscatedForge()) {
+ 			DependencyProvider.addDependency(project, getForgeJar(), Constants.Configurations.FORGE_EXTRA);
+ 		}
+@@ -268,8 +304,6 @@ public class MinecraftPatchedProvider {
+ 		if (providesClientJar()) {
+ 			DependencyProvider.addDependency(project, minecraftClientExtra, Constants.Configurations.FORGE_EXTRA);
+ 		}
+-
+-		return null;
+ 	}
+ 
+ 	/**
+diff --git a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+index c61b4aa2efedf2dad2b2aa6d9f138477cd914f19..ecfe4f8de1a3ed70e96143d5047862145b98f1ec 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+@@ -319,31 +319,78 @@ public abstract class CompileConfiguration implements Runnable {
+ 		final String key = "minecraft-provision:" + extension.getMinecraftProvider().minecraftVersion() + ":" + mappingsIdentifier;
+ 		final LoomCacheService cacheService = LoomCacheService.get(project).get();
+ 
++		// 无锁快路径：所有 mapped provider 的产物均已就绪（shouldRefreshOutputs 为纯只读的
++		// 存在性/脏标志检查）时，本次供给不含任何共享缓存写入，内部 provide 各自的快路径
++		// 也不会取锁，故整段事务可无锁执行。
++		final var warmContext = new AbstractMappedMinecraftProvider.ProvideContext(true, extension.refreshDeps(), configContext);
++
++		if (isMappedJarsWarm(extension, project, jarConfiguration, intermediaryMinecraftProvider, namedMinecraftProvider, warmContext)) {
++			provideMappedProviders(extension, project, jarConfiguration, intermediaryMinecraftProvider, namedMinecraftProvider, warmContext);
++			return;
++		}
++
+ 		cacheService.runExclusive(lockRoot, key, LoomCacheService.defaultTimeout(), () -> {
+ 			final var provideContext = new AbstractMappedMinecraftProvider.ProvideContext(true, extension.refreshDeps(), configContext);
++			provideMappedProviders(extension, project, jarConfiguration, intermediaryMinecraftProvider, namedMinecraftProvider, provideContext);
++			return null;
++		});
++	}
+ 
+-			if (intermediaryMinecraftProvider != null) {
+-				extension.setIntermediaryMinecraftProvider(intermediaryMinecraftProvider);
+-				intermediaryMinecraftProvider.provide(provideContext);
+-			}
++	/**
++	 * {@return 所有 mapped provider 的产物是否已就绪（无需重建）}.
++	 *
++	 * <p>shouldRefreshOutputs 仅做文件存在性与脏标志检查，不写入任何共享缓存，可安全在锁外调用。
++	 */
++	private boolean isMappedJarsWarm(LoomGradleExtension extension, Project project, MinecraftJarConfiguration<?, ?, ?> jarConfiguration,
++			IntermediaryMinecraftProvider<?> intermediaryMinecraftProvider,
++			NamedMinecraftProvider<?> namedMinecraftProvider,
++			AbstractMappedMinecraftProvider.ProvideContext context) {
++		if (intermediaryMinecraftProvider != null && !intermediaryMinecraftProvider.isUpToDate(context)) {
++			return false;
++		}
+ 
+-			extension.setNamedMinecraftProvider(namedMinecraftProvider);
+-			namedMinecraftProvider.provide(provideContext);
++		if (!namedMinecraftProvider.isUpToDate(context)) {
++			return false;
++		}
+ 
+-			if (extension.isForge()) {
+-				final SrgMinecraftProvider<?> srgMinecraftProvider = jarConfiguration.createSrgMinecraftProvider(project);
+-				extension.setSrgMinecraftProvider(srgMinecraftProvider);
+-				srgMinecraftProvider.provide(provideContext);
++		if (extension.isForge()) {
++			if (!jarConfiguration.createSrgMinecraftProvider(project).isUpToDate(context)) {
++				return false;
+ 			}
++		}
+ 
+-			if (extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime() && !extension.isUnobfuscatedForge()) {
+-				final MojangMappedMinecraftProvider<?> mojangMappedMinecraftProvider = jarConfiguration.createMojangMappedMinecraftProvider(project);
+-				extension.setMojangMappedMinecraftProvider(mojangMappedMinecraftProvider);
+-				mojangMappedMinecraftProvider.provide(provideContext);
++		if (extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime() && !extension.isUnobfuscatedForge()) {
++			if (!jarConfiguration.createMojangMappedMinecraftProvider(project).isUpToDate(context)) {
++				return false;
+ 			}
++		}
+ 
+-			return null;
+-		});
++		return true;
++	}
++
++	private void provideMappedProviders(LoomGradleExtension extension, Project project, MinecraftJarConfiguration<?, ?, ?> jarConfiguration,
++			IntermediaryMinecraftProvider<?> intermediaryMinecraftProvider,
++			NamedMinecraftProvider<?> namedMinecraftProvider,
++			AbstractMappedMinecraftProvider.ProvideContext provideContext) throws Exception {
++		if (intermediaryMinecraftProvider != null) {
++			extension.setIntermediaryMinecraftProvider(intermediaryMinecraftProvider);
++			intermediaryMinecraftProvider.provide(provideContext);
++		}
++
++		extension.setNamedMinecraftProvider(namedMinecraftProvider);
++		namedMinecraftProvider.provide(provideContext);
++
++		if (extension.isForge()) {
++			final SrgMinecraftProvider<?> srgMinecraftProvider = jarConfiguration.createSrgMinecraftProvider(project);
++			extension.setSrgMinecraftProvider(srgMinecraftProvider);
++			srgMinecraftProvider.provide(provideContext);
++		}
++
++		if (extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime() && !extension.isUnobfuscatedForge()) {
++			final MojangMappedMinecraftProvider<?> mojangMappedMinecraftProvider = jarConfiguration.createMojangMappedMinecraftProvider(project);
++			extension.setMojangMappedMinecraftProvider(mojangMappedMinecraftProvider);
++			mojangMappedMinecraftProvider.provide(provideContext);
++		}
+ 	}
+ 
+ 	private void registerGameProcessors(ConfigContext configContext) {
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
+index d7924997ff23ac7e0087dc8676362f424910d1c1..3c2741e6ba575ef6a825be60e95cdaf8439f7566 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
+@@ -240,6 +240,16 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 		return "net.minecraft:%s:%s".formatted(getName(type), getVersion());
+ 	}
+ 
++	/**
++	 * {@return 产物是否已就绪（无需重建）}.
++	 *
++	 * <p>供外部（如 {@code minecraft-provision} 事务锁的无锁快路径）在锁外做只读判定；
++	 * 实现即 {@link #shouldRefreshOutputs} 的取反，同样仅做文件存在性与脏标志检查。
++	 */
++	public boolean isUpToDate(ProvideContext context) {
++		return !shouldRefreshOutputs(context);
++	}
++
+ 	protected boolean shouldRefreshOutputs(ProvideContext context) {
+ 		if (context.refreshOutputs()) {
+ 			LOGGER.info("Refreshing outputs for mapped jar, as refresh outputs was requested");

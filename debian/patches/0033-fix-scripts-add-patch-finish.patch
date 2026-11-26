@@ -1,0 +1,34 @@
+From 960b0d30c737abcbe357ac8947093ec27cf860bc Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:39 +0800
+Subject: [PATCH 033/147] =?UTF-8?q?fix(scripts):=20=E4=BF=AE=E5=A4=8D=20ad?=
+ =?UTF-8?q?d-patch=20finish=20=E7=9A=84=E8=AF=AD=E6=B3=95=E9=94=99?=
+ =?UTF-8?q?=E8=AF=AF?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上一次改动在替换时丢了引号，导致 for-each-ref 的 --format 参数未加引号、
+且 printf 的格式串被换行拆断，脚本报语法错误。此处修正并补上 add-patch 全流程
+的实测（start → 提交带溯源块的补丁 → 从默认分支 finish → 生成候选并校对）。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/scripts/sync-upstream.sh b/scripts/sync-upstream.sh
+index 8b13cab258c49ddc3b02bb2109c7cf90a5c292e1..c2101f12eaffbc03295ea31a9d417953437cf408 100644
+--- a/scripts/sync-upstream.sh
++++ b/scripts/sync-upstream.sh
+@@ -123,10 +123,9 @@ cmd_add_patch_finish() {
+ 	local branch="${1:-}" queue oldtip cand cands
+ 	# finish 必须从默认分支执行：add-patch 分支切自队列末端，其上没有 scripts/ 目录
+ 	if [ -z "${branch}" ]; then
+-		cands="$(git for-each-ref --format=%(refname:short) refs/heads/add-patch/*)"
++		cands="$(git for-each-ref --format='%(refname:short)' 'refs/heads/add-patch/*')"
+ 		[ -n "${cands}" ] || die "没有 add-patch/* 分支；用法: add-patch finish <分支名>"
+-		[ "$(printf %s
+- "${cands}" | wc -l)" = "1" ] || die "存在多个 add-patch/* 分支，请显式指定：add-patch finish <分支名>"
++		[ "$(printf '%s\n' "${cands}" | wc -l)" = "1" ] || die "存在多个 add-patch/* 分支，请显式指定：add-patch finish <分支名>"
+ 		branch="${cands}"
+ 	fi
+ 	git rev-parse -q --verify "refs/heads/${branch}" >/dev/null || die "分支 ${branch} 不存在"

@@ -1,0 +1,100 @@
+From 49f1c9a020e6016af77945e4f0d9c3074cc1643c Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:43 +0800
+Subject: [PATCH 039/147] =?UTF-8?q?fix(ci):=20=E7=A8=B3=E5=AE=9A=20TestKit?=
+ =?UTF-8?q?=20=E4=BE=9D=E8=B5=96=E8=A7=A3=E6=9E=90=E5=B9=B6=E4=BD=BF=20Rel?=
+ =?UTF-8?q?ease=20=E9=87=8D=E8=B7=91=E5=B9=82=E7=AD=89=20(#3)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- 正式版 Release 已存在时跳过重复创建；处理并发创建竞态，避免同一 tag 重跑返回 422
+- 限制 TestKit 矩阵并发为 6，并缓存独立 TestKit Gradle User Home 的依赖与 wrapper，降低 Maven 403 和 runner 失联
+- 修复 Windows 测试 artifact 名引用未定义的 matrix.java
+- 为 Release Notes 增加通配兜底分类，未标记 PR 也会进入变更清单
+
+本地验收：actionlint 与 YAML 校验通过；SimpleDevOnlyRemapTest 3 项、InterfaceInjectionTest 5 项通过。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/.github/release.yml b/.github/release.yml
+index 586adcc57d0080f80537e75866fe1be7d46d0328..63d05582d0146a76d60c346fa48581960aa148e8 100644
+--- a/.github/release.yml
++++ b/.github/release.yml
+@@ -41,3 +41,5 @@ changelog:
+         - test
+         - tests
+     - title: 其他变更
++      labels:
++        - '*'
+diff --git a/.github/workflows/publish.yml b/.github/workflows/publish.yml
+index 2ffad9228dff87f1aed44d1d2662e571250e6b6e..74f86b6babc1b54d7553848c3f553fb8c2f6f102 100644
+--- a/.github/workflows/publish.yml
++++ b/.github/workflows/publish.yml
+@@ -110,8 +110,24 @@ jobs:
+         # --generate-notes 由 GitHub 按 .github/release.yml 的分组配置自动生成
+         # What's Changed（逐 PR 列出作者与编号）、New Contributors 与 Full Changelog；
+         # 要求该版本的改动经由 PR 合入默认分支（直接 push 的提交不会单独列出）。
++        # 重跑或重复推送同一 tag 时保留现有 Release，避免 gh release create 返回 422。
+         run: |
+-          gh release create "$TAG_NAME" \
++          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
++            echo "::notice::Release $TAG_NAME 已存在，跳过重复创建"
++            exit 0
++          fi
++
++          if gh release create "$TAG_NAME" \
+             --repo "$GITHUB_REPOSITORY" \
+             --title "wcpe-loom $TAG_NAME" \
+-            --generate-notes
++            --generate-notes; then
++            exit 0
++          fi
++
++          # 并发运行可能在检查后、创建前由另一运行先创建；仅在确认 Release 已存在时视为成功。
++          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
++            echo "::notice::Release $TAG_NAME 已由并发运行创建"
++            exit 0
++          fi
++
++          exit 1
+diff --git a/.github/workflows/test-push.yml b/.github/workflows/test-push.yml
+index ef074d6117f1c8848af0a95bf8c2ac4fda7a7cf3..9bec306557ec5566ca56b8e3b251f5aab9781937 100644
+--- a/.github/workflows/test-push.yml
++++ b/.github/workflows/test-push.yml
+@@ -86,6 +86,8 @@ jobs:
+ 
+     strategy:
+       fail-fast: false
++      # TestKit 各矩阵任务共享外部 Maven 仓库，限制并发以降低集中下载触发 403/runner 失联的概率。
++      max-parallel: 6
+       matrix:
+         test: ${{ fromJson(needs.prepare_test_matrix.outputs.matrix) }}
+ 
+@@ -93,6 +95,16 @@ jobs:
+ 
+     steps:
+       - uses: actions/checkout@v6
++      # TestKit 使用 .gradle/test-files/integration/gradle_home，不是 runner 默认 Gradle User Home。
++      - name: 缓存 TestKit Gradle 依赖
++        uses: actions/cache@v6
++        with:
++          path: |
++            .gradle/test-files/integration/gradle_home/caches/modules-2
++            .gradle/test-files/integration/gradle_home/wrapper/dists
++          key: ${{ runner.os }}-testkit-gradle-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', '**/*.gradle', '**/*.gradle.kts', 'src/test/**') }}
++          restore-keys: |
++            ${{ runner.os }}-testkit-gradle-
+       # Forge 自带的 ForgeFlower 反编译器不支持 JDK 25，需为 forge 系列测试准备 JDK 21（放在 25 之前，避免顶掉 JAVA_HOME）
+       - name: setup jdk 21 (Forge tooling)
+         uses: actions/setup-java@v5
+@@ -154,7 +166,7 @@ jobs:
+       - uses: actions/upload-artifact@v7
+         if: ${{ failure() }}
+         with:
+-          name: ${{ steps.test.outputs.test }} (${{ matrix.java }}) Results (Windows)
++          name: ${{ steps.test.outputs.test }} Results (Windows)
+           path: build/reports/
+       - uses: actions/upload-artifact@v7
+         if: ${{ failure() }}

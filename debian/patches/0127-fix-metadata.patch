@@ -1,0 +1,421 @@
+From 932995a1c4559adc4ed5340931ecd8f99487db58 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Tue, 3 Nov 2026 00:13:39 +0800
+Subject: [PATCH 127/147] =?UTF-8?q?fix(metadata):=20=E7=89=88=E6=9C=AC?=
+ =?UTF-8?q?=E6=B8=85=E5=8D=95=E6=8B=89=E5=8F=96=E5=A4=B1=E8=B4=A5=E6=97=B6?=
+ =?UTF-8?q?=E9=99=8D=E7=BA=A7=E7=94=A8=E6=9C=AC=E5=9C=B0=E5=89=AF=E6=9C=AC?=
+ =?UTF-8?q?=E5=B9=B6=E7=BC=A9=E7=9F=AD=E8=B6=85=E6=97=B6?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+配置期必然联网拉 version_manifest_v2.json：setupMinecraft 里读
+minecraftJarConfiguration，其 convention 要 versionMeta，而 versionMeta 来自
+版本清单，策略是 maxAge(ONE_DAY)——超过一天必重新下载。这一步在 afterEvaluate
+里，下载失败即项目配置失败，整个构建起不来（help 也一样）。
+
+原超时 connectTimeout(2min) + requestTimeout(10min)，重试 3 次。受限网络下
+实测单次配置要 485~534 秒才失败，且多个构建并发时会一起卡住。
+
+三处改动：
+
+1. 元数据下载超时压到 15s 连接 / 30s 请求（DownloadBuilder 新增
+   connectTimeout/requestTimeout，Download 按超时值缓存 HttpClient）。
+   最坏情况从 8~9 分钟降到 45 秒量级。
+
+2. 下载失败时降级读本地已有副本（readManifestEntryFromCache：不校验 maxAge、
+   不联网），并在日志里 warn 说明用的是旧副本。本地也没有副本才抛原始异常，
+   不掩盖真正的问题。
+   注意：必须捕 IOException —— DownloadException 继承自它而非 RuntimeException。
+
+3. 新增 refreshVersionsManifest 任务，显式强制刷新清单（forceDownload，
+   超时 30s）。配置期降级后清单可能长期停在旧版本，这是给人用的明确入口。
+   该任务不参与任何依赖图，只手动调用。
+
+验证：在 AllinCore 工程上用 init script 注入一个不可达的清单 URL（
+http://127.0.0.1:9/hole.json）并预置其过期本地副本，观察到
+「无法刷新 Minecraft 版本清单……本次改用本地已有副本」且 BUILD SUCCESSFUL；
+对照：无本地副本时同样场景 9 秒内失败（原为 485~534 秒）。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: metadata-offline-resilience
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftMetadataProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftMetadataProvider.java
+index 6bf080d8e1e34b2ddac156d21c8eae0a4a637e9d..7c7d89e97147d7434e8fbf18028d0ce770930fa9 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftMetadataProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftMetadataProvider.java
+@@ -26,7 +26,10 @@ package net.fabricmc.loom.configuration.providers.minecraft;
+ 
+ import java.io.IOException;
+ import java.io.UncheckedIOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.time.Duration;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.function.Function;
+@@ -51,6 +54,17 @@ public final class MinecraftMetadataProvider {
+ 	/** L2 规格层命名空间：版本清单的「目标版本条目」缓存. */
+ 	private static final String NAMESPACE_VERSIONS_MANIFEST = "versions-manifest";
+ 
++	/**
++	 * 元数据类下载的连接超时.
++	 *
++	 * <p>取得很短：这类下载失败时只影响「能不能拿到最新的版本清单」，不影响构建能否开始（
++	 * 有本地副本就降级）。默认的 2 分钟会让一次网络抖动把整个构建挂上数分钟。
++	 */
++	private static final Duration METADATA_CONNECT_TIMEOUT = Duration.ofSeconds(15);
++
++	/** 元数据类下载的单次请求超时. */
++	private static final Duration METADATA_REQUEST_TIMEOUT = Duration.ofSeconds(30);
++
+ 	private static final Logger LOGGER = LoggerFactory.getLogger(MinecraftMetadataProvider.class);
+ 
+ 	private final Options options;
+@@ -149,15 +163,69 @@ public final class MinecraftMetadataProvider {
+ 			builder = builder.defaultCache();
+ 		}
+ 
++		// 元数据下载是「拿不到就让构建起不来」的强依赖，因此把超时压到「快速失败」的量级：
++		// 默认的 2 分钟连接 + 10 分钟请求 × 3 次重试，在网络抖动的环境下实测单次配置要 8~9 分钟，
++		// 而且最终仍然失败。压到 15s / 30s 后最坏情况在 45s 量级内落定，要么成功要么降级。
++		builder = builder.connectTimeout(METADATA_CONNECT_TIMEOUT)
++				.requestTimeout(METADATA_REQUEST_TIMEOUT);
++
+ 		final Path cacheFile = location.cacheFile(options.userCache());
+-		final String versionManifest = builder.downloadString(cacheFile);
+-		final VersionsManifest.Version version = findVersion(versionManifest, cacheFile);
+ 
+-		if (version != null) {
+-			return new ManifestEntryLocation(location, version);
++		try {
++			final String versionManifest = builder.downloadString(cacheFile);
++			final VersionsManifest.Version version = findVersion(versionManifest, cacheFile);
++
++			if (version != null) {
++				return new ManifestEntryLocation(location, version);
++			}
++
++			return null;
++		} catch (IOException e) {
++			// 下载失败且本地已有可用的旧清单时降级：元数据只用来「选侧/找版本 URL」，
++			// 不是产物本身。本地副本完全够用，不该因为拉不到新版就把整个构建打死。
++			//
++			// 注意：必须捕 IOException —— DownloadException 继承自它而不是 RuntimeException，
++			// 写成 catch (RuntimeException) 会让异常直接冒泡、降级分支永不执行。
++			final ManifestEntryLocation fallback = readManifestEntryFromCache(location, cacheFile);
++
++			if (fallback != null) {
++				LOGGER.warn(
++						"无法刷新 Minecraft 版本清单（{}），本次改用本地已有副本：{}",
++						location.url(),
++						e.getMessage()
++				);
++				return fallback;
++			}
++
++			// 本地也没有可用的旧副本——退回到原始失败，不掩盖真正的问题。
++			throw e;
++		}
++	}
++
++	/**
++	 * 从已落盘的清单副本里取目标版本条目，供「下载失败时降级」使用.
++	 *
++	 * <p>不校验 maxAge、不联网：本地文件存在且能解析出目标版本就够。
++	 */
++	@Nullable
++	private ManifestEntryLocation readManifestEntryFromCache(ManifestLocation location, Path cacheFile) {
++		if (!Files.isRegularFile(cacheFile)) {
++			return null;
+ 		}
+ 
+-		return null;
++		try {
++			final String json = Files.readString(cacheFile, StandardCharsets.UTF_8);
++			final VersionsManifest.Version version = findVersion(json, cacheFile);
++
++			if (version == null) {
++				return null;
++			}
++
++			return new ManifestEntryLocation(location, version);
++		} catch (RuntimeException | IOException e) {
++			LOGGER.debug("本地版本清单副本不可用：{}", cacheFile, e);
++			return null;
++		}
+ 	}
+ 
+ 	/**
+diff --git a/src/main/java/net/fabricmc/loom/task/LoomTasks.java b/src/main/java/net/fabricmc/loom/task/LoomTasks.java
+index 6922ad71e60d2a5ed438e4b7decc5c4af248d1e9..2bd25b9a70a53bbc042dfccf2d462ce239f2227f 100644
+--- a/src/main/java/net/fabricmc/loom/task/LoomTasks.java
++++ b/src/main/java/net/fabricmc/loom/task/LoomTasks.java
+@@ -69,6 +69,10 @@ public abstract class LoomTasks implements Runnable {
+ 			registerMigrateMappingsTasks();
+ 		}
+ 
++		// 配置期拉不到版本清单时会降级用本地副本（见 MinecraftMetadataProvider），
++		// 代价是清单可能长期停在旧版本。这个任务给出显式刷新入口。
++		getTasks().register("refreshVersionsManifest", RefreshVersionsManifestTask.class);
++
+ 		var generateLog4jConfig = getTasks().register("generateLog4jConfig", GenerateLog4jConfigTask.class, t -> {
+ 			t.setDescription("Generate the log4j config file");
+ 		});
+diff --git a/src/main/java/net/fabricmc/loom/task/RefreshVersionsManifestTask.java b/src/main/java/net/fabricmc/loom/task/RefreshVersionsManifestTask.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..f228d0b3dda4d59d551c0a0da00fe33c9b80548d
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/task/RefreshVersionsManifestTask.java
+@@ -0,0 +1,106 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2025 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.task;
++
++import java.io.IOException;
++import java.nio.file.Path;
++import java.time.Duration;
++
++import org.gradle.api.provider.Property;
++import org.gradle.api.tasks.Input;
++import org.gradle.api.tasks.TaskAction;
++import org.gradle.work.DisableCachingByDefault;
++
++import net.fabricmc.loom.LoomGradleExtension;
++import net.fabricmc.loom.configuration.providers.minecraft.ManifestLocations.ManifestLocation;
++import net.fabricmc.loom.util.Constants;
++import net.fabricmc.loom.util.download.DownloadBuilder;
++
++/**
++ * 强制刷新 Minecraft 版本清单缓存.
++ *
++ * <p>配置期只在清单超过 {@code maxAge}（一天）时才尝试联网，且失败时降级用本地副本
++ * （见 {@code MinecraftMetadataProvider}）。因此拉取失败不会阻塞构建，代价是清单可能长期停在旧版本。
++ * 本任务提供显式入口：拿得到就刷新，拿不到就明确报错，而不是默默继续用旧的。
++ *
++ * <p>典型用法：
++ * <ul>
++ *     <li>刚发布新 MC 版本、想让它出现在版本清单里；</li>
++ *     <li>怀疑本地清单太旧导致选错了客户端/服务端。</li>
++ * </ul>
++ *
++ * <p>不参与任何其他任务的依赖图，只由人手动调用。
++ */
++@DisableCachingByDefault
++public abstract class RefreshVersionsManifestTask extends AbstractLoomTask {
++	/**
++	 * 刷新使用的连接超时（秒）.
++	 *
++	 * <p>比配置期宽容：这是人主动等的一次性操作，不需要「快速失败」。
++	 */
++	@Input
++	public abstract Property<Integer> getConnectTimeoutSeconds();
++
++	public RefreshVersionsManifestTask() {
++		setGroup(Constants.TaskGroup.FABRIC);
++		setDescription("强制刷新 Minecraft 版本清单缓存（配置期拉不到时会降级用旧副本，本任务则必须成功）");
++		getConnectTimeoutSeconds().convention(30);
++	}
++
++	@TaskAction
++	public void refresh() throws IOException {
++		final LoomGradleExtension extension = getExtension();
++		final Path userCache = extension.getFiles().getUserCache().toPath();
++
++		int refreshed = 0;
++		int failed = 0;
++
++		for (ManifestLocation location : extension.getVersionsManifests()) {
++			final Path cacheFile = location.cacheFile(userCache);
++
++			try {
++				final DownloadBuilder builder = extension.download(location.url())
++						.forceDownload()
++						.connectTimeout(Duration.ofSeconds(getConnectTimeoutSeconds().get()));
++
++				final String json = builder.downloadString(cacheFile);
++
++				getLogger().lifecycle("已刷新版本清单 [{}] -> {}（{} 字符）", location.name(), cacheFile, json.length());
++				refreshed++;
++			} catch (RuntimeException e) {
++				failed++;
++				getLogger().error("刷新版本清单失败 [{}] {}：{}", location.name(), location.url(), e.getMessage());
++			}
++		}
++
++		if (refreshed == 0 && failed > 0) {
++			throw new IOException("所有版本清单都刷新失败（" + failed + " 个），请检查网络或代理设置");
++		}
++
++		if (failed > 0) {
++			getLogger().warn("有 {} 个版本清单刷新失败，其余 {} 个已更新", failed, refreshed);
++		}
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/util/download/Download.java b/src/main/java/net/fabricmc/loom/util/download/Download.java
+index 9ac6e663a445677ffd4b38369367f48478643788..23490a377e99572132c4df6bf490b3c47ae8eb68 100644
+--- a/src/main/java/net/fabricmc/loom/util/download/Download.java
++++ b/src/main/java/net/fabricmc/loom/util/download/Download.java
+@@ -71,12 +71,41 @@ public final class Download {
+ 
+ 	// 陈旧临时文件的回收阈值（仅用于清理被 kill 掉的构建留下的 .part，不影响热路径）
+ 	private static final Duration PART_RETENTION = Duration.ofHours(1);
+-	private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
+-			.executor(Executors.newVirtualThreadPerTaskExecutor())
+-			.followRedirects(HttpClient.Redirect.ALWAYS)
+-			.proxy(ProxySelector.getDefault())
+-			.connectTimeout(Duration.ofMinutes(2))
+-			.build();
++
++	/** 默认连接超时. */
++	public static final Duration DEFAULT_CONNECT_TIMEOUT = Duration.ofMinutes(2);
++
++	/** 默认单次请求超时. */
++	public static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofMinutes(10);
++
++	private static final HttpClient HTTP_CLIENT = newClient(DEFAULT_CONNECT_TIMEOUT);
++
++	/**
++	 * 按连接超时值缓存客户端.
++	 *
++	 * <p>{@link HttpClient} 的连接超时只能在构建时定下，而本类允许单次下载覆盖它
++	 * （见 {@link DownloadBuilder#connectTimeout(Duration)}）。这里按超时值分流，避免
++	 * 为每一次下载都新建一个客户端（那会各自持有独立的线程池与连接）。
++	 */
++	private static final java.util.concurrent.ConcurrentHashMap<Duration, HttpClient> CLIENT_CACHE =
++			new java.util.concurrent.ConcurrentHashMap<>();
++
++	private static HttpClient newClient(Duration connectTimeout) {
++		return HttpClient.newBuilder()
++				.executor(Executors.newVirtualThreadPerTaskExecutor())
++				.followRedirects(HttpClient.Redirect.ALWAYS)
++				.proxy(ProxySelector.getDefault())
++				.connectTimeout(connectTimeout)
++				.build();
++	}
++
++	private static HttpClient clientFor(Duration connectTimeout) {
++		if (DEFAULT_CONNECT_TIMEOUT.equals(connectTimeout)) {
++			return HTTP_CLIENT;
++		}
++
++		return CLIENT_CACHE.computeIfAbsent(connectTimeout, Download::newClient);
++	}
+ 
+ 	public static DownloadBuilder create(String url) throws URISyntaxException {
+ 		return DownloadBuilder.create(url);
+@@ -88,23 +117,28 @@ public final class Download {
+ 	private final boolean forceDownload;
+ 	private final boolean offline;
+ 	private final Duration maxAge;
++	private final Duration connectTimeout;
++	private final Duration requestTimeout;
+ 	private final DownloadProgressListener progressListener;
+ 	private final HttpClient.Version httpVersion;
+ 
+-	Download(URI url, @Nullable String expectedHash, boolean useEtag, boolean forceDownload, boolean offline, Duration maxAge, DownloadProgressListener progressListener, HttpClient.Version httpVersion) {
++	Download(URI url, @Nullable String expectedHash, boolean useEtag, boolean forceDownload, boolean offline, Duration maxAge,
++			Duration connectTimeout, Duration requestTimeout, DownloadProgressListener progressListener, HttpClient.Version httpVersion) {
+ 		this.url = url;
+ 		this.expectedHash = expectedHash;
+ 		this.useEtag = useEtag;
+ 		this.forceDownload = forceDownload;
+ 		this.offline = offline;
+ 		this.maxAge = maxAge;
++		this.connectTimeout = connectTimeout;
++		this.requestTimeout = requestTimeout;
+ 		this.progressListener = progressListener;
+ 		this.httpVersion = httpVersion;
+ 	}
+ 
+ 	private HttpRequest.Builder requestBuilder() {
+ 		return HttpRequest.newBuilder(url)
+-				.timeout(Duration.ofMinutes(10))
++				.timeout(requestTimeout)
+ 				.version(httpVersion)
+ 				.GET();
+ 	}
+@@ -128,7 +162,7 @@ public final class Download {
+ 		progressListener.onStart();
+ 
+ 		try {
+-			return HTTP_CLIENT.send(httpRequest, bodyHandler);
++			return clientFor(connectTimeout).send(httpRequest, bodyHandler);
+ 		} catch (IOException | InterruptedException e) {
+ 			throw error(e, "Failed to download (%s)", url);
+ 		}
+diff --git a/src/main/java/net/fabricmc/loom/util/download/DownloadBuilder.java b/src/main/java/net/fabricmc/loom/util/download/DownloadBuilder.java
+index b9366d527cbce5b4c22ccb8ee4534e94b1093436..457e8429ee5d09174c784f0f78b829938f9246a4 100644
+--- a/src/main/java/net/fabricmc/loom/util/download/DownloadBuilder.java
++++ b/src/main/java/net/fabricmc/loom/util/download/DownloadBuilder.java
+@@ -47,6 +47,8 @@ public class DownloadBuilder {
+ 	private boolean forceDownload = false;
+ 	private boolean offline = false;
+ 	private Duration maxAge = Duration.ZERO;
++	private Duration connectTimeout = Download.DEFAULT_CONNECT_TIMEOUT;
++	private Duration requestTimeout = Download.DEFAULT_REQUEST_TIMEOUT;
+ 	private DownloadProgressListener progressListener = DownloadProgressListener.NONE;
+ 	private int maxRetries = 3;
+ 	private boolean allowInsecureProtocol = false;
+@@ -100,6 +102,27 @@ public class DownloadBuilder {
+ 		return maxAge(ONE_DAY);
+ 	}
+ 
++	/**
++	 * 覆盖连接超时.
++	 *
++	 * <p>默认值见 {@link Download#DEFAULT_CONNECT_TIMEOUT}。给「拉不到就快速过去」的探测型下载
++	 * 用更短的值，避免一次网络抖动把整个构建挂上数分钟。
++	 */
++	public DownloadBuilder connectTimeout(Duration duration) {
++		this.connectTimeout = duration;
++		return this;
++	}
++
++	/**
++	 * 覆盖单次请求超时（不含重试）.
++	 *
++	 * <p>默认值见 {@link Download#DEFAULT_REQUEST_TIMEOUT}。
++	 */
++	public DownloadBuilder requestTimeout(Duration duration) {
++		this.requestTimeout = duration;
++		return this;
++	}
++
+ 	public DownloadBuilder allowInsecureProtocol() {
+ 		this.allowInsecureProtocol = true;
+ 		return this;
+@@ -115,7 +138,8 @@ public class DownloadBuilder {
+ 			throw new IllegalArgumentException("Cannot create download for url (%s) with insecure protocol".formatted(url.toString()));
+ 		}
+ 
+-		return new Download(this.url, this.expectedHash, this.useEtag, this.forceDownload, this.offline, maxAge, progressListener, httpVersion);
++		return new Download(this.url, this.expectedHash, this.useEtag, this.forceDownload, this.offline, maxAge,
++				connectTimeout, requestTimeout, progressListener, httpVersion);
+ 	}
+ 
+ 	public CompletableFuture<DownloadResult> downloadPathAsync(Path path, DownloadExecutor executor) {

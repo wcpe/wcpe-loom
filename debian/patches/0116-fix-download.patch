@@ -1,0 +1,980 @@
+From bef6358b18e93cc773c4e08fded1c4de4ba6b028 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Sun, 1 Nov 2026 07:19:40 +0800
+Subject: [PATCH 116/147] =?UTF-8?q?fix(download):=20=E4=B8=8B=E8=BD=BD?=
+ =?UTF-8?q?=E9=94=81=E6=94=B9=E4=B8=BA=E3=80=8C=E5=88=A4=E6=B4=BB=20+=20?=
+ =?UTF-8?q?=E6=8E=A5=E7=AE=A1=E3=80=8D=EF=BC=8C=E4=B8=8D=E5=86=8D=E8=AF=AF?=
+ =?UTF-8?q?=E4=BC=A4=E5=B9=B6=E5=8F=91=E4=B8=8E=E5=B4=A9=E6=BA=83=E6=AE=8B?=
+ =?UTF-8?q?=E7=95=99?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+<name>.lock 原本是"下载前先独占创建、结束前删掉"的一次性标记，它的存在被同时用来
+表达两件完全不同的事：「有人在写」和「必须重下」。这条语义在并发场景下两头都错：
+
+  · 两个构建同时冷下载同一文件时，后到的 Files.createFile 直接抛 DownloadException
+    （Download.java:453-457），只能靠 DownloadBuilder.withRetries 重试才自愈；
+  · 进程被 kill 后残留的锁文件，下一次下载见到它就判定「强制重下」
+    （Download.java:331-334）——本地文件完好也白下载一遍几十 MB。
+
+改为按持有者信息判活，并把「正在写」与「残留」分开处理（新增 DownloadLock）：
+
+  · 锁文件里写 pid / 进程启动时刻 / hostname / token（写完才认自己持锁成功）；
+  · 本机 PID 不存在，或进程启动时刻与记录不符（PID 被复用）-> 残留，立即接管；
+  · 本机 PID 还活着且不是本 JVM -> 正在写，等待；
+  · 本 JVM：本 classloader 的持有表里有它 -> 另一个线程在写，等待；没有且锁文件已
+    存在超过 10s -> 本 JVM 的遗留锁，接管；
+  · 跨主机（共享缓存盘）或持有者信息还没写出 -> 只能按锁文件年龄推断（2s / 30min）；
+  · 等待超时后**接管**而不是失败：正确性不依赖这把锁——内容写入本次尝试专用的唯一
+    临时文件（<name>.<uuid>.part），写完用 AtomicFiles.move 原子落位，两个写入者
+    同时存在最多重复一次网络传输，不会产出半成品。
+
+requiresDownload 相应不再查看锁文件：本地文件是否可用只由存在性、期望 hash、maxAge
+决定，锁文件存在与否与此无关。downloadAttempt 这个只服务于旧语义的字段随之删除。
+
+配套的两处修正：
+
+  · 临时文件名加唯一后缀。原本固定的 <name>.part 在并发下会被两个写入者互相踩踏
+    （后来者 CREATE_NEW 直接失败，或删掉前者正在写的文件）。改唯一名后，代价是被
+    kill 的构建留下的 .part 不再被下一次下载顺手删掉，因此在冷路径（已决定要下载）
+    里回收同一目标一小时以前的临时文件；热路径不做任何目录 IO。
+  · etag 从锁外挪到锁内读。锁外读到的是另一个写入者落位之前的旧文件，拿它当
+    If-None-Match 只会换回一个毫无意义的 304。
+
+热路径（文件已存在且 hash 匹配）零额外开销：requiresDownload 命中时 downloadPath
+直接返回，从不创建、不打开也不 stat 锁文件，与改造前逐字节等价。
+
+产物落位路径、缓存键、任务输入输出属性一律未改，既有 Gradle 缓存不受影响。
+
+测试（DownloadFileTest 新增三条）：
+  · 残留锁被接管：预置一个 pid 不存在的陈旧锁，断言既不抛异常也不重下；目标文件缺失
+    时则接管并正常下载；
+  · 两线程并发下载同一文件：maxRetries(1) 下两个调用都成功、内容完整、只发生一次
+    网络请求（后到者等锁期间前一个已落位，锁内重检直接复用）；
+  · 热路径不取锁：第二次调用不请求、不产生锁文件、不留 .part。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: assets-download-lock
+
+diff --git a/src/main/java/net/fabricmc/loom/util/download/Download.java b/src/main/java/net/fabricmc/loom/util/download/Download.java
+index 5d6815bd21f20d7a3ba417998a22c7cc5a32170a..9ac6e663a445677ffd4b38369367f48478643788 100644
+--- a/src/main/java/net/fabricmc/loom/util/download/Download.java
++++ b/src/main/java/net/fabricmc/loom/util/download/Download.java
+@@ -46,6 +46,7 @@ import java.time.Duration;
+ import java.time.Instant;
+ import java.util.Locale;
+ import java.util.Optional;
++import java.util.UUID;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.atomic.AtomicLong;
+ import java.util.function.IntConsumer;
+@@ -62,6 +63,14 @@ import net.fabricmc.loom.util.cache.AtomicFiles;
+ public final class Download {
+ 	private static final String E_TAG = "ETag";
+ 	private static final Logger LOGGER = LoggerFactory.getLogger(Download.class);
++
++	// 等待「另一个进程/线程正在写同一文件」的上限。超时后不再失败，而是接管锁继续下载：
++	// 内容由「本次尝试专用的唯一临时文件 + 原子落位」保证完整，多一个写入者最多重复一次网络传输。
++	// 实测正常热路径（文件已存在）根本不会走到这里，冷下载的典型耗时在秒级。
++	private static final Duration LOCK_WAIT_TIMEOUT = Duration.ofMinutes(2);
++
++	// 陈旧临时文件的回收阈值（仅用于清理被 kill 掉的构建留下的 .part，不影响热路径）
++	private static final Duration PART_RETENTION = Duration.ofHours(1);
+ 	private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
+ 			.executor(Executors.newVirtualThreadPerTaskExecutor())
+ 			.followRedirects(HttpClient.Redirect.ALWAYS)
+@@ -81,9 +90,8 @@ public final class Download {
+ 	private final Duration maxAge;
+ 	private final DownloadProgressListener progressListener;
+ 	private final HttpClient.Version httpVersion;
+-	private final int downloadAttempt;
+ 
+-	Download(URI url, @Nullable String expectedHash, boolean useEtag, boolean forceDownload, boolean offline, Duration maxAge, DownloadProgressListener progressListener, HttpClient.Version httpVersion, int downloadAttempt) {
++	Download(URI url, @Nullable String expectedHash, boolean useEtag, boolean forceDownload, boolean offline, Duration maxAge, DownloadProgressListener progressListener, HttpClient.Version httpVersion) {
+ 		this.url = url;
+ 		this.expectedHash = expectedHash;
+ 		this.useEtag = useEtag;
+@@ -92,7 +100,6 @@ public final class Download {
+ 		this.maxAge = maxAge;
+ 		this.progressListener = progressListener;
+ 		this.httpVersion = httpVersion;
+-		this.downloadAttempt = downloadAttempt;
+ 	}
+ 
+ 	private HttpRequest.Builder requestBuilder() {
+@@ -156,99 +163,124 @@ public final class Download {
+ 		}
+ 
+ 		try {
+-			doDownload(output);
++			return new DownloadResultImpl(doDownload(output));
+ 		} catch (Throwable throwable) {
+-			tryCleanup(output);
+ 			throw error(throwable, "Failed to download file from (%s) to (%s)", url, output);
+ 		} finally {
+ 			progressListener.onEnd();
+ 		}
+-
+-		return new DownloadResultImpl(true);
+ 	}
+ 
+-	private void doDownload(Path output) throws DownloadException {
+-		Optional<String> eTag = Optional.empty();
+-
+-		if (!forceDownload && useEtag && exists(output)) {
+-			eTag = readEtag(output);
+-		}
+-
++	/**
++	 * {@return 本次调用是否真的写了文件（并发去重时可能由另一个写入者代劳）}.
++	 */
++	private boolean doDownload(Path output) throws DownloadException {
+ 		try {
+ 			Files.createDirectories(output.getParent());
+ 		} catch (IOException e) {
+ 			throw error(e, "Failed to create parent directories");
+ 		}
+ 
+-		final HttpRequest httpRequest = eTag
+-				.map(this::getETagRequest)
+-				.orElseGet(this::getRequest);
+-
+-		// Create a .lock file, this allows us to re-download if the download was forcefully aborted part way through.
+-		createLock(output);
+-		HttpResponse<InputStream> response = send(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
+-		getAndResetLock(output);
++		// <name>.lock 只负责「同一个文件不并发写」，持有者信息写在锁文件里；
++		// 残留锁（持有者已不在）由 DownloadLock 判活后直接接管，既不报错也不触发重下。
++		// 下载全程持锁：后到者不为同一个文件重复走一趟网络。
++		final DownloadLock lock;
+ 
+-		final int statusCode = response.statusCode();
+-		boolean success = statusCode == HttpURLConnection.HTTP_NOT_MODIFIED || (statusCode >= 200 && statusCode < 300);
++		try {
++			lock = DownloadLock.acquire(getLockFile(output), LOCK_WAIT_TIMEOUT);
++		} catch (IOException e) {
++			throw error(e, "Failed to acquire lock on %s", getLockFile(output));
++		}
+ 
+-		if (statusCode == HttpURLConnection.HTTP_NOT_MODIFIED) {
+-			try {
+-				// Update the last modified time so we don't retry the request until the max age has passed again.
+-				Files.setLastModifiedTime(output, FileTime.from(Instant.now()));
+-			} catch (IOException e) {
+-				throw error(e, "Failed to update last modified time");
++		try (lock) {
++			// 锁内重检（只在真的等过锁时才做）：持锁者在此期间可能已经把完整文件落位（同一 URL、
++			// 同一期望 hash）。没等过就不可能有人写过，重检只会白多一次 IO，热路径不受影响。
++			if (lock.waitedForLock() && !requiresDownload(output)) {
++				LOGGER.debug("等待下载锁期间 {} 已由其它写入者完成，直接复用", output);
++				return false;
+ 			}
+ 
+-			// Success, etag matched.
+-			return;
+-		}
++			// etag 在锁内读：锁外读到的是另一个写入者落位之前的旧文件，拿它当 If-None-Match
++			// 只会得到一个毫无意义的 304
++			final Optional<String> eTag = !forceDownload && useEtag && exists(output) ? readEtag(output) : Optional.empty();
++			final HttpRequest httpRequest = eTag
++					.map(this::getETagRequest)
++					.orElseGet(this::getRequest);
+ 
+-		if (!success) {
+-			throw statusError("HTTP request returned unsuccessful status (%d)", statusCode);
+-		}
++			final HttpResponse<InputStream> response = send(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
++			final int statusCode = response.statusCode();
++			boolean success = statusCode == HttpURLConnection.HTTP_NOT_MODIFIED || (statusCode >= 200 && statusCode < 300);
+ 
+-		downloadToPath(output, response);
++			if (statusCode == HttpURLConnection.HTTP_NOT_MODIFIED) {
++				try {
++					// Update the last modified time so we don't retry the request until the max age has passed again.
++					Files.setLastModifiedTime(output, FileTime.from(Instant.now()));
++				} catch (IOException e) {
++					throw error(e, "Failed to update last modified time");
++				}
+ 
+-		if (useEtag) {
+-			final HttpHeaders headers = response.headers();
+-			final String responseETag = headers.firstValue(E_TAG.toLowerCase(Locale.ROOT)).orElse(null);
++				// Success, etag matched.
++				return false;
++			}
+ 
+-			if (responseETag != null) {
+-				writeEtag(output, responseETag);
++			if (!success) {
++				throw statusError("HTTP request returned unsuccessful status (%d)", statusCode);
+ 			}
+-		}
+ 
+-		if (expectedHash != null) {
+-			// Ensure we downloaded the expected hash.
+-			if (!isHashValid(output)) {
+-				String downloadedHash;
++			downloadToPath(output, response);
+ 
+-				try {
+-					downloadedHash = Checksum.of(output).sha1().hex();
+-					Files.deleteIfExists(output);
+-				} catch (IOException e) {
+-					downloadedHash = "unknown hash";
++			if (useEtag) {
++				final HttpHeaders headers = response.headers();
++				final String responseETag = headers.firstValue(E_TAG.toLowerCase(Locale.ROOT)).orElse(null);
++
++				if (responseETag != null) {
++					writeEtag(output, responseETag);
+ 				}
++			}
++
++			if (expectedHash != null) {
++				// Ensure we downloaded the expected hash.
++				if (!isHashValid(output)) {
++					String downloadedHash;
+ 
+-				throw error("Failed to download (%s) with expected hash: %s got %s", url, expectedHash, downloadedHash);
++					try {
++						downloadedHash = Checksum.of(output).sha1().hex();
++						Files.deleteIfExists(output);
++					} catch (IOException e) {
++						downloadedHash = "unknown hash";
++					}
++
++					throw error("Failed to download (%s) with expected hash: %s got %s", url, expectedHash, downloadedHash);
++				}
+ 			}
++
++			return true;
+ 		}
+ 	}
+ 
+ 	private void downloadToPath(Path output, HttpResponse<InputStream> response) throws DownloadException {
+-		// Download the file initially to a .part file
+-		final Path partFile = getPartFile(output);
+-
+ 		// 刻意不在下载前删除 output：那会留下「文件不存在」的窗口，而 output 是可以被并发读取的共享缓存产物
+ 		// （依赖 jar 就是被 remap classpath 读的）。读方在窗口里打开它，关闭时就会因 toRealPath() 失败而把该
+ 		// 路径的 zipfs 登记簿条目永久留成死实例（JDK-8291712）。old output 由下载完成后的原子 move 覆盖。
++		//
++		// 临时文件按「每次尝试唯一」命名：两个写入者重叠时（锁被超时接管、上一轮的临时文件未清）各写各的，
++		// 写完再原子落位，谁也覆盖不了谁。
++		deleteStalePartFiles(output);
++		final Path partFile = getUniquePartFile(output);
++
+ 		try {
+-			Files.deleteIfExists(partFile);
+-		} catch (IOException e) {
+-			throw error(e, "Failed to delete existing file");
++			writeToPath(output, partFile, response);
++		} finally {
++			// 成功时 partFile 已被原子 move 走，这里是空操作；失败时不留半成品给下一次构建
++			try {
++				Files.deleteIfExists(partFile);
++			} catch (IOException ignored) {
++				// ignored
++			}
+ 		}
++	}
+ 
++	private void writeToPath(Path output, Path partFile, HttpResponse<InputStream> response) throws DownloadException {
+ 		final long length = Long.parseLong(response.headers().firstValue("Content-Length").orElse("-1"));
+ 		AtomicLong totalBytes = new AtomicLong(0);
+ 
+@@ -312,8 +344,6 @@ public final class Download {
+ 	}
+ 
+ 	private boolean requiresDownload(Path output) throws DownloadException {
+-		final boolean locked = getAndResetLock(output);
+-
+ 		if (forceDownload || !exists(output)) {
+ 			// 内容寻址下载的快路径：带期望 hash 的文件（如 vanilla jar）内容永不改变，
+ 			// 本地 hash 匹配 = 重下结果必然一字节不差。即使 --refresh-dependencies 强制刷新，
+@@ -328,11 +358,9 @@ public final class Download {
+ 			return true;
+ 		}
+ 
+-		if (locked && downloadAttempt == 1) {
+-			LOGGER.warn("Forcing downloading {} as existing lock file was found. This may happen if the gradle build was forcefully canceled.", output);
+-			return true;
+-		}
+-
++		// 这里刻意**不看** <name>.lock：锁文件存在只说明「有人正在写」或「写的人崩了」，与本地已有文件
++		// 是否可用无关。前者由 DownloadLock 串行化，后者由 DownloadLock 的判活逻辑接管；把锁当成
++		// 「必须重下」的信号，等于让进程被 kill 后的残留锁白白触发一次完整下载。
+ 		if (offline) {
+ 			// We know the file exists, nothing more we can do.
+ 			return false;
+@@ -399,26 +427,6 @@ public final class Download {
+ 		}
+ 	}
+ 
+-	private void tryCleanup(Path output) {
+-		try {
+-			Files.deleteIfExists(output);
+-		} catch (IOException ignored) {
+-			// ignored
+-		}
+-
+-		try {
+-			Files.deleteIfExists(getLockFile(output));
+-		} catch (IOException ignored) {
+-			// ignored
+-		}
+-
+-		try {
+-			Files.deleteIfExists(getPartFile(output));
+-		} catch (IOException ignored) {
+-			// ignored
+-		}
+-	}
+-
+ 	// A faster exists check
+ 	private static boolean exists(Path path) {
+ 		return path.getFileSystem() == FileSystems.getDefault() ? path.toFile().exists() : Files.exists(path);
+@@ -428,32 +436,46 @@ public final class Download {
+ 		return output.resolveSibling(output.getFileName() + ".lock");
+ 	}
+ 
+-	private Path getPartFile(Path output) {
+-		return output.resolveSibling(output.getFileName() + ".part");
++	// 临时文件名带唯一后缀：并发写同一目标时各自写各自的临时文件，最后原子 move 落位
++	private Path getUniquePartFile(Path output) {
++		return output.resolveSibling(output.getFileName() + "." + UUID.randomUUID() + ".part");
+ 	}
+ 
+-	private boolean getAndResetLock(Path output) throws DownloadException {
+-		final Path lock = getLockFile(output);
+-		final boolean exists = exists(lock);
+-
+-		if (exists) {
+-			try {
+-				Files.delete(lock);
+-			} catch (IOException e) {
+-				throw error(e, "Failed to release lock on %s", lock);
+-			}
++	/**
++	 * 清掉同一目标遗留的陈旧临时文件.
++	 *
++	 * <p>临时文件名带唯一后缀后，被 kill 掉的构建不会再被下一次下载「顺手删掉」；这里在下一次真正要下载
++	 * 同一个文件时回收它们。<b>只在冷路径（已经决定要下载）调用</b>，热路径一次目录 IO 都不会多。
++	 *
++	 * <p>只删一小时以前的：锁可能被超时接管，此时另一个写入者正在写它的临时文件，删掉它会让那一次
++	 * 下载白做。一小时遠超过任何单文件的下载耗时，这个阈值把误删的可能降到可以忽略。
++	 */
++	private void deleteStalePartFiles(Path output) {
++		final Path parent = output.getParent();
++
++		if (parent == null || !Files.isDirectory(parent)) {
++			return;
+ 		}
+ 
+-		return exists;
+-	}
+-
+-	private void createLock(Path output) throws DownloadException {
+-		final Path lock = getLockFile(output);
++		final String prefix = output.getFileName() + ".";
++		final Instant cutoff = Instant.now().minus(PART_RETENTION);
+ 
+-		try {
+-			Files.createFile(lock);
++		try (var entries = Files.newDirectoryStream(parent, entry -> {
++			final String name = entry.getFileName().toString();
++			return name.startsWith(prefix) && name.endsWith(".part");
++		})) {
++			for (Path entry : entries) {
++				try {
++					if (Files.getLastModifiedTime(entry).toInstant().isBefore(cutoff)) {
++						Files.deleteIfExists(entry);
++					}
++				} catch (IOException e) {
++					// 回收临时文件是尽力而为：删不掉不影响本次下载
++					LOGGER.debug("清理旧临时文件失败：{}", entry, e);
++				}
++			}
+ 		} catch (IOException e) {
+-			throw error(e, "Failed to acquire lock on %s", lock);
++			LOGGER.debug("枚举临时文件失败：{}", parent, e);
+ 		}
+ 	}
+ 
+diff --git a/src/main/java/net/fabricmc/loom/util/download/DownloadBuilder.java b/src/main/java/net/fabricmc/loom/util/download/DownloadBuilder.java
+index db161583559d383d26fda66be962f6d27c9aaf4f..b9366d527cbce5b4c22ccb8ee4534e94b1093436 100644
+--- a/src/main/java/net/fabricmc/loom/util/download/DownloadBuilder.java
++++ b/src/main/java/net/fabricmc/loom/util/download/DownloadBuilder.java
+@@ -110,12 +110,12 @@ public class DownloadBuilder {
+ 		return this;
+ 	}
+ 
+-	private Download build(int downloadAttempt) {
++	private Download build() {
+ 		if (!allowInsecureProtocol && !isSecureUrl(url)) {
+ 			throw new IllegalArgumentException("Cannot create download for url (%s) with insecure protocol".formatted(url.toString()));
+ 		}
+ 
+-		return new Download(this.url, this.expectedHash, this.useEtag, this.forceDownload, this.offline, maxAge, progressListener, httpVersion, downloadAttempt);
++		return new Download(this.url, this.expectedHash, this.useEtag, this.forceDownload, this.offline, maxAge, progressListener, httpVersion);
+ 	}
+ 
+ 	public CompletableFuture<DownloadResult> downloadPathAsync(Path path, DownloadExecutor executor) {
+@@ -156,7 +156,7 @@ public class DownloadBuilder {
+ 					httpVersion(HttpClient.Version.HTTP_1_1);
+ 				}
+ 
+-				return supplier.get(build(i));
++				return supplier.get(build());
+ 			} catch (DownloadException e) {
+ 				if (e.getStatusCode() == 404) {
+ 					// Don't retry on 404's
+diff --git a/src/main/java/net/fabricmc/loom/util/download/DownloadLock.java b/src/main/java/net/fabricmc/loom/util/download/DownloadLock.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..5d1e6b3a7a0b712c9d22e7e026b9033696dbfd50
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/util/download/DownloadLock.java
+@@ -0,0 +1,396 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2025 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.util.download;
++
++import java.io.IOException;
++import java.net.InetAddress;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.FileAlreadyExistsException;
++import java.nio.file.Files;
++import java.nio.file.NoSuchFileException;
++import java.nio.file.Path;
++import java.nio.file.attribute.BasicFileAttributes;
++import java.nio.file.attribute.FileTime;
++import java.time.Duration;
++import java.time.Instant;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.Objects;
++import java.util.Optional;
++import java.util.UUID;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
++
++import org.jspecify.annotations.Nullable;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * 单个下载目标的跨进程互斥锁.
++ *
++ * <h2>锁文件里记的是什么</h2>
++ *
++ * <p>锁文件 {@code <name>.lock} 用 {@link Files#createFile} 独占创建，创建成功后立刻写入持有者信息
++ * （PID、进程启动时刻、主机名、token）。判活全部基于这份信息：<b>锁文件存在</b>只说明「曾经有人持有」，
++ * 与「现在有人在写」是两件事——改造前把两者当成同一件事，于是崩溃残留会让下一次构建白下载一遍，
++ * 而真正并发的第二个写入者却直接被判失败。
++ *
++ * <h2>残留与「正在写」怎么区分</h2>
++ *
++ * <ul>
++ *   <li>持有者在本机、PID 已不存在（或进程启动时刻与记录不符，说明 PID 被复用）→ <b>残留</b>，立即接管；</li>
++ *   <li>持有者在本机、PID 还活着且不是本 JVM → <b>正在写</b>，等待；</li>
++ *   <li>持有者是本 JVM：本 classloader 的持有表里有它 → 另一个线程在写，等待；表里没有、且锁文件已存在
++ *       超过 {@code SAME_JVM_GRACE} → 本 JVM 的遗留锁（收尾删除失败或另一份 Loom classloader 已放手），接管；</li>
++ *   <li>跨主机（共享缓存盘 / NFS）或持有者信息还没写完 → 无法判活，按锁文件年龄推断：
++ *       刚创建视为正在写，超过 {@code EMPTY_CONTENT_GRACE} / {@code FOREIGN_STALE_AFTER} 视为残留.</li>
++ * </ul>
++ *
++ * <h2>为什么等待超时也接管</h2>
++ *
++ * <p>这把锁只负责去重与礼仪，<b>正确性不依赖它</b>：下载写入本次尝试专用的唯一临时文件，
++ * 写完整后原子落位（{@link net.fabricmc.loom.util.cache.AtomicFiles}），因此两个写入者同时存在
++ * 最多重复一次网络传输，不会产出半成品或损坏的文件。既然如此，「持有者挂死也不让构建失败」
++ * 就比「等不到锁就抛异常」更合适。
++ */
++public final class DownloadLock implements AutoCloseable {
++	private static final Logger LOGGER = LoggerFactory.getLogger(DownloadLock.class);
++
++	// 本 JVM（本 classloader）当前持有的锁：用于把「同进程另一线程在写」与「本进程的遗留锁」区分开
++	private static final ConcurrentMap<Path, String> HELD = new ConcurrentHashMap<>();
++
++	// 持有者信息还没写出来时的等待窗口（创建与写信息之间的窗口在毫秒级）
++	private static final Duration EMPTY_CONTENT_GRACE = Duration.ofSeconds(2);
++
++	// 持有者在本 JVM 但不在本 classloader 的持有表里时的等待窗口
++	private static final Duration SAME_JVM_GRACE = Duration.ofSeconds(10);
++
++	// 跨主机（共享缓存盘）无法判活时的陈旧阈值
++	private static final Duration FOREIGN_STALE_AFTER = Duration.ofMinutes(30);
++
++	private static final Duration POLL_INTERVAL = Duration.ofMillis(50);
++
++	private static final String LOCAL_HOST = localHostName();
++
++	private final Path lockFile;
++	private final Path key;
++	private final String token;
++	private final boolean tookOverLiveLock;
++	private final boolean waited;
++
++	private DownloadLock(Path lockFile, Path key, String token, boolean tookOverLiveLock, boolean waited) {
++		this.lockFile = lockFile;
++		this.key = key;
++		this.token = token;
++		this.tookOverLiveLock = tookOverLiveLock;
++		this.waited = waited;
++	}
++
++	/**
++	 * 取得 {@code lockFile} 的独占权，必要时接管残留锁.
++	 *
++	 * @param lockFile 锁文件路径，父目录会被创建
++	 * @param timeout  等待「正在写」的持有者释放锁的最长时间，超时后强制接管
++	 * @return 已持有的锁，调用方必须在 finally / try-with-resources 中关闭
++	 * @throws IOException 无法创建或接管锁文件时
++	 */
++	public static DownloadLock acquire(Path lockFile, Duration timeout) throws IOException {
++		final Path key = lockFile.toAbsolutePath().normalize();
++		final String token = UUID.randomUUID().toString();
++		final long timeoutNanos = timeout.toNanos();
++		long deadline = System.nanoTime() + timeoutNanos;
++		boolean forced = false;
++		boolean announcedWait = false;
++		boolean waited = false;
++
++		Files.createDirectories(key.getParent());
++
++		while (true) {
++			if (tryCreate(lockFile, token)) {
++				HELD.put(key, token);
++				return new DownloadLock(lockFile, key, token, forced, waited);
++			}
++
++			waited = true;
++			final Snapshot snapshot = Snapshot.read(lockFile);
++
++			if (snapshot == null) {
++				// 判活期间持有者刚好放手，重来一次即可
++				continue;
++			}
++
++			if (holderOf(snapshot, key) == Holder.STALE) {
++				LOGGER.debug("接管残留的下载锁 {}", lockFile);
++
++				if (!deleteSnapshot(lockFile, snapshot)) {
++					pause();
++				}
++
++				continue;
++			}
++
++			if (System.nanoTime() >= deadline) {
++				if (!forced) {
++					// 只报一次：下面可能还要重试几轮才能真的删掉别人的锁，每轮都 warn 就是刷屏
++					LOGGER.warn("等待下载锁超时（{}），接管 {} 继续下载；内容由唯一临时文件 + 原子落位保证完整", timeout, lockFile);
++					forced = true;
++				}
++
++				// 顺延一个超时周期：抢不到就继续按正常节奏等，而不是每 50ms 重报一次
++				deadline = System.nanoTime() + timeoutNanos;
++
++				if (!deleteSnapshot(lockFile, snapshot)) {
++					pause();
++				}
++
++				continue;
++			}
++
++			if (!announcedWait) {
++				LOGGER.info("正在等待另一个进程/线程下载 {}（持有者：{}）", key.getFileName(), snapshot.describeOwner());
++				announcedWait = true;
++			}
++
++			pause();
++		}
++	}
++
++	/**
++	 * {@return 本次取得锁是否属于「持有者看起来还活着但仍被接管」}.
++	 *
++	 * <p>调用方据此可以加一条提示；下载本身不依赖该信息。
++	 */
++	public boolean tookOverLiveLock() {
++		return tookOverLiveLock;
++	}
++
++	/**
++	 * {@return 取得锁的过程中是否碰过别人留下的锁文件（等过或接管过）}.
++	 *
++	 * <p>调用方据此判断「锁内重检」是否值得做：从未碰到过锁文件，就不可能有人在此期间把产物写好，
++	 * 重检只是白白多一次 IO（并可能多算一次 hash）。
++	 */
++	public boolean waitedForLock() {
++		return waited;
++	}
++
++	@Override
++	public void close() {
++		HELD.remove(key, token);
++
++		try {
++			// 只删自己那一把：若等锁期间超时被接管，锁文件里已经是别人的 token，这时删掉等于放开两个写入者
++			// （虽不影响正确性，但会让去重失效）。收尾这一步在写路径上，多读一次文件不算热路径负担。
++			final Snapshot snapshot = Snapshot.read(lockFile);
++
++			if (snapshot != null && snapshot.owner() != null && !token.equals(snapshot.owner().token())) {
++				return;
++			}
++
++			Files.deleteIfExists(lockFile);
++		} catch (IOException e) {
++			// 删不掉不是构建失败的理由：下一次 acquire 会把它判成残留并接管
++			LOGGER.debug("释放下载锁失败：{}", lockFile, e);
++		}
++	}
++
++	private enum Holder {
++		ALIVE,
++		STALE
++	}
++
++	private static boolean tryCreate(Path lockFile, String token) throws IOException {
++		try {
++			Files.createFile(lockFile);
++		} catch (FileAlreadyExistsException e) {
++			return false;
++		}
++
++		writeOwner(lockFile, token);
++		return true;
++	}
++
++	// 持有者信息写不进去也不影响互斥（只是少了诊断与判活依据），因此失败只记 debug
++	private static void writeOwner(Path lockFile, String token) {
++		try {
++			final String info = "pid=%d start=%d host=%s token=%s since=%d".formatted(
++					ProcessHandle.current().pid(),
++					ProcessHandle.current().info().startInstant().map(Instant::toEpochMilli).orElse(0L),
++					LOCAL_HOST,
++					token,
++					System.currentTimeMillis());
++			Files.writeString(lockFile, info, StandardCharsets.UTF_8);
++		} catch (IOException e) {
++			LOGGER.debug("写入下载锁持有者信息失败（仅影响诊断与判活）：{}", lockFile, e);
++		}
++	}
++
++	private static Holder holderOf(Snapshot snapshot, Path key) {
++		final Owner owner = snapshot.owner();
++
++		if (owner == null) {
++			// 内容还不可读：可能是持有者刚创建完还没有写信息，也可能创建完就崩了
++			return olderThan(snapshot.lastModified(), EMPTY_CONTENT_GRACE) ? Holder.STALE : Holder.ALIVE;
++		}
++
++		if (!LOCAL_HOST.equals(owner.host())) {
++			// 跨主机（共享缓存盘）或早期版本写下的锁：只能按年龄推断，阈值取得大一些以免误接管正在进行的慢下载
++			return olderThan(snapshot.lastModified(), FOREIGN_STALE_AFTER) ? Holder.STALE : Holder.ALIVE;
++		}
++
++		final Optional<ProcessHandle> handle = ProcessHandle.of(owner.pid());
++
++		if (handle.isEmpty()) {
++			return Holder.STALE;
++		}
++
++		final ProcessHandle process = handle.get();
++		final Optional<Instant> actualStart = process.info().startInstant();
++
++		if (owner.start() > 0 && actualStart.isPresent() && actualStart.get().toEpochMilli() != owner.start()) {
++			// PID 被复用了：写下这把锁的进程早已不在
++			return Holder.STALE;
++		}
++
++		if (owner.pid() == ProcessHandle.current().pid()) {
++			if (HELD.containsKey(key)) {
++				// 同一 JVM 内的另一个线程正在写
++				return Holder.ALIVE;
++			}
++
++			// 本 JVM 写下的、却没有人认领的锁：收尾删除失败留下的遗留锁
++			return olderThan(snapshot.lastModified(), SAME_JVM_GRACE) ? Holder.STALE : Holder.ALIVE;
++		}
++
++		return process.isAlive() ? Holder.ALIVE : Holder.STALE;
++	}
++
++	// 只删「刚刚判定为残留/超时」的那一个文件：期间若被别人换掉（fileKey 或 mtime 变了）就放弃，避免误删活着的锁
++	private static boolean deleteSnapshot(Path lockFile, Snapshot snapshot) {
++		try {
++			final BasicFileAttributes now = Files.readAttributes(lockFile, BasicFileAttributes.class);
++
++			if (!now.lastModifiedTime().equals(snapshot.lastModified()) || !Objects.equals(now.fileKey(), snapshot.fileKey())) {
++				return false;
++			}
++
++			Files.delete(lockFile);
++			return true;
++		} catch (NoSuchFileException e) {
++			return true;
++		} catch (IOException e) {
++			LOGGER.debug("删除下载锁失败：{}", lockFile, e);
++			return false;
++		}
++	}
++
++	private static boolean olderThan(FileTime lastModified, Duration grace) {
++		return lastModified.toInstant().isBefore(Instant.now().minus(grace));
++	}
++
++	private static void pause() throws IOException {
++		try {
++			Thread.sleep(POLL_INTERVAL.toMillis());
++		} catch (InterruptedException e) {
++			Thread.currentThread().interrupt();
++			throw new IOException("等待下载锁时被中断", e);
++		}
++	}
++
++	private static String localHostName() {
++		try {
++			return InetAddress.getLocalHost().getHostName();
++		} catch (IOException e) {
++			return "unknown";
++		}
++	}
++
++	private record Snapshot(FileTime lastModified, @Nullable Object fileKey, @Nullable Owner owner) {
++		@Nullable
++		static Snapshot read(Path lockFile) throws IOException {
++			try {
++				final BasicFileAttributes attributes = Files.readAttributes(lockFile, BasicFileAttributes.class);
++				final String content;
++
++				try {
++					content = Files.readString(lockFile, StandardCharsets.UTF_8);
++				} catch (NoSuchFileException e) {
++					return null;
++				}
++
++				return new Snapshot(attributes.lastModifiedTime(), attributes.fileKey(), Owner.parse(content));
++			} catch (NoSuchFileException e) {
++				return null;
++			}
++		}
++
++		String describeOwner() {
++			return owner == null ? "信息未写出" : owner.describe();
++		}
++	}
++
++	private record Owner(long pid, long start, String host, @Nullable String token) {
++		@Nullable
++		static Owner parse(String content) {
++			final Map<String, String> values = new HashMap<>();
++
++			for (String part : content.trim().split("\\s+")) {
++				final int equals = part.indexOf('=');
++
++				if (equals > 0) {
++					values.put(part.substring(0, equals), part.substring(equals + 1));
++				}
++			}
++
++			final String pid = values.get("pid");
++
++			if (pid == null) {
++				return null;
++			}
++
++			try {
++				return new Owner(Long.parseLong(pid), parseLong(values.get("start")), values.getOrDefault("host", "unknown"), values.get("token"));
++			} catch (NumberFormatException e) {
++				return null;
++			}
++		}
++
++		private static long parseLong(@Nullable String value) {
++			if (value == null) {
++				return 0L;
++			}
++
++			try {
++				return Long.parseLong(value);
++			} catch (NumberFormatException e) {
++				return 0L;
++			}
++		}
++
++		String describe() {
++			return "pid=%d host=%s".formatted(pid, host);
++		}
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/download/DownloadFileTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/download/DownloadFileTest.groovy
+index 9f332488cc213e202acbad96cd9c1160322f385d..4994c4f8bc865218a0383201473dd6b797d8423b 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/download/DownloadFileTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/download/DownloadFileTest.groovy
+@@ -25,10 +25,14 @@
+ package net.fabricmc.loom.test.unit.download
+ 
+ import java.nio.file.Files
++import java.nio.file.Path
+ import java.nio.file.Paths
+ import java.nio.file.attribute.FileTime
+ import java.time.Duration
+ import java.time.Instant
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
+ 
+ import io.javalin.http.HttpStatus
+ import spock.lang.IgnoreIf
+@@ -485,6 +489,125 @@ class DownloadFileTest extends DownloadTest {
+ 		Files.readAllBytes(output) == data
+ 	}
+ 
++	def "Lock: 残留锁被接管，既不抛异常也不强制重下"() {
++		setup:
++		int requestCount = 0
++
++		server.get("/staleLock.txt") {
++			it.result("Hello World")
++			requestCount ++
++		}
++
++		def dir = File.createTempDir().toPath()
++		def output = dir.resolve("file.txt")
++		def lockFile = dir.resolve("file.txt.lock")
++		Files.writeString(output, "Hello World")
++		// 造一个「持有者进程早已不在」的残留锁：用一个肯定不存在的 PID（模拟被杀掉的构建）
++		writeStaleLock(lockFile)
++
++		when: "本地文件完好，但上次构建留下的锁文件还在"
++		def result = Download.create("$PATH/staleLock.txt")
++				.sha1("0a4d55a8d778e5022fab701977c5d840bbc486d0")
++				.downloadPath(output)
++
++		then: "不抛异常、也不重下：锁只说明“曾经有人写过”，与本地文件是否可用无关"
++		!result.didDownload()
++		requestCount == 0
++		Files.readString(output) == "Hello World"
++
++		when: "同一个残留锁 + 目标文件缺失：必需接管而不是抛 DownloadException"
++		Files.delete(output)
++		def second = Download.create("$PATH/staleLock.txt")
++				.sha1("0a4d55a8d778e5022fab701977c5d840bbc486d0")
++				.downloadPath(output)
++
++		then:
++		second.didDownload()
++		requestCount == 1
++		Files.readString(output) == "Hello World"
++		// 自己那一轮收尾时释放掉，不把残留留给下一个构建
++		Files.notExists(lockFile)
++	}
++
++	def "Lock: 两个线程并发下载同一文件都能成功，且只下载一次"() {
++		setup:
++		int requestCount = 0
++		byte[] data = new byte[1024 * 512]
++		new Random().nextBytes(data)
++
++		server.get("/concurrentLock.bin") {
++			it.result(data)
++			requestCount ++
++		}
++
++		def dir = File.createTempDir().toPath()
++		def output = dir.resolve("concurrent.bin")
++		def pool = Executors.newFixedThreadPool(2)
++		def ready = new CountDownLatch(2)
++		def start = new CountDownLatch(1)
++		def sha1 = Checksum.of(data).sha1().hex()
++
++		when:
++		// maxRetries(1)：证明「并发下也能成功」不靠外部重试兜底
++		def futures = (1..2).collect {
++			pool.submit {
++				ready.countDown()
++				start.await()
++				return Download.create("$PATH/concurrentLock.bin")
++						.sha1(sha1)
++						.maxRetries(1)
++						.downloadPath(output)
++			}
++		}
++		ready.await()
++		start.countDown()
++		def results = futures.collect { it.get(60, TimeUnit.SECONDS) }
++		pool.shutdown()
++
++		then:
++		// 两个调用都成功，且文件内容完整
++		results.size() == 2
++		Arrays.equals(Files.readAllBytes(output), data)
++		Files.notExists(dir.resolve("concurrent.bin.lock"))
++		// 后到者等锁期间前一个已把文件落位，锁内重检直接复用，不需要第二趟网络
++		requestCount == 1
++	}
++
++	def "Lock: 热路径不取锁"() {
++		setup:
++		int requestCount = 0
++
++		server.get("/hotPath.txt") {
++			it.result("Hello World")
++			requestCount ++
++		}
++
++		def dir = File.createTempDir().toPath()
++		def output = dir.resolve("hot.txt")
++		Download.create("$PATH/hotPath.txt")
++				.sha1("0a4d55a8d778e5022fab701977c5d840bbc486d0")
++				.downloadPath(output)
++
++		when:
++		def result = Download.create("$PATH/hotPath.txt")
++				.sha1("0a4d55a8d778e5022fab701977c5d840bbc486d0")
++				.downloadPath(output)
++
++		then:
++		!result.didDownload()
++		requestCount == 1
++		// 热路径连锁文件都没碰过
++		Files.notExists(dir.resolve("hot.txt.lock"))
++		// 也不再留下 .part
++		dir.toFile().listFiles().every { !it.name.endsWith(".part") }
++	}
++
++	// 造一个「持有者进程早已不在」的残留锁：PID 用一个肯定不存在的值（模拟被 kill 掉的构建）
++	private static void writeStaleLock(Path lockFile) {
++		Files.writeString(lockFile, "pid=2147483647 start=0 host=${InetAddress.getLocalHost().getHostName()} token=stale since=0")
++		Files.setLastModifiedTime(lockFile, FileTime.from(Instant.now() - Duration.ofHours(1)))
++	}
++
+ 	def "File: Insecure protocol"() {
+ 		setup:
+ 		def output = new File(File.createTempDir(), "file").toPath()

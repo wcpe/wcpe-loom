@@ -1,0 +1,633 @@
+From 5b0e4946f84e5d00868eee062c4a45c64e2734bc Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Wed, 11 Nov 2026 07:59:39 +0800
+Subject: [PATCH 131/147] =?UTF-8?q?fix(cache):=20mapped=20provider=20?=
+ =?UTF-8?q?=E5=B0=B1=E7=BB=AA=E5=88=A4=E5=AE=9A=E6=94=B9=E7=94=A8=E4=BB=BB?=
+ =?UTF-8?q?=E5=8A=A1=E6=8A=95=E5=BD=B1=EF=BC=8C=E4=B8=8D=E9=A2=84=E8=AF=BB?=
+ =?UTF-8?q?=E5=B0=9A=E6=9C=AA=E7=94=9F=E4=BA=A7=E7=9A=84=E4=BA=A7=E7=89=A9?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+配置期原用 `isUpToDate(context)`（底层是 `shouldRefreshOutputs`）判断 mapped provider
+是否已就绪，这是**文件存在性检查**。但本仓库已把多数 provider 改成任务生产，产物在
+配置期本就不该存在——于是首轮构建中「产物未生成」被当成「需要重建」，配置缓存
+在下一轮立刻失效，形成无谓的重建循环。
+
+改动：
+
+- `AbstractMappedMinecraftProvider` 新增 `isReadyForConfiguration`：可任务化时按纯模型
+  条件判就绪，不碰 jar/POM/backup；只有配置期回退形态才委托 `isUpToDate`。
+- 新增 `usesProvisioningImplementation`：**按 provide 方法的声明类**判断，不调用钩子。
+  第三方覆写 `provide` 后可能在配置期写盘，不能仅凭基类的任务开关就绕过原有事务锁，
+  需由其显式覆写 readiness 说明契约。
+- `ProcessedNamedMinecraftProvider` 覆写 readiness：父供给须先就绪，处理器链须能投影；
+  抽出 `processorProjectionBlocker()`，让就绪判定与任务注册**共用同一 descriptor 判据**，
+  避免两处各判一遍而结论不一致。
+- `CompileConfiguration.isMappedJarsWarm` 改名 `areMappedProvidersReadyForConfiguration`，
+  语义从「产物是否就绪」改为「是否均无需在配置期写共享产物」。
+- `MappingConfiguration.getMappingsPath` 调换 `&&` 两侧顺序：先判任务产物再查文件，
+  否则首轮任务生成文件本身就会使下一轮配置缓存失效。
+
+仍需配置期生产的形态沿用双检事务锁，互斥边界不变。
+
+测试：MappedMinecraftProviderReadinessTest 7 个用例（可任务化不预读、关闭任务生产仍按
+真实产物判定、未知覆写不被直接放行等）、TaskProducedMappingsCacheTest 2 个用例。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: mapped-provider-readiness-projection
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+index 45b2df95d5e2808c800f978e4fc32bb82c4f31d4..faac20950e49348d240d3ece17f984a9ee6270cf 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+@@ -334,25 +334,12 @@ public abstract class CompileConfiguration implements Runnable {
+ 		final String key = "minecraft-provision:" + extension.getMinecraftProvider().minecraftVersion() + ":" + mappingsIdentifier;
+ 		final LoomCacheService cacheService = LoomCacheService.get(project).get();
+ 
+-		// 无锁快路径：所有 mapped provider 的产物均已就绪（shouldRefreshOutputs 为纯只读的
+-		// 存在性/脏标志检查）时，本次供给不含任何共享缓存写入，内部 provide 各自的快路径
+-		// 也不会取锁，故整段事务可无锁执行。
++		// 可任务化的 provider 只接线，不提前观察其 jar/POM/backup；共享产物由任务检查和生产。
++		// 仍需配置期生产的形态沿用双检事务锁，保持跨进程供给的互斥边界。
+ 		final var warmContext = new AbstractMappedMinecraftProvider.ProvideContext(true, extension.refreshDeps(), configContext);
+ 
+-		// 用双检锁形式供给 mapped jar：
+-		//
+-		// 干净环境（CI 首次构建）下，多个共享同一份 Minecraft 的项目会算出同一个 key；
+-		// 而 isMappedJarsWarm 在冷构建时全部为 false。若直接进 runExclusive，第 2..N 个项目
+-		// 必须先拿到锁才能做那次检查，于是就各自白等「第一个项目做完整条 download→remap」
+-		// 的时间（实测在 CI runner 上远超锁超时）。
+-		//
+-		// runExclusiveChecking 把就绪检查提到取锁之前，并在锁内重检：第一个项目持锁生产，
+-		// 其余项目只需等它做完，拿到锁后立刻发现产物已就绪而秒退，不会再重建一遍。
+-		//
+-		// 两次检查都是纯只读的（shouldRefreshOutputs / 存在性与脏标志），不含共享缓存写入，
+-		// 因此放在锁外安全；产物本身的写入仍由锁内的 provideMappedProviders 完成。
+ 		cacheService.runExclusiveChecking(lockRoot, key, LoomCacheService.defaultTimeout(),
+-				() -> isMappedJarsWarm(extension, project, jarConfiguration, intermediaryMinecraftProvider,
++				() -> areMappedProvidersReadyForConfiguration(extension, project, jarConfiguration, intermediaryMinecraftProvider,
+ 						namedMinecraftProvider, warmContext),
+ 				() -> {
+ 					// 已就绪（无需生产）：照旧读已发布的产物。这一步不含共享缓存写入。
+@@ -369,30 +356,30 @@ public abstract class CompileConfiguration implements Runnable {
+ 	}
+ 
+ 	/**
+-	 * {@return 所有 mapped provider 的产物是否已就绪（无需重建）}.
++	 * {@return 所有 mapped provider 是否均无需在配置期写共享产物}.
+ 	 *
+-	 * <p>shouldRefreshOutputs 仅做文件存在性与脏标志检查，不写入任何共享缓存，可安全在锁外调用。
++	 * <p>优先按任务投影的纯模型条件判断；只有配置期回退形态才检查实际产物状态。
+ 	 */
+-	private boolean isMappedJarsWarm(LoomGradleExtension extension, Project project, MinecraftJarConfiguration<?, ?, ?> jarConfiguration,
++	private boolean areMappedProvidersReadyForConfiguration(LoomGradleExtension extension, Project project, MinecraftJarConfiguration<?, ?, ?> jarConfiguration,
+ 			IntermediaryMinecraftProvider<?> intermediaryMinecraftProvider,
+ 			NamedMinecraftProvider<?> namedMinecraftProvider,
+ 			AbstractMappedMinecraftProvider.ProvideContext context) {
+-		if (intermediaryMinecraftProvider != null && !intermediaryMinecraftProvider.isUpToDate(context)) {
++		if (intermediaryMinecraftProvider != null && !intermediaryMinecraftProvider.isReadyForConfiguration(context)) {
+ 			return false;
+ 		}
+ 
+-		if (!namedMinecraftProvider.isUpToDate(context)) {
++		if (!namedMinecraftProvider.isReadyForConfiguration(context)) {
+ 			return false;
+ 		}
+ 
+ 		if (extension.isForge()) {
+-			if (!jarConfiguration.createSrgMinecraftProvider(project).isUpToDate(context)) {
++			if (!jarConfiguration.createSrgMinecraftProvider(project).isReadyForConfiguration(context)) {
+ 				return false;
+ 			}
+ 		}
+ 
+ 		if (extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime() && !extension.isUnobfuscatedForge()) {
+-			if (!jarConfiguration.createMojangMappedMinecraftProvider(project).isUpToDate(context)) {
++			if (!jarConfiguration.createMojangMappedMinecraftProvider(project).isReadyForConfiguration(context)) {
+ 				return false;
+ 			}
+ 		}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+index 11ad057f9a183a4b428a0d29a9ac3e206c2f2aa6..89e94153f4a4ba9893136b2013034adbc956d976 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+@@ -311,13 +311,14 @@ public class MappingConfiguration {
+ 	 *
+ 	 * <p>放宽的只有**迁移产物**这一族；其余选项（原始 mappings、mixin 派生映射）仍按存在性拒绝，
+ 	 * 因为那些文件在配置期结束时必定已由本类的 setup/setupPost 落位，缺失说明配置流程本身出了问题。
++	 * 必须先判断是否为任务产物再检查文件，否则首轮任务生成文件本身就会使下一轮配置缓存失效。
+ 	 */
+ 	public Path getMappingsPath(MappingOption mappingOption) {
+ 		Supplier<Path> mappingsSupplier = this.mappingOptions.get(mappingOption);
+ 
+ 		if (mappingsSupplier == null) {
+ 			throw new UnsupportedOperationException("Unsupported mapping option: " + mappingOption + ", it is possible that this option is not supported by this project / platform!");
+-		} else if (Files.notExists(mappingsSupplier.get()) && !isTaskProducedMappings(mappingOption)) {
++		} else if (!isTaskProducedMappings(mappingOption) && Files.notExists(mappingsSupplier.get())) {
+ 			throw new UnsupportedOperationException("Mapping option " + mappingOption + " found but file does not exist!");
+ 		}
+ 
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
+index 5ae0f64114779f9d5a64aa093e9ebbff4a0f4e28..523cbe7a3d7ed30fade5271098ecc174d963e474 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
+@@ -425,11 +425,42 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 	}
+ 
+ 	/**
+-	 * {@return 产物是否已就绪（无需重建）}.
++	 * {@return 本轮能否只在配置期接线，而不生产共享产物}.
+ 	 *
+-	 * <p>供外部（如 {@code minecraft-provision} 事务锁的无锁快路径）在锁外做只读判定；
+-	 * 实现即 {@link #shouldRefreshOutputs} 的取反，判定产物存在且内容可复用（见下）。
++	 * <p>可任务化时不观察 jar、POM 或 backup 是否已存在：它们的有效性由执行期任务保证。
++	 * 必须在配置期生产的形态仍按实际产物就绪状态进入原有事务锁，不能放松回退的互斥协议。
+ 	 */
++	public boolean isReadyForConfiguration(ProvideContext context) {
++		if (taskProduction && usesProvisioningImplementation(AbstractMappedMinecraftProvider.class)) {
++			try {
++				for (RemappedJars remappedJar : getRemappedJars()) {
++					verifyProjectable(remappedJar);
++				}
++
++				return true;
++			} catch (UnsupportedOperationException e) {
++				// 实际 provide 会说明回退原因；这里只保留配置期生产的就绪检查。
++			}
++		}
++
++		return isUpToDate(context);
++	}
++
++	/**
++	 * {@return provide 是否仍由已审核的实现承担}.
++	 *
++	 * <p>只检查方法的声明者，不调用钩子。第三方覆写 provide 后可能在配置期写盘，
++	 * 不能仅凭基类的任务开关就绕过原有事务锁；需由其显式覆写 readiness 说明契约。
++	 */
++	protected final boolean usesProvisioningImplementation(Class<?> implementation) {
++		try {
++			return getClass().getMethod("provide", ProvideContext.class).getDeclaringClass() == implementation;
++		} catch (NoSuchMethodException e) {
++			throw new IllegalStateException("Minecraft provider 缺少 provide 方法", e);
++		}
++	}
++
++	/** {@return 产物是否已就绪，无需配置期重建} 仅用于配置期回退形态的就绪判定. */
+ 	public boolean isUpToDate(ProvideContext context) {
+ 		return !shouldRefreshOutputs(context);
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/ProcessedNamedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/ProcessedNamedMinecraftProvider.java
+index a362c4c475a7a6c04148df893af4c89e3157ba1f..63edc42b166af4483e563aa935c8dfa6764949a8 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/ProcessedNamedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/ProcessedNamedMinecraftProvider.java
+@@ -132,6 +132,32 @@ public abstract class ProcessedNamedMinecraftProvider<M extends MinecraftProvide
+ 		return List.copyOf(minecraftJarOutputMap.values());
+ 	}
+ 
++	/** {@return 父供给与处理器链是否均无需配置期生产} 与实际任务注册共用 descriptor 判据. */
++	@Override
++	public boolean isReadyForConfiguration(ProvideContext context) {
++		if (!usesProvisioningImplementation(ProcessedNamedMinecraftProvider.class)) {
++			return isUpToDate(context);
++		}
++
++		if (!parentMinecraftProvider.isReadyForConfiguration(context)) {
++			return false;
++		}
++
++		return processorProjectionBlocker() == null || isUpToDate(context);
++	}
++
++	private @Nullable String processorProjectionBlocker() {
++		for (MinecraftJarProcessor<?> processor : jarProcessorManager.getProcessors()) {
++			try {
++				requireDescriptor(processor);
++			} catch (UnsupportedOperationException e) {
++				return e.toString();
++			}
++		}
++
++		return null;
++	}
++
+ 	/**
+ 	 * 为每个命名 jar 注册「processor 链处理」任务，并注册补出 pom / backup 的伴随任务.
+ 	 *
+@@ -148,19 +174,17 @@ public abstract class ProcessedNamedMinecraftProvider<M extends MinecraftProvide
+ 		//   · 该形态的 spec 来自 DeobfSpecContext，它本身就不提供映射（实际也不读）。
+ 		// 因此不再按形态整批回退，往下走正常的处理器链校验与任务登记。
+ 
+-		final List<MinecraftJarProcessor<?>> processors = jarProcessorManager.getProcessors();
+-		final List<MinecraftJarProcessor.Spec> specs = jarProcessorManager.getSpecs();
++		final String blocker = processorProjectionBlocker();
+ 
+-		for (MinecraftJarProcessor<?> processor : processors) {
+-			try {
+-				requireDescriptor(processor);
+-			} catch (UnsupportedOperationException e) {
+-				LOGGER.warn("{} 的 jar processor 链无法投影成任务，本 provider 保持配置期生产：{}",
+-						getClass().getSimpleName(), e.getMessage());
+-				return null;
+-			}
++		if (blocker != null) {
++			LOGGER.warn("{} 的 jar processor 链无法投影成任务，本 provider 保持配置期生产：{}",
++					getClass().getSimpleName(), blocker);
++			return null;
+ 		}
+ 
++		final List<MinecraftJarProcessor<?>> processors = jarProcessorManager.getProcessors();
++		final List<MinecraftJarProcessor.Spec> specs = jarProcessorManager.getSpecs();
++
+ 		final Map<MinecraftJar.Type, ProcessedArtifact> tasks = new LinkedHashMap<>();
+ 
+ 		for (MinecraftJar parentJar : minecraftJarOutputMap.keySet()) {
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/TaskProducedMappingsCacheTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/TaskProducedMappingsCacheTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..32bbffa062c7d613c8d0966fe6c39669172aac73
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/TaskProducedMappingsCacheTest.groovy
+@@ -0,0 +1,168 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration
++
++import java.nio.file.Files
++import java.nio.file.Path
++
++import org.gradle.testkit.runner.BuildResult
++import org.gradle.testkit.runner.GradleRunner
++import org.gradle.testkit.runner.TaskOutcome
++import spock.lang.Specification
++import spock.lang.TempDir
++
++/**
++ * 执行期映射产物的缺失状态不应成为配置输入，就绪应交给声明了输出的生产任务.
++ *
++ * <p>通过真实 MappingConfiguration 子类区分任务产出与配置期产出，不启动 Minecraft 生产链.
++ */
++class TaskProducedMappingsCacheTest extends Specification {
++	private static final String CONFIGURED = "MAPPINGS_CONFIGURED"
++	private static final String TINY = "tiny\t2\t0\tintermediary\tnamed\n"
++
++	@TempDir
++	Path projectDir
++
++	def setup() {
++		Files.writeString(projectDir.resolve("settings.gradle"), "rootProject.name = 'task-mappings-cache-test'\n")
++		Files.writeString(projectDir.resolve("build.gradle"), """
++			plugins {
++				id 'top.wcpe.loom-repositories'
++			}
++
++			import java.nio.file.Files
++			import java.nio.file.Path
++			import dev.architectury.loom.mappings.MappingOption
++			import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration
++
++			class FixtureMappingConfiguration extends MappingConfiguration {
++				private final boolean taskProduced
++
++				FixtureMappingConfiguration(Path path, boolean taskProduced) {
++					super('fixture', path)
++					this.taskProduced = taskProduced
++				}
++
++				@Override
++				protected boolean isTaskProducedMappings(MappingOption option) {
++					return (taskProduced && option == MappingOption.DEFAULT) || super.isTaskProducedMappings(option)
++				}
++			}
++
++			def taskProduced = providers.gradleProperty('fixture.taskProduced').map { it.toBoolean() }.getOrElse(true)
++			def workingDirectory = layout.buildDirectory.dir('mappings').get().asFile.toPath()
++			def mappings = new FixtureMappingConfiguration(workingDirectory, taskProduced)
++			def mappingsFile = mappings.getMappingsPath(MappingOption.DEFAULT).toFile()
++			println '${CONFIGURED}'
++
++			abstract class WriteMappings extends DefaultTask {
++				@OutputFile
++				abstract RegularFileProperty getMappingsFile()
++
++				@Input
++				abstract Property<String> getMappingsText()
++
++				@TaskAction
++				void writeMappings() {
++					def output = mappingsFile.get().asFile.toPath()
++					Files.createDirectories(output.parent)
++					Files.writeString(output, mappingsText.get())
++					println 'MAPPINGS_WRITTEN'
++				}
++			}
++
++			tasks.register('writeMappings', WriteMappings) {
++				getMappingsFile().fileValue(mappingsFile)
++				getMappingsText().set('tiny\\t2\\t0\\tintermediary\\tnamed\\n')
++			}
++			""".stripIndent())
++	}
++
++	def "任务首次生成及删除后重建映射文件均立即复用配置缓存"() {
++		given:
++		assert !Files.exists(mappingFile())
++
++		when:
++		def first = runner().build()
++
++		then:
++		first.output.contains(CONFIGURED)
++		first.task(":writeMappings").outcome == TaskOutcome.SUCCESS
++		Files.readString(mappingFile()) == TINY
++
++		when: "首轮由任务创建的文件不应使下一轮重新配置"
++		def second = runner().build()
++
++		then:
++		reused(second)
++		second.task(":writeMappings").outcome == TaskOutcome.UP_TO_DATE
++
++		when: "任务输出被删除时由任务重建，而不是让配置期存在性检查触发失效"
++		Files.delete(mappingFile())
++		def afterDeletion = runner().build()
++
++		then:
++		reused(afterDeletion)
++		afterDeletion.task(":writeMappings").outcome == TaskOutcome.SUCCESS
++		Files.readString(mappingFile()) == TINY
++	}
++
++	def "配置期自行产出的映射缺失时仍必须明确失败"() {
++		when:
++		def failed = runner("-Pfixture.taskProduced=false").buildAndFail()
++
++		then:
++		failed.output.contains("Mapping option DEFAULT found but file does not exist!")
++		!failed.output.contains(CONFIGURED)
++		!Files.exists(mappingFile())
++	}
++
++	private Path mappingFile() {
++		return projectDir.resolve("build/mappings/mappings.tiny")
++	}
++
++	private GradleRunner runner(String... options) {
++		def arguments = [
++			"writeMappings",
++			"--configuration-cache",
++			"--configuration-cache-problems=fail",
++			"--console=plain",
++			"--stacktrace",
++			"--gradle-user-home",
++			projectDir.resolve("gradle-home").toString()
++		] + options.toList()
++		return GradleRunner.create()
++				.withProjectDir(projectDir.toFile())
++				.withPluginClasspath()
++				.withGradleVersion("9.5.0")
++				.withArguments(arguments)
++	}
++
++	private static boolean reused(BuildResult result) {
++		assert result.output.contains("Configuration cache entry reused")
++		assert !result.output.contains(CONFIGURED)
++		return true
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/providers/MappedMinecraftProviderReadinessTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/providers/MappedMinecraftProviderReadinessTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..5e227a64d147233f8919ea3e1367188c5a321cff
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/providers/MappedMinecraftProviderReadinessTest.groovy
+@@ -0,0 +1,207 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.providers
++
++import java.nio.file.Path
++
++import org.gradle.api.Project
++import org.mockito.Mockito
++import spock.lang.Specification
++import spock.lang.TempDir
++
++import net.fabricmc.loom.api.mappings.layered.MappingsNamespace
++import net.fabricmc.loom.api.processor.MinecraftJarProcessor
++import net.fabricmc.loom.configuration.processors.MinecraftJarProcessorManager
++import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJar
++import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider
++import net.fabricmc.loom.configuration.providers.minecraft.mapped.NamedMinecraftProvider
++import net.fabricmc.loom.configuration.providers.minecraft.mapped.ProcessedNamedMinecraftProvider
++import net.fabricmc.loom.test.util.GradleTestUtil
++import net.fabricmc.tinyremapper.TinyRemapper
++
++class MappedMinecraftProviderReadinessTest extends Specification {
++	@TempDir
++	Path directory
++
++	def "可任务化的供给不预读尚未生产的jar或POM"() {
++		given:
++		def provider = new ProbeProvider(GradleTestUtil.mockProject(), directory)
++
++		expect:
++		provider.isReadyForConfiguration(null)
++		provider.outputChecks == 0
++	}
++
++	def "显式关闭任务生产时仍按真实产物状态决定是否可无锁供给"() {
++		given:
++		def provider = new ProbeProvider(GradleTestUtil.mockProject(), directory)
++		provider.useConfigurationProduction()
++
++		expect:
++		!provider.isReadyForConfiguration(null)
++		provider.outputChecks == 1
++
++		when:
++		provider.outputsReady = true
++
++		then:
++		provider.isReadyForConfiguration(null)
++		provider.outputChecks == 2
++	}
++
++	def "未知重映射钩子仍回退到原有产物检查而不被直接放行"() {
++		given:
++		def provider = new UnknownHookProvider(GradleTestUtil.mockProject(), directory)
++
++		expect:
++		!provider.isReadyForConfiguration(null)
++		provider.outputChecks == 1
++	}
++
++	def "未知provide覆写仍按原有产物状态判断而不被直接放行"() {
++		given:
++		def provider = new UnknownProvideProvider(GradleTestUtil.mockProject(), directory)
++
++		expect:
++		!provider.isReadyForConfiguration(null)
++		provider.outputChecks == 1
++	}
++
++	def "可任务化处理器包装不预读父产物或处理后产物"() {
++		given:
++		def parent = new ProbeProvider(GradleTestUtil.mockProject(), directory)
++		def manager = Mockito.mock(MinecraftJarProcessorManager)
++		Mockito.when(manager.getProcessors()).thenReturn([])
++		def provider = new ProcessedProbe(parent, manager)
++
++		expect:
++		provider.isReadyForConfiguration(null)
++		parent.outputChecks == 0
++		provider.outputChecks == 0
++	}
++
++	def "不可任务化处理器保留回退检查"() {
++		given:
++		def parent = new ProbeProvider(GradleTestUtil.mockProject(), directory)
++		def manager = Mockito.mock(MinecraftJarProcessorManager)
++		def processor = Mockito.mock(MinecraftJarProcessor)
++		Mockito.when(processor.descriptor()).thenThrow(new UnsupportedOperationException("无任务描述符"))
++		Mockito.when(manager.getProcessors()).thenReturn([processor])
++		def provider = new ProcessedProbe(parent, manager)
++
++		expect:
++		!provider.isReadyForConfiguration(null)
++		provider.outputChecks == 1
++	}
++
++	def "处理器包装不能把仍需配置期生产的父供给当作已就绪"() {
++		given:
++		def parent = new ProbeProvider(GradleTestUtil.mockProject(), directory)
++		parent.useConfigurationProduction()
++		def manager = Mockito.mock(MinecraftJarProcessorManager)
++		def provider = new ProcessedProbe(parent, manager)
++		provider.outputsReady = true
++
++		expect:
++		!provider.isReadyForConfiguration(null)
++		parent.outputChecks == 1
++		provider.outputChecks == 0
++	}
++
++	private static class ProbeProvider extends NamedMinecraftProvider<MinecraftProvider> {
++		private final List<RemappedJars> remappedJars
++		int outputChecks
++		boolean outputsReady
++
++		ProbeProvider(Project project, Path root) {
++			super(project, null)
++			remappedJars = [
++				new RemappedJars(root.resolve("input.jar"), new MinecraftJar.Merged(root.resolve("output.jar")), MappingsNamespace.OFFICIAL)
++			]
++		}
++
++		@Override
++		List<RemappedJars> getRemappedJars() {
++			return remappedJars
++		}
++
++		@Override
++		List<MinecraftJar> getMinecraftJars() {
++			return remappedJars.collect { it.outputJar() }
++		}
++
++		@Override
++		MavenScope getMavenScope() {
++			return MavenScope.GLOBAL
++		}
++
++		@Override
++		boolean isUpToDate(ProvideContext context) {
++			outputChecks++
++			return outputsReady
++		}
++
++		void useConfigurationProduction() {
++			disableTaskProduction()
++		}
++	}
++
++	private static class UnknownProvideProvider extends ProbeProvider {
++		UnknownProvideProvider(Project project, Path root) {
++			super(project, root)
++		}
++
++		@Override
++		List<MinecraftJar> provide(ProvideContext context) {
++			throw new AssertionError("就绪检查不应执行未知provide实现")
++		}
++	}
++
++	private static class ProcessedProbe extends ProcessedNamedMinecraftProvider<MinecraftProvider, ProbeProvider> {
++		int outputChecks
++		boolean outputsReady
++
++		ProcessedProbe(ProbeProvider parent, MinecraftJarProcessorManager manager) {
++			super(parent, manager)
++		}
++
++		@Override
++		boolean isUpToDate(ProvideContext context) {
++			outputChecks++
++			return outputsReady
++		}
++	}
++
++	private static class UnknownHookProvider extends ProbeProvider {
++		UnknownHookProvider(Project project, Path root) {
++			super(project, root)
++		}
++
++		@Override
++		protected void configureRemapper(RemappedJars jars, TinyRemapper.Builder builder) {
++			// 不声明钩子的可投影形态，保持第三方扩展的保守回退协议。
++		}
++	}
++}

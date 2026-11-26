@@ -1,0 +1,386 @@
+From 9c5972e8465625de354c55e35a560c204cb865b4 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:21 +0800
+Subject: [PATCH 002/147] =?UTF-8?q?fix(forge):=20=E5=AE=8C=E5=96=84?=
+ =?UTF-8?q?=E6=97=A0=E6=B7=B7=E6=B7=86=20Forge=20=E8=BF=90=E8=A1=8C?=
+ =?UTF-8?q?=E9=93=BE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+无混淆（no-remap）模式下运行链缺少若干处理，补齐后在 Forge/NeoForge 上可正常 dev 运行。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/gradle/runtime.libs.versions.toml b/gradle/runtime.libs.versions.toml
+index 5737e91fffb38b433a8ce94e719149481844dfb0..a8bd6dba4e1744c3c9199afa86a068e1b5c68ab5 100644
+--- a/gradle/runtime.libs.versions.toml
++++ b/gradle/runtime.libs.versions.toml
+@@ -19,7 +19,8 @@ enigma = "3.0.1"
+ javax-annotations = "3.0.2"
+ forge-runtime = "2.0.9"
+ access-transformers = "3.0.1"
+-access-transformers-new = "8.0.5"
++# 8.2.17：FG7 对 26.2 的版本（可解析 26.x 新 AT 语法；8.0.5 会把新语法判 Invalid 导致 FML 启动崩溃）
++access-transformers-new = "8.2.17"
+ access-transformers-neo = "10.0.2"
+ unprotect = "2.0.2"
+ asm = "9.9.1"
+diff --git a/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java b/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java
+index 490ff08f466a80d32623661cd9560ea31cddf5da..9f64c701fb7abad2f10e37f211380b7e9976eec9 100644
+--- a/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java
++++ b/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java
+@@ -171,6 +171,16 @@ public final class McpExecutorBuilder {
+ 		return this;
+ 	}
+ 
++	/**
++	 * 判断当前 MCP 配置是否声明了指定步骤.
++	 *
++	 * @param step 步骤名称
++	 * @return 配置中存在该步骤时为 true
++	 */
++	public boolean hasStep(String step) {
++		return steps.stream().anyMatch(candidate -> candidate.name().equals(step));
++	}
++
+ 	/**
+ 	 * Builds options for an executor that runs all queued steps and their dependencies.
+ 	 *
+diff --git a/src/main/java/net/fabricmc/loom/configuration/ide/RunConfig.java b/src/main/java/net/fabricmc/loom/configuration/ide/RunConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d5e138894cafdeb0431d82818243f89662a6fbf0
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/configuration/ide/RunConfig.java
+@@ -0,0 +1,278 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2016-2021 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.configuration.ide;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Objects;
++import java.util.function.Consumer;
++import java.util.stream.Collectors;
++
++import com.google.gson.JsonElement;
++import com.google.gson.JsonObject;
++import groovy.xml.XmlUtil;
++import org.gradle.api.JavaVersion;
++import org.gradle.api.Project;
++import org.gradle.api.tasks.SourceSet;
++import org.gradle.plugins.ide.eclipse.model.EclipseModel;
++
++import net.fabricmc.loom.LoomGradleExtension;
++import net.fabricmc.loom.configuration.InstallerData;
++import net.fabricmc.loom.configuration.ide.idea.IdeaSyncTask;
++import net.fabricmc.loom.configuration.ide.idea.IdeaUtils;
++import net.fabricmc.loom.configuration.providers.minecraft.MinecraftVersionMeta;
++import net.fabricmc.loom.configuration.providers.minecraft.library.LibraryContext;
++import net.fabricmc.loom.util.gradle.GradleUtils;
++import net.fabricmc.loom.util.gradle.SourceSetReference;
++
++public class RunConfig {
++	public String configName;
++	public String eclipseProjectName;
++	public String ideaModuleName;
++	public String mainClass;
++	public String runDirIdeaUrl;
++	public String runDir;
++	public String environment;
++	public List<String> vmArgs = new ArrayList<>();
++	public List<String> programArgs = new ArrayList<>();
++	public List<String> vscodeBeforeRun = new ArrayList<>();
++	public transient SourceSet sourceSet;
++	public Map<String, Object> environmentVariables;
++	public String projectName;
++	public String folderName;
++	public String name;
++
++	// Turns camelCase/PascalCase into Capital Case
++	// caseConversionExample -> Case Conversion Example
++	private static String capitalizeCamelCaseName(String name) {
++		if (name.isEmpty()) {
++			return "";
++		}
++
++		return name.substring(0, 1).toUpperCase() + name.substring(1).replaceAll("([^A-Z])([A-Z])", "$1 $2");
++	}
++
++	public static RunConfig runConfig(Project project, RunConfigSettings settings) {
++		settings.evaluateNow();
++		LoomGradleExtension extension = LoomGradleExtension.get(project);
++		LibraryContext context = new LibraryContext(extension.getMinecraftProvider().getVersionInfo(), JavaVersion.current());
++
++		if (settings.getEnvironment().equals("client") && context.usesLWJGL3()) {
++			settings.startFirstThread();
++		}
++
++		String name = settings.getName();
++
++		String configName = settings.getConfigName();
++		String environment = settings.getEnvironment();
++		SourceSet sourceSet = settings.getSource(project);
++
++		String mainClass = settings.getMainClass().getOrNull();
++
++		if (mainClass == null) {
++			throw new IllegalArgumentException("Run configuration '" + name + "' must specify 'mainClass'");
++		}
++
++		if (configName == null) {
++			configName = "";
++			String srcName = sourceSet.getName();
++
++			final boolean isSplitClientSourceSet = extension.areEnvironmentSourceSetsSplit()
++					&& srcName.equals("client")
++					&& environment.equals("client");
++
++			if (!srcName.equals(SourceSet.MAIN_SOURCE_SET_NAME) && !isSplitClientSourceSet) {
++				configName += capitalizeCamelCaseName(srcName) + " ";
++			}
++
++			configName += "Minecraft " + capitalizeCamelCaseName(name);
++		}
++
++		Objects.requireNonNull(environment, "No environment set for run config");
++
++		String runDir = settings.getRunDir();
++
++		if (runDir == null) {
++			runDir = "run";
++		}
++
++		boolean appendProjectPath = settings.getAppendProjectPathToConfigName().get();
++		RunConfig runConfig = new RunConfig();
++		runConfig.configName = configName;
++		runConfig.name = name;
++
++		if (appendProjectPath && !GradleUtils.isRootProject(project)) {
++			runConfig.configName += " (" + project.getPath() + ")";
++		}
++
++		runConfig.mainClass = settings.devLaunchMainClass().get();
++		runConfig.vmArgs.add("-Dfabric.dli.config=" + encodeEscaped(extension.getFiles().getDevLauncherConfig().getAbsolutePath()));
++		runConfig.vmArgs.add("-Dfabric.dli.env=" + environment.toLowerCase());
++		runConfig.eclipseProjectName = project.getExtensions().getByType(EclipseModel.class).getProject().getName();
++		runConfig.ideaModuleName = IdeaUtils.getIdeaModuleName(new SourceSetReference(sourceSet, project));
++		runConfig.runDirIdeaUrl = "file://$PROJECT_DIR$/" + runDir;
++		runConfig.runDir = runDir;
++		runConfig.sourceSet = sourceSet;
++		runConfig.environment = environment;
++
++		// Custom parameters
++		runConfig.programArgs.addAll(settings.getProgramArgs());
++		runConfig.vmArgs.addAll(settings.getVmArgs());
++		runConfig.vmArgs.add("-Dfabric.dli.main=" + mainClass);
++		runConfig.environmentVariables = new HashMap<>();
++		runConfig.environmentVariables.putAll(settings.getEnvironmentVariables());
++		runConfig.projectName = project.getName();
++		runConfig.folderName = settings.getIdeConfigFolder().getOrNull();
++
++		MinecraftVersionMeta.JavaVersion javaVersion = extension.getMinecraftProvider().getVersionInfo().javaVersion();
++
++		if (javaVersion != null && javaVersion.majorVersion() >= 25) {
++			runConfig.vmArgs.add("--sun-misc-unsafe-memory-access=allow");
++			runConfig.vmArgs.add("--enable-native-access=ALL-UNNAMED");
++		}
++
++		for (Consumer<RunConfig> consumer : extension.getSettingsPostEdit()) {
++			consumer.accept(runConfig);
++		}
++
++		return runConfig;
++	}
++
++	public String fromDummy(String dummy, boolean relativeDir, Project project) throws IOException {
++		String dummyConfig;
++
++		try (InputStream input = IdeaSyncTask.class.getClassLoader().getResourceAsStream(dummy)) {
++			dummyConfig = new String(input.readAllBytes(), StandardCharsets.UTF_8);
++		}
++
++		String runDir = this.runDir;
++
++		if (relativeDir && project.getRootProject() != project) {
++			Path rootPath = project.getRootDir().toPath();
++			Path projectPath = project.getProjectDir().toPath();
++			String relativePath = rootPath.relativize(projectPath).toString();
++
++			runDir = relativePath + "/" + runDir;
++		}
++
++		dummyConfig = dummyConfig.replace("%NAME%", configName);
++		dummyConfig = dummyConfig.replace("%MAIN_CLASS%", mainClass);
++		dummyConfig = dummyConfig.replace("%ECLIPSE_PROJECT%", eclipseProjectName);
++		dummyConfig = dummyConfig.replace("%IDEA_MODULE%", ideaModuleName);
++		dummyConfig = dummyConfig.replace("%RUN_DIRECTORY%", runDir);
++		dummyConfig = dummyConfig.replace("%PROGRAM_ARGS%", joinArguments(programArgs).replaceAll("\"", "&quot;"));
++		dummyConfig = dummyConfig.replace("%VM_ARGS%", joinArguments(vmArgs).replaceAll("\"", "&quot;"));
++		dummyConfig = dummyConfig.replace("%IDEA_ENV_VARS%", getEnvVars("<env name=\"%s\" value=\"%s\"/>"));
++		dummyConfig = dummyConfig.replace("%ECLIPSE_ENV_VARS%", getEnvVars("<mapEntry key=\"%s\" value=\"%s\"/>"));
++		dummyConfig = dummyConfig.replace("%IDEA_FOLDER_NAME%", folderName == null ? "" : "folderName=\"" + XmlUtil.escapeXml(folderName) + "\"");
++
++		return dummyConfig;
++	}
++
++	private String getEnvVars(String pattern) {
++		return environmentVariables.entrySet().stream()
++			.map(entry ->
++				pattern.formatted(entry.getKey(), entry.getValue().toString())
++			).collect(Collectors.joining());
++	}
++
++	public static String joinArguments(List<String> args) {
++		final var sb = new StringBuilder();
++		boolean first = true;
++
++		for (String arg : args) {
++			if (!first) {
++				sb.append(" ");
++			}
++
++			first = false;
++
++			if (arg.contains(" ")) {
++				sb.append("\"").append(arg).append("\"");
++			} else {
++				sb.append(arg);
++			}
++		}
++
++		return sb.toString();
++	}
++
++	static String getMainClass(String side, LoomGradleExtension extension, String defaultMainClass) {
++		InstallerData installerData = extension.getInstallerData() == null ? null : extension.getInstallerData();
++
++		if (installerData == null) {
++			return defaultMainClass;
++		}
++
++		JsonObject installerJson = installerData.installerJson();
++
++		if (installerJson != null && installerJson.has("mainClass")) {
++			JsonElement mainClassJson = installerJson.get("mainClass");
++
++			String mainClassName = "";
++
++			if (mainClassJson.isJsonObject()) {
++				JsonObject mainClassesJson = mainClassJson.getAsJsonObject();
++
++				if (mainClassesJson.has(side)) {
++					mainClassName = mainClassesJson.get(side).getAsString();
++				}
++			} else {
++				mainClassName = mainClassJson.getAsString();
++			}
++
++			return mainClassName;
++		}
++
++		return defaultMainClass;
++	}
++
++	public List<String> getExcludedLibraryPaths(Project project) {
++		return RuntimeLibraries.getExcludedLibraryPaths(project, this);
++	}
++
++	private static String encodeEscaped(String s) {
++		StringBuilder ret = new StringBuilder();
++
++		for (int i = 0; i < s.length(); i++) {
++			char c = s.charAt(i);
++
++			if (c == '@' && i > 0 && s.charAt(i - 1) == '@' || c == ' ') {
++				ret.append(String.format(Locale.ENGLISH, "@@%04x", (int) c));
++			} else {
++				ret.append(c);
++			}
++		}
++
++		return ret.toString();
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/RuntimeLibrariesTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/RuntimeLibrariesTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..7ef53818e0f2172c1ec0f42660406cb0018ee5bc
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/RuntimeLibrariesTest.groovy
+@@ -0,0 +1,46 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 WCPE
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit
++
++import spock.lang.Specification
++
++import net.fabricmc.loom.LoomGradleExtension
++import net.fabricmc.loom.configuration.ide.RunConfig
++import net.fabricmc.loom.test.util.GradleTestUtil
++
++import static org.mockito.Mockito.when
++
++class RuntimeLibrariesTest extends Specification {
++	def "unobfuscated server run keeps the complete runtime module graph"() {
++		given:
++		def project = GradleTestUtil.mockProject()
++		def extension = LoomGradleExtension.get(project)
++		when(extension.disableObfuscation()).thenReturn(true)
++		def runConfig = new RunConfig(environment: "server")
++
++		expect:
++		runConfig.getExcludedLibraryPaths(project).empty
++	}
++}

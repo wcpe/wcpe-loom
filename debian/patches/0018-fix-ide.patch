@@ -1,0 +1,31 @@
+From 6b71f4de3324fc5c6f959894f3499478c704fcdb Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:30 +0800
+Subject: [PATCH 018/147] =?UTF-8?q?fix(ide):=20=E8=BF=90=E8=A1=8C=E7=9B=AE?=
+ =?UTF-8?q?=E5=BD=95=E7=9B=B8=E5=AF=B9=E8=B7=AF=E5=BE=84=E7=BB=9F=E4=B8=80?=
+ =?UTF-8?q?=E4=BD=BF=E7=94=A8=E6=AD=A3=E6=96=9C=E6=9D=A0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+基底把 1.15 的 URI.getPath() 重构成 Path.toString()，Windows 下会产出
+$PROJECT_DIR$/sub\run 这类混用分隔符的运行配置。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/ide/RunConfigUtils.java b/src/main/java/net/fabricmc/loom/configuration/ide/RunConfigUtils.java
+index 95ce6a10296f3b5deb68a19066a1332a2d4ad26e..70de9f33ee44650d7a44ce3330c181aa404cfca7 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/ide/RunConfigUtils.java
++++ b/src/main/java/net/fabricmc/loom/configuration/ide/RunConfigUtils.java
+@@ -111,7 +111,9 @@ public class RunConfigUtils {
+ 		File projectDir = project.getRootProject().getProjectDir();
+ 
+ 		if (runDir.toPath().startsWith(projectDir.toPath())) {
+-			String relativePath = projectDir.toPath().relativize(runDir.toPath()).toString();
++			// Windows 上 Path.toString() 使用反斜杠，而 $PROJECT_DIR$ / ${workspace_loc} 这类 IDE 宏约定用正斜杠
++			// （1.15 由 URI.getPath() 保证恒为正斜杠），不归一化会写出 $PROJECT_DIR$/sub\run 这种混用分隔符的配置。
++			String relativePath = projectDir.toPath().relativize(runDir.toPath()).toString().replace(File.separatorChar, '/');
+ 			return relativeFormatter.apply(relativePath);
+ 		} else {
+ 			return absoluteFormatter.apply(runDir);

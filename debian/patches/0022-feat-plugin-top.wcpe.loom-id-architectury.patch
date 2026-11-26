@@ -1,0 +1,298 @@
+From fcb357825409af47b2440b1ef03e76f3fe06fa0d Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:32 +0800
+Subject: [PATCH 022/147] =?UTF-8?q?feat(plugin):=20=E6=96=B0=E5=A2=9E=20to?=
+ =?UTF-8?q?p.wcpe.loom=20=E6=8F=92=E4=BB=B6=20id=20=E5=B9=B6=E4=BF=9D?=
+ =?UTF-8?q?=E7=95=99=20architectury=20=E5=88=AB=E5=90=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+本 fork 改用自有域名的插件 id，同时保留 dev.architectury.loom* 作为兼容别名；
+检测逻辑统一走各插件类的 isApplied()，避免"插件装了但 loom 认不出"。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/build.gradle b/build.gradle
+index c749d52aca7824338d84ea57af18734accaf4a3f..0e89c0de4b8879e7a95222726dd3c9c59ded1f9d 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -269,6 +269,30 @@ codenarc {
+ 
+ gradlePlugin {
+ 	plugins {
++		// 本 fork 的插件 id
++		wcpeLoom {
++			id = 'top.wcpe.loom'
++			implementationClass = 'net.fabricmc.loom.LoomGradlePlugin'
++		}
++		wcpeLoomNoRemap {
++			id = 'top.wcpe.loom-no-remap'
++			implementationClass = 'net.fabricmc.loom.LoomNoRemapGradlePlugin'
++		}
++		wcpeLoomRemap {
++			id = 'top.wcpe.loom-remap'
++			implementationClass = 'net.fabricmc.loom.LoomRemapGradlePlugin'
++		}
++		wcpeLoomCompanion {
++			id = 'top.wcpe.loom-companion'
++			implementationClass = 'net.fabricmc.loom.LoomCompanionGradlePlugin'
++		}
++		wcpeLoomRepositories {
++			id = 'top.wcpe.loom-repositories'
++			implementationClass = 'net.fabricmc.loom.LoomRepositoryPlugin'
++		}
++
++		// 兼容别名：上一层分叉（architectury）的 id。
++		// 既有下游项目与 src/test/resources 下的测试夹具都使用这些 id，勿删。
+ 		fabricLoom {
+ 			id = 'dev.architectury.loom'
+ 			implementationClass = 'net.fabricmc.loom.LoomGradlePlugin'
+diff --git a/src/main/java/net/fabricmc/loom/LoomCompanionGradlePlugin.java b/src/main/java/net/fabricmc/loom/LoomCompanionGradlePlugin.java
+index 87d98101dd0d4230629f30be472b9d47e356e715..67cae1b447652fd2adf323ccd39d7c6cc2c406a0 100644
+--- a/src/main/java/net/fabricmc/loom/LoomCompanionGradlePlugin.java
++++ b/src/main/java/net/fabricmc/loom/LoomCompanionGradlePlugin.java
+@@ -32,9 +32,18 @@ import net.fabricmc.loom.task.launch.ExportClasspathTask;
+ import net.fabricmc.loom.util.Constants;
+ 
+ public class LoomCompanionGradlePlugin implements Plugin<Project> {
+-	public static final String NAME = "dev.architectury.loom-companion";
++	public static final String NAME = "top.wcpe.loom-companion";
++	/** 上一层分叉（architectury）的插件 id，作为兼容别名保留. */
++	public static final String ARCH_NAME = "dev.architectury.loom-companion";
+ 	public static final String UPSTREAM_NAME = "net.fabricmc.fabric-loom-companion";
+ 
++	/** 本项目是否已应用 companion（本 fork / architectury / 上游任一 id）. */
++	public static boolean isApplied(Project project) {
++		return project.getPluginManager().hasPlugin(NAME)
++				|| project.getPluginManager().hasPlugin(ARCH_NAME)
++				|| project.getPluginManager().hasPlugin(UPSTREAM_NAME);
++	}
++
+ 	@Override
+ 	public void apply(Project project) {
+ 		var exportClassPathTask = project.getTasks().register(Constants.Task.EXPORT_CLASSPATH, ExportClasspathTask.class);
+diff --git a/src/main/java/net/fabricmc/loom/LoomGradlePlugin.java b/src/main/java/net/fabricmc/loom/LoomGradlePlugin.java
+index f9290dc281bc521ae4d6438d28ff5445dcf72532..97f7677cec2fa4908530fc16667c63dedfede97e 100644
+--- a/src/main/java/net/fabricmc/loom/LoomGradlePlugin.java
++++ b/src/main/java/net/fabricmc/loom/LoomGradlePlugin.java
+@@ -56,6 +56,14 @@ import net.fabricmc.loom.util.OneDrive;
+ 
+ public class LoomGradlePlugin implements Plugin<PluginAware> {
+ 	public static final String NAME = Constants.PLUGIN_ID;
++	/** 上一层分叉（architectury）的插件 id，作为兼容别名保留，使既有项目与测试夹具无需改动. */
++	public static final String LEGACY_NAME = "dev.architectury.loom";
++
++	/** 目标是否已应用 loom（新旧任一 id）. */
++	public static boolean isApplied(PluginAware target) {
++		return target.getPluginManager().hasPlugin(NAME) || target.getPluginManager().hasPlugin(LEGACY_NAME);
++	}
++
+ 	public static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+ 	public static final String LOOM_VERSION = Objects.requireNonNullElse(LoomGradlePlugin.class.getPackage().getImplementationVersion(), "0.0.0+unknown");
+ 
+diff --git a/src/main/java/net/fabricmc/loom/LoomNoRemapGradlePlugin.java b/src/main/java/net/fabricmc/loom/LoomNoRemapGradlePlugin.java
+index c0b2a022b76dd63c82e1bbf5ffc3683667487df4..4eaf2aab33df0734a5622f6c26788ee0c262bba0 100644
+--- a/src/main/java/net/fabricmc/loom/LoomNoRemapGradlePlugin.java
++++ b/src/main/java/net/fabricmc/loom/LoomNoRemapGradlePlugin.java
+@@ -31,11 +31,18 @@ import org.gradle.api.Project;
+  * A marker plugin to indicate to the main loom plugin not to setup for remapping.
+  */
+ public class LoomNoRemapGradlePlugin implements Plugin<Project> {
+-	public static final String NAME = "dev.architectury.loom-no-remap";
++	public static final String NAME = "top.wcpe.loom-no-remap";
++	/** 上一层分叉（architectury）的插件 id，作为兼容别名保留. */
++	public static final String LEGACY_NAME = "dev.architectury.loom-no-remap";
++
++	/** 本项目是否已应用 no-remap 变体（新旧任一 id）. */
++	public static boolean isApplied(Project project) {
++		return project.getPluginManager().hasPlugin(NAME) || project.getPluginManager().hasPlugin(LEGACY_NAME);
++	}
+ 
+ 	@Override
+ 	public void apply(Project target) {
+-		if (target.getPluginManager().hasPlugin(LoomGradlePlugin.NAME)) {
++		if (LoomGradlePlugin.isApplied(target)) {
+ 			throw new IllegalStateException(NAME + " must be applied before " + LoomGradlePlugin.NAME);
+ 		}
+ 
+diff --git a/src/main/java/net/fabricmc/loom/LoomRemapGradlePlugin.java b/src/main/java/net/fabricmc/loom/LoomRemapGradlePlugin.java
+index e80a665c30da262b20539f8c70b4e21c49d5a427..cfc01a5b79b33a2195843364f6334024414727bb 100644
+--- a/src/main/java/net/fabricmc/loom/LoomRemapGradlePlugin.java
++++ b/src/main/java/net/fabricmc/loom/LoomRemapGradlePlugin.java
+@@ -31,7 +31,7 @@ import org.gradle.api.Project;
+  * An alias for `net.fabricmc.fabric-loom-remap` to `fabric-loom`.
+  */
+ public class LoomRemapGradlePlugin implements Plugin<Project> {
+-	public static final String NAME = "dev.architectury.loom-remap";
++	public static final String NAME = "top.wcpe.loom-remap";
+ 
+ 	@Override
+ 	public void apply(Project target) {
+diff --git a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+index e9dfc3b9fa870547223b4a63e00d832610633f96..c61b4aa2efedf2dad2b2aa6d9f138477cd914f19 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+@@ -232,13 +232,13 @@ public abstract class CompileConfiguration implements Runnable {
+ 
+ 		// TODO: Re-evaluate if isUnobfuscatedForge() should even exist, or if the checks below should be removed
+ 		if (extension.isForgeLike() && extension.disableObfuscation() && !extension.isUnobfuscatedForge()) {
+-			throw new UnsupportedOperationException(("Architectury Loom: The dev.architectury.loom-no-remap plugin was applied, but the Minecraft version '%s' is obfuscated. "
+-					+ "Forge / NeoForge support for obfuscated Minecraft is through the regular dev.architectury.loom plugin instead.").formatted(metadataProvider.getMinecraftVersion()));
++			throw new UnsupportedOperationException(("Architectury Loom: The top.wcpe.loom-no-remap plugin was applied, but the Minecraft version '%s' is obfuscated. "
++					+ "Forge / NeoForge support for obfuscated Minecraft is through the regular top.wcpe.loom plugin instead.").formatted(metadataProvider.getMinecraftVersion()));
+ 		}
+ 
+ 		if (extension.isForgeLike() && !extension.disableObfuscation() && extension.isUnobfuscatedForge()) {
+ 			throw new UnsupportedOperationException(("Architectury Loom: The Minecraft version '%s' is unobfuscated (no mappings). "
+-					+ "Forge / NeoForge support for unobfuscated Minecraft is through the dev.architectury.loom-no-remap plugin instead.").formatted(metadataProvider.getMinecraftVersion()));
++					+ "Forge / NeoForge support for unobfuscated Minecraft is through the top.wcpe.loom-no-remap plugin instead.").formatted(metadataProvider.getMinecraftVersion()));
+ 		}
+ 
+ 		extension.setMinecraftProvider(minecraftProvider);
+diff --git a/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java b/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java
+index d96c00931824f00de95aa2679a40260bfa9bf484..17baf112181f36e6b55bfe1a91754a8a8acea46e 100644
+--- a/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java
++++ b/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java
+@@ -139,7 +139,7 @@ public abstract class LoomGradleExtensionImpl extends LoomGradleExtensionApiImpl
+ 		disableObfuscation = project.getObjects().property(Boolean.class);
+ 		dontRemap = project.getObjects().property(Boolean.class);
+ 
+-		if (project.getPluginManager().hasPlugin(LoomNoRemapGradlePlugin.NAME)) {
++		if (LoomNoRemapGradlePlugin.isApplied(project)) {
+ 			disableObfuscation.set(true);
+ 			disableObfuscation.finalizeValue();
+ 		} else {
+diff --git a/src/main/java/net/fabricmc/loom/task/AbstractLoomTask.java b/src/main/java/net/fabricmc/loom/task/AbstractLoomTask.java
+index 29c581e13e63b1f548851f3075ec0351aae8eb9d..9a5d15932096b4146c038832f5f148302d4ff0f5 100644
+--- a/src/main/java/net/fabricmc/loom/task/AbstractLoomTask.java
++++ b/src/main/java/net/fabricmc/loom/task/AbstractLoomTask.java
+@@ -49,7 +49,7 @@ public abstract class AbstractLoomTask extends DefaultTask {
+ 
+ 		// Store the platform if Loom is applied.
+ 		// This code might run in projects without Loom, such as Loom Companion projects.
+-		if (getProject().getPluginManager().hasPlugin(LoomGradlePlugin.NAME)) {
++		if (LoomGradlePlugin.isApplied(getProject())) {
+ 			getModPlatform().value(getExtension().getPlatform()).finalizeValue();
+ 		}
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/task/service/MixinAPMappingService.java b/src/main/java/net/fabricmc/loom/task/service/MixinAPMappingService.java
+index 45ee45868a41e827cf7f2996a973b947f8298b36..c9722f61c526ee2d7bd9a7bf30384986c630f9b4 100644
+--- a/src/main/java/net/fabricmc/loom/task/service/MixinAPMappingService.java
++++ b/src/main/java/net/fabricmc/loom/task/service/MixinAPMappingService.java
+@@ -109,7 +109,7 @@ public class MixinAPMappingService extends Service<MixinAPMappingService.Options
+ 			processProject.accept(thisProject);
+ 		} else {
+ 			GradleUtils.allLoomProjects(thisProject.getGradle(), project -> {
+-				if (project.getPlugins().hasPlugin(LoomNoRemapGradlePlugin.NAME)) {
++				if (LoomNoRemapGradlePlugin.isApplied(project)) {
+ 					// Unobfuscated projects do not have mappings to provide.
+ 					return;
+ 				}
+diff --git a/src/main/java/net/fabricmc/loom/util/Constants.java b/src/main/java/net/fabricmc/loom/util/Constants.java
+index 940d8183d5b4d4f1886db77d6dd018ce8eef3c5d..c7a0ced7e6c0a5c5b9ad9d9637c10803d18baea8 100644
+--- a/src/main/java/net/fabricmc/loom/util/Constants.java
++++ b/src/main/java/net/fabricmc/loom/util/Constants.java
+@@ -28,7 +28,7 @@ import org.jetbrains.annotations.ApiStatus;
+ import org.objectweb.asm.Opcodes;
+ 
+ public class Constants {
+-	public static final String PLUGIN_ID = "dev.architectury.loom";
++	public static final String PLUGIN_ID = "top.wcpe.loom";
+ 	public static final boolean PLUGIN_BETA = false;
+ 	public static final boolean PLUGIN_DEPRECATED = false;
+ 	public static final String LIBRARIES_BASE = "https://libraries.minecraft.net/";
+diff --git a/src/main/java/net/fabricmc/loom/util/gradle/GradleUtils.java b/src/main/java/net/fabricmc/loom/util/gradle/GradleUtils.java
+index 644746118a0da6c2807a605e0c3ff72fab1d9424..01aec655e77dbf191f60690dba7dc0872d4af2a5 100644
+--- a/src/main/java/net/fabricmc/loom/util/gradle/GradleUtils.java
++++ b/src/main/java/net/fabricmc/loom/util/gradle/GradleUtils.java
+@@ -61,11 +61,11 @@ public final class GradleUtils {
+ 	}
+ 
+ 	public static boolean isLoomProject(Project project) {
+-		return project.getPluginManager().hasPlugin(LoomGradlePlugin.NAME);
++		return LoomGradlePlugin.isApplied(project);
+ 	}
+ 
+ 	public static boolean isLoomCompanionProject(Project project) {
+-		return project.getPluginManager().hasPlugin(LoomCompanionGradlePlugin.NAME) || project.getPluginManager().hasPlugin(LoomCompanionGradlePlugin.UPSTREAM_NAME);
++		return LoomCompanionGradlePlugin.isApplied(project);
+ 	}
+ 
+ 	public static Provider<Boolean> getBooleanPropertyProvider(Project project, String key) {
+diff --git a/src/test/resources/patches/fabric_api_unobf.patch b/src/test/resources/patches/fabric_api_unobf.patch
+index e75d239e7a88cb5ed08f5eea73854080a6bc4312..a1888c80d5bad843cc4d2f780c3fa1c5a7813706 100644
+--- a/src/test/resources/patches/fabric_api_unobf.patch
++++ b/src/test/resources/patches/fabric_api_unobf.patch
+@@ -6,7 +6,7 @@ diff --git a/build.gradle b/build.gradle
+  	id "eclipse"
+  	id "maven-publish"
+ -	id "net.fabricmc.fabric-loom" version "1.16.2" apply false
+-+	id "net.fabricmc.fabric-loom" apply false
+++	id "top.wcpe.loom-no-remap" apply false
+  	id "com.diffplug.spotless" version "8.5.1"
+  	id "me.modmuss50.remotesign" version "0.5.0" apply false
+  	id "me.modmuss50.mod-publish-plugin" version "2.0.0-beta.1"
+@@ -43,3 +43,12 @@ diff --git a/build.gradle b/build.gradle
+  }
+ 
+  def moduleDependencies(project, List<String> depNames) {
++@@ -146,7 +146,7 @@
++ 
++ 	apply plugin: "java-library"
++ 	apply plugin: "checkstyle"
++-	apply plugin: "net.fabricmc.fabric-loom"
+++	apply plugin: "top.wcpe.loom-no-remap"
++ 	apply plugin: "com.diffplug.spotless"
++ 
++ 	tasks.withType(JavaCompile).configureEach {
+diff --git a/src/test/resources/projects/forge/legacy/externalModDependency/build.gradle b/src/test/resources/projects/forge/legacy/externalModDependency/build.gradle
+index e526d3e28d7cf5a876b9681cc088471f42e697ab..da60a6ca7fe3e67b73645ecf984b88eb0d786b97 100644
+--- a/src/test/resources/projects/forge/legacy/externalModDependency/build.gradle
++++ b/src/test/resources/projects/forge/legacy/externalModDependency/build.gradle
+@@ -1,5 +1,6 @@
+ plugins {
+-	id 'dev.architectury.loom'
++	// 本夹具用新插件 id，其余夹具仍用 dev.architectury.loom 以覆盖别名路径
++	id 'top.wcpe.loom'
+ 	id 'maven-publish'
+ }
+ 
+diff --git a/src/test/resources/projects/multiProjectDirectLoom/build.gradle b/src/test/resources/projects/multiProjectDirectLoom/build.gradle
+index d244cde1d5c314ddfa30e1618d4964f6b7cb33c9..7577ed1f724deabdc8e978ff0ac8d115f4721fbf 100644
+--- a/src/test/resources/projects/multiProjectDirectLoom/build.gradle
++++ b/src/test/resources/projects/multiProjectDirectLoom/build.gradle
+@@ -2,7 +2,7 @@ plugins {
+ 	id "java"
+ }
+ 
+-apply plugin: "gg.essential.loom"
++apply plugin: "top.wcpe.loom"
+ 
+ version = "1.0.0"
+ 
+diff --git a/src/test/resources/projects/multiProjectDirectLoom/one/build.gradle b/src/test/resources/projects/multiProjectDirectLoom/one/build.gradle
+index d0d1c59aa5144ce73b6b09debd1a5d1eb0ce5bc2..885d4c1cb9286ad79742b91436f13a5a2656bb93 100644
+--- a/src/test/resources/projects/multiProjectDirectLoom/one/build.gradle
++++ b/src/test/resources/projects/multiProjectDirectLoom/one/build.gradle
+@@ -1,6 +1,6 @@
+ plugins {
+ 	id "java"
+-	id "gg.essential.loom"
++	id "top.wcpe.loom"
+ }
+ 
+ version = "1.0.0"
+diff --git a/src/test/resources/projects/multiProjectDirectLoom/two/build.gradle b/src/test/resources/projects/multiProjectDirectLoom/two/build.gradle
+index dc69ea11decd36eabab77f174b40e8803429214d..c4b2490b497b3d2d9e06acb2e38e106278b1c752 100644
+--- a/src/test/resources/projects/multiProjectDirectLoom/two/build.gradle
++++ b/src/test/resources/projects/multiProjectDirectLoom/two/build.gradle
+@@ -1,6 +1,6 @@
+ plugins {
+ 	id "java"
+-	id "gg.essential.loom"
++	id "top.wcpe.loom"
+ }
+ 
+ version = "1.0.0"

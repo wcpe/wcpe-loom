@@ -1,0 +1,1033 @@
+From e028de5ae226ce80a6670008981fa0390fbd32b8 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:21 +0800
+Subject: [PATCH 003/147] =?UTF-8?q?fix(cache):=20=E6=89=A9=E5=B1=95?=
+ =?UTF-8?q?=E8=B7=A8=20daemon=20=E5=8A=A0=E9=94=81=E4=B8=8E=E5=8E=9F?=
+ =?UTF-8?q?=E5=AD=90=E5=8F=91=E5=B8=83=E5=88=B0=E5=85=A8=E9=83=A8=E7=BC=93?=
+ =?UTF-8?q?=E5=AD=98=E4=BA=A7=E7=89=A9?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+下载、抽取、合并、映射与源码重映射等全部缓存产物统一纳入跨进程锁与原子发布，
+避免并发构建产生半成品产物。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/LocalMavenHelper.java b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/LocalMavenHelper.java
+index 71ff6f09c3872a356afdc4788cdd46ddd20ca028..5d5184f619e520124b3dc150a84c385ef7af90dd 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/LocalMavenHelper.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/LocalMavenHelper.java
+@@ -28,6 +28,7 @@ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.UncheckedIOException;
+ import java.nio.charset.StandardCharsets;
++import java.nio.file.AtomicMoveNotSupportedException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.StandardCopyOption;
+@@ -46,7 +47,30 @@ public record LocalMavenHelper(String group, String name, String version, @Nulla
+ 
+ 		Files.createDirectories(getDirectory());
+ 		savePom();
+-		return Files.copy(artifact, getOutputFile(classifier), StandardCopyOption.REPLACE_EXISTING);
++
++		final Path target = getOutputFile(classifier);
++		// 原子发布：先写「唯一」临时文件再原子 move。唯一名避免两个进程/线程并发写同一目标时
++		// 共享 .tmp 互相踩踏；原子 move 保证读方要么看到旧文件要么看到完整新文件（内容寻址下二者等价）。
++		final Path tmp = Files.createTempFile(target.getParent(), target.getFileName().toString(), ".tmp");
++
++		try {
++			Files.copy(artifact, tmp, StandardCopyOption.REPLACE_EXISTING);
++			atomicMove(tmp, target);
++		} finally {
++			// 原子 move 成功后 tmp 已不存在；失败时清理残留，避免遗留垃圾临时文件
++			Files.deleteIfExists(tmp);
++		}
++
++		return target;
++	}
++
++	// 原子 move：优先 ATOMIC_MOVE，个别平台不支持时退化为普通 move
++	private static void atomicMove(Path source, Path target) throws IOException {
++		try {
++			Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
++		} catch (AtomicMoveNotSupportedException e) {
++			Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
++		}
+ 	}
+ 
+ 	public boolean exists(String classifier) {
+@@ -74,7 +98,16 @@ public record LocalMavenHelper(String group, String name, String version, @Nulla
+ 					.replace("%NAME%", name)
+ 					.replace("%VERSION%", version);
+ 
+-			Files.writeString(getPomPath(), pomTemplate, StandardCharsets.UTF_8);
++			// 原子发布：先写「唯一」临时文件再原子 move，避免跨进程读到半写的 pom，且唯一名避免并发写同一 pom 时 tmp 踩踏
++			final Path pom = getPomPath();
++			final Path tmp = Files.createTempFile(pom.getParent(), pom.getFileName().toString(), ".tmp");
++
++			try {
++				Files.writeString(tmp, pomTemplate, StandardCharsets.UTF_8);
++				atomicMove(tmp, pom);
++			} finally {
++				Files.deleteIfExists(tmp);
++			}
+ 		} catch (IOException e) {
+ 			throw new UncheckedIOException("Failed to write mod pom", e);
+ 		}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/BundleMetadata.java b/src/main/java/net/fabricmc/loom/configuration/providers/BundleMetadata.java
+index 8b766c80460ae555f29af3dfba2248aad8c4507f..aefda28d6d6d7e4966d1f681ee1016bb28c5a4d9 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/BundleMetadata.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/BundleMetadata.java
+@@ -40,6 +40,7 @@ import org.jspecify.annotations.Nullable;
+ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.util.AttributeHelper;
+ import net.fabricmc.loom.util.FileSystemUtil;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ 
+ public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String mainClass) {
+ 	private static final String LIBRARIES_LIST_PATH = "META-INF/libraries.list";
+@@ -99,11 +100,15 @@ public record BundleMetadata(List<Entry> libraries, List<Entry> versions, String
+ 				}
+ 			}
+ 
+-			try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar)) {
+-				Files.copy(fs.get().getPath(path()), dest, StandardCopyOption.REPLACE_EXISTING);
+-			}
++			// 原子发布：先抽取到同目录唯一临时文件并写入 hash 标记，完整后再原子 move 到 dest。
++			// 避免跨进程的无锁存在性检查在抽取期间看到半写的 server jar 误判就绪。
++			AtomicFiles.publish(dest, tmp -> {
++				try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar)) {
++					Files.copy(fs.get().getPath(path()), tmp, StandardCopyOption.REPLACE_EXISTING);
++				}
+ 
+-			writeHash(dest, sha1);
++				writeHash(tmp, sha1);
++			});
+ 		}
+ 
+ 		private Optional<String> readHash(Path output) {
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/IntermediaryMappingsProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/IntermediaryMappingsProvider.java
+index 682d5142856121630ac11ff47ec9e76392304b64..3a1d31ac05602e9a3170a8b728abacf867a23bc5 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/IntermediaryMappingsProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/IntermediaryMappingsProvider.java
+@@ -48,6 +48,7 @@ import org.slf4j.LoggerFactory;
+ import net.fabricmc.loom.api.mappings.intermediate.IntermediateMappingsProvider;
+ import net.fabricmc.loom.extension.LoomGradleExtensionApiImpl;
+ import net.fabricmc.loom.util.Checksum;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ 
+ @ApiStatus.Internal
+ public abstract class IntermediaryMappingsProvider extends IntermediateMappingsProviderInternal {
+@@ -89,13 +90,11 @@ public abstract class IntermediaryMappingsProvider extends IntermediateMappingsP
+ 					intermediaryJarPath,
+ 					StandardCopyOption.REPLACE_EXISTING
+ 			);
+-			Files.deleteIfExists(tinyMappings);
+ 		} else {
+ 			final String url = urlRaw.formatted(encodedMcVersion);
+ 
+ 			LOGGER.info("Downloading intermediary from {}", url);
+ 
+-			Files.deleteIfExists(tinyMappings);
+ 			Files.deleteIfExists(intermediaryJarPath);
+ 
+ 			getDownloader().get().apply(url)
+@@ -103,7 +102,10 @@ public abstract class IntermediaryMappingsProvider extends IntermediateMappingsP
+ 					.downloadPath(intermediaryJarPath);
+ 		}
+ 
+-		MappingConfiguration.extractMappings(intermediaryJarPath, tinyMappings);
++		// 原子发布共享的 intermediary.tiny：tinyMappings 位于 <userCache>/<version>/，跨 daemon 共享。
++		// 该方法可能被不同的锁 key（mappings: 与 layered-mappings:）在冷缓存下并发触发，
++		// 故必须原子写入（写临时 + move），保证「文件存在 ⟺ 内容完整」，并发写同一文件也安全（内容寻址、幂等）。
++		AtomicFiles.publish(tinyMappings, tmp -> MappingConfiguration.extractMappings(intermediaryJarPath, tmp));
+ 	}
+ 
+ 	@Override
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/LayeredMappingsFactory.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/LayeredMappingsFactory.java
+index a04b3eeab2554b21bd93d14639aa778ff6ef7c9a..15f198bc19323abe861ee25f8ded76809aba0e90 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/LayeredMappingsFactory.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/LayeredMappingsFactory.java
+@@ -51,7 +51,9 @@ import net.fabricmc.loom.configuration.providers.mappings.extras.annotations.Ann
+ import net.fabricmc.loom.configuration.providers.mappings.extras.unpick.UnpickLayer;
+ import net.fabricmc.loom.configuration.providers.mappings.unpick.UnpickMetadata;
+ import net.fabricmc.loom.configuration.providers.mappings.utils.AddConstructorMappingVisitor;
++import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.ZipUtils;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.mappingio.adapter.MappingDstNsReorder;
+ import net.fabricmc.mappingio.adapter.MappingSourceNsSwitch;
+ import net.fabricmc.mappingio.format.tiny.Tiny2FileWriter;
+@@ -70,26 +72,52 @@ public record LayeredMappingsFactory(LayeredMappingSpec spec) {
+ 		for (LayeredMappingsFactory layeredMappingFactory : configContext.extension().getLayeredMappingFactories()) {
+ 			try {
+ 				layeredMappingFactory.evaluate(configContext);
+-			} catch (IOException e) {
+-				throw new UncheckedIOException("Failed to setup layered mappings: %s".formatted(layeredMappingFactory.mavenNotation()), e);
++			} catch (Exception e) {
++				throw new UncheckedIOException("Failed to setup layered mappings: %s".formatted(layeredMappingFactory.mavenNotation(configContext.project())), new IOException(e));
+ 			}
+ 		}
+ 	}
+ 
+-	private void evaluate(ConfigContext configContext) throws IOException {
+-		LOGGER.info("Evaluating layer mapping: {}", mavenNotation());
++	private void evaluate(ConfigContext configContext) throws Exception {
++		final String mappingVersion = mappingVersion(configContext.project());
++		LOGGER.info("Evaluating layer mapping: {}", mavenNotation(mappingVersion));
+ 
+ 		final Path mavenRepoDir = configContext.extension().getFiles().getGlobalMinecraftRepo().toPath();
+-		final LocalMavenHelper maven = new LocalMavenHelper(GROUP, MODULE, spec().getVersion(), null, mavenRepoDir);
+-		final Path jar = resolve(configContext.project());
+-		maven.copyToMaven(jar, null);
++		final LocalMavenHelper maven = new LocalMavenHelper(GROUP, MODULE, mappingVersion, null, mavenRepoDir);
++		final boolean refresh = configContext.extension().refreshDeps();
++
++		// 无锁快路径（关键）：全局仓库已存在该 layered mapping 产物且未要求刷新时，直接返回——
++		// 既不取跨进程锁，也不重写全局产物。
++		// layered mapping 产物按内容寻址（版本号含 hash），一旦存在即不会变化；
++		// 这是暖缓存下多 daemon 并发构建同一版本时「明明只是读取，却互相抢 layered-mappings 锁、
++		// 且不断把 mappings jar 重写进全局仓库、导致另一 daemon 的依赖解析冲突」的根因，必须在锁外短路。
++		if (!refresh && maven.exists(null)) {
++			return;
++		}
++
++		final LoomCacheService cacheService = LoomCacheService.get(configContext.project()).get();
++		final Path lockRoot = configContext.extension().getFiles().getCacheLocks().toPath();
++
++		// 冷/刷新路径：写 GLOBAL 仓库（跨 daemon 共享），用跨进程 per-key 锁串行化首次产出，
++		// 避免多个 daemon 同时首次产出同一 layered mapping spec 时互相踩踏。
++		cacheService.runExclusive(lockRoot, "layered-mappings:" + mappingVersion, LoomCacheService.defaultTimeout(), () -> {
++			// 锁内二次确认：等锁期间可能已被其它进程产出，避免重复写
++			if (!refresh && maven.exists(null)) {
++				return null;
++			}
++
++			final Path jar = resolve(configContext.project());
++			maven.copyToMaven(jar, null);
++			return null;
++		});
+ 	}
+ 
+ 	public Path resolve(Project project) throws IOException {
+ 		final LoomGradleExtension extension = LoomGradleExtension.get(project);
+-		final MappingContext mappingContext = new GradleMappingContext(project, spec.getVersion().replace("+", "_").replace(".", "_"));
++		final String mappingVersion = mappingVersion(project);
++		final MappingContext mappingContext = new GradleMappingContext(project, mappingVersion.replace("+", "_").replace(".", "_"));
+ 		final Path mappingsDir = mappingContext.minecraftProvider().dir("layered").toPath();
+-		final Path mappingsZip = mappingsDir.resolve(String.format("%s.%s-%s.jar", GROUP, MODULE, spec.getVersion()));
++		final Path mappingsZip = mappingsDir.resolve(String.format("%s.%s-%s.jar", GROUP, MODULE, mappingVersion));
+ 
+ 		if (Files.exists(mappingsZip) && !mappingContext.refreshDeps()) {
+ 			return mappingsZip;
+@@ -110,11 +138,41 @@ public record LayeredMappingsFactory(LayeredMappingSpec spec) {
+ 	}
+ 
+ 	public Dependency createDependency(Project project) {
+-		return project.getDependencies().create(mavenNotation());
++		return project.getDependencies().create(mavenNotation(project));
+ 	}
+ 
+ 	public String mavenNotation() {
+-		return String.format("%s:%s:%s", GROUP, MODULE, spec.getVersion());
++		return mavenNotation(spec.getVersion());
++	}
++
++	private String mavenNotation(Project project) {
++		return mavenNotation(mappingVersion(project));
++	}
++
++	private String mappingVersion(Project project) {
++		final var minecraftDependencies = project.getConfigurations()
++				.getByName(Constants.Configurations.MINECRAFT)
++				.getDependencies();
++
++		if (minecraftDependencies.size() != 1) {
++			throw new IllegalStateException("Expected exactly one minecraft dependency for layered mappings");
++		}
++
++		final String minecraftVersion = minecraftDependencies.iterator().next().getVersion();
++
++		if (minecraftVersion == null || minecraftVersion.isBlank()) {
++			throw new IllegalStateException("The minecraft dependency must declare a version for layered mappings");
++		}
++
++		return mappingVersion(spec.getVersion(), minecraftVersion);
++	}
++
++	static String mappingVersion(String layeredVersion, String minecraftVersion) {
++		return layeredVersion + "-mc." + minecraftVersion;
++	}
++
++	private static String mavenNotation(String version) {
++		return String.format("%s:%s:%s", GROUP, MODULE, version);
+ 	}
+ 
+ 	private void writeMapping(LayeredMappingsProcessor processor, List<MappingLayer> layers, Path mappingsFile, boolean useIntermediateMappings) throws IOException {
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+index b441e9f6b8613645ff2c541c92c984890bc4124f..afde8b705dbadb2a6eefa80e1c96593cdce86b35 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+@@ -31,6 +31,7 @@ import java.io.Reader;
+ import java.io.UncheckedIOException;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.FileSystem;
++import java.nio.file.FileSystems;
+ import java.nio.file.Files;
+ import java.nio.file.NoSuchFileException;
+ import java.nio.file.Path;
+@@ -72,6 +73,7 @@ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.DeletingFileVisitor;
+ import net.fabricmc.loom.util.FileSystemUtil;
+ import net.fabricmc.loom.util.ZipUtils;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.loom.util.service.ScopedServiceFactory;
+ import net.fabricmc.loom.util.service.ServiceFactory;
+ import net.fabricmc.mappingio.MappingReader;
+@@ -161,9 +163,9 @@ public class MappingConfiguration {
+ 
+ 		try {
+ 			mappingProvider.setup(project, serviceFactory, minecraftProvider, inputJar);
+-		} catch (IOException e) {
++		} catch (Exception e) {
+ 			cleanWorkingDirectory(workingDir);
+-			throw new UncheckedIOException("Failed to setup mappings: " + dependency.getDepString(), e);
++			throw new RuntimeException("Failed to setup mappings: " + dependency.getDepString(), e);
+ 		}
+ 
+ 		return mappingProvider;
+@@ -197,12 +199,36 @@ public class MappingConfiguration {
+ 		return serviceFactory.get(getMappingsServiceOptions(project, mappingOption));
+ 	}
+ 
+-	protected void setup(Project project, ServiceFactory serviceFactory, MinecraftProvider minecraftProvider, Path inputJar) throws IOException {
+-		if (minecraftProvider.refreshDeps()) {
++	private void setup(Project project, ServiceFactory serviceFactory, MinecraftProvider minecraftProvider, Path inputJar) throws Exception {
++		final boolean refresh = minecraftProvider.refreshDeps();
++
++		// 无锁快路径：mappings 产物均已就绪且未要求刷新时，不获取文件锁，仅在内存中重新提取额外信息（每次必须执行）
++		if (!refresh && Files.exists(tinyMappings) && Files.exists(tinyMappingsJar)) {
++			try (FileSystem fileSystem = FileSystems.newFileSystem(inputJar, (ClassLoader) null)) {
++				extractExtras(fileSystem);
++			}
++
++			return;
++		}
++
++		final LoomCacheService cacheService = LoomCacheService.get(project).get();
++		final Path lockRoot = LoomGradleExtension.get(project).getFiles().getCacheLocks().toPath();
++		final String key = "mappings:" + mappingsIdentifier;
++
++		cacheService.runExclusive(lockRoot, key, LoomCacheService.defaultTimeout(), () -> {
++			produceMappings(project, serviceFactory, minecraftProvider, inputJar, refresh);
++			return null;
++		});
++	}
++
++	// 产 mappings 文件：受 per-key 锁保护。注意 extractExtras 会在内存中填充字段，
++	// 但本方法仅在「冷/刷新」路径执行；暖路径的内存填充已在 setup 的无锁快路径中完成。
++	private void produceMappings(Project project, ServiceFactory serviceFactory, MinecraftProvider minecraftProvider, Path inputJar, boolean refresh) throws IOException {
++		if (refresh) {
+ 			cleanWorkingDirectory(mappingsWorkingDir);
+ 		}
+ 
+-		if (Files.notExists(tinyMappings) || minecraftProvider.refreshDeps()) {
++		if (Files.notExists(tinyMappings) || refresh) {
+ 			storeMappings(project, serviceFactory, minecraftProvider, inputJar);
+ 		} else {
+ 			try (FileSystemUtil.Delegate fileSystem = FileSystemUtil.getJarFileSystem(inputJar, false)) {
+@@ -210,7 +236,7 @@ public class MappingConfiguration {
+ 			}
+ 		}
+ 
+-		if (Files.notExists(tinyMappingsJar) || minecraftProvider.refreshDeps()) {
++		if (Files.notExists(tinyMappingsJar) || refresh) {
+ 			Files.deleteIfExists(tinyMappingsJar);
+ 			ZipUtils.add(tinyMappingsJar, "mappings/mappings.tiny", Files.readAllBytes(tinyMappings));
+ 		}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MergedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MergedMinecraftProvider.java
+index 5171c81ce5de9adc388bed1efd15636a73f52b4a..a3531821e250bf4e83fbd178487389474f5dcdfe 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MergedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MergedMinecraftProvider.java
+@@ -36,6 +36,8 @@ import org.slf4j.LoggerFactory;
+ 
+ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.configuration.ConfigContext;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ 
+ public class MergedMinecraftProvider extends MinecraftProvider {
+ 	private static final Logger LOGGER = LoggerFactory.getLogger(MergedMinecraftProvider.class);
+@@ -73,17 +75,28 @@ public class MergedMinecraftProvider extends MinecraftProvider {
+ 			throw new UnsupportedOperationException("This version does not provide both the client and server jars - please select the client-only or server-only jar configuration!");
+ 		}
+ 
++		// 无锁快路径：merged jar 已就绪且未要求刷新时不获取文件锁
+ 		if (!Files.exists(minecraftMergedJar) || getExtension().refreshDeps()) {
+-			try {
+-				mergeJars();
+-			} catch (Throwable e) {
+-				Files.deleteIfExists(getMinecraftClientJar().toPath());
+-				Files.deleteIfExists(getMinecraftServerJar().toPath());
+-				Files.deleteIfExists(minecraftMergedJar);
+-
+-				getProject().getLogger().error("Could not merge JARs! Deleting source JARs - please re-run the command and move on.", e);
+-				throw e;
+-			}
++			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
++			final Path lockRoot = getExtension().getFiles().getCacheLocks().toPath();
++
++			cacheService.runExclusive(lockRoot, cacheKey(), LoomCacheService.defaultTimeout(), () -> {
++				// 锁内二次确认：可能已被他人在等锁期间合并完成
++				if (!Files.exists(minecraftMergedJar) || getExtension().refreshDeps()) {
++					try {
++						mergeJars();
++					} catch (Throwable e) {
++						Files.deleteIfExists(getMinecraftClientJar().toPath());
++						Files.deleteIfExists(getMinecraftServerJar().toPath());
++						Files.deleteIfExists(minecraftMergedJar);
++
++						getProject().getLogger().error("Could not merge JARs! Deleting source JARs - please re-run the command and move on.", e);
++						throw e;
++					}
++				}
++
++				return null;
++			});
+ 		}
+ 	}
+ 
+@@ -95,7 +108,10 @@ public class MergedMinecraftProvider extends MinecraftProvider {
+ 			minecraftServerJar = getMinecraftExtractedServerJar();
+ 		}
+ 
+-		mergeJars(minecraftClientJar, minecraftServerJar, minecraftMergedJar.toFile());
++		final File clientJar = minecraftClientJar;
++		final File serverJar = minecraftServerJar;
++		// 原子发布：合并写到同目录唯一临时 jar，完整后再原子 move 到 minecraftMergedJar
++		AtomicFiles.publish(minecraftMergedJar, tmpJar -> mergeJars(clientJar, serverJar, tmpJar.toFile()));
+ 	}
+ 
+ 	public static void mergeJars(File clientJar, File serverJar, File mergedJar) throws IOException {
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
+index 271e3800b648a462b3091d37944debfceb128f7f..e9702afac33dfb33c20335b6e640ba4f4678385a 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
+@@ -48,6 +48,7 @@ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.download.DownloadExecutor;
+ import net.fabricmc.loom.util.download.GradleDownloadProgressListener;
+ import net.fabricmc.loom.util.gradle.GradleUtils;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.loom.util.gradle.ProgressGroup;
+ 
+ public abstract class MinecraftProvider {
+@@ -80,6 +81,7 @@ public abstract class MinecraftProvider {
+ 	}
+ 
+ 	public void provide() throws Exception {
++		// 内存配置：无论缓存冷热都必须执行
+ 		if (getExtension().shouldGenerateSrgTiny() && !getExtension().isForgeLike()) {
+ 			getProject().getDependencies().add(Constants.Configurations.SRG, "de.oceanlabs.mcp:mcp_config:" + minecraftVersion());
+ 		}
+@@ -88,24 +90,89 @@ public abstract class MinecraftProvider {
+ 
+ 		verifyJavaVersion();
+ 
+-		boolean didDownload = downloadJars();
++		// 无锁快路径：未要求刷新且所有产物已就绪时，不获取任何文件锁
++		if (jarsRequireProduction()) {
++			// 产文件部分（下载/抽取/校验）用 per-key 锁保护，按 mcVersion 串行、不同版本可并行
++			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
++			final Path lockRoot = getExtension().getFiles().getCacheLocks().toPath();
+ 
+-		if (provideServer()) {
+-			serverBundleMetadata = BundleMetadata.fromJar(minecraftServerJar.toPath());
++			cacheService.runExclusive(lockRoot, downloadLockKey(), LoomCacheService.defaultTimeout(), () -> {
++				// 锁内二次确认：等锁期间可能已被其它进程/线程下载完成，避免重复下载/抽取
++				if (!jarsRequireProduction()) {
++					return null;
++				}
+ 
+-			if (serverBundleMetadata != null) {
+-				extractBundledServerJar();
+-			}
++				boolean didDownload = downloadJars();
++
++				if (provideServer()) {
++					// 锁内读取 bundle 元数据用于决定是否抽取（extractBundledServerJar 依赖该字段）
++					serverBundleMetadata = BundleMetadata.fromJar(minecraftServerJar.toPath());
++
++					if (serverBundleMetadata != null) {
++						extractBundledServerJar();
++					}
++				}
++
++				if (didDownload) {
++					verifyJars();
++				}
++
++				return null;
++			});
+ 		}
+ 
+-		if (didDownload) {
+-			verifyJars();
++		// 暖路径补设字段：上面锁内可能整段跳过（缓存就绪时未进入生产），但 server jar 必已就绪，
++		// 故在锁外对已存在的 server jar 再读取一次，保证暖缓存下 serverBundleMetadata 也正确。
++		if (provideServer() && serverBundleMetadata == null) {
++			serverBundleMetadata = BundleMetadata.fromJar(minecraftServerJar.toPath());
+ 		}
+ 
++		// 内存配置：libraryProvider 每次都必须执行
+ 		final MinecraftLibraryProvider libraryProvider = new MinecraftLibraryProvider(this, configContext.project());
+ 		libraryProvider.provide();
+ 	}
+ 
++	// 下载/抽取产物的跨进程锁 key：始终按版本，确保同一 mcVersion 的所有 jar 配置共享同一把下载锁、只下载一次。
++	// 不可用会被子类覆写的 cacheKey()，否则不同 jar 配置（如 server-only/client-only single jar）会用不同 key 并发下载同一批共享 jar。
++	private String downloadLockKey() {
++		return "minecraft:" + minecraftVersion();
++	}
++
++	// 跨进程互斥 key：用于子类自身产物（merge/split/env-only jar）的生产锁，子类可覆写以区分不同产物
++	protected String cacheKey() {
++		return "minecraft:" + minecraftVersion();
++	}
++
++	// 无锁存在性检查：判断下载/抽取产物是否需要生产。返回 false 即所有产物已就绪，可走无锁快路径。
++	private boolean jarsRequireProduction() {
++		if (getExtension().refreshDeps()) {
++			return true;
++		}
++
++		if (provideClient() && !minecraftClientJar.exists()) {
++			return true;
++		}
++
++		if (provideServer()) {
++			if (!minecraftServerJar.exists()) {
++				return true;
++			}
++
++			// 该版本若使用 bundler，则抽取后的 server jar 也必须存在。
++			// serverBundleMetadata 此时尚未读取，故直接读已下载的 server jar 判断是否为 bundler。
++			try {
++				if (BundleMetadata.fromJar(minecraftServerJar.toPath()) != null && !minecraftExtractedServerJar.exists()) {
++					return true;
++				}
++			} catch (IOException e) {
++				// 读取失败视为需要重新生产
++				return true;
++			}
++		}
++
++		return false;
++	}
++
+ 	private void verifyJavaVersion() {
+ 		if (configContext.extension().disableObfuscation()) {
+ 			return;
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SingleJarMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SingleJarMinecraftProvider.java
+index 8001c4eb408846e8319a06c3ccaf2e47afc074dc..197060f990f062d61fd5d813193bb7fe9c99a464 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SingleJarMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SingleJarMinecraftProvider.java
+@@ -32,6 +32,8 @@ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.configuration.ConfigContext;
+ import net.fabricmc.loom.configuration.providers.BundleMetadata;
+ import net.fabricmc.loom.util.TinyRemapperLoggerAdapter;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.tinyremapper.NonClassCopyMode;
+ import net.fabricmc.tinyremapper.OutputConsumerPath;
+ import net.fabricmc.tinyremapper.TinyRemapper;
+@@ -87,35 +89,58 @@ public abstract class SingleJarMinecraftProvider extends MinecraftProvider {
+ 	}
+ 
+ 	protected void processJar() throws Exception {
++		// 无锁快路径：env-only jar 已就绪且未要求刷新时不获取文件锁
+ 		boolean requiresRefresh = getExtension().refreshDeps() || Files.notExists(minecraftEnvOnlyJar);
+ 
+ 		if (!requiresRefresh) {
+ 			return;
+ 		}
+ 
+-		final Path inputJar = getInputJar(this);
++		final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
++		final Path lockRoot = getExtension().getFiles().getCacheLocks().toPath();
+ 
+-		TinyRemapper remapper = null;
++		cacheService.runExclusive(lockRoot, cacheKey(), LoomCacheService.defaultTimeout(), () -> {
++			// 锁内二次确认：可能已被他人在等锁期间生产完成
++			if (!getExtension().refreshDeps() && Files.exists(minecraftEnvOnlyJar)) {
++				return null;
++			}
+ 
+-		try {
+-			remapper = TinyRemapper.newRemapper(TinyRemapperLoggerAdapter.INSTANCE).build();
++			final Path inputJar = getInputJar(this);
++
++			TinyRemapper remapper = null;
++
++			try {
++				remapper = TinyRemapper.newRemapper(TinyRemapperLoggerAdapter.INSTANCE).build();
++
++				Files.deleteIfExists(minecraftEnvOnlyJar);
++
++				final TinyRemapper effectiveRemapper = remapper;
++				// 原子发布：remapper 先写到同目录唯一临时 jar，完整后再原子 move 到 minecraftEnvOnlyJar
++				AtomicFiles.publish(minecraftEnvOnlyJar, tmpJar -> {
++					// Pass through tiny remapper to fix the meta-inf
++					try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(tmpJar).build()) {
++						outputConsumer.addNonClassFiles(inputJar, NonClassCopyMode.FIX_META_INF, effectiveRemapper);
++						effectiveRemapper.readInputs(inputJar);
++						effectiveRemapper.apply(outputConsumer);
++					}
++				});
++			} catch (Exception e) {
++				Files.deleteIfExists(minecraftEnvOnlyJar);
++				throw new RuntimeException("Failed to process %s only jar".formatted(type()), e);
++			} finally {
++				if (remapper != null) {
++					remapper.finish();
++				}
++			}
+ 
+-			Files.deleteIfExists(minecraftEnvOnlyJar);
++			return null;
++		});
++	}
+ 
+-			// Pass through tiny remapper to fix the meta-inf
+-			try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(minecraftEnvOnlyJar).build()) {
+-				outputConsumer.addNonClassFiles(inputJar, NonClassCopyMode.FIX_META_INF, remapper);
+-				remapper.readInputs(inputJar);
+-				remapper.apply(outputConsumer);
+-			}
+-		} catch (Exception e) {
+-			Files.deleteIfExists(minecraftEnvOnlyJar);
+-			throw new RuntimeException("Failed to process %s only jar".formatted(type()), e);
+-		} finally {
+-			if (remapper != null) {
+-				remapper.finish();
+-			}
+-		}
++	// 区分 server/client env-only jar，避免 legacy-merged 下两个 single jar provider 用同一把锁互相串扰
++	@Override
++	protected String cacheKey() {
++		return "minecraft:" + minecraftVersion() + ":" + type();
+ 	}
+ 
+ 	public Path getMinecraftEnvOnlyJar() {
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SplitMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SplitMinecraftProvider.java
+index 8b56df433be08c0403d072579ba234452955e8b6..01cc94b79585d62e2495b3f63f19fdd915ca5071 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SplitMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SplitMinecraftProvider.java
+@@ -31,6 +31,8 @@ import java.util.List;
+ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.configuration.ConfigContext;
+ import net.fabricmc.loom.configuration.providers.BundleMetadata;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ 
+ public final class SplitMinecraftProvider extends MinecraftProvider {
+ 	private Path minecraftClientOnlyJar;
+@@ -62,34 +64,58 @@ public final class SplitMinecraftProvider extends MinecraftProvider {
+ 	public void provide() throws Exception {
+ 		super.provide();
+ 
++		// 无锁快路径：拆分产物已就绪且未要求刷新时不获取文件锁
+ 		boolean requiresRefresh = getExtension().refreshDeps() || Files.notExists(minecraftClientOnlyJar) || Files.notExists(minecraftCommonJar);
+ 
+ 		if (!requiresRefresh) {
+ 			return;
+ 		}
+ 
+-		BundleMetadata serverBundleMetadata = getServerBundleMetadata();
+-
+-		if (serverBundleMetadata == null) {
+-			throw new UnsupportedOperationException("Only Minecraft versions using a bundled server jar can be split, please use a merged jar setup for this version of minecraft");
+-		}
+-
+-		final Path clientJar = getMinecraftClientJar().toPath();
+-		final Path serverJar = getMinecraftExtractedServerJar().toPath();
+-
+-		try (MinecraftJarSplitter jarSplitter = new MinecraftJarSplitter(clientJar, serverJar)) {
+-			// Required for loader to compute the version info also useful to have in both jars.
+-			jarSplitter.sharedEntry("version.json");
+-			jarSplitter.sharedEntry("assets/.mcassetsroot");
+-			jarSplitter.sharedEntry("assets/minecraft/lang/en_us.json");
+-
+-			jarSplitter.split(minecraftClientOnlyJar, minecraftCommonJar);
+-		} catch (Exception e) {
+-			Files.deleteIfExists(minecraftClientOnlyJar);
+-			Files.deleteIfExists(minecraftCommonJar);
+-
+-			throw new RuntimeException("Failed to split minecraft", e);
+-		}
++		final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
++		final Path lockRoot = getExtension().getFiles().getCacheLocks().toPath();
++
++		cacheService.runExclusive(lockRoot, cacheKey(), LoomCacheService.defaultTimeout(), () -> {
++			// 锁内二次确认：可能已被他人在等锁期间拆分完成
++			if (!getExtension().refreshDeps() && Files.exists(minecraftClientOnlyJar) && Files.exists(minecraftCommonJar)) {
++				return null;
++			}
++
++			BundleMetadata serverBundleMetadata = getServerBundleMetadata();
++
++			if (serverBundleMetadata == null) {
++				throw new UnsupportedOperationException("Only Minecraft versions using a bundled server jar can be split, please use a merged jar setup for this version of minecraft");
++			}
++
++			final Path clientJar = getMinecraftClientJar().toPath();
++			final Path serverJar = getMinecraftExtractedServerJar().toPath();
++
++			// 原子发布：split 写到两个同目录唯一临时 jar，完整后再分别原子 move 到最终路径，
++			// 避免跨进程读到任一半写的拆分产物误判就绪
++			final Path tmpClientOnly = AtomicFiles.tempSibling(minecraftClientOnlyJar);
++			final Path tmpCommon = AtomicFiles.tempSibling(minecraftCommonJar);
++
++			try (MinecraftJarSplitter jarSplitter = new MinecraftJarSplitter(clientJar, serverJar)) {
++				// Required for loader to compute the version info also useful to have in both jars.
++				jarSplitter.sharedEntry("version.json");
++				jarSplitter.sharedEntry("assets/.mcassetsroot");
++				jarSplitter.sharedEntry("assets/minecraft/lang/en_us.json");
++
++				jarSplitter.split(tmpClientOnly, tmpCommon);
++				AtomicFiles.move(tmpClientOnly, minecraftClientOnlyJar);
++				AtomicFiles.move(tmpCommon, minecraftCommonJar);
++			} catch (Exception e) {
++				Files.deleteIfExists(minecraftClientOnlyJar);
++				Files.deleteIfExists(minecraftCommonJar);
++
++				throw new RuntimeException("Failed to split minecraft", e);
++			} finally {
++				// 原子 move 成功后临时文件已不存在；失败时清理残留
++				Files.deleteIfExists(tmpClientOnly);
++				Files.deleteIfExists(tmpCommon);
++			}
++
++			return null;
++		});
+ 	}
+ 
+ 	public Path getMinecraftClientOnlyJar() {
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
+index 107324ee614442721b7169500405f712badce98f..d7924997ff23ac7e0087dc8676362f424910d1c1 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
+@@ -28,7 +28,6 @@ import java.io.File;
+ import java.io.IOException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+-import java.nio.file.StandardCopyOption;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Locale;
+@@ -62,6 +61,8 @@ import net.fabricmc.loom.configuration.providers.minecraft.SignatureFixerApplyVi
+ import net.fabricmc.loom.extension.LoomFiles;
+ import net.fabricmc.loom.util.SidedClassVisitor;
+ import net.fabricmc.loom.util.TinyRemapperHelper;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.mappingio.tree.MemoryMappingTree;
+ import net.fabricmc.tinyremapper.OutputConsumerPath;
+ import net.fabricmc.tinyremapper.TinyRemapper;
+@@ -109,15 +110,24 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 			throw new IllegalStateException("No remapped jars provided");
+ 		}
+ 
++		// 无锁快路径：shouldRefreshOutputs 仅做存在性检查，缓存就绪时不会进入下面的锁
+ 		if (shouldRefreshOutputs(context)) {
+-			try {
+-				remapInputs(remappedJars, context.configContext());
+-				createBackupJars(minecraftJars);
+-			} catch (Throwable t) {
+-				cleanOutputs(remappedJars);
++			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
++			final Path lockRoot = extension.getFiles().getCacheLocks().toPath();
++
++			cacheService.runExclusive(lockRoot, cacheKey(), LoomCacheService.defaultTimeout(), () -> {
++				// 锁内二次确认：可能已被其它进程/线程在我们等锁期间生产完成
++				if (shouldRefreshOutputs(context)) {
++					try {
++						remapInputs(remappedJars, context.configContext());
++						createBackupJars(minecraftJars);
++					} catch (Throwable t) {
++						throw new RuntimeException("Failed to remap minecraft", t);
++					}
++				}
+ 
+-				throw new RuntimeException("Failed to remap minecraft", t);
+-			}
++				return null;
++			});
+ 		}
+ 
+ 		if (context.applyDependencies()) {
+@@ -134,6 +144,12 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 		return minecraftJars;
+ 	}
+ 
++	// 跨进程互斥 key：targetNamespace 区分 provider 实例（intermediary/named），getVersion 含 mcVersion+mappingsIdentifier，二者已唯一标识这批产物。
++	// protected：legacy-merged 等覆写 provide() 的子类需要复用同一把锁保护其 GLOBAL 合并产物
++	protected String cacheKey() {
++		return getTargetNamespace().name() + ":" + getVersion();
++	}
++
+ 	// Create two copies of the remapped jar, the backup jar is used as the input of genSources
+ 	public static Path getBackupJarPath(MinecraftJar minecraftJar) {
+ 		final Path outputJarPath = minecraftJar.getPath();
+@@ -150,7 +166,8 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 		}
+ 
+ 		for (MinecraftJar minecraftJar : minecraftJars) {
+-			Files.copy(minecraftJar.getPath(), getBackupJarPath(minecraftJar), StandardCopyOption.REPLACE_EXISTING);
++			// backup 是「最后产生」的就绪标志，必须原子落位，避免跨进程读到半写的 backup 误判就绪
++			AtomicFiles.copy(minecraftJar.getPath(), getBackupJarPath(minecraftJar));
+ 		}
+ 	}
+ 
+@@ -261,8 +278,6 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 	}
+ 
+ 	private void remapInputs(List<RemappedJars> remappedJars, ConfigContext configContext) throws IOException {
+-		cleanOutputs(remappedJars);
+-
+ 		for (RemappedJars remappedJar : remappedJars) {
+ 			remapJar(remappedJar, configContext);
+ 		}
+@@ -271,8 +286,8 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 	protected void remapJar(RemappedJars remappedJars, ConfigContext configContext) throws IOException {
+ 		if (extension.disableObfuscation()) {
+ 			// TODO debof - can we skip this?
+-			Files.createDirectories(remappedJars.outputJarPath().getParent());
+-			Files.copy(remappedJars.inputJar(), remappedJars.outputJarPath(), StandardCopyOption.REPLACE_EXISTING);
++			// 原子复制：避免跨进程读到半写的输出 jar 误判就绪
++			AtomicFiles.copy(remappedJars.inputJar(), remappedJars.outputJarPath());
+ 			getMavenHelper(remappedJars.type()).savePom();
+ 			return;
+ 		}
+@@ -281,8 +296,6 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 		final String fromM = remappedJars.sourceNamespace().toString();
+ 		final String toM = getTargetNamespace().toString();
+ 
+-		Files.deleteIfExists(remappedJars.outputJarPath());
+-
+ 		final Set<String> classNames = extension.isForgeLike() ? InnerClassRemapper.readClassNames(remappedJars.inputJar()) : Set.of();
+ 		final AnnotationsData remappedAnnotations = AnnotationsData.getRemappedAnnotations(getTargetNamespace(), mappingConfiguration, getProject(), configContext.serviceFactory(), toM);
+ 		final Map<String, String> remappedSignatures = SignatureFixerApplyVisitor.getRemappedSignatures(getTargetNamespace() == MappingsNamespace.INTERMEDIARY, mappingConfiguration, getProject(), configContext.serviceFactory(), toM);
+@@ -303,15 +316,20 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 			configureRemapper(remappedJars, builder);
+ 		}, classNames);
+ 
+-		try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(remappedJars.outputJarPath()).build()) {
+-			outputConsumer.addNonClassFiles(remappedJars.inputJar());
++		// 原子发布：remapper 先写到同目录唯一临时 jar，完整后再原子 move 到 outputJarPath
++		try {
++			AtomicFiles.publish(remappedJars.outputJarPath(), tmpJar -> {
++				try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(tmpJar).build()) {
++					outputConsumer.addNonClassFiles(remappedJars.inputJar());
+ 
+-			for (Path path : remappedJars.remapClasspath()) {
+-				remapper.readClassPath(path);
+-			}
++					for (Path path : remappedJars.remapClasspath()) {
++						remapper.readClassPath(path);
++					}
+ 
+-			remapper.readInputs(remappedJars.inputJar());
+-			remapper.apply(outputConsumer);
++					remapper.readInputs(remappedJars.inputJar());
++					remapper.apply(outputConsumer);
++				}
++			});
+ 		} catch (Exception e) {
+ 			throw new RuntimeException("Failed to remap JAR " + remappedJars.inputJar() + " with mappings from " + mappingConfiguration.tinyMappings, e);
+ 		} finally {
+@@ -351,13 +369,6 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 		}
+ 	}
+ 
+-	private void cleanOutputs(List<RemappedJars> remappedJars) throws IOException {
+-		for (RemappedJars remappedJar : remappedJars) {
+-			Files.deleteIfExists(remappedJar.outputJarPath());
+-			Files.deleteIfExists(getBackupJarPath(remappedJar.outputJar()));
+-		}
+-	}
+-
+ 	public Project getProject() {
+ 		return project;
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/NamedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/NamedMinecraftProvider.java
+index 02077a983ac1d13a8bac5305f20899d4248444b9..38cd4533d4c7cbf97b5fe48402af86ddd836a7f6 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/NamedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/NamedMinecraftProvider.java
+@@ -24,6 +24,7 @@
+ 
+ package net.fabricmc.loom.configuration.providers.minecraft.mapped;
+ 
++import java.nio.file.Path;
+ import java.util.List;
+ 
+ import org.gradle.api.Project;
+@@ -37,6 +38,8 @@ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftSourceSets;
+ import net.fabricmc.loom.configuration.providers.minecraft.SingleJarEnvType;
+ import net.fabricmc.loom.configuration.providers.minecraft.SingleJarMinecraftProvider;
+ import net.fabricmc.loom.configuration.providers.minecraft.SplitMinecraftProvider;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.tinyremapper.TinyRemapper;
+ 
+ public abstract class NamedMinecraftProvider<M extends MinecraftProvider> extends AbstractMappedMinecraftProvider<M> {
+@@ -98,14 +101,26 @@ public abstract class NamedMinecraftProvider<M extends MinecraftProvider> extend
+ 			client.provide(childContext);
+ 
+ 			if (refreshOutputs) {
+-				// then merge them
+-				MergedMinecraftProvider.mergeJars(
+-							client.getEnvOnlyJar().toFile(),
+-							server.getEnvOnlyJar().toFile(),
+-							getMergedJar().toFile()
+-				);
+-
+-				createBackupJars(minecraftJars);
++				// 合并产物写 GLOBAL 共享仓库：用与常规 named provider 相同的 per-key 跨进程锁串行化，
++				// 并原子落位，避免多 daemon 并发构建同一 MC<1.3 版本时损坏共享 merged jar。
++				final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
++				final Path lockRoot = extension.getFiles().getCacheLocks().toPath();
++
++				cacheService.runExclusive(lockRoot, cacheKey(), LoomCacheService.defaultTimeout(), () -> {
++					// 锁内二次确认：等锁期间可能已被其它进程合并完成
++					if (this.shouldRefreshOutputs(childContext)) {
++						// 原子发布：合并写到唯一临时 jar，完整后再原子 move 到 GLOBAL merged jar
++						AtomicFiles.publish(getMergedJar().getPath(), tmpJar -> MergedMinecraftProvider.mergeJars(
++									client.getEnvOnlyJar().toFile(),
++									server.getEnvOnlyJar().toFile(),
++									tmpJar.toFile()
++						));
++
++						createBackupJars(minecraftJars);
++					}
++
++					return null;
++				});
+ 			}
+ 
+ 			getMavenHelper(MinecraftJar.Type.MERGED).savePom();
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/ProcessedNamedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/ProcessedNamedMinecraftProvider.java
+index ef52bdba02c39767ececa572041a969f02990d66..11770a14826716724221fbca34dd2b282e007f2f 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/ProcessedNamedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/ProcessedNamedMinecraftProvider.java
+@@ -45,6 +45,7 @@ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftSourceSets;
+ import net.fabricmc.loom.configuration.providers.minecraft.SingleJarEnvType;
+ import net.fabricmc.loom.configuration.providers.minecraft.SingleJarMinecraftProvider;
+ import net.fabricmc.loom.configuration.providers.minecraft.SplitMinecraftProvider;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ 
+ public abstract class ProcessedNamedMinecraftProvider<M extends MinecraftProvider, P extends NamedMinecraftProvider<M>> extends NamedMinecraftProvider<M> {
+ 	private final P parentMinecraftProvider;
+@@ -65,13 +66,31 @@ public abstract class ProcessedNamedMinecraftProvider<M extends MinecraftProvide
+ 
+ 		parentMinecraftProvider.provide(context.withApplyDependencies(false));
+ 
++		// 无锁快路径：requiresProcessing 仅做存在性/处理判定，缓存就绪时不会进入下面的锁
+ 		boolean requiresProcessing = shouldRefreshOutputs(context) || parentMinecraftJars.stream()
+ 				.map(this::getProcessedPath)
+ 				.anyMatch(jarProcessorManager::requiresProcessingJar);
+ 
+ 		if (requiresProcessing) {
+-			processJars(minecraftJarOutputMap, context.configContext());
+-			createBackupJars(minecraftJars);
++			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
++			final Path lockRoot = extension.getFiles().getCacheLocks().toPath();
++			// 产物写入 LOCAL 仓库但跨同根多子项目共享（getName 含 jar processor 哈希），--parallel 下需 per-key 互斥。
++			// key 含 processor 哈希以与父类 remap 锁区分；父 provide() 已在上面返回，此处非嵌套持锁。
++			final String key = "processed:" + getTargetNamespace().name() + ":" + getVersion() + ":" + jarProcessorManager.getJarHash();
++
++			cacheService.runExclusive(lockRoot, key, LoomCacheService.defaultTimeout(), () -> {
++				// 锁内二次确认：可能已被其它进程/线程在等锁期间处理完成
++				boolean stillRequiresProcessing = shouldRefreshOutputs(context) || parentMinecraftJars.stream()
++						.map(this::getProcessedPath)
++						.anyMatch(jarProcessorManager::requiresProcessingJar);
++
++				if (stillRequiresProcessing) {
++					processJars(minecraftJarOutputMap, context.configContext());
++					createBackupJars(minecraftJars);
++				}
++
++				return null;
++			});
+ 		}
+ 
+ 		if (context.applyDependencies()) {
+diff --git a/src/main/java/net/fabricmc/loom/util/Constants.java b/src/main/java/net/fabricmc/loom/util/Constants.java
+index 1100f3a30d4f641330ac48e6cf36478129200bb1..acf81e6bec3d4b755559c7eda90e6ecf92ad5263 100644
+--- a/src/main/java/net/fabricmc/loom/util/Constants.java
++++ b/src/main/java/net/fabricmc/loom/util/Constants.java
+@@ -200,6 +200,17 @@ public class Constants {
+ 		public static final String IGNORE_DEPENDENCY_LOOM_VERSION_VALIDATION = "loom.ignoreDependencyLoomVersionValidation";
+ 	}
+ 
++	/**
++	 * 共享缓存相关常量.
++	 */
++	public static final class Cache {
++		private Cache() {
++		}
++
++		// 跨进程锁文件所在子目录
++		public static final String LOCKS_DIR = ".locks";
++	}
++
+ 	public static final class Manifest {
+ 		public static final String PATH = "META-INF/MANIFEST.MF";
+ 
+diff --git a/src/test/groovy/net/fabricmc/loom/configuration/providers/mappings/LayeredMappingsFactoryTest.groovy b/src/test/groovy/net/fabricmc/loom/configuration/providers/mappings/LayeredMappingsFactoryTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..1b4c8586d71860df40597145bc677eb45a2cb425
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/configuration/providers/mappings/LayeredMappingsFactoryTest.groovy
+@@ -0,0 +1,39 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.configuration.providers.mappings
++
++import spock.lang.Specification
++
++class LayeredMappingsFactoryTest extends Specification {
++	def "mapping version includes the Minecraft version"() {
++		expect:
++		LayeredMappingsFactory.mappingVersion('layered+hash.2198', minecraftVersion) == expectedVersion
++
++		where:
++		minecraftVersion || expectedVersion
++		'1.20.1'        || 'layered+hash.2198-mc.1.20.1'
++		'1.21.1'        || 'layered+hash.2198-mc.1.21.1'
++	}
++}

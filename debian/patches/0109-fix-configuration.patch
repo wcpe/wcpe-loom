@@ -1,0 +1,629 @@
+From 55f95304eeebf579c1a7f1906a8be9486ff3b47c Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 29 Oct 2026 17:49:14 +0800
+Subject: [PATCH 109/147] =?UTF-8?q?fix(configuration):=20=E5=8E=BB?=
+ =?UTF-8?q?=E6=8E=89=E9=85=8D=E7=BD=AE=E6=9C=9F=E6=95=B4=E6=AE=B5=E4=B8=B2?=
+ =?UTF-8?q?=E8=A1=8C=E7=9A=84=E8=B7=A8=E9=A1=B9=E7=9B=AE=E7=BC=93=E5=AD=98?=
+ =?UTF-8?q?=E9=94=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+配置期有一把 per-project 的粗锁（acquireProcessLockWaiting）包住整个 setupMinecraft。
+同一构建里 N 个应用 Loom 的项目各自在 afterEvaluate 里等自己那把锁，而它们等的是同一件
+重活：生产同一份共享 Minecraft 缓存。干净环境（CI 首次构建）下第一个项目持锁要跑完
+download→extract→merge→remap，远超锁的 1 分钟超时；开启 Isolated Projects 后 Gradle
+并行配置各项目，这个问题从「可能」变成「必现」。
+
+实测现场（下游 10 个 Loom 项目的复合构建，CI=true + 空缓存 + isolated-projects + --parallel）：
+7~8 个项目同时在配置阶段等同一份缓存，60s 后一齐失败并报
+"Cannot get MinecraftMetadataProvider before it has been setup"。
+
+删掉整个锁文件机制，而不是「保留但不等待」。它有三个解不开的矛盾：
+
+1. 粒度错配
+   锁按**项目**划分（.{sha1(projectDir:projectPath)}.lock），而它保护的是按
+   「MC 版本 + 映射标识」划分的共享缓存。同一构建里多个项目共存于同一缓存时，后到的
+   项目必然看到前一个项目的**活**锁文件，于是永远打出「上次构建异常终止，复用既有缓存」
+   ——这条诊断在多项目场景下本身就是错的。
+
+2. 与并行配置冲突
+   见上，这是本次问题的直接成因。
+
+3. 职责已被覆盖
+   它声称保证的「同一共享缓存条目只被生产一次」，已由每个生产点各自的 per-key 跨进程锁
+   （LoomCacheService）承担，键覆盖 mc 版本+映射标识、mappings、download、remap、
+   processed、forge 补丁链等全部产出路径；且产物一律原子发布，被中断的构建不会留下
+   半截产物——残留锁本来就不该触发重建（这点旧代码的注释里已经写明）。
+
+保留「只检测不等待」的方案被否：那会留下一个在多项目场景下必然撒谎的诊断。
+
+同时把 mapped jar 供给改为双检锁（LoomCacheService.runExclusiveChecking）。
+只删粗锁不够：冷构建下 N 个项目算的是同一个 per-key
+（minecraft-provision:<mc>:<mappingsId>），而 runExclusive 是纯串行——后到者必须先拿到锁
+才能做 isMappedJarsWarm 检查，于是各自白等第一个项目跑完整条流程。双检锁把就绪检查提到
+取锁之前、并在锁内重检：第一个项目持锁生产，其余只需等它做完、拿到锁后立刻发现已就绪而
+秒退。两次检查都是纯只读的存在性与脏标志判断，不含共享缓存写入。
+
+共享缓存锁的 CI 超时 1 分钟 → 10 分钟：原先按「CI 上不太可能解锁」取 1 分钟，但干净环境
+首次构建本就要下载、解压、重映射整份 Minecraft，1 分钟不足以覆盖正常持锁时长。
+
+测试随之调整（语义变更，保留同样的风险覆盖）：
+ConfigurationCacheTest 与 OfflineModeTest 原先断言「reusing the existing loom cache」
+——那正是被删掉的那行诊断。现在它们仍然手工制造残留 .lock 文件（真实世界里升级前的旧
+版本会留下它），改为断言真正值得守的东西：残留锁的存在不得影响配置缓存复用、不得导致
+离线构建失败、也不得引入任何锁等待。
+
+验收（本地）：
+- compileJava / compileTestGroovy 通过；
+- ./gradlew build check -x test 通过；
+- ConfigurationCacheTest（9 例）与 OfflineModeTest 全部通过，含改写的
+  "Leftover cache lock file"；
+- 字节码核对：修复前 jar 的 CompileConfiguration 含 acquireProcessLockWaiting 引用 3 处，
+  修复后 0 处；
+- 下游 10 个 Loom 项目的复合构建在 CI=true + 隔离 GRADLE_USER_HOME + isolated-projects
+  + --parallel 下配置 30 个项目，锁等待 0 次、残留锁告警 0 次、争抢 0 次。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+index 86d9d3f485856f08ed713f10d16768f288e6ddf6..45b2df95d5e2808c800f978e4fc32bb82c4f31d4 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/CompileConfiguration.java
+@@ -28,17 +28,7 @@ import static net.fabricmc.loom.util.Constants.Configurations;
+ 
+ import java.io.IOException;
+ import java.io.UncheckedIOException;
+-import java.nio.channels.FileChannel;
+-import java.nio.channels.FileLock;
+-import java.nio.channels.OverlappingFileLockException;
+ import java.nio.charset.StandardCharsets;
+-import java.nio.file.Files;
+-import java.nio.file.NoSuchFileException;
+-import java.nio.file.Path;
+-import java.nio.file.StandardOpenOption;
+-import java.time.Duration;
+-import java.util.Set;
+-import java.util.concurrent.ConcurrentHashMap;
+ import java.util.function.Consumer;
+ 
+ import javax.inject.Inject;
+@@ -56,12 +46,9 @@ import dev.architectury.loom.forge.dependency.SrgProvider;
+ import dev.architectury.loom.forge.minecraft.ForgeMinecraftProvider;
+ import dev.architectury.loom.mcpconfig.McpConfigProvider;
+ import org.gradle.api.Action;
+-import org.gradle.api.GradleException;
+ import org.gradle.api.Project;
+ import org.gradle.api.Task;
+ import org.gradle.api.file.FileCollection;
+-import org.gradle.api.logging.Logger;
+-import org.gradle.api.logging.Logging;
+ import org.gradle.api.plugins.JavaPlugin;
+ import org.gradle.api.plugins.JavaPluginExtension;
+ import org.gradle.api.provider.Provider;
+@@ -99,7 +86,6 @@ import net.fabricmc.loom.configuration.providers.minecraft.mapped.NamedMinecraft
+ import net.fabricmc.loom.configuration.providers.minecraft.mapped.SrgMinecraftProvider;
+ import net.fabricmc.loom.extension.MixinExtension;
+ import net.fabricmc.loom.task.service.ClasspathGroupService;
+-import net.fabricmc.loom.util.Checksum;
+ import net.fabricmc.loom.util.ExceptionUtil;
+ import net.fabricmc.loom.util.gradle.GradleUtils;
+ import net.fabricmc.loom.util.gradle.LoomCacheService;
+@@ -109,11 +95,6 @@ import net.fabricmc.loom.util.service.ScopedServiceFactory;
+ import net.fabricmc.loom.util.service.ServiceFactory;
+ 
+ public abstract class CompileConfiguration implements Runnable {
+-	// 本进程当前持有的构建锁路径，用于识别同一进程内的重复加锁
+-	private static final Set<Path> OWNED_LOCKS = ConcurrentHashMap.newKeySet();
+-	private FileLock processLock;
+-	private FileChannel processLockChannel;
+-
+ 	@Inject
+ 	protected abstract Project getProject();
+ 
+@@ -140,17 +121,21 @@ public abstract class CompileConfiguration implements Runnable {
+ 
+ 			final boolean previousRefreshDeps = extension.refreshDeps();
+ 
+-			final LockResult lockResult = acquireProcessLockWaiting(getLockFile());
+-
+-			if (lockResult != LockResult.ACQUIRED_CLEAN) {
+-				// 残留锁只作为「上次构建未干净收尾」的诊断信息，不再升级为全量重建：
+-				// 1) 共享产物一律「临时文件 + 原子落位」，被中断的构建不会留下半截产物，无需用重建兜底；
+-				// 2) 一旦升级为 refreshDeps，多个工作树会轮流删除共享缓存，正是并发冲突的根源；
+-				// 3) 是否重建改由各 provider 的产物校验决定（缺失 / 补丁版本过期 / 显式 --refresh-dependencies）。
+-				getProject().getLogger().lifecycle(
+-						"Found existing cache lock file ({}), assuming the previous build was canceled; reusing the existing loom cache.",
+-						lockResult);
+-			}
++			// 这里曾有一把「配置期整段串行」的 per-project 粗锁（acquireProcessLockWaiting）。
++			// 它包住整个 setupMinecraft，因此同一构建里 N 个应用 Loom 的项目（尤其开启 Isolated
++			// Projects 后 Gradle 并行配置时）会各自在 afterEvaluate 里等自己的锁，而它们等的是
++			// 同一件重活：在生产同一份共享 Minecraft 缓存。干净环境（CI 首次构建）下，第一个
++			// 项目持锁要跑完 download→extract→merge→remap，远超锁的 1 分钟超时。
++			//
++			// 删掉它是安全的：它原本要保证的「同一共享缓存条目只被生产一次」已经由每个生产点各自的
++			// per-key 跨进程锁（LoomCacheService.runExclusive / runExclusiveChecking）承担，键覆盖
++			// mc 版本+映射标识、mappings、download、remap、processed、forge 补丁链等全部产出路径。
++			// 而锁文件本身只剩「上次构建是否干净收尾」这一条诊断信息——它要求对本项目的缓存做
++			// 独占判断，与真实用例（多项目共存于同一缓存）相矛盾：后到的项目永远看到前一个项目的
++			// 活锁文件，本就会打出“assume canceled”的误导性日志。
++			//
++			// 这与更早那次删除 getGlobalLockObject() 是同一个论证：那把锁剩下的唯一作用只是把各项目
++			// 的 setup 串成一条，而它恰好是把 Gradle 的项目状态转换拖进临界区、造成锁序反转的根源。
+ 
+ 			try {
+ 				// 刻意**不**在这里包一层「跨项目全局锁」。历史上这里是一把经系统属性共享的 String monitor，
+@@ -176,11 +161,9 @@ public abstract class CompileConfiguration implements Runnable {
+ 				dependencyManager.handleDependencies();
+ 			} catch (Exception e) {
+ 				ExceptionUtil.processException(e, DaemonUtils.Context.fromProject(getProject()));
+-				disownLock();
+ 				throw ExceptionUtil.createDescriptiveWrapper(RuntimeException::new, "Failed to setup Minecraft", e);
+ 			}
+ 
+-			releaseLock();
+ 			extension.setRefreshDeps(previousRefreshDeps);
+ 
+ 			MixinExtension mixin = LoomGradleExtension.get(getProject()).getMixin();
+@@ -356,16 +339,33 @@ public abstract class CompileConfiguration implements Runnable {
+ 		// 也不会取锁，故整段事务可无锁执行。
+ 		final var warmContext = new AbstractMappedMinecraftProvider.ProvideContext(true, extension.refreshDeps(), configContext);
+ 
+-		if (isMappedJarsWarm(extension, project, jarConfiguration, intermediaryMinecraftProvider, namedMinecraftProvider, warmContext)) {
+-			provideMappedProviders(extension, project, jarConfiguration, intermediaryMinecraftProvider, namedMinecraftProvider, warmContext);
+-			return;
+-		}
+-
+-		cacheService.runExclusive(lockRoot, key, LoomCacheService.defaultTimeout(), () -> {
+-			final var provideContext = new AbstractMappedMinecraftProvider.ProvideContext(true, extension.refreshDeps(), configContext);
+-			provideMappedProviders(extension, project, jarConfiguration, intermediaryMinecraftProvider, namedMinecraftProvider, provideContext);
+-			return null;
+-		});
++		// 用双检锁形式供给 mapped jar：
++		//
++		// 干净环境（CI 首次构建）下，多个共享同一份 Minecraft 的项目会算出同一个 key；
++		// 而 isMappedJarsWarm 在冷构建时全部为 false。若直接进 runExclusive，第 2..N 个项目
++		// 必须先拿到锁才能做那次检查，于是就各自白等「第一个项目做完整条 download→remap」
++		// 的时间（实测在 CI runner 上远超锁超时）。
++		//
++		// runExclusiveChecking 把就绪检查提到取锁之前，并在锁内重检：第一个项目持锁生产，
++		// 其余项目只需等它做完，拿到锁后立刻发现产物已就绪而秒退，不会再重建一遍。
++		//
++		// 两次检查都是纯只读的（shouldRefreshOutputs / 存在性与脏标志），不含共享缓存写入，
++		// 因此放在锁外安全；产物本身的写入仍由锁内的 provideMappedProviders 完成。
++		cacheService.runExclusiveChecking(lockRoot, key, LoomCacheService.defaultTimeout(),
++				() -> isMappedJarsWarm(extension, project, jarConfiguration, intermediaryMinecraftProvider,
++						namedMinecraftProvider, warmContext),
++				() -> {
++					// 已就绪（无需生产）：照旧读已发布的产物。这一步不含共享缓存写入。
++					provideMappedProviders(extension, project, jarConfiguration, intermediaryMinecraftProvider,
++							namedMinecraftProvider, warmContext);
++					return null;
++				},
++				() -> {
++					final var provideContext = new AbstractMappedMinecraftProvider.ProvideContext(true, extension.refreshDeps(), configContext);
++					provideMappedProviders(extension, project, jarConfiguration, intermediaryMinecraftProvider,
++							namedMinecraftProvider, provideContext);
++					return null;
++				});
+ 	}
+ 
+ 	/**
+@@ -524,229 +524,6 @@ public abstract class CompileConfiguration implements Runnable {
+ 		});
+ 	}
+ 
+-	private LockFile getLockFile() {
+-		final LoomGradleExtension extension = LoomGradleExtension.get(getProject());
+-		final Path cacheDirectory = extension.getFiles().getUserCache().toPath();
+-		final String pathHash = Checksum.of(getProject()).sha1().hex();
+-		return new LockFile(
+-				cacheDirectory.resolve("." + pathHash + ".lock"),
+-				"Lock for cache='%s', project='%s'".formatted(
+-						cacheDirectory, getProject().absoluteProjectPath(getProject().getPath())
+-				)
+-		);
+-	}
+-
+-	record LockFile(Path file, String description) {
+-		@Override
+-		public String toString() {
+-			return this.description;
+-		}
+-	}
+-
+-	enum LockResult {
+-		// acquired immediately or after waiting for another process to release
+-		ACQUIRED_CLEAN,
+-		// already owned by the current process
+-		ACQUIRED_ALREADY_OWNED,
+-		// acquired after a previous build left the lock file behind
+-		ACQUIRED_PREVIOUS_OWNER_MISSING
+-	}
+-
+-	// 判断锁文件是否存在。
+-	// 不能直接用 Files.exists / File.exists：这类存在性判断会被配置缓存记入指纹，
+-	// 而锁文件是配置阶段创建、构建末尾删除的瞬时文件。
+-	// 一旦某次构建带着上次被杀留下的锁文件启动，构建就会记录“文件存在”，
+-	// 但该文件在本次构建末尾被删除，于是下一次构建读到“文件不存在”，
+-	// 配置缓存被判为失效（the file system entry '...lock' has been removed），白白重算约 33 秒。
+-	// 这里改用文件通道探测：打开成功即存在，通道打开不会被配置缓存记录。
+-	private static boolean lockFileExists(Path file) {
+-		try (FileChannel channel = FileChannel.open(file, StandardOpenOption.WRITE)) {
+-			return true;
+-		} catch (final NoSuchFileException e) {
+-			return false;
+-		} catch (final IOException e) {
+-			// 无法判定时保守视为存在，交由后续加锁逻辑处理
+-			return true;
+-		}
+-	}
+-
+-	// 删除锁文件，文件本来就不存在时静默返回。
+-	// 不使用 Files.deleteIfExists，因为它内部同样包含会污染配置缓存指纹的存在性判断。
+-	private static void deleteLockFile(Path file) throws IOException {
+-		try {
+-			Files.delete(file);
+-		} catch (final NoSuchFileException ignored) {
+-			// 文件已不存在，无需处理
+-		}
+-	}
+-
+-	private LockResult acquireProcessLockWaiting(LockFile lockFile) {
+-		// one hour
+-		return this.acquireProcessLockWaiting(lockFile, getDefaultTimeout());
+-	}
+-
+-	private LockResult acquireProcessLockWaiting(LockFile lockFile, Duration timeout) {
+-		try {
+-			return this.acquireProcessLockWaiting_(lockFile, timeout);
+-		} catch (final IOException e) {
+-			throw new RuntimeException("Exception acquiring lock " + lockFile, e);
+-		}
+-	}
+-
+-	// 取得跨进程构建锁。
+-	// 锁文件只承载两件事：是否存在（上次构建是否干净收尾）、以及 OS 文件锁（是否有进程正在配置构建）。
+-	// 这里刻意不读取文件内容：读内容会被配置缓存记为文件输入，
+-	// 而锁文件在构建末尾会因干净收尾被删除，下一次构建便会以 file '...lock' has been removed 为由丢弃配置缓存。
+-	// 返回 ACQUIRED_CLEAN 表示上次构建干净收尾，其余结果表示上次构建未干净收尾——仅用于输出诊断信息，
+-	// 不再据此触发全量重建（见 run() 中的说明）。
+-	@SuppressWarnings("BusyWait")
+-	private LockResult acquireProcessLockWaiting_(LockFile lockFile, Duration timeout) throws IOException {
+-		final long timeoutMs = timeout.toMillis();
+-		final Logger logger = Logging.getLogger("loom_acquireProcessLockWaiting");
+-		final Path lock = lockFile.file;
+-
+-		if (OWNED_LOCKS.contains(lock)) {
+-			// 同一进程已持有该锁
+-			return LockResult.ACQUIRED_ALREADY_OWNED;
+-		}
+-
+-		// createDirectories 在目录已存在时不会报错，省去一次会污染配置缓存指纹的存在性判断
+-		Files.createDirectories(lock.getParent());
+-
+-		// 锁文件在干净收尾时会被删除，因此它存在即表示上次构建没能清理自己
+-		final boolean leftByPreviousBuild = lockFileExists(lock);
+-
+-		if (leftByPreviousBuild) {
+-			logger.lifecycle("Lock file \"{}\" was left by a previous build, assuming abrupt termination.", lockFile);
+-		}
+-
+-		// 仅以写方式打开，不读取文件内容
+-		final FileChannel channel = FileChannel.open(lock, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+-		FileLock fileLock = null;
+-		long waitedMs = 0;
+-		boolean reported = false;
+-
+-		try {
+-			while (fileLock == null) {
+-				try {
+-					fileLock = channel.tryLock();
+-				} catch (OverlappingFileLockException e) {
+-					// 同一 JVM 内已持有，按被占用处理
+-				}
+-
+-				if (fileLock != null) {
+-					break;
+-				}
+-
+-				if (!reported) {
+-					reported = true;
+-					logger.lifecycle("\"{}\" is currently held by another process, waiting for it to be released...", lockFile);
+-				}
+-
+-				try {
+-					Thread.sleep(100);
+-				} catch (final InterruptedException e) {
+-					Thread.currentThread().interrupt();
+-					throw new IOException("Interrupted while waiting for " + lockFile, e);
+-				}
+-
+-				waitedMs += 100;
+-
+-				if (waitedMs >= 1000 * 60 && waitedMs % (1000 * 60) == 0L) {
+-					logger.lifecycle(
+-							"""
+-									Have been waiting on "{}" held by another process for {} minute(s).
+-									If this persists for an unreasonable length of time, kill this process, run './gradlew --stop' and then try again.""",
+-							lockFile, waitedMs / 1000 / 60
+-					);
+-				}
+-
+-				if (waitedMs >= timeoutMs) {
+-					throw new GradleException("Have been waiting on lock file '%s' for %s ms. Giving up as timeout is %s ms."
+-							.formatted(lockFile, waitedMs, timeoutMs));
+-				}
+-			}
+-		} catch (Throwable t) {
+-			closeQuietly(channel);
+-			throw t;
+-		}
+-
+-		processLock = fileLock;
+-		processLockChannel = channel;
+-		OWNED_LOCKS.add(lock);
+-
+-		return leftByPreviousBuild ? LockResult.ACQUIRED_PREVIOUS_OWNER_MISSING : LockResult.ACQUIRED_CLEAN;
+-	}
+-
+-	private static Duration getDefaultTimeout() {
+-		if (System.getenv("CI") != null) {
+-			// Set a small timeout on CI, as it's unlikely going to unlock.
+-			return Duration.ofMinutes(1);
+-		}
+-
+-		return Duration.ofHours(1);
+-	}
+-
+-	// 配置失败时保留锁文件、只释放 OS 锁，
+-	// 使下一次构建能判定上次未干净收尾（并据此输出诊断信息），而无需等待本进程退出。
+-	// 注意：残留锁不再触发全量重建——共享产物一律原子发布，被中断的构建不会留下半截产物。
+-	private void disownLock() {
+-		releaseProcessLock();
+-	}
+-
+-	private void releaseProcessLock() {
+-		final FileLock lock = processLock;
+-		final FileChannel channel = processLockChannel;
+-		processLock = null;
+-		processLockChannel = null;
+-
+-		if (lock == null) {
+-			return;
+-		}
+-
+-		try {
+-			lock.release();
+-		} catch (IOException ignored) {
+-			// 忽略
+-		}
+-
+-		closeQuietly(channel);
+-		OWNED_LOCKS.remove(getLockFile().file);
+-	}
+-
+-	private static void closeQuietly(FileChannel channel) {
+-		if (channel == null) {
+-			return;
+-		}
+-
+-		try {
+-			channel.close();
+-		} catch (IOException ignored) {
+-			// 忽略
+-		}
+-	}
+-
+-	private void releaseLock() {
+-		releaseProcessLock();
+-
+-		final Path lock = getLockFile().file;
+-
+-		try {
+-			deleteLockFile(lock);
+-		} catch (IOException e1) {
+-			try {
+-				// If we failed to delete the lock file, moving it before trying to delete it may help.
+-				final Path del = lock.resolveSibling(lock.getFileName() + ".del");
+-				Files.move(lock, del);
+-				Files.delete(del);
+-			} catch (IOException e2) {
+-				var exception = new UncheckedIOException("Failed to release getProject() configuration lock", e2);
+-				exception.addSuppressed(e1);
+-				throw exception;
+-			}
+-		}
+-	}
+-
+ 	private void finalizedBy(String a, String b) {
+ 		getTasks().named(a).configure(task -> task.finalizedBy(getTasks().named(b)));
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/util/gradle/LoomCacheService.java b/src/main/java/net/fabricmc/loom/util/gradle/LoomCacheService.java
+index 25490d57c517bb7258521758d59a33fc8c80faa2..124373bacea03092d387bf85300c855404ee8d14 100644
+--- a/src/main/java/net/fabricmc/loom/util/gradle/LoomCacheService.java
++++ b/src/main/java/net/fabricmc/loom/util/gradle/LoomCacheService.java
+@@ -86,12 +86,62 @@ public abstract class LoomCacheService implements BuildService<BuildServiceParam
+ 		}
+ 	}
+ 
++	/**
++	 * 双检锁形式执行「先检查、再生产」：已就绪时连锁都不取.
++	 *
++	 * <p><b>为什么需要它</b>：{@link #runExclusive} 是纯串行——后到的调用方必须先拿到锁，
++	 * 才能进入临界区做 {@code isUpToDate()} 检查，然后立刻退出。干净环境（CI 首次构建）下
++	 * N 个项目配置同一份 Minecraft 时，它们算出同一个 key，于是第 2..N 个项目各自白等
++	 * 「第一个项目做完整条 download→remap」的时间，而这个时间远超锁的 1 分钟超时。
++	 *
++	 * <p>双检锁把等待变成「只等第一个项目生产完」，而不是「每个都排一遍队」：
++	 * <ol>
++	 *   <li>锁外检查：已就绪 → 直接跑 {@code action} 之外的回退分支，不取锁；</li>
++	 *   <li>未就绪 → 取锁（可能等前一个项目生产完）；</li>
++	 *   <li>锁内<b>重检</b>：若前一个项目已经把产物做好，就跳过生产。这是关键一步：
++	 *       没有它，第 2..N 个项目拿到锁后会把同一份产物再重建一遍。</li>
++	 * </ol>
++	 *
++	 * <p>两次检查都必须是纯只读的存在性/脏标志判断（调用方保证），不得在锁外写共享缓存。
++	 *
++	 * @param lockRoot     锁文件目录
++	 * @param key          互斥 key
++	 * @param timeout      等待跨进程锁的超时时间
++	 * @param upToDate     只读就绪判定；锁内会被再次调用
++	 * @param onUpToDate   已就绪时的动作（跑在锁外，应做「读已发布产物」这类无副作用的事）
++	 * @param produce      需要生产时的动作（跑在锁内）
++	 */
++	public void runExclusiveChecking(Path lockRoot, String key, Duration timeout,
++			Callable<Boolean> upToDate, Callable<Void> onUpToDate, Callable<Void> produce) throws Exception {
++		if (Boolean.TRUE.equals(upToDate.call())) {
++			// 快路径：产物已就绪，全程不取锁（与 runExclusive 的「只在需要生产时才取锁」一致）
++			onUpToDate.call();
++			return;
++		}
++
++		final Object monitor = monitors.computeIfAbsent(key, k -> new Object());
++
++		synchronized (monitor) {
++			CacheEntryLock.withLock(lockRoot, key, timeout, () -> {
++				// 锁内重检：前一个持锁者可能刚把产物做完，此时不必再产一遍
++				if (Boolean.TRUE.equals(upToDate.call())) {
++					onUpToDate.call();
++					return null;
++				}
++
++				return produce.call();
++			});
++		}
++	}
++
+ 	/**
+ 	 * 共享缓存锁的默认等待超时.
+ 	 *
+ 	 * <p>可通过系统属性 {@code fabric.loom.lock.timeout.minutes} 覆盖
+ 	 * （在 gradle.properties 中写 {@code systemProp.fabric.loom.lock.timeout.minutes=10}）。
+-	 * 未配置时：CI 上 1 分钟（不太可能解锁），本地 30 分钟（容忍首次冷构建的慢速下载，
++	 * 未配置时：CI 上 10 分钟（干净环境首次构建要下载、解压、重映射整份 MC，
++	 * 实测在 CI runner 上远超 1 分钟；原先按「CI 上不太可能解锁」取的 1 分钟正是
++	 * 多项目并发配置时超时的直接原因），本地 30 分钟（容忍首次冷构建的慢速下载，
+ 	 * 但避免在异常持有者上无限等待——配合等待日志中的持有者 PID 可手动处置）。
+ 	 */
+ 	public static Duration defaultTimeout() {
+@@ -106,7 +156,7 @@ public abstract class LoomCacheService implements BuildService<BuildServiceParam
+ 		}
+ 
+ 		if (System.getenv("CI") != null) {
+-			return Duration.ofMinutes(1);
++			return Duration.ofMinutes(10);
+ 		}
+ 
+ 		return Duration.ofMinutes(30);
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/ConfigurationCacheTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/ConfigurationCacheTest.groovy
+index 007e17bd8921806c90161c1af3f9256fcf25f99d..c1e262d9239723b6bd30153d56239ca8b604af4c 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/ConfigurationCacheTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/ConfigurationCacheTest.groovy
+@@ -147,17 +147,20 @@ class ConfigurationCacheTest extends Specification implements GradleProjectTestT
+ 		def result1 = gradle.run(task: "help")
+ 		def projectHash = result1.output.split("%%")[1]
+ 
+-		// 模拟上一次构建在配置阶段被杀，留下一个记录着已死进程号的锁文件
++		// 模拟上一次构建在配置阶段被杀，留下一个残留锁文件。
++		//
++		// 注意：这里刻意保留这个**已废弃机制的遗留物**——Loom 现在不再读取也不写它，
++		// 但真实世界里升级前的旧版本、或降级回去的构建会在缓存目录里留下这类文件。
++		// 本用例要守的就是：这种东西存在与否，都不得影响新版本的配置缓存与产物。
+ 		def lockFile = new File(gradle.gradleHomeDir, "caches/fabric-loom/.${projectHash}.lock")
+ 		lockFile.text = "12345"
+ 
+-		// 残留锁不得使配置缓存失效，此时配置阶段未被重跑，Loom 也无从清理该文件
++		// 残留锁不得使配置缓存失效，此时配置阶段未被重跑
+ 		def result2 = gradle.run(task: "help")
+ 
+-		// 强制重新配置，此时 Loom 才会执行加锁逻辑并识别残留锁
++		// 强制重新配置（此时会重新执行整套 setup，包括 mapped jar 的供给）
+ 		gradle.buildGradle << "\n// force reconfiguration\n"
+ 		def result3 = gradle.run(task: "help")
+-		// 锁文件已在上一轮被清理，必须恢复复用
+ 		def result4 = gradle.run(task: "help")
+ 
+ 		then:
+@@ -165,17 +168,44 @@ class ConfigurationCacheTest extends Specification implements GradleProjectTestT
+ 		// 残留锁文件不得让配置缓存失效：第 2 轮必须直接复用
+ 		result2.output.contains("Reusing configuration cache")
+ 		result3.task(":help").outcome != FAILED
+-		// 重新配置时识别残留锁，但仅作诊断：复用既有 loom 缓存，不再全量重建
+-		result3.output.contains("reusing the existing loom cache")
+-		// 后续构建不得再因锁文件被删除或内容变化而失效
+-		// （loom 缓存产物被创建导致的失效属于既有行为，不在本用例范围内）
++		// 重新配置后仍能正常复用（锁文件不再参与配置期判断，自然也不会污染它）
++		result4.output.contains("Reusing configuration cache")
++		// 后续构建不得因锁文件被删除或内容变化而失效
+ 		!result4.output.contains(".lock' has been removed")
+ 		!result4.output.contains(".lock' has changed")
+ 
++		and: "整个过程不得出现「等待锁」——配置期不再存在跨项目串行点"
++		!result3.output.contains("Have been waiting on")
++
+ 		where:
+ 		version << STANDARD_TEST_VERSIONS
+ 	}
+ 
++	/**
++	 * 锁文件机制的废弃说明（本用例的语义变更依据）.
++	 *
++	 * <p>旧版会用一把 per-project 的文件锁包住整个 setupMinecraft：进入时获取、退出时删除，
++	 * 并以「锁文件是否已存在」判断上次构建是否干净收尾。它带来了三个无法解开的矛盾：
++	 * <ul>
++	 *   <li><b>粒度错配</b>：锁按项目划分，而它保护的是按「MC 版本 + 映射标识」划分的共享缓存。
++	 *       同一构建里多个项目共存于同一缓存时，后到的项目必然看到前一个项目的**活**锁文件，
++	 *       于是永远打出「上次构建异常终止」——这条诊断在多项目场景下本身就是错的；</li>
++	 *   <li><b>与并行配置冲突</b>：开启 Isolated Projects 后 Gradle 并行配置各项目，N 个项目各自
++	 *       在自己那把锁上等同一件重活（首次构建要下载、解压、重映射整份 MC），CI 上 1 分钟
++	 *       超时必现失败，报出与真实原因无关的「Cannot get MinecraftMetadataProvider before
++	 *       it has been setup」；</li>
++	 *   <li><b>职责已被覆盖</b>：它声称保证的「同一共享缓存条目只被生产一次」，已由每个生产点
++	 *       各自的 per-key 跨进程锁（{@code LoomCacheService}）承担，键覆盖 mc 版本+映射标识、
++	 *       mappings、download、remap、processed、forge 补丁链等全部产出路径；且产物一律原子
++	 *       发布，被中断的构建不会留下半截产物——残留锁本来就不该触发重建。</li>
++	 * </ul>
++	 *
++	 * <p>因此它被整机制删除，而不是「保留但不等待」：后一种做法会留下一个在多项目场景下必然
++	 * 撒谎的诊断。本用例与 {@code OfflineModeTest} 原先断言的「reusing the existing loom cache」
++	 * 就是那行诊断的输出；现在改为守真正值得守的东西：<b>残留锁文件的存在不得影响配置缓存
++	 * 复用、不得导致构建失败、也不得引入等待</b>。
++	 */
++
+ 	static def fmj(String version) {
+ 		return """
+ 		{
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/OfflineModeTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/OfflineModeTest.groovy
+index 88f56128cc773979141aca6ac854467cfc07264c..761171d208120b230269f31fe07bb254ec444ab5 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/OfflineModeTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/OfflineModeTest.groovy
+@@ -58,8 +58,11 @@ class OfflineModeTest extends Specification implements GradleProjectTestTrait {
+ 
+ 		def projectHash = result1.output.split("%%")[1]
+ 
+-		// 写入一个伪造的残留锁文件：下一次运行只会把它当作「上次构建未干净收尾」的诊断信息，
+-		// 不再触发 loom 缓存重建，因此缓存必须保持完好且可离线复用
++		// 写入一个伪造的残留锁文件。
++		//
++		// 锁文件机制已整个废弃（理由见 ConfigurationCacheTest 末尾的说明）：Loom 不再读写它。
++		// 但升级前的旧版本、或降级回去的构建会在缓存目录里留下这类文件，所以「它的存在
++		// 不得影响新版本」是一个真实且必须守住的风险。
+ 		def lockFile = new File(gradle.gradleHomeDir, "caches/fabric-loom/.${projectHash}.lock")
+ 		lockFile.text = "12345"
+ 
+@@ -67,9 +70,10 @@ class OfflineModeTest extends Specification implements GradleProjectTestTrait {
+ 		def result2 = gradle.run(tasks: ["clean", "build"], args: ["--offline"])
+ 		then:
+ 		result1.task(":build").outcome == SUCCESS
++		// 残留锁文件不得导致离线构建失败，也不得触发缓存重建（离线环境下重建必然失败）
+ 		result2.task(":build").outcome == SUCCESS
+ 
+-		result2.output.contains("was left by a previous build, assuming abrupt termination.")
+-		result2.output.contains("reusing the existing loom cache")
++		and: "离线构建全程不得等待锁——配置期不再存在跨项目串行点"
++		!result2.output.contains("Have been waiting on")
+ 	}
+ }

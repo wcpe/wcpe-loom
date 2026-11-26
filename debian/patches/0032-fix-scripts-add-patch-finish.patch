@@ -1,0 +1,61 @@
+From 70c307da9c7bfc30be07f0f7e0908a64d5cd2910 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:38 +0800
+Subject: [PATCH 032/147] =?UTF-8?q?fix(scripts):=20add-patch=20finish=20?=
+ =?UTF-8?q?=E6=94=B9=E4=B8=BA=E5=8F=AF=E4=BB=8E=E9=BB=98=E8=AE=A4=E5=88=86?=
+ =?UTF-8?q?=E6=94=AF=E6=89=A7=E8=A1=8C?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+add-patch 工作分支切自队列末端（元数据提交之前），其上没有 scripts/ 目录，
+导致 finish 在分支内无法执行。改为接受分支名、从默认分支运行：
+  scripts/sync-upstream.sh add-patch finish <分支名>
+未指定时取唯一的 add-patch/* 分支；执行前要求工作区干净。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/scripts/sync-upstream.sh b/scripts/sync-upstream.sh
+index bcb0e29d554648cf4e4f350129e51fcffa4621db..8b13cab258c49ddc3b02bb2109c7cf90a5c292e1 100644
+--- a/scripts/sync-upstream.sh
++++ b/scripts/sync-upstream.sh
+@@ -87,8 +87,8 @@ cmd_verify() {
+ 
+ cmd_add_patch() {
+ 	local arg="${1:-}"
+-	[ -n "${arg}" ] || die "用法: scripts/sync-upstream.sh add-patch <补丁名> | add-patch finish"
+-	if [ "${arg}" = "finish" ]; then cmd_add_patch_finish; return; fi
++	[ -n "${arg}" ] || die "用法: scripts/sync-upstream.sh add-patch <补丁名> | add-patch finish [分支名]"
++	if [ "${arg}" = "finish" ]; then cmd_add_patch_finish "${2:-}"; return; fi
+ 
+ 	local queue branch
+ 	queue="$(queue_commit)"
+@@ -115,14 +115,23 @@ cmd_add_patch() {
+      Origin 取值： vendor, wcpe-loom | backport, <上游版本> | upstream, <URL>
+      Forwarded 取值： no | not-needed | <URL>
+ 
+-  3) 完成后执行： scripts/sync-upstream.sh add-patch finish
++  3) 提交后切回默认分支，执行： scripts/sync-upstream.sh add-patch finish ${branch}
+ EOF
+ }
+ 
+ cmd_add_patch_finish() {
+-	local branch queue oldtip cand
+-	branch="$(git rev-parse --abbrev-ref HEAD)"
+-	case "${branch}" in add-patch/*) ;; *) die "当前不在 add-patch/* 分支上（现在：${branch}）";; esac
++	local branch="${1:-}" queue oldtip cand cands
++	# finish 必须从默认分支执行：add-patch 分支切自队列末端，其上没有 scripts/ 目录
++	if [ -z "${branch}" ]; then
++		cands="$(git for-each-ref --format=%(refname:short) refs/heads/add-patch/*)"
++		[ -n "${cands}" ] || die "没有 add-patch/* 分支；用法: add-patch finish <分支名>"
++		[ "$(printf %s
++ "${cands}" | wc -l)" = "1" ] || die "存在多个 add-patch/* 分支，请显式指定：add-patch finish <分支名>"
++		branch="${cands}"
++	fi
++	git rev-parse -q --verify "refs/heads/${branch}" >/dev/null || die "分支 ${branch} 不存在"
++	[ -z "$(git status --porcelain)" ] || die "工作区不干净，请先提交或清理"
++	git checkout -q "${branch}"
+ 	queue="$(queue_commit)"
+ 	[ -n "${queue}" ] || die "找不到队列末端 tag ${QUEUE_TAG}"
+ 

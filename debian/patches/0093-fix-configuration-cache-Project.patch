@@ -1,0 +1,67 @@
+From 106861c655e6b7967a3bc64e9faa8e34a7e8ce64 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 22 Oct 2026 23:04:11 +0800
+Subject: [PATCH 093/147] =?UTF-8?q?fix(configuration-cache):=20=E9=85=8D?=
+ =?UTF-8?q?=E7=BD=AE=E6=9C=9F=E5=8F=96=E5=A5=BD=E9=87=8D=E6=98=A0=E5=B0=84?=
+ =?UTF-8?q?=E6=BA=90=E9=85=8D=E7=BD=AE=EF=BC=8C=E9=81=BF=E5=85=8D=E6=89=A7?=
+ =?UTF-8?q?=E8=A1=8C=E6=9C=9F=E8=AE=BF=E9=97=AE=20Project?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+RemapModsTask 的 remapClasspath 惰性 provider 里遍历 extension.getRemapConfigurations()
+再调 entry.getSourceConfiguration()，而 RemapConfigurationSettings 是 Gradle 装饰对象，
+其 getSourceConfiguration() 内部要走抽象方法 getProject()——在 provider 的 lambda 里
+回调它就构成「执行期访问 Project」，配置缓存直接抛 InvalidUserCodeException
+（--rerun-tasks 这类跳过快照的用法必踩）。
+
+改为在配置期先取好全部 NamedDomainObjectProvider<Configuration>：它本身是可序列化的
+惰性句柄，getFiles() 仍推迟到快照时刻解析，因此不改变原有的性能约束。
+
+顺带移除 getMappingConfiguration() 里一行遗留调试代码。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java b/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java
+index b834d116d4622faec8122cbcc81f88ef2bd87710..61df2e55958c2266c4d83fd841da754c4df032a3 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java
+@@ -312,11 +312,23 @@ public class ModConfigurationRemapper {
+ 
+ 					// 只声明认领到的产物；声明集合同时就是写出集合（见 RemapModsTask.getOutputJars）
+ 					task.getOutputJars().from(ownedArtifacts.stream().map(Path::toFile).toList());
++					// 源配置的 provider 必须在**配置期**取好：RemapConfigurationSettings 是 Gradle 装饰对象，
++					// 它的 getSourceConfiguration() 内部要走抽象方法 getProject()——在 provider 的 lambda 里回调它，
++					// 就构成「执行期访问 Project」，配置缓存会直接抛
++					// InvalidUserCodeException（--rerun-tasks 这类跳过快照的用法必踩）。
++					// 取到的 NamedDomainObjectProvider 本身是可序列化的惰性句柄，getFiles() 仍推迟到快照时刻解析，
++					// 因此不改变上面那段性能约束。
++					final List<NamedDomainObjectProvider<Configuration>> remapSourceConfigurations = new ArrayList<>();
++
++					for (RemapConfigurationSettings entry : extension.getRemapConfigurations()) {
++						remapSourceConfigurations.add(entry.getSourceConfiguration());
++					}
++
+ 					task.getRemapClasspath().from(project.provider(() -> {
+ 						final List<File> remapConfigSourceFiles = new ArrayList<>();
+ 
+-						for (RemapConfigurationSettings entry : extension.getRemapConfigurations()) {
+-							remapConfigSourceFiles.addAll(entry.getSourceConfiguration().get().getFiles());
++						for (NamedDomainObjectProvider<Configuration> sourceConfiguration : remapSourceConfigurations) {
++							remapConfigSourceFiles.addAll(sourceConfiguration.get().getFiles());
+ 						}
+ 
+ 						return RemapModsTask.collectRemapClasspath(remapConfigSourceFiles, inputsBeingRemapped);
+diff --git a/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java b/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java
+index a25811845f8c089085351f57067cac1c62cdef35..a001fe50852eff24347aa57e97972820df0c2f33 100644
+--- a/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java
++++ b/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java
+@@ -210,7 +210,6 @@ public abstract class LoomGradleExtensionImpl extends LoomGradleExtensionApiImpl
+ 	@Override
+ 	public MappingConfiguration getMappingConfiguration() {
+ 		if (disableObfuscation()) {
+-			project.getLogger().lifecycle("help", new RuntimeException());
+ 			throw new UnsupportedOperationException("Cannot get mappings configuration in a non-obfuscated environment");
+ 		}
+ 

@@ -1,0 +1,406 @@
+From c90e7786ebbc972a505af574c1ecdbb1e99b77b9 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Wed, 25 Nov 2026 01:39:50 +0800
+Subject: [PATCH 138/147] =?UTF-8?q?fix(mcp):=20=E5=A4=8D=E7=94=A8=E9=80=9A?=
+ =?UTF-8?q?=E8=BF=87=E5=AE=98=E6=96=B9=E6=91=98=E8=A6=81=E6=A0=A1=E9=AA=8C?=
+ =?UTF-8?q?=E7=9A=84=E7=A6=BB=E7=BA=BF=E6=98=A0=E5=B0=84?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+按发布清单的摘要校验并复用持久副本，让工作目录变化不再迫使离线构建重新下载映射。保留执行工具的原有缓存边界。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: mcp-offline-input-cache
+
+diff --git a/src/main/java/dev/architectury/loom/mcpconfig/McpExecutor.java b/src/main/java/dev/architectury/loom/mcpconfig/McpExecutor.java
+index 8d66709c38ff0d56df41335415af2f933a24a9a7..850267c90cbf8082bec48005f8bb8a6856d2b94c 100644
+--- a/src/main/java/dev/architectury/loom/mcpconfig/McpExecutor.java
++++ b/src/main/java/dev/architectury/loom/mcpconfig/McpExecutor.java
+@@ -252,6 +252,16 @@ public final class McpExecutor extends Service<McpExecutor.Options> {
+ 			return target;
+ 		}
+ 
++		@Override
++		public boolean offline() {
++			return getOptions().getOffline().get();
++		}
++
++		@Override
++		public boolean refreshDownloads() {
++			return getOptions().getManualRefreshDeps().get();
++		}
++
+ 		@Override
+ 		public DownloadBuilder downloadBuilder(String url) {
+ 			DownloadBuilder builder;
+diff --git a/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java b/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java
+index 9016d6b6307482e7b077bfd7076d96a78016c56c..0b74db6ab3d338b16bafa2070002156d76da7652 100644
+--- a/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java
++++ b/src/main/java/dev/architectury/loom/mcpconfig/McpExecutorBuilder.java
+@@ -227,6 +227,10 @@ public final class McpExecutorBuilder {
+ 		return cache.resolve("downloads").resolve(Checksum.of(url).sha256().hex(24));
+ 	}
+ 
++	private Path userCache() {
++		return LoomGradleExtension.get(project).getFiles().getUserCache().toPath();
++	}
++
+ 	/**
+ 	 * Enqueues a step and its dependencies to be executed.
+ 	 *
+@@ -310,12 +314,8 @@ public final class McpExecutorBuilder {
+ 		case "downloadServer" -> ConstantLogic.createOptions(setupContext, () -> minecraftProvider.getMinecraftServerJar().toPath());
+ 		case "strip" -> StripLogic.createOptions(setupContext);
+ 		case "listLibraries" -> ListLibrariesLogic.createOptions(setupContext);
+-		case "downloadClientMappings" -> DownloadManifestFileLogic.createOptions(setupContext,
+-				Objects.requireNonNull(minecraftProvider.getVersionInfo().download("client_mappings"),
+-						"client_mappings download is not available for this Minecraft version"));
+-		case "downloadServerMappings" -> DownloadManifestFileLogic.createOptions(setupContext,
+-				Objects.requireNonNull(minecraftProvider.getVersionInfo().download("server_mappings"),
+-						"server_mappings download is not available for this Minecraft version"));
++		case "downloadClientMappings" -> officialMappings("client");
++		case "downloadServerMappings" -> officialMappings("server");
+ 		case "inject" -> InjectLogic.createOptions(setupContext);
+ 		case "patch" -> PatchLogic.createOptions(setupContext);
+ 		default -> {
+@@ -328,6 +328,14 @@ public final class McpExecutorBuilder {
+ 		};
+ 	}
+ 
++	private Provider<DownloadManifestFileLogic.Options> officialMappings(String side) {
++		final String key = side + "_mappings";
++		return DownloadManifestFileLogic.createOptions(setupContext,
++				Objects.requireNonNull(minecraftProvider.getVersionInfo().download(key),
++						key + " download is not available for this Minecraft version"),
++				userCache().resolve(minecraftProvider.minecraftVersion()), side);
++	}
++
+ 	private class SetupContextImpl implements StepLogic.SetupContext {
+ 		@Override
+ 		public Project project() {
+diff --git a/src/main/java/dev/architectury/loom/mcpconfig/steplogic/DownloadManifestFileLogic.java b/src/main/java/dev/architectury/loom/mcpconfig/steplogic/DownloadManifestFileLogic.java
+index 798bb8d3e18a89a08753d57e2f9c5b485371688d..b5f951c027bb7e3bf472b4be6ab86d4fd72311a2 100644
+--- a/src/main/java/dev/architectury/loom/mcpconfig/steplogic/DownloadManifestFileLogic.java
++++ b/src/main/java/dev/architectury/loom/mcpconfig/steplogic/DownloadManifestFileLogic.java
+@@ -25,12 +25,22 @@
+ package dev.architectury.loom.mcpconfig.steplogic;
+ 
+ import java.io.IOException;
++import java.io.UncheckedIOException;
++import java.nio.file.Files;
++import java.nio.file.NoSuchFileException;
++import java.nio.file.Path;
++import java.util.Locale;
++import java.util.stream.Stream;
+ 
++import org.gradle.api.file.DirectoryProperty;
+ import org.gradle.api.provider.Property;
+ import org.gradle.api.provider.Provider;
+ import org.gradle.api.tasks.Input;
++import org.gradle.api.tasks.Internal;
+ 
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftVersionMeta;
++import net.fabricmc.loom.util.Checksum;
++import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.loom.util.service.Service;
+ import net.fabricmc.loom.util.service.ServiceFactory;
+ import net.fabricmc.loom.util.service.ServiceType;
+@@ -44,10 +54,20 @@ public final class DownloadManifestFileLogic extends StepLogic<DownloadManifestF
+ 	public interface Options extends Service.Options {
+ 		@Input
+ 		Property<MinecraftVersionMeta.Download> getDownload();
++
++		@Input
++		Property<String> getSide();
++
++		@Internal
++		DirectoryProperty getVersionCache();
+ 	}
+ 
+-	public static Provider<Options> createOptions(SetupContext context, MinecraftVersionMeta.Download download) {
+-		return TYPE.create(context.project(), options -> options.getDownload().set(download));
++	public static Provider<Options> createOptions(SetupContext context, MinecraftVersionMeta.Download download, Path versionCache, String side) {
++		return TYPE.create(context.project(), options -> {
++			options.getDownload().set(download);
++			options.getVersionCache().set(versionCache.toFile());
++			options.getSide().set(side);
++		});
+ 	}
+ 
+ 	public DownloadManifestFileLogic(Options options, ServiceFactory serviceFactory) {
+@@ -56,9 +76,80 @@ public final class DownloadManifestFileLogic extends StepLogic<DownloadManifestF
+ 
+ 	@Override
+ 	public void execute(ExecutionContext context) throws IOException {
+-		MinecraftVersionMeta.Download download = getOptions().getDownload().get();
+-		context.downloadBuilder(download.url())
+-				.sha1(download.sha1())
+-				.downloadPath(context.setOutput("output"));
++		final MinecraftVersionMeta.Download download = getOptions().getDownload().get();
++		final String side = getOptions().getSide().get();
++		final String expected = download.sha1();
++
++		if (expected == null || !expected.matches("[0-9a-fA-F]{40}")) {
++			throw new IOException("Invalid official SHA-1 for MCP " + side + " mappings: " + expected);
++		}
++
++		final String sha1 = expected.toLowerCase(Locale.ROOT);
++		final Path versionCache = getOptions().getVersionCache().get().getAsFile().toPath();
++		final String name = side + ".txt";
++		final Path persistent = versionCache.resolve("mcp/official-mappings").resolve(sha1).resolve(name);
++		final Path output = context.setOutput("output");
++		final Path layered = versionCache.resolve("layered/working_dir");
++
++		if (context.offline() || !context.refreshDownloads()) {
++			if (matchesSha1(persistent, sha1)) {
++				copyVerified(persistent, output, sha1);
++				return;
++			}
++
++			if (Files.isDirectory(layered)) {
++				try (Stream<Path> layers = Files.list(layered)) {
++					for (Path layer : layers.sorted().toList()) {
++						final Path candidate = layer.resolve("mojang").resolve(name);
++
++						if (matchesSha1(candidate, sha1)) {
++							copyVerified(candidate, persistent, sha1);
++							copyVerified(persistent, output, sha1);
++							return;
++						}
++					}
++				}
++			}
++		}
++
++		if (context.offline()) {
++			throw new IOException("Official MCP " + side + " mappings unavailable in offline mode (SHA-1 " + sha1
++					+ "): no matching file at " + persistent + " or under " + layered);
++		}
++
++		AtomicFiles.publish(persistent, temporary -> {
++			context.downloadBuilder(download.url()).sha1(sha1).downloadPath(temporary);
++			requireSha1(temporary, sha1);
++		});
++		copyVerified(persistent, output, sha1);
++	}
++
++	private static boolean matchesSha1(Path path, String sha1) throws IOException {
++		if (!Files.isRegularFile(path)) {
++			return false;
++		}
++
++		try {
++			return Checksum.of(path).sha1().matchesStr(sha1);
++		} catch (UncheckedIOException e) {
++			if (e.getCause() instanceof NoSuchFileException) {
++				return false;
++			}
++
++			throw e.getCause();
++		}
++	}
++
++	private static void requireSha1(Path path, String sha1) throws IOException {
++		if (!matchesSha1(path, sha1)) {
++			throw new IOException("Official MCP mappings SHA-1 mismatch for " + path + " (expected " + sha1 + ")");
++		}
++	}
++
++	private static void copyVerified(Path source, Path target, String sha1) throws IOException {
++		AtomicFiles.publish(target, temporary -> {
++			Files.copy(source, temporary);
++			requireSha1(temporary, sha1);
++		});
+ 	}
+ }
+diff --git a/src/main/java/dev/architectury/loom/mcpconfig/steplogic/StepLogic.java b/src/main/java/dev/architectury/loom/mcpconfig/steplogic/StepLogic.java
+index 35287b1c2bac533b62d6ad38455eb537c6a1a2bc..ef2422cf8232ebe5d14ac2c07338c788dcddae45 100644
+--- a/src/main/java/dev/architectury/loom/mcpconfig/steplogic/StepLogic.java
++++ b/src/main/java/dev/architectury/loom/mcpconfig/steplogic/StepLogic.java
+@@ -65,6 +65,8 @@ public abstract class StepLogic<O extends Service.Options> extends Service<O> {
+ 		Path mappings();
+ 		String resolve(ConfigValue value);
+ 		DownloadBuilder downloadBuilder(String url);
++		boolean offline();
++		boolean refreshDownloads();
+ 		void javaexec(Action<? super ForgeToolExecutor.Settings> configurator);
+ 
+ 		/**
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/McpOfflineInputsTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/McpOfflineInputsTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..d8eb9f51de4cb8302daab78802a7a9b6e1750fd3
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/McpOfflineInputsTest.groovy
+@@ -0,0 +1,170 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit
++
++import java.nio.file.Files
++import java.nio.file.Path
++
++import com.google.gson.JsonObject
++import dev.architectury.loom.mcpconfig.McpConfigData
++import dev.architectury.loom.mcpconfig.McpConfigProvider
++import dev.architectury.loom.mcpconfig.McpConfigStep
++import dev.architectury.loom.mcpconfig.McpExecutor
++import dev.architectury.loom.mcpconfig.McpExecutorBuilder
++import org.gradle.api.Project
++import org.gradle.testfixtures.ProjectBuilder
++import spock.lang.Specification
++import spock.lang.TempDir
++
++import net.fabricmc.loom.LoomGradleExtension
++import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider
++import net.fabricmc.loom.configuration.providers.minecraft.MinecraftVersionMeta
++import net.fabricmc.loom.extension.LoomFiles
++import net.fabricmc.loom.util.Checksum
++import net.fabricmc.loom.util.service.ScopedServiceFactory
++import net.fabricmc.loom.util.service.Service
++
++class McpOfflineInputsTest extends Specification {
++	private static final String VERSION = 'test-version'
++	// 不可用于网络传输；若错误进入下载分支，会在 URL 解析时失败。
++	private static final String NO_NETWORK_REPO = 'not-a-network-protocol://mcp/'
++
++	@TempDir Path tempDir
++	private Project project
++	private Path userCache
++	private Path versionCache
++
++	def setup() {
++		project = ProjectBuilder.builder().withProjectDir(tempDir.toFile()).build()
++		userCache = tempDir.resolve('loom')
++		versionCache = userCache.resolve(VERSION)
++		def files = Stub(LoomFiles) {
++			getUserCache() >> userCache.toFile()
++		}
++		project.extensions.add('loom', Stub(LoomGradleExtension) {
++			getFiles() >> files
++		})
++	}
++
++	def '离线 #side 映射只选匹配官方摘要的 layered 文件，并跨步骤目录复用持久副本'() {
++		given:
++		def type = side == 'client' ? 'downloadClientMappings' : 'downloadServerMappings'
++		def mapping = "${side} 官方映射".toString()
++		def sha1 = Checksum.of(mapping).sha1().hex()
++		def persistent = versionCache.resolve("mcp/official-mappings/${sha1}/${side}.txt")
++		def wrong = versionCache.resolve("layered/working_dir/a/mojang/${side}.txt")
++		def correct = versionCache.resolve("layered/working_dir/z/mojang/${side}.txt")
++		put(wrong, '摘要不符')
++		put(correct, mapping)
++		put(persistent, '损坏的持久副本')
++		def step = new McpConfigStep(type, 'mojangMappings', [:])
++		def options = stepOptions(step, [("${side}_mappings".toString()): download(sha1)])
++
++		when:
++		def first = execute(step, options, 'first')
++		Files.delete(correct)
++		def second = execute(step, options, 'second')
++
++		then:
++		first == tempDir.resolve('first/mojangMappings/output')
++		second == tempDir.resolve('second/mojangMappings/output')
++		Files.readString(first) == mapping
++		Files.readString(second) == mapping
++		Files.readString(persistent) == mapping
++		Files.readString(wrong) == '摘要不符'
++
++		where:
++		side << ['client', 'server']
++	}
++
++	def '离线 #caseName 不使用未经校验的步骤输出，也不尝试下载'() {
++		given:
++		def sha1 = Checksum.of('官方映射').sha1().hex()
++		def persistent = versionCache.resolve("mcp/official-mappings/${sha1}/client.txt")
++		def output = tempDir.resolve('work/mojangMappings/output')
++		if (corrupt) {
++			put(output, '不可信的旧输出')
++			put(persistent, '持久副本摘要不符')
++			put(versionCache.resolve('layered/working_dir/a/mojang/client.txt'), '原文摘要不符')
++		}
++		def step = new McpConfigStep('downloadClientMappings', 'mojangMappings', [:])
++		def options = stepOptions(step, [client_mappings: download(sha1)])
++
++		when:
++		execute(step, options, 'work')
++
++		then:
++		def failure = thrown(IOException)
++		failure.message.contains('offline')
++		failure.message.contains('client')
++		failure.message.contains(sha1)
++		corrupt ? Files.readString(output) == '不可信的旧输出' : Files.notExists(output)
++		corrupt ? Files.readString(persistent) == '持久副本摘要不符' : Files.notExists(persistent)
++
++		where:
++		caseName | corrupt
++		'资料损坏' | true
++		'资料缺失' | false
++	}
++
++	private static MinecraftVersionMeta.Download download(String sha1) {
++		new MinecraftVersionMeta.Download(null, sha1, 0L, NO_NETWORK_REPO + 'mapping.txt')
++	}
++
++	private Service.Options stepOptions(McpConfigStep step, Map downloads) {
++		def versionMeta = new MinecraftVersionMeta(null, null, '', 0, downloads, VERSION, [], null, '', 0, '', '', '', null)
++		def versionDir = versionCache.toFile()
++		def minecraft = Stub(MinecraftProvider) {
++			minecraftVersion() >> VERSION
++			getVersionInfo() >> versionMeta
++			workingDir() >> versionDir
++		}
++		def data = new McpConfigData(VERSION, new JsonObject(), null, false, [joined: [step]], [:])
++		def mcp = Stub(McpConfigProvider) {
++			getData() >> data
++		}
++		def builder = new McpExecutorBuilder(project, minecraft, tempDir.resolve('work'), mcp, 'joined')
++		def setupStep = McpExecutorBuilder.getDeclaredMethod('getStepLogic', String, String)
++		setupStep.accessible = true
++		setupStep.invoke(builder, step.name(), step.type()).get()
++	}
++
++	private Path execute(McpConfigStep step, Service.Options logic, String work) {
++		def options = McpExecutor.TYPE.create(project) {
++			it.stepLogicOptions.set([(step.name()): logic])
++			it.stepsToExecute.set([step])
++			it.initialConfig.set([:])
++			it.cache.set(tempDir.resolve(work).toFile())
++			it.offline.set(true)
++			it.manualRefreshDeps.set(false)
++		}
++		new ScopedServiceFactory().withCloseable { it.get(options).execute() }
++	}
++
++	private static void put(Path path, String content) {
++		Files.createDirectories(path.parent)
++		Files.writeString(path, content)
++	}
++}

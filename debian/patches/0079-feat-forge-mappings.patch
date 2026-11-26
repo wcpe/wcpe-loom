@@ -1,0 +1,1659 @@
+From 53559e0d54e50ea57c7844813c00dd8df7b6ecd4 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Sat, 3 Oct 2026 11:19:20 +0800
+Subject: [PATCH 079/147] =?UTF-8?q?feat(forge):=20mappings=20=E8=BF=81?=
+ =?UTF-8?q?=E7=A7=BB=E8=BF=81=E5=88=B0=E6=89=A7=E8=A1=8C=E6=9C=9F=E4=BB=BB?=
+ =?UTF-8?q?=E5=8A=A1?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+第 4 步：两个映射迁移器（FieldMappingsMigrator / MethodInheritanceMappingsMigrator）原本在
+缓存未命中时于配置期按路径读 patched 中间 jar（经 getOrProduceMinecraftPatchedIntermediateJar），
+改为执行期任务 manipulateForgeMappings 承担：输入=两份原始 mappings + patched 中间 jar +
+universal/userdev jar + hasSrg/hasMojang/refreshDeps/migratorCacheDir/platformId，输出=两份迁移
+产物 + 就绪标记。
+
+迁移器改 project-free：配置缓存下执行期触碰 Task.project 会被 Gradle 直接拒绝（实测报
+"Invocation of 'Task.project' ... unsupported with the configuration cache"）。MappingsMigrator
+引入 Inputs 记录，patched jar 由调用方显式给出；ForgeMigratedMappingConfiguration 做投影/回退
+分流，两条路径共用同一份静态生产实现。
+
+存在性校验按族放宽：MappingConfiguration 的 Files.notExists(...) 增加 && !isTaskProducedMappings
+（默认 false，Forge 覆写为 manipulateTaskPath != null）——只有迁移产物这一族放宽，legacy /
+unobfuscated 仍拒绝；srgNamedProjectionBlocker 同样跳过「不存在」。
+
+消费任务接线共 12 处（后 6 处必须用惰性 Provider：remapJar 在插件 apply 期就 eager 创建，立刻
+查询映射配置会静默接不上），逐处已在代码中列出。
+
+零回归：金标逐行 SHA-256——mappings-migrated.tiny 85705 行、mappings-srg-migrated.tiny 86355 行，
+任务产物 vs 配置期实现差异 0 行；移出产物后新工程整链重建再比对差异 0 行。
+负对照两条（均实测变红后撤销）：删掉 generateForgePatchedJar 接线 → Gradle 报 uses-this-output
+未声明依赖；rawMappingsWithNs 指向 mappings.tiny → :remapJar 失败。
+
+验证：compileJava / checkstyleMain / checkstyleTest / codenarcTest 与 build -x test -x spotless*
+均 SUCCESSFUL；ForgeTest 13/13、ForgeRunConfigTest 5/5、AccessTransformerTest 1/1、Forge1206Test
+1/1、PatchedDecompileTest 3/3、pipeline 全绿、新用例 2/2。首轮 pipeline.Forge* 2 红系 /tmp 写满、
+SplitModDependencyProducerTest 首轮 DaemonStoppedException，均为环境性，重跑 PASSED。
+
+新增留痕：Forge 的 mappings 迁移由执行期任务承担：:manipulateForgeMappings
+
+计划外发现：legacy mixin AP 的 getReplacedTarget 是配置期真读平台映射文件的读者（实测
+forge/simpleMixinAp 的 mappings-mixin-srg.tiny 由配置期写出），已加为新回退判据。
+
+第 5 步（解除 Forge 的 vanilla jar 回退门）受阻未做：projectionBlocker() 在
+setupDependencyProviders 之前执行，isLegacyForge() 会 NPE（实测改成 isForgeLike() && isLegacyForge()
+后 ForgeRunConfigTest 5/5 全红：getDependencyProviders() is null）。已在原地留注释说明下一手。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/dev/architectury/loom/forge/FieldMappingsMigrator.java b/src/main/java/dev/architectury/loom/forge/FieldMappingsMigrator.java
+index 34a6c5fc1be25f7055c67e9a9d5f031c114b9cb1..1e865a09adbc0fa86fa0b645c9b78148959a946c 100644
+--- a/src/main/java/dev/architectury/loom/forge/FieldMappingsMigrator.java
++++ b/src/main/java/dev/architectury/loom/forge/FieldMappingsMigrator.java
+@@ -38,22 +38,19 @@ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
++import java.util.function.Consumer;
+ 
+ import com.google.gson.Gson;
+ import com.google.gson.reflect.TypeToken;
+-import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
+ import dev.architectury.loom.util.Stopwatch;
+ import dev.architectury.loom.util.ThreadingUtils;
+-import org.gradle.api.Project;
+ import org.objectweb.asm.ClassReader;
+ import org.objectweb.asm.ClassVisitor;
+ import org.objectweb.asm.FieldVisitor;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+-import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.FileSystemUtil;
+ import net.fabricmc.loom.util.cache.AtomicFiles;
+@@ -69,26 +66,12 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
+ 	private List<Map.Entry<FieldMember, String>> migratedFields = new ArrayList<>();
+ 	public Path migratedFieldsCache;
+ 
+-	/**
+-	 * {@return 本次 {@code setup} 是否会按路径读 patched 中间产物}.
+-	 *
+-	 * <p>判据与 {@link #setup} 里的分支逐字对应：缓存命中且未要求刷新时读缓存，否则在 hasSrg/hasMojang 时
+-	 * 读那件产物。供「能否把该产物投影成执行期任务」的前置判定使用。
+-	 */
+-	public static boolean needsPatchedIntermediateJar(Path cache, boolean refreshDeps, boolean hasSrg, boolean hasMojang) {
+-		if (!hasSrg && !hasMojang) {
+-			return false;
+-		}
+-
+-		return refreshDeps || !Files.exists(cache.resolve("migrated-fields.json"));
+-	}
+-
+ 	@Override
+-	public long setup(Project project, MinecraftProvider minecraftProvider, Path cache, Path rawMappings, boolean hasSrg, boolean hasMojang) throws IOException {
+-		migratedFieldsCache = cache.resolve("migrated-fields.json");
++	public long setup(Inputs inputs) throws IOException {
++		migratedFieldsCache = inputs.cache().resolve("migrated-fields.json");
+ 		migratedFields.clear();
+ 
+-		if (!minecraftProvider.refreshDeps() && Files.exists(migratedFieldsCache)) {
++		if (!inputs.refreshDeps() && Files.exists(migratedFieldsCache)) {
+ 			try (BufferedReader reader = Files.newBufferedReader(migratedFieldsCache)) {
+ 				Map<String, String> map = new Gson().fromJson(reader, new TypeToken<Map<String, String>>() {
+ 				});
+@@ -101,12 +84,10 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
+ 		} else {
+ 			migratedFields.clear();
+ 
+-			if (hasSrg) {
+-				// 共享缓存可能正被其它进程重建（或其它工作树仍在用会删除整组产物的旧版本 loom）：
+-				// 用 getOrProduce... 在产物缺失时先按件补齐，避免直接读取抛 NoSuchFileException
+-				migratedFields.addAll(generateNewFieldMigration(MinecraftPatchedProvider.get(project).getOrProduceMinecraftPatchedIntermediateJar(), MappingsNamespace.SRG.toString(), rawMappings).entrySet());
+-			} else if (hasMojang) {
+-				migratedFields.addAll(generateNewFieldMigration(MinecraftPatchedProvider.get(project).getOrProduceMinecraftPatchedIntermediateJar(), MappingsNamespace.MOJANG.toString(), rawMappings).entrySet());
++			if (inputs.hasSrg()) {
++				migratedFields.addAll(generateNewFieldMigration(inputs.patchedIntermediateJar(), MappingsNamespace.SRG.toString(), inputs.rawMappings()).entrySet());
++			} else if (inputs.hasMojang()) {
++				migratedFields.addAll(generateNewFieldMigration(inputs.patchedIntermediateJar(), MappingsNamespace.MOJANG.toString(), inputs.rawMappings()).entrySet());
+ 			}
+ 
+ 			Map<String, String> map = new HashMap<>();
+@@ -123,20 +104,19 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
+ 	}
+ 
+ 	@Override
+-	public void migrate(Project project, List<MappingsEntry> entries) {
++	public void migrate(List<MappingsEntry> entries, Consumer<String> info) {
+ 		Stopwatch stopwatch = Stopwatch.createStarted();
+-		LoomGradleExtension extension = LoomGradleExtension.get(project);
+ 
+ 		try {
+-			updateFieldMigration(project, entries);
++			updateFieldMigration(entries, info);
+ 		} catch (IOException e) {
+ 			throw new UncheckedIOException(e);
+ 		}
+ 
+-		LOGGER.info(":migrated {} fields in {}", extension.getPlatform().get().id(), stopwatch.stop());
++		LOGGER.info(":migrated fields in {}", stopwatch.stop());
+ 	}
+ 
+-	public void updateFieldMigration(Project project, List<MappingsEntry> entries) throws IOException {
++	public void updateFieldMigration(List<MappingsEntry> entries, Consumer<String> info) throws IOException {
+ 		// A map of class name -> field name -> actual descriptor
+ 		final Map<String, Map<String, String>> fieldDescriptorMap = new HashMap<>();
+ 
+@@ -146,11 +126,11 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
+ 		}
+ 
+ 		for (MappingsEntry entry : entries) {
+-			injectMigration(project, fieldDescriptorMap, entry.path());
++			injectMigration(info, fieldDescriptorMap, entry.path());
+ 		}
+ 	}
+ 
+-	private static void injectMigration(Project project, Map<String, Map<String, String>> fieldDescriptorMap, Path path) throws IOException {
++	private static void injectMigration(Consumer<String> info, Map<String, Map<String, String>> fieldDescriptorMap, Path path) throws IOException {
+ 		MemoryMappingTree mappings = new MemoryMappingTree();
+ 
+ 		try (BufferedReader reader = Files.newBufferedReader(path)) {
+@@ -167,7 +147,7 @@ public final class FieldMappingsMigrator implements MappingsMigrator {
+ 					if (newDescriptor != null) {
+ 						String prev = fieldDef.getDesc(MappingsNamespace.INTERMEDIARY.toString());
+ 						fieldDef.setSrcDesc(mappings.mapDesc(newDescriptor, mappings.getNamespaceId(MappingsNamespace.INTERMEDIARY.toString()), MappingTreeView.SRC_NAMESPACE_ID));
+-						project.getLogger().info("Migrated field descriptor of field {}#{} from {} to {}", classDef.getName(MappingsNamespace.INTERMEDIARY.toString()), fieldDef.getName(MappingsNamespace.INTERMEDIARY.toString()), prev, newDescriptor);
++						info.accept("Migrated field descriptor of field %s#%s from %s to %s".formatted(classDef.getName(MappingsNamespace.INTERMEDIARY.toString()), fieldDef.getName(MappingsNamespace.INTERMEDIARY.toString()), prev, newDescriptor));
+ 					}
+ 				}
+ 			}
+diff --git a/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java b/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
+index 074fa605148888f0128dc53abb0bb9e80e594459..915248033e1577525864bff37c1becff9ae0f4c6 100644
+--- a/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
++++ b/src/main/java/dev/architectury/loom/forge/ForgeMigratedMappingConfiguration.java
+@@ -29,14 +29,22 @@ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.util.List;
++import java.util.Map;
+ import java.util.concurrent.Callable;
++import java.util.function.Consumer;
+ 
+ import dev.architectury.loom.forge.dependency.ForgeProvider;
++import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
++import dev.architectury.loom.mappings.MappingOption;
+ import dev.architectury.loom.util.Stopwatch;
+ import org.gradle.api.Project;
++import org.jspecify.annotations.Nullable;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration;
++import net.fabricmc.loom.pipeline.ManipulateForgeMappingsTask;
++import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
++import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.cache.AtomicFiles;
+ import net.fabricmc.loom.util.gradle.LoomCacheService;
+ 
+@@ -57,29 +65,80 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
+ 	private Path rawTinyMappingsWithMojang;
+ 	private long hash;
+ 
++	/** 迁移产物的产出任务路径；未投影（配置期生产）时为 {@code null}. */
++	@Nullable
++	private String manipulateTaskPath;
++
+ 	public ForgeMigratedMappingConfiguration(String mappingsIdentifier, Path mappingsWorkingDir) {
+ 		super(mappingsIdentifier, mappingsWorkingDir);
+ 	}
+ 
+ 	/**
+-	 * {@return 本次配置期是否会按路径读 patched 中间产物}.
++	 * {@return 不能把 mappings 迁移投影成执行期任务的原因；可以投影时为 {@code null}}.
++	 *
++	 * <p>与 {@code MinecraftPatchedProvider.provideProjectionBlocker()} 同一风格：每一条都是一个
++	 * 「配置期有确定的读者会真读迁移产物」的形态，命中即整段退回配置期路径（那条路径与改造前逐字一致），
++	 * 并留下 lifecycle 留痕。
++	 *
++	 * <p><b>判据必须是 {@code LoomGradleExtension} 的纯函数</b>：同一个判据还要在
++	 * {@code MinecraftProvider.projectionBlocker()} 里使用，而后者执行得比 mappings 阶段早得多
++	 * （那时 {@code MappingConfiguration} 还不存在）。两处一旦不一致，就会出现「vanilla jar 投影了、
++	 * 迁移却留在配置期」这类组合——配置期读者随后会按路径读到执行期才落位的文件。
++	 *
++	 * <ul>
++	 *   <li><b>legacy mixin AP</b>：{@code AnnotationProcessorInvoker.passMixinArguments} 在配置期调用
++	 *       {@code MappingConfiguration.getReplacedTarget}，它按内容判据校验平台映射文件
++	 *       （Forge 下即 {@code mappings-srg-migrated.tiny}）并读它派生出 {@code mappings-mixin-<ns>.tiny}
++	 *       ——那个文件在配置期就要交给注解处理器的编译参数。投影后平台映射文件只在执行期落位，
++	 *       该读者会直接以 {@code IllegalStateException} 中断构建（本仓库实测：{@code forge/simpleMixinAp}
++	 *       的 {@code mappings-mixin-srg.tiny} 正是配置期写出来的）。</li>
++	 * </ul>
++	 */
++	public static @Nullable String mappingsMigrationProjectionBlocker(LoomGradleExtension extension) {
++		if (extension.isLegacyForge()) {
++			// legacy Forge 的迁移本就在 manipulateMappings 开头整段返回（补丁在官方命名空间里），
++			// 单独列出只是为了让「这一形态不投影」在日志里可见
++			return "legacy Forge（1.8-1.16）不做映射迁移";
++		}
++
++		if (extension.getMixin().getUseLegacyMixinAp().get()) {
++			return "legacy mixin AP 开启：getReplacedTarget 在配置期读平台映射文件并派生 mappings-mixin-<ns>.tiny";
++		}
++
++		return null;
++	}
++
++	/**
++	 * {@return 迁移产物的产出任务路径；未投影时为 {@code null}}.
+ 	 *
+-	 * <p>{@link #manipulateMappings} 在配置期调用 {@link #migrators}，而两个迁移器在各自缓存未命中时都会
+-	 * 按路径读那件产物（见 {@code MinecraftPatchedProvider#getOrProduceMinecraftPatchedIntermediateJar}）。
+-	 * 判据必须与迁移器 {@code setup} 里的分支逐字对应——否则「判定为不需要读」而实际读了，
+-	 * 配置期就会拿到执行期才产出的文件。
++	 * <p>供消费方把「我的输入就是你的产出」表达成任务依赖。返回任务**路径**而不是任务实例：
++	 * 产出方可能由另一份 Loom classloader 配置（约定插件/included build 各自带一份 Loom），
++	 * 把对方的任务实例交过来会在使用处抛 {@link ClassCastException}。
++	 */
++	public @Nullable String getManipulateMappingsTaskPath() {
++		return manipulateTaskPath;
++	}
++
++	/**
++	 * {@return 迁移产物的产出任务路径；未投影时为 {@code null}}.
+ 	 *
+-	 * <p>这是「把 patched 中间产物投影成执行期任务」的**前置阻碍**：迁移器自身任务化之后，
+-	 * 本方法与 {@code MinecraftPatchedProvider.provideProjectionBlocker()} 里对应的那一条应当一并删除。
++	 * <p>三个映射选项（{@code DEFAULT} / {@code WITH_SRG} / {@code WITH_MOJANG}）在本配置下都指向
++	 * 迁移产物，故它们共用同一个产出任务。
++	 */
++	@Override
++	public @Nullable String mappingsProducerTaskPath() {
++		return manipulateTaskPath;
++	}
++
++	/**
++	 * {@return 该映射选项指向的迁移产物是否由执行期任务产出}.
+ 	 *
+-	 * @param forgeCache 迁移器缓存所在的 forge 缓存目录（与 {@code migrator.setup} 的 {@code cache} 同一个）
+-	 * @param refreshDeps 是否显式要求刷新（刷新时迁移器一律走重建分支）
+-	 * @param hasSrg 本配置是否生成 srg 命名空间的映射
+-	 * @param hasMojang 本配置是否为 NeoForge（生成 mojang 命名空间的映射）
++	 * <p>未投影时（legacy Forge 与 legacy mixin AP）产物在配置期已落位，
++	 * {@link MappingConfiguration#getMappingsPath} 的存在性校验照旧生效。
+ 	 */
+-	public static boolean needsPatchedIntermediateJar(Path forgeCache, boolean refreshDeps, boolean hasSrg, boolean hasMojang) {
+-		return FieldMappingsMigrator.needsPatchedIntermediateJar(forgeCache, refreshDeps, hasSrg, hasMojang)
+-				|| MethodInheritanceMappingsMigrator.needsPatchedIntermediateJar(forgeCache, refreshDeps);
++	@Override
++	protected boolean isTaskProducedMappings(MappingOption mappingOption) {
++		return manipulateTaskPath != null;
+ 	}
+ 
+ 	@Override
+@@ -109,16 +168,38 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
+ 		this.rawTinyMappingsWithMojang = this.tinyMappingsWithMojang;
+ 		Path rawTinyMappingsWithNs = hasSrg ? this.rawTinyMappingsWithSrg : hasMojang ? this.rawTinyMappingsWithMojang : this.rawTinyMappings;
+ 
++		// 产物路径在两条路径下都必须重写成迁移后的位置：消费方（getMappingsPath / getPlatformMappingFile）
++		// 读的是这两个字段，无论迁移由谁生产
+ 		this.tinyMappings = mappingsWorkingDir().resolve("mappings-migrated.tiny");
+ 		this.tinyMappingsWithSrg = mappingsWorkingDir().resolve("mappings-srg-migrated.tiny");
+ 		this.tinyMappingsWithMojang = mappingsWorkingDir().resolve("mappings-mojang-migrated.tiny");
+ 		Path tinyMappingsWithNs = hasSrg ? this.tinyMappingsWithSrg : hasMojang ? this.tinyMappingsWithMojang : this.tinyMappings;
+ 
++		final String blocker = mappingsMigrationProjectionBlocker(extension);
++
++		if (blocker == null) {
++			// 可投影：配置期只做接线，产物由执行期任务写出
++			projectManipulateMappingsToTasks(project, extension, forgeCache, this.rawTinyMappings, rawTinyMappingsWithNs, tinyMappingsWithNs, hasSrg, hasMojang);
++			return;
++		}
++
++		project.getLogger().lifecycle("Forge 的 mappings 迁移保持配置期生产：{}", blocker);
++
++		// 配置期路径：判据、跨进程锁、锁内二次确认、原子发布都与改造前逐字一致。
++		// 走到这里时 patched 中间产物必然已在配置期落位——投影判据与本判据同源，
++		// 二者非空时 {@code MinecraftPatchedProvider.provide()} 同样走配置期路径。
++		final Path patchedIntermediateJar = MinecraftPatchedProvider.get(project).getOrProduceMinecraftPatchedIntermediateJar();
++
+ 		// 迁移器的中间缓存位于共享的 forge 缓存目录，各自原子发布；其内容只由「原始 mappings + 补丁 jar」
+ 		// 决定，同一输入下结果一致，故无锁写入最多互相覆盖成等价内容，不会让读方看到半截文件。
+ 		// 迁移器返回值参与 hash 计算，构成迁移产物的就绪标记。
++		final MappingsMigrator.Inputs inputs = new MappingsMigrator.Inputs(forgeCache, rawTinyMappingsWithNs,
++				patchedIntermediateJar, extension.getForgeUniversalProvider().getForge().toPath(),
++				extension.getForgeUserdevProvider().getUserdevJar().toPath(), hasSrg, hasMojang,
++				extension.refreshDeps(), project.getLogger()::info);
++
+ 		for (MappingsMigrator migrator : this.migrators) {
+-			hash = hash * 31 + migrator.setup(project, extension.getMinecraftProvider(), forgeCache, rawTinyMappingsWithNs, hasSrg, hasMojang);
++			hash = hash * 31 + migrator.setup(inputs);
+ 		}
+ 
+ 		// 无锁快路径：就绪标记与各迁移产物齐备且 hash 一致时，本次不含任何共享缓存写入，不取锁。
+@@ -130,9 +211,10 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
+ 		}
+ 
+ 		withMappingsLock(project, extension, () -> {
+-			// 锁内二次确认：等锁期间其它进程可能已产出同一 hash 的迁移结果，此时直接复用
++			// 锁内二次确认：等期间其它进程可能已产出同一 hash 的迁移结果，此时直接复用
+ 			if (isOutdated(extension, hasSrg, hasMojang)) {
+-				produceMigratedMappings(project, extension, rawTinyMappingsWithNs, tinyMappingsWithNs);
++				produceMigratedMappings(this.migrators, this.rawTinyMappings, rawTinyMappingsWithNs, this.tinyMappings,
++						tinyMappingsWithNs, this.hashPath, this.hash, extension.getPlatform().get().id(), project.getLogger()::info);
+ 			}
+ 
+ 			return null;
+@@ -140,10 +222,70 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
+ 	}
+ 
+ 	/**
+-	 * 生产迁移后的 mappings：复制与迁移结果一律原子发布，就绪标记先失效、最后才落位.
++	 * 把 mappings 迁移投影成执行期任务.
++	 *
++	 * <p>配置期只做「配置期已知量 → 任务输入」的映射，不写产物文件：产物有效性交给 Gradle 的 up-to-date
++	 * 判定与构建缓存，并发保护交给任务图。产物路径沿用既有位置（{@code <userCache>/<mappingsIdentifier>/}），
++	 * 否则 {@code getMappingsPath} / {@code getPlatformMappingFile} 给出的路径会全部悬空。
++	 *
++	 * <p>输入里的 {@code patchedIntermediateJar} 由补丁链的中间产物任务产出——这正是本步要消灭的那条
++	 * 「配置期按路径读执行期产物」依赖：迁移器缓存未命中时读它，配置期读不到，故改为任务输入。
++	 */
++	private void projectManipulateMappingsToTasks(Project project, LoomGradleExtension extension, Path forgeCache,
++			Path rawTinyMappings, Path rawTinyMappingsWithNs, Path tinyMappingsWithNs, boolean hasSrg, boolean hasMojang) {
++		final Path migratedMappings = this.tinyMappings.toAbsolutePath().normalize();
++		final Path migratedMappingsWithNs = tinyMappingsWithNs.toAbsolutePath().normalize();
++		final Path readyMarker = this.hashPath.toAbsolutePath().normalize();
++		final Path patchedIntermediateJar = MinecraftPatchedProvider.get(project).getMinecraftPatchedIntermediateJar();
++		final Path forgeJar = extension.getForgeUniversalProvider().getForge().toPath();
++		final Path userdevJar = extension.getForgeUserdevProvider().getUserdevJar().toPath();
++
++		// 同一产物路径在本构建内只能有一个生产者：同一构建内两个配置相同的子项目会算出同一条路径。
++		// 指纹只放**决定内容**的量，refreshDeps 只影响「这轮要不要重建」故不参与。
++		this.manipulateTaskPath = RemapMinecraftTaskRegistry.claim(project, migratedMappings, Map.of(
++				"stage", "forge-migrated-mappings",
++				"mappings", rawTinyMappingsWithNs.toAbsolutePath().normalize().toString(),
++				"patchedIntermediateJar", patchedIntermediateJar.toAbsolutePath().normalize().toString(),
++				"hasSrg", Boolean.toString(hasSrg),
++				"hasMojang", Boolean.toString(hasMojang)
++		), () -> project.getTasks().register(ManipulateForgeMappingsTask.NAME, ManipulateForgeMappingsTask.class, task -> {
++			task.setGroup(Constants.TaskGroup.FABRIC);
++			task.setDescription("Migrates the %s mappings for %s".formatted(
++					extension.getPlatform().get().id(), mappingsIdentifier()));
++			task.getRawMappings().set(rawTinyMappings.toFile());
++			task.getRawMappingsWithNs().set(rawTinyMappingsWithNs.toFile());
++			task.getMigratedMappings().set(migratedMappings.toFile());
++			task.getMigratedMappingsWithNs().set(migratedMappingsWithNs.toFile());
++			task.getReadyMarker().set(readyMarker.toFile());
++			task.getMigratorCacheDir().set(forgeCache.toAbsolutePath().toString());
++			task.getPatchedIntermediateJar().set(patchedIntermediateJar.toFile());
++			task.getForgeJar().set(forgeJar.toFile());
++			task.getForgeUserdevJar().set(userdevJar.toFile());
++			task.getHasSrg().set(hasSrg);
++			task.getHasMojang().set(hasMojang);
++			task.getRefreshDeps().set(extension.refreshDeps());
++			task.getPlatformId().set(extension.getPlatform().get().id());
++
++			// 迁移器缓存未命中时要读 patched 中间产物：它由补丁链的中间产物任务产出，按路径声明输入
++			// 不会带任务依赖，必须显式接线（产出方可能来自另一份 Loom classloader，故用任务路径）
++			extension.getMinecraftProvider().addProducerDependency(task, patchedIntermediateJar);
++		})).taskPath();
++
++		// 用 Gradle 的 lifecycle 而不是 SLF4J 的 info：默认控制台级别是 LIFECYCLE，
++		// 「本次到底走哪条生产路径」必须默认可见，否则回退是静默的
++		project.getLogger().lifecycle("Forge 的 mappings 迁移由执行期任务承担：{}", manipulateTaskPath);
++	}
++
++	/**
++	 * 一次完整的迁移生产：跑迁移器 + 复制/改写 + 落就绪标记.
+ 	 *
+-	 * <p>旧写法直接以共享产物为输出（先原地覆盖、迁移器再读回并就地重写），读方会看到半截 mappings；
+-	 * 而 hash 就绪标记先于内容落位时，读方还会读到「标记在、内容半截」的错位状态。
++	 * <p><b>配置期路径与执行期任务共用这一份实现</b>，因此两条路径的复制顺序、迁移器调用顺序、
++	 * 原子落位方式与就绪标记内容逐字一致——否则同一份输入在「投影」与「回退」下会产出不同的 mappings，
++	 * 而这种差异不会让任何一方失败，只会静默地换一套映射。
++	 *
++	 * <p>复制与迁移结果一律原子发布，就绪标记先失效、最后才落位。旧写法直接以共享产物为输出
++	 * （先原地覆盖、迁移器再读回并就地重写），读方会看到半截 mappings；而 hash 就绪标记先于内容落位时，
++	 * 读方还会读到「标记在、内容半截」的错位状态。
+ 	 *
+ 	 * <p>「单文件原子」不等于「集合原子」：多件产物逐个落位，过程中盘上必然存在「部分新、部分旧」
+ 	 * 的混合集合，此时旧标记（内容与重建前的 hash 相同）看起来依然合法。带 refresh 的重建尤其危险——
+@@ -151,27 +293,34 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
+ 	 * 通过 {@link #isOutdated} 的 hash 比较直接判定「已就绪」，并据此读入只迁移了一半的 mappings。
+ 	 * 因此重建的第一步就是让标记失效，全部产物落位后才发布真实 hash，维持
+ 	 * 「标记有效 ⟹ 所有产物已就绪」这一不变式；若中途失败，标记留在失效态，下次构建会重建（安全方向）。
++	 * 执行期任务路径下并发由任务图保证，但标记照旧写：它位于跨 daemon 共享的缓存目录，
++	 * 另一棵工作树若仍在跑改造前的 loom，会读它判断「迁移产物是否与当前输入同代」。
++	 *
++	 * @param migrators 迁移器（顺序即应用顺序，两条路径必须一致）
++	 * @param hash 迁移器 {@code setup} 的返回值算出的哈希（见 {@link #manipulate} 与 {@code manipulateMappings}）
+ 	 */
+-	private void produceMigratedMappings(Project project, LoomGradleExtension extension, Path rawTinyMappingsWithNs, Path tinyMappingsWithNs) throws IOException {
++	private static void produceMigratedMappings(List<MappingsMigrator> migrators, Path rawTinyMappings,
++			Path rawTinyMappingsWithNs, Path tinyMappings, Path tinyMappingsWithNs, Path hashPath, long hash,
++			String platformId, Consumer<String> info) throws IOException {
+ 		Stopwatch stopwatch = Stopwatch.createStarted();
+ 		// 先失效标记再碰任何产物：保证重建期间没有读方能凭旧标记把半迁移产物当成就绪产物
+-		invalidateMigratedMappingsMarker();
+-		AtomicFiles.copy(this.rawTinyMappings, this.tinyMappings);
++		invalidateMigratedMappingsMarker(hashPath);
++		AtomicFiles.copy(rawTinyMappings, tinyMappings);
+ 		AtomicFiles.copy(rawTinyMappingsWithNs, tinyMappingsWithNs);
+ 
+-		for (MappingsMigrator migrator : this.migrators) {
++		for (MappingsMigrator migrator : migrators) {
+ 			// 临时文件与产物同目录：跨文件系统的 move 会退化成「复制 + 删除」而不再原子
+-			final Path path = AtomicFiles.tempSibling(this.tinyMappings);
++			final Path path = AtomicFiles.tempSibling(tinyMappings);
+ 			final Path pathWithNs = AtomicFiles.tempSibling(tinyMappingsWithNs);
+ 
+ 			try {
+-				Files.copy(this.tinyMappings, path);
++				Files.copy(tinyMappings, path);
+ 				Files.copy(tinyMappingsWithNs, pathWithNs);
+ 
+ 				List<MappingsMigrator.MappingsEntry> entries = List.of(new MappingsMigrator.MappingsEntry(path), new MappingsMigrator.MappingsEntry(pathWithNs));
+-				migrator.migrate(project, entries);
++				migrator.migrate(entries, info);
+ 
+-				AtomicFiles.move(path, this.tinyMappings);
++				AtomicFiles.move(path, tinyMappings);
+ 				AtomicFiles.move(pathWithNs, tinyMappingsWithNs);
+ 			} finally {
+ 				Files.deleteIfExists(path);
+@@ -180,9 +329,9 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
+ 		}
+ 
+ 		// 就绪标记最后落位：标记先于内容落位会让读方读到「标记在、内容半截」
+-		AtomicFiles.publish(this.hashPath, tmp -> Files.writeString(tmp, Long.toString(this.hash), StandardCharsets.UTF_8));
++		AtomicFiles.publish(hashPath, tmp -> Files.writeString(tmp, Long.toString(hash), StandardCharsets.UTF_8));
+ 
+-		project.getLogger().info(":manipulated {} mappings in " + stopwatch.stop(), extension.getPlatform().get().id());
++		info.accept(":manipulated " + platformId + " mappings in " + stopwatch.stop());
+ 	}
+ 
+ 	/**
+@@ -191,8 +340,30 @@ public final class ForgeMigratedMappingConfiguration extends MappingConfiguratio
+ 	 * <p>用原子发布写哨兵值而不是删除标记文件：删除会在「存在性检查 → 读取」之间给并发读方
+ 	 * 留下 {@code NoSuchFileException} 窗口，原子写入则保证标记始终存在，内容要么是哨兵、要么是完整 hash。
+ 	 */
+-	private void invalidateMigratedMappingsMarker() throws IOException {
+-		AtomicFiles.publish(this.hashPath, tmp -> Files.writeString(tmp, INVALIDATED_HASH, StandardCharsets.UTF_8));
++	private static void invalidateMigratedMappingsMarker(Path hashPath) throws IOException {
++		AtomicFiles.publish(hashPath, tmp -> Files.writeString(tmp, INVALIDATED_HASH, StandardCharsets.UTF_8));
++	}
++
++	/**
++	 * 执行期任务的入口：跑迁移器准备中间数据，再产出迁移后的 mappings.
++	 *
++	 * <p>与配置期路径的差别只有「谁触发、谁保证并发」：这里由 Gradle 的任务图保证顺序、
++	 * 由 up-to-date 判定与构建缓存保证就绪，故不再取跨进程锁、也不再看就绪标记。
++	 * 产物的字节与配置期路径逐字一致（同一份 {@link #produceMigratedMappings} 实现）。
++	 *
++	 * <p>迁移器的中间缓存仍落在共享的 forge 缓存目录：它们只是「由输入决定的中间数据」的记忆化，
++	 * 不参与本任务的 up-to-date 判定（判定只看真实输入与输出），因此无需声明成任务输出。
++	 */
++	public static void manipulate(MappingsMigrator.Inputs inputs, Path rawTinyMappings, Path tinyMappings,
++			Path tinyMappingsWithNs, Path hashPath, String platformId, Consumer<String> info) throws IOException {
++		final List<MappingsMigrator> migrators = List.of(new FieldMappingsMigrator(), new MethodInheritanceMappingsMigrator());
++		long hash = 1;
++
++		for (MappingsMigrator migrator : migrators) {
++			hash = hash * 31 + migrator.setup(inputs);
++		}
++
++		produceMigratedMappings(migrators, rawTinyMappings, inputs.rawMappings(), tinyMappings, tinyMappingsWithNs, hashPath, hash, platformId, info);
+ 	}
+ 
+ 	/**
+diff --git a/src/main/java/dev/architectury/loom/forge/MappingsMigrator.java b/src/main/java/dev/architectury/loom/forge/MappingsMigrator.java
+index 411b15ceb9d4d23d685d23b297a35a102a4d1ea5..6eb1339e81fa03d694648493440aa24fc8c3dbbc 100644
+--- a/src/main/java/dev/architectury/loom/forge/MappingsMigrator.java
++++ b/src/main/java/dev/architectury/loom/forge/MappingsMigrator.java
+@@ -27,15 +27,43 @@ package dev.architectury.loom.forge;
+ import java.io.IOException;
+ import java.nio.file.Path;
+ import java.util.List;
+-
+-import org.gradle.api.Project;
+-
+-import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
++import java.util.function.Consumer;
+ 
+ public interface MappingsMigrator {
+-	long setup(Project project, MinecraftProvider minecraftProvider, Path cache, Path rawMappings, boolean hasSrg, boolean hasMojang) throws IOException;
++	/**
++	 * 一次迁移所需的全部输入.
++	 *
++	 * <p><b>刻意不含 {@code Project}</b>：同一份实现被配置期回退路径与执行期任务共用，而任务在
++	 * 配置缓存开启时不允许在执行期触碰 {@code Task.project}（Gradle 会直接以
++	 * {@code Invocation of 'Task.project' ... is unsupported with the configuration cache} 拒绝执行）。
++	 * 因此配置期路径负责把「项目模型里读到的值」折算成这里的纯值，执行期任务给出它自己声明的输入。
++	 *
++	 * @param cache 迁移器缓存所在目录（与 {@code ForgeProvider.getForgeCache} 同一个）
++	 * @param rawMappings 迁移前、已按命名空间合并好的映射树
++	 * @param patchedIntermediateJar 打补丁后的中间 Minecraft jar（缓存未命中时才读）
++	 * @param forgeJar Forge 的 universal jar（继承关系来源之一）
++	 * @param userdevJar Forge 的 userdev jar（同上）
++	 * @param hasSrg 本配置是否生成 srg 命名空间的映射
++	 * @param hasMojang 本配置是否生成 mojang 命名空间的映射
++	 * @param refreshDeps 是否显式要求刷新（刷新时一律走重建分支、忽略缓存）
++	 * @param info 日志出口：配置期路径传项目 logger，执行期任务传任务自己的 logger
++	 */
++	record Inputs(Path cache, Path rawMappings, Path patchedIntermediateJar, Path forgeJar, Path userdevJar,
++			boolean hasSrg, boolean hasMojang, boolean refreshDeps, Consumer<String> info) {
++	}
++
++	/**
++	 * 准备本次迁移所需的中间数据，并返回参与「迁移产物就绪标记」的哈希.
++	 *
++	 * <p>缓存未命中时本方法要按路径读 patched 中间产物（{@link FieldMappingsMigrator} 读它的字段描述符、
++	 * {@link MethodInheritanceMappingsMigrator} 读它的继承关系），因此该路径必须由调用方**显式给出**
++	 * （见 {@link Inputs#patchedIntermediateJar()}）：配置期路径给的是自己刚产出的那一件，
++	 * 执行期任务给的是它声明的 {@code @InputFile}。早先这里由实现内部向 {@code MinecraftPatchedProvider}
++	 * 现取，那正是「配置期按路径读执行期产物」的根源。
++	 */
++	long setup(Inputs inputs) throws IOException;
+ 
+-	void migrate(Project project, List<MappingsEntry> entries) throws IOException;
++	void migrate(List<MappingsEntry> entries, Consumer<String> info) throws IOException;
+ 
+ 	record MappingsEntry(Path path) {
+ 	}
+diff --git a/src/main/java/dev/architectury/loom/forge/MethodInheritanceMappingsMigrator.java b/src/main/java/dev/architectury/loom/forge/MethodInheritanceMappingsMigrator.java
+index 81947b4c1d002d58dc2f89eba65b9cb76a5e66ed..fe07125a0f6b41cb690c3b131de459eba5d98a9f 100644
+--- a/src/main/java/dev/architectury/loom/forge/MethodInheritanceMappingsMigrator.java
++++ b/src/main/java/dev/architectury/loom/forge/MethodInheritanceMappingsMigrator.java
+@@ -38,20 +38,16 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
++import java.util.function.Consumer;
+ 
+ import com.google.gson.Gson;
+ import com.google.gson.reflect.TypeToken;
+-import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
+ import dev.architectury.loom.util.collection.Multimap;
+-import org.gradle.api.Project;
+-import org.gradle.api.logging.Logger;
+ import org.objectweb.asm.ClassReader;
+ import org.objectweb.asm.ClassVisitor;
+ import org.objectweb.asm.MethodVisitor;
+ 
+-import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+-import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.FileSystemUtil;
+ import net.fabricmc.loom.util.Pair;
+@@ -70,34 +66,19 @@ import net.fabricmc.mappingio.tree.MemoryMappingTree;
+ public final class MethodInheritanceMappingsMigrator implements MappingsMigrator {
+ 	private Set<Pair<String, String>> methodsToRemove;
+ 
+-	/**
+-	 * {@return 本次 {@code setup} 是否会按路径读 patched 中间产物}.
+-	 *
+-	 * <p>判据与 {@link #setup} 里的分支逐字对应：缓存命中且未要求刷新时读缓存，否则读那件产物
+-	 * （本迁移器与命名空间无关，故没有 hasSrg/hasMojang 这个条件）。
+-	 * 供「能否把该产物投影成执行期任务」的前置判定使用。
+-	 */
+-	public static boolean needsPatchedIntermediateJar(Path cache, boolean refreshDeps) {
+-		return refreshDeps || !Files.exists(cache.resolve("method-inheritance-migrator.json"));
+-	}
+-
+ 	@Override
+-	public long setup(Project project, MinecraftProvider minecraftProvider, Path cache, Path rawMappings, boolean hasSrg, boolean hasMojang) throws IOException {
+-		Path cacheFile = cache.resolve("method-inheritance-migrator.json");
++	public long setup(Inputs inputs) throws IOException {
++		Path cacheFile = inputs.cache().resolve("method-inheritance-migrator.json");
+ 
+-		if (!minecraftProvider.refreshDeps() && Files.exists(cacheFile)) {
++		if (!inputs.refreshDeps() && Files.exists(cacheFile)) {
+ 			try (BufferedReader reader = Files.newBufferedReader(cacheFile)) {
+ 				List<Pair<String, String>> list = new Gson().fromJson(reader, new TypeToken<List<Pair<String, String>>>() {
+ 				});
+ 				methodsToRemove = new HashSet<>(list);
+ 			}
+ 		} else {
+-			LoomGradleExtension extension = LoomGradleExtension.get(project);
+-			// 共享缓存可能正被其它进程重建（或其它工作树仍在用会删除整组产物的旧版本 loom）：
+-			// 用 getOrProduce... 在产物缺失时先按件补齐，避免直接读取抛 NoSuchFileException
+-			Path patchedIntermediateJar = MinecraftPatchedProvider.get(project).getOrProduceMinecraftPatchedIntermediateJar();
+-			List<Path> jars = List.of(patchedIntermediateJar, extension.getForgeUniversalProvider().getForge().toPath(), extension.getForgeUserdevProvider().getUserdevJar().toPath());
+-			methodsToRemove = prepareCache(project.getLogger(), rawMappings, jars, hasSrg, hasMojang);
++			List<Path> jars = List.of(inputs.patchedIntermediateJar(), inputs.forgeJar(), inputs.userdevJar());
++			methodsToRemove = prepareCache(inputs.info(), inputs.rawMappings(), jars, inputs.hasSrg(), inputs.hasMojang());
+ 			// 原子发布：缓存位于跨 daemon 共享的 forge 缓存目录（不按项目隔离），旧写法先删除再就地写入，
+ 			// 读方会看到内容缺失或半截
+ 			AtomicFiles.publish(cacheFile, tmp -> Files.writeString(tmp, new Gson().toJson(methodsToRemove.stream().sorted(Comparator.comparing(p -> p.left() + "|" + p.right())).toList())));
+@@ -107,7 +88,7 @@ public final class MethodInheritanceMappingsMigrator implements MappingsMigrator
+ 	}
+ 
+ 	@Override
+-	public void migrate(Project project, List<MappingsEntry> entries) throws IOException {
++	public void migrate(List<MappingsEntry> entries, Consumer<String> info) throws IOException {
+ 		for (MappingsEntry entry : entries) {
+ 			MemoryMappingTree mappings = new MemoryMappingTree();
+ 
+@@ -132,7 +113,7 @@ public final class MethodInheritanceMappingsMigrator implements MappingsMigrator
+ 		}
+ 	}
+ 
+-	private Set<Pair<String, String>> prepareCache(Logger logger, Path rawMappings, List<Path> jars, boolean hasSrg, boolean hasMojang) throws IOException {
++	private Set<Pair<String, String>> prepareCache(Consumer<String> logger, Path rawMappings, List<Path> jars, boolean hasSrg, boolean hasMojang) throws IOException {
+ 		MemoryMappingTree mappings = new MemoryMappingTree();
+ 		String patchedNs = hasSrg ? MappingsNamespace.SRG.toString() : MappingsNamespace.MOJANG.toString();
+ 
+@@ -163,9 +144,9 @@ public final class MethodInheritanceMappingsMigrator implements MappingsMigrator
+ 					MappingTree.ClassMapping sClass = mappings.getClass(superClass);
+ 
+ 					if (sClass == null) {
+-						logger.info("Method {}.{}{} is inherited from a class {} that is not in the mappings, removing it if there are more than one", method.className(), method.name(), method.descriptor(), superClass);
++						logger.accept("Method %s.%s%s is inherited from a class %s that is not in the mappings, removing it if there are more than one".formatted(method.className(), method.name(), method.descriptor(), superClass));
+ 					} else if (sClass.getMethod(method.name(), method.descriptor()) == null) {
+-						logger.info("Method {}.{}{} is inheriting a method in {} that is not in the mappings, removing it if there are more than one", method.className(), method.name(), method.descriptor(), superClass);
++						logger.accept("Method %s.%s%s is inheriting a method in %s that is not in the mappings, removing it if there are more than one".formatted(method.className(), method.name(), method.descriptor(), superClass));
+ 					} else {
+ 						continue;
+ 					}
+@@ -186,7 +167,7 @@ public final class MethodInheritanceMappingsMigrator implements MappingsMigrator
+ 				// as the particular method is inherited by multiple different intermediary names
+ 				for (MethodKey methodKey : entry.getValue()) {
+ 					methodsToRemove.add(new Pair<>(methodKey.name(), methodKey.descriptor()));
+-					logger.info("Removing method {}{} from the mappings", methodKey.name(), methodKey.descriptor());
++					logger.accept("Removing method %s%s from the mappings".formatted(methodKey.name(), methodKey.descriptor()));
+ 				}
+ 			}
+ 		}
+diff --git a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+index 96a0b056204ed7989775272d5f8613c9c4237f03..e5d0031147c4c34486e866d9904d5339c2229bc8 100644
+--- a/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/minecraft/MinecraftPatchedProvider.java
+@@ -150,8 +150,6 @@ public class MinecraftPatchedProvider {
+ 
+ 	// pre-patch jar 的产出方：投影成任务时非空（见 registerPatchedChainTasks），配置期生产时为 null
+ 	private @Nullable Producer prePatchJarProducer;
+-	// 三级产物是否已投影成执行期任务：决定 provide() 与按件补齐各走哪条路径
+-	private boolean taskBasedChain = false;
+ 
+ 	public static MinecraftPatchedProvider get(Project project) {
+ 		MinecraftProvider provider = LoomGradleExtension.get(project).getMinecraftProvider();
+@@ -309,10 +307,12 @@ public class MinecraftPatchedProvider {
+ 	 *   <li><b>disableObfuscation / unobfuscated Forge</b>：pre-patch jar 走
+ 	 *       {@code createUnobfuscatedPrePatchJar}（userdev 合并分支），且 {@code remapJar} 也在配置期生产
+ 	 *       最终 jar 并读 at-patched jar——两处都不在本次迁移的形态之内。</li>
+-	 *   <li><b>mappings 迁移器缓存未命中</b>：{@code ForgeMigratedMappingConfiguration.manipulateMappings}
+-	 *       在配置期调用两个迁移器，它们在各自缓存未命中时会按路径读 intermediate jar
++	 *   <li><b>mappings 迁移留在配置期</b>：{@code ForgeMigratedMappingConfiguration.manipulateMappings}
++	 *       在配置期生产迁移产物时，要按路径读 intermediate jar
+ 	 *       （见 {@link #getOrProduceMinecraftPatchedIntermediateJar()}）。投影后那件产物只在执行期落位，
+-	 *       配置期读者会拿到不存在的文件——因此该情形整批回退。迁移器自身任务化之后这一条应当删除。</li>
++	 *       配置期读者会拿到不存在的文件——因此该情形整批回退。迁移本身同样任务化之后，剩下的阻碍
++	 *       只有「配置期有别的读者要真读迁移产物」，判据统一放在
++	 *       {@link ForgeMigratedMappingConfiguration#mappingsMigrationProjectionBlocker}。</li>
+ 	 * </ul>
+ 	 */
+ 	protected @Nullable String provideProjectionBlocker() {
+@@ -320,10 +320,10 @@ public class MinecraftPatchedProvider {
+ 			return "disableObfuscation / unobfuscated Forge 的 pre-patch jar 与最终 jar 都走 userdev 合并分支，形态不同";
+ 		}
+ 
+-		if (ForgeMigratedMappingConfiguration.needsPatchedIntermediateJar(ForgeProvider.getForgeCache(project),
+-				getExtension().refreshDeps(), getExtension().shouldGenerateSrgTiny(), getExtension().isNeoForge())) {
+-			return "mappings 迁移器（FieldMappingsMigrator / MethodInheritanceMappingsMigrator）缓存未命中，"
+-					+ "配置期会按路径读 patched 中间产物";
++		final String migrationBlocker = ForgeMigratedMappingConfiguration.mappingsMigrationProjectionBlocker(getExtension());
++
++		if (migrationBlocker != null) {
++			return "mappings 迁移留在配置期（" + migrationBlocker + "），它要按路径读 patched 中间产物";
+ 		}
+ 
+ 		return null;
+@@ -438,8 +438,10 @@ public class MinecraftPatchedProvider {
+ 		// at-patched jar 的产出方必须让 registerPatchedJarTask 找得到：那里的
+ 		// minecraftProvider.addProducerDependency(task, atPatched) 正是从这张表里取任务依赖
+ 		minecraftProvider.registerTaskProducedArtifact(atPatched, atPatchedProducer);
++		// 中间产物的产出方同样要登记：mappings 迁移任务把它声明成 @InputFile（迁移器缓存未命中时读它），
++		// 只按路径声明输入不会带任务依赖，Gradle 的隐式依赖校验会直接拒绝构建
++		minecraftProvider.registerTaskProducedArtifact(patchedIntermediate, patchedProducer);
+ 		this.prePatchJarProducer = prePatchProducer;
+-		this.taskBasedChain = true;
+ 
+ 		logger.lifecycle("Forge 的 patched 三级产物由执行期任务承担：{}",
+ 				List.of(prePatchProducer.taskPath(), patchedProducer.taskPath(), atPatchedProducer.taskPath()));
+@@ -569,19 +571,14 @@ public class MinecraftPatchedProvider {
+ 	 * 阶段生成（{@code provide()} 只做判定），由子类覆盖补齐。
+ 	 *
+ 	 * <p>任务路径下不能走 {@code provide()}：那条路径只做接线、不写产物。本方法只被**配置期读者**调用
+-	 * （{@code getOrProduceMinecraftPatchedIntermediateJar} 的两个迁移器），而它们在缓存未命中时会
+-	 * 让 {@link #provideProjectionBlocker()} 整批回退——也就是说走到这里时任务路径本不该生效。
+-	 * 真走到这里只可能是：产物在「缓存命中」之后被外部（其它工作树 / 仍会删除整组产物的旧版本 loom）
+-	 * 删掉或写坏。配置期无法等执行期任务，故按件补齐退回配置期实现——语义与改造前逐字一致
+-	 * （取跨进程锁 → 锁内二次确认 → 只重建缺失或不可复用的那几件 → 原子落位）。
++	 * （{@code getOrProduceMinecraftPatchedIntermediateJar} 的调用方：mappings 迁移的配置期回退路径），
++	 * 而那个读者与 {@link #provideProjectionBlocker()} 用的是同一个判据——走到这里时任务路径本不该生效。
++	 * 真走到这里（产物在判定之后被其它工作树删掉或写坏）时，{@code provide()} 只做接线，
++	 * 随后 {@code getOrProduceMinecraftPatchedIntermediateJar} 的可复用性复检会以明确异常报出，
++	 * 而不是把不存在的路径交给迁移器去读。
+ 	 */
+ 	protected void produceIntermediateJarIfMissing() throws Exception {
+-		if (!taskBasedChain) {
+-			provide();
+-			return;
+-		}
+-
+-		withPatchedLock(this::providePatched);
++		provide();
+ 	}
+ 
+ 	/**
+@@ -671,6 +668,8 @@ public class MinecraftPatchedProvider {
+ 			task.getForgeJar().set(getForgeJar());
+ 			task.getForgeUserdevJar().set(getForgeUserdevJar());
+ 			task.getMappingsServiceOptions().set(mappingsOptions);
++			// 映射树取自迁移产物：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
++			mappingConfiguration.addMappingsProducerDependency(task);
+ 			task.getClientExtraEnabled().set(providesClientJar());
+ 			task.getPatchVersion().set(CURRENT_LOOM_PATCH_VERSION);
+ 			task.getNeoForge().set(extension.isNeoForge());
+diff --git a/src/main/java/net/fabricmc/loom/LoomGradleExtension.java b/src/main/java/net/fabricmc/loom/LoomGradleExtension.java
+index a0e41fc36db9714b0eebe60225c89a784ef16781..0c2ec4c25b52753a3fd4f1e47992f5f61d82b560 100644
+--- a/src/main/java/net/fabricmc/loom/LoomGradleExtension.java
++++ b/src/main/java/net/fabricmc/loom/LoomGradleExtension.java
+@@ -38,11 +38,13 @@ import dev.architectury.loom.forge.dependency.SrgProvider;
+ import dev.architectury.loom.mcpconfig.McpConfigProvider;
+ import org.gradle.api.GradleException;
+ import org.gradle.api.Project;
++import org.gradle.api.Task;
+ import org.gradle.api.file.ConfigurableFileCollection;
+ import org.gradle.api.file.FileCollection;
+ import org.gradle.api.provider.ListProperty;
+ import org.gradle.api.provider.Provider;
+ import org.jetbrains.annotations.ApiStatus;
++import org.jspecify.annotations.Nullable;
+ 
+ import net.fabricmc.loom.api.LoomGradleExtensionAPI;
+ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+@@ -114,8 +116,46 @@ public interface LoomGradleExtension extends LoomGradleExtensionAPI {
+ 
+ 	MappingConfiguration getMappingConfiguration();
+ 
++	/**
++	 * {@return 已建立的映射配置；本工程不使用映射（{@code disableObfuscation} / unobfuscated Forge）
++	 * 或尚未 setup 时为 {@code null}}.
++	 *
++	 * <p>与 {@link #getMappingConfiguration()} 的差别只有一个：不抛异常。任务侧需要「有就接线、没有就跳过」
++	 * 的语义（见 {@link #addPlatformMappingsDependency(Task)}），在那里抛异常会把一个可选的接线点变成崩溃点。
++	 */
++	@Nullable
++	MappingConfiguration findMappingConfiguration();
++
+ 	void setMappingConfiguration(MappingConfiguration mappingConfiguration);
+ 
++	/**
++	 * 把「本任务以平台映射文件为输入」表达成任务依赖.
++	 *
++	 * <p>平台映射文件（Forge 下是迁移产物 {@code mappings-srg-migrated.tiny} / {@code mappings-mojang-migrated.tiny}）
++	 * 在投影后只在执行期落位。它的消费者散布在各个任务里（{@code remapJar}、{@code remapSourcesJar}、
++	 * {@code genSources}、{@code genForgePatchedSources}、{@code generateDLIConfig}……），
++	 * 而它作为 {@code @InputFile} 只按路径声明、不带任务依赖，因此每一处都必须显式接线：
++	 * 漏接一处 = 任务在产物落位前开跑，随后以「输入文件不存在」失败。
++	 *
++	 * <p>映射由配置期产出、或本工程根本不使用映射时，本方法什么也不做。
++	 */
++	default void addPlatformMappingsDependency(Task task) {
++		// 依赖边必须**惰性**求值，不能用「构造期立刻查询映射配置」的写法：
++		// remapJar 由 RemapTaskConfiguration 在插件 apply 期就 eager 创建，那时 mappings 阶段还没跑
++		// （映射配置为 null），立刻查询会静默地接不上。Gradle 在任务图计算时才解析 dependsOn 的 Provider，
++		// 那时映射配置必定已建立。
++		task.dependsOn(task.getProject().provider(() -> {
++			final MappingConfiguration mappings = findMappingConfiguration();
++
++			if (mappings == null) {
++				return List.of();
++			}
++
++			final String taskPath = mappings.mappingsProducerTaskPath();
++			return taskPath == null ? List.of() : List.of(taskPath);
++		}));
++	}
++
+ 	NamedMinecraftProvider<?> getNamedMinecraftProvider();
+ 
+ 	IntermediaryMinecraftProvider<?> getIntermediaryMinecraftProvider();
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java b/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java
+index c8a7027da3656fa9b56404063545bd62903d1ced..b834d116d4622faec8122cbcc81f88ef2bd87710 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java
+@@ -329,6 +329,8 @@ public class ModConfigurationRemapper {
+ 					task.getRemapClasspath().from(extension.getMinecraftJarsCollection(extension.getProductionNamespaceEnum().get()));
+ 					task.getMappingsServiceOptions().set(
+ 							mappingConfiguration.getMappingsServiceOptions(project, MappingOption.forPlatform(extension)));
++					// 映射树取自迁移产物：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
++					mappingConfiguration.addMappingsProducerDependency(task);
+ 					task.getSourceNamespace().set(sourceNamespace);
+ 					task.getTargetNamespace().set(targetNamespace);
+ 					task.getPlatform().set(extension.getPlatform().get());
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+index 276347a1a31a733fc5241dde18563a04d15656c9..b4066644dff2a605e2a97dcf95e0b8d2ef768524 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+@@ -55,6 +55,7 @@ import dev.architectury.loom.mappings.MappingOption;
+ import dev.architectury.loom.util.Stopwatch;
+ import org.apache.tools.ant.util.StringUtils;
+ import org.gradle.api.Project;
++import org.gradle.api.Task;
+ import org.gradle.api.artifacts.Configuration;
+ import org.gradle.api.provider.Provider;
+ import org.jspecify.annotations.Nullable;
+@@ -278,18 +279,67 @@ public class MappingConfiguration {
+ 		return mappingProvider;
+ 	}
+ 
++	/**
++	 * {@return 该映射选项指向的映射文件}.
++	 *
++	 * <p>存在性校验对**执行期产出**的映射放宽：Forge 的迁移后 mappings 由执行期任务产出
++	 * （见 {@code ForgeMigratedMappingConfiguration.manipulateMappings}），配置期它们必然还不存在，
++	 * 而调用点（任务的 {@code @InputFile} 接线、运行配置里的路径字符串）只需要路径。
++	 * 这类路径的就绪由任务依赖保证——每个消费任务都必须经
++	 * {@code ForgeMigratedMappingConfiguration.addMappingsProducerDependency} 声明依赖，
++	 * 否则 Gradle 会在执行期以「输入文件不存在」失败（而不是静默读到空映射）。
++	 *
++	 * <p>放宽的只有**迁移产物**这一族；其余选项（原始 mappings、mixin 派生映射）仍按存在性拒绝，
++	 * 因为那些文件在配置期结束时必定已由本类的 setup/setupPost 落位，缺失说明配置流程本身出了问题。
++	 */
+ 	public Path getMappingsPath(MappingOption mappingOption) {
+ 		Supplier<Path> mappingsSupplier = this.mappingOptions.get(mappingOption);
+ 
+ 		if (mappingsSupplier == null) {
+ 			throw new UnsupportedOperationException("Unsupported mapping option: " + mappingOption + ", it is possible that this option is not supported by this project / platform!");
+-		} else if (Files.notExists(mappingsSupplier.get())) {
++		} else if (Files.notExists(mappingsSupplier.get()) && !isTaskProducedMappings(mappingOption)) {
+ 			throw new UnsupportedOperationException("Mapping option " + mappingOption + " found but file does not exist!");
+ 		}
+ 
+ 		return Objects.requireNonNull(mappingsSupplier.get());
+ 	}
+ 
++	/**
++	 * {@return 该映射选项指向的文件是否由执行期任务产出（配置期允许它尚不存在）}.
++	 *
++	 * <p>默认恒为假：绝大多数平台（Fabric/Quilt）的映射文件都在配置期就绪，那条存在性校验仍然有效。
++	 * Forge 系覆写它，把「迁移产物」这一族标出来。
++	 */
++	protected boolean isTaskProducedMappings(MappingOption mappingOption) {
++		return false;
++	}
++
++	/**
++	 * {@return 本配置的映射文件的产出任务路径；映射由配置期产出时为 {@code null}}.
++	 *
++	 * <p>供消费方把「我的输入就是你的产出」表达成任务依赖。返回任务**路径**而不是任务实例：
++	 * 产出方可能由另一份 Loom classloader 配置（约定插件/included build 各自带一份 Loom），
++	 * 把对方的任务实例交过来会在使用处抛 {@link ClassCastException}。
++	 */
++	public @Nullable String mappingsProducerTaskPath() {
++		return null;
++	}
++
++	/**
++	 * 把「本任务以本配置的映射文件为输入」表达成任务依赖；映射由配置期产出时什么也不做.
++	 *
++	 * <p>映射文件在投影后只在执行期落位，而它的消费者遍布各个任务（重映射、处理链、mod 重映射、
++	 * srg→named、运行配置……）。任何一处漏接都会让任务在产物落位前开跑，随后以
++	 * 「{@code @InputFile} 不存在」失败。
++	 */
++	public void addMappingsProducerDependency(Task task) {
++		final String taskPath = mappingsProducerTaskPath();
++
++		if (taskPath != null) {
++			task.dependsOn(taskPath);
++		}
++	}
++
+ 	/**
+ 	 * {@return srg→named 产物的产出任务路径；未投影（整批回退配置期）时为 {@code null}}.
+ 	 *
+@@ -628,7 +678,10 @@ public class MappingConfiguration {
+ 			return "srg 命名空间的映射树来源未登记（" + MappingOption.WITH_SRG + "）：产出任务没有可读的输入";
+ 		}
+ 
+-		if (!isReusableMappingsText(source)) {
++		// 迁移产物由执行期任务产出时，配置期它必然还不存在——就绪由产出方任务保证（见 projectSrgNamedToTasks）。
++		// 这里刻意不把「不存在」判为阻碍：那会让绝大多数真实 Forge 工程整批退回配置期，
++		// 而配置期那条路径同样读不到文件（它读的是同一份迁移产物）。
++		if (!isTaskProducedMappings(MappingOption.WITH_SRG) && !isReusableMappingsText(source)) {
+ 			return "srg 命名空间的映射树不可用（" + describeMappingsTextSize(source) + "）：产出任务没有可读的输入";
+ 		}
+ 
+@@ -681,6 +734,8 @@ public class MappingConfiguration {
+ 			task.getMappings().set(source.toFile());
+ 			task.getRefreshDeps().set(refresh);
+ 			task.getSrgFile().set(output.toFile());
++			// 输入是迁移后的 srg 映射树：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
++			addMappingsProducerDependency(task);
+ 		})).taskPath();
+ 
+ 		// 用 Gradle 的 lifecycle 而不是 SLF4J 的 info：默认控制台级别是 LIFECYCLE，
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
+index b0675750d7f395cd1e672f85264d1f679d8228b6..8ea0b954814fd78844ca583b6640844dfb1c588f 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
+@@ -167,6 +167,11 @@ public abstract class MinecraftProvider {
+ 	 */
+ 	protected @Nullable String projectionBlocker() {
+ 		if (getExtension().isForgeLike()) {
++			// 这一条**不能**细化成「legacy Forge 才回退」：本方法执行得比 setupDependencyProviders 早得多
++			// （{@code CompileConfiguration.setupMinecraft} 里 minecraftProvider.provide() 在
++			// setupDependencyProviders 之前），而 isLegacyForge() 要读 ForgeUserdevProvider，
++			// 那时 getDependencyProviders() 仍是 null，判据会以 NPE 打断配置。
++			// 真要细化，必须先让依赖 provider 早于本方法建立、或把 vanilla jar 的生产决策整体推迟到那之后。
+ 			return "Forge 系的 vanilla jar 在配置期就被真读（patch 流程、MCP 映射合并、内部类名集合）";
+ 		}
+ 
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
+index 65fa67c3583558f2d478ebe5d9c6e20be06f6267..985219f14bfa7e61cf81c605f80b2ac0baa47345 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/AbstractMappedMinecraftProvider.java
+@@ -802,6 +802,8 @@ public abstract class AbstractMappedMinecraftProvider<M extends MinecraftProvide
+ 					}
+ 
+ 					task.getMappingsServiceOptions().set(mappingConfiguration.getMappingsServiceOptions(project, MappingOption.forPlatform(extension)));
++					// 映射树取自迁移产物：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
++					mappingConfiguration.addMappingsProducerDependency(task);
+ 					task.getFromNamespace().set(fromNamespace);
+ 					task.getToNamespace().set(toNamespace);
+ 					task.getFixRecords().set(fixRecords);
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/ProcessedNamedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/ProcessedNamedMinecraftProvider.java
+index 82f6f68b63289c1e3f3b9c6783cb781878cf5bd9..17a19685f160ac436eb5768fe831e7b7282f8b42 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/ProcessedNamedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/ProcessedNamedMinecraftProvider.java
+@@ -581,6 +581,8 @@ public abstract class ProcessedNamedMinecraftProvider<M extends MinecraftProvide
+ 					task.getProductionNamespace().set(productionNamespace);
+ 					task.getIntermediaryNamespace().set(IntermediaryNamespaces.intermediaryNamespace(project));
+ 					task.getMappingsServiceOptions().set(extension.getMappingConfiguration().getMappingsServiceOptions(project, MappingOption.forPlatform(extension)));
++					// 映射树取自迁移产物：投影时它由迁移任务产出，按路径声明输入不带任务依赖，必须显式接线
++					extension.getMappingConfiguration().addMappingsProducerDependency(task);
+ 					task.getRemapperServiceOptions().set(TinyRemapperService.createSimple(project,
+ 							project.provider(() -> productionNamespace.toString()),
+ 							project.provider(() -> targetNamespace.toString()),
+diff --git a/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java b/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java
+index 99f62e142b667d63c1f91885853b4d8c23f4acb2..a25811845f8c089085351f57067cac1c62cdef35 100644
+--- a/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java
++++ b/src/main/java/net/fabricmc/loom/extension/LoomGradleExtensionImpl.java
+@@ -46,6 +46,7 @@ import org.gradle.api.file.FileCollection;
+ import org.gradle.api.provider.ListProperty;
+ import org.gradle.api.provider.Property;
+ import org.gradle.api.provider.Provider;
++import org.jspecify.annotations.Nullable;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.LoomNoRemapGradlePlugin;
+@@ -216,6 +217,11 @@ public abstract class LoomGradleExtensionImpl extends LoomGradleExtensionApiImpl
+ 		return Objects.requireNonNull(mappingConfiguration, "Cannot get MappingsProvider before it has been setup");
+ 	}
+ 
++	@Override
++	public @Nullable MappingConfiguration findMappingConfiguration() {
++		return mappingConfiguration;
++	}
++
+ 	@Override
+ 	public void setMappingConfiguration(MappingConfiguration mappingConfiguration) {
+ 		if (disableObfuscation()) {
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/ManipulateForgeMappingsTask.java b/src/main/java/net/fabricmc/loom/pipeline/ManipulateForgeMappingsTask.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..dcec18a68d47dee70f8f018131f94a18ae705160
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/pipeline/ManipulateForgeMappingsTask.java
+@@ -0,0 +1,165 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.pipeline;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++
++import dev.architectury.loom.forge.ForgeMigratedMappingConfiguration;
++import dev.architectury.loom.forge.MappingsMigrator;
++import org.gradle.api.DefaultTask;
++import org.gradle.api.file.RegularFileProperty;
++import org.gradle.api.provider.Property;
++import org.gradle.api.tasks.CacheableTask;
++import org.gradle.api.tasks.Input;
++import org.gradle.api.tasks.InputFile;
++import org.gradle.api.tasks.OutputFile;
++import org.gradle.api.tasks.PathSensitive;
++import org.gradle.api.tasks.PathSensitivity;
++import org.gradle.api.tasks.TaskAction;
++
++/**
++ * L3 流水线：生产 Forge 的「迁移后 mappings」（{@code mappings-migrated.tiny} 与
++ * {@code mappings-srg-migrated.tiny} / {@code mappings-mojang-migrated.tiny}）.
++ *
++ * <p>它取代的是 {@code ForgeMigratedMappingConfiguration.manipulateMappings} 里那段配置期同步执行的
++ * 「复制原始 mappings → 跑两个迁移器改写 → 原子落位 → 发布就绪标记」。
++ *
++ * <table>
++ *   <caption>旧路径 vs 本任务</caption>
++ *   <tr><th></th><th>旧路径</th><th>本任务</th></tr>
++ *   <tr><td>是否需要重建</td><td>配置期 {@code isOutdated} 判定（就绪标记的 hash 比对）</td>
++ *       <td>Gradle up-to-date 检查（输入内容 + 输出快照）</td></tr>
++ *   <tr><td>并发保护</td><td>跨进程文件锁 + 锁内二次确认</td><td>任务图 + 构建缓存</td></tr>
++ *   <tr><td>残骸恢复</td><td>标记先失效、产物全部落位后才发布</td><td>输出快照不符即重建</td></tr>
++ *   <tr><td>执行时机</td><td>配置期（{@code setupPost}）</td><td>执行期</td></tr>
++ * </table>
++ *
++ * <h2>生产逻辑不在这里</h2>
++ * 真正的生产由 {@link ForgeMigratedMappingConfiguration#manipulate} 持有：配置期回退路径与执行期任务
++ * 共用同一份实现（复制顺序、迁移器调用顺序、原子落位与就绪标记内容都一致），因此两条路径的产物逐字节一致。
++ * 本任务另写一套「等价」的实现就会引入分叉——同一个输入产出两份略有差异的 mappings，
++ * 而且这种差异不会让任何一方失败，只会静默地换一套映射。
++ *
++ * <h2>为什么输入里有 patched 中间产物</h2>
++ * 两个迁移器（{@code FieldMappingsMigrator} / {@code MethodInheritanceMappingsMigrator}）在各自缓存
++ * 未命中时要按路径读 patched 中间 jar。这正是本步要消灭的那条「配置期按路径读执行期产物」依赖：
++ * 那件产物由 {@code generateForgePatchedIntermediateJar} 产出，配置期读不到。改为任务输入之后，
++ * 依赖由任务图表达，缓存未命中也不再需要整批回退到配置期。
++ *
++ * <h2>为什么就绪标记也是输出</h2>
++ * {@code mappings-migrated.hash} 位于跨 daemon、跨工作树共享的缓存目录：另一棵工作树若仍在跑改造前的
++ * loom，会读它判断「迁移产物是否与当前输入同代」。因此本任务照旧写出它，内容与配置期路径逐字一致
++ * （同一份实现算出的哈希）。它只是兼容性产物，不参与本任务自己的 up-to-date 判定之外的任何逻辑。
++ */
++@CacheableTask
++public abstract class ManipulateForgeMappingsTask extends DefaultTask {
++	/** 任务名：消费侧（本仓库的测试与诊断）按它引用产出任务. */
++	public static final String NAME = "manipulateForgeMappings";
++
++	/** 迁移前、未按命名空间合并的映射树（{@code mappings.tiny}）. */
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getRawMappings();
++
++	/** 迁移前、已按命名空间合并的映射树（{@code mappings-srg.tiny} / {@code mappings-mojang.tiny}）. */
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getRawMappingsWithNs();
++
++	/** 打补丁后的中间 Minecraft jar：迁移器缓存未命中时读它的字段与继承关系. */
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getPatchedIntermediateJar();
++
++	/** Forge 的 universal jar：{@code MethodInheritanceMappingsMigrator} 的继承关系来源之一. */
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getForgeJar();
++
++	/** Forge 的 userdev jar：同上. */
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getForgeUserdevJar();
++
++	/** 迁移器缓存所在目录（共享的 forge 缓存目录）；目录不存在时执行期创建. */
++	@Input
++	public abstract Property<String> getMigratorCacheDir();
++
++	/** 本配置是否生成 srg 命名空间的映射（决定读哪一份 patched 中间产物的命名空间）. */
++	@Input
++	public abstract Property<Boolean> getHasSrg();
++
++	/** 本配置是否为 NeoForge（同上，mojang 命名空间）. */
++	@Input
++	public abstract Property<Boolean> getHasMojang();
++
++	/** 是否强制重建（对应 {@code --refresh-dependencies}）：旧路径在该情形下无条件重跑迁移器. */
++	@Input
++	public abstract Property<Boolean> getRefreshDeps();
++
++	/** 平台 id：只用于日志文本（与旧路径的 {@code :manipulated <platform> mappings in ...} 逐字一致）. */
++	@Input
++	public abstract Property<String> getPlatformId();
++
++	/** 产物：迁移后的默认映射树（{@code mappings-migrated.tiny}，与旧路径同一条路径）. */
++	@OutputFile
++	public abstract RegularFileProperty getMigratedMappings();
++
++	/** 产物：迁移后的命名空间映射树（{@code mappings-srg-migrated.tiny} / {@code mappings-mojang-migrated.tiny}）. */
++	@OutputFile
++	public abstract RegularFileProperty getMigratedMappingsWithNs();
++
++	/** 产物：迁移产物的就绪标记（{@code mappings-migrated.hash}，内容与旧路径逐字一致）. */
++	@OutputFile
++	public abstract RegularFileProperty getReadyMarker();
++
++	@TaskAction
++	public void manipulate() throws IOException {
++		final Path cacheDir = Path.of(getMigratorCacheDir().get());
++		Files.createDirectories(cacheDir);
++
++		// 全程不触碰 Project：配置缓存开启时执行期调用 Task.project 会被 Gradle 直接拒绝。
++		// 因此生产实现只认这里构造的纯值输入，日志出口是任务自己的 logger。
++		ForgeMigratedMappingConfiguration.manipulate(
++				new MappingsMigrator.Inputs(
++						cacheDir,
++						getRawMappingsWithNs().get().getAsFile().toPath(),
++						getPatchedIntermediateJar().get().getAsFile().toPath(),
++						getForgeJar().get().getAsFile().toPath(),
++						getForgeUserdevJar().get().getAsFile().toPath(),
++						getHasSrg().get(),
++						getHasMojang().get(),
++						getRefreshDeps().get(),
++						getLogger()::info),
++				getRawMappings().get().getAsFile().toPath(),
++				getMigratedMappings().get().getAsFile().toPath(),
++				getMigratedMappingsWithNs().get().getAsFile().toPath(),
++				getReadyMarker().get().getAsFile().toPath(),
++				getPlatformId().get(),
++				getLogger()::info);
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/task/AbstractRemapJarTask.java b/src/main/java/net/fabricmc/loom/task/AbstractRemapJarTask.java
+index c0375ff3e4ecae8b1ebb32ef81a07d68de4b29af..01f7372a5979f669513124177ff3762556f6a1e4 100644
+--- a/src/main/java/net/fabricmc/loom/task/AbstractRemapJarTask.java
++++ b/src/main/java/net/fabricmc/loom/task/AbstractRemapJarTask.java
+@@ -164,6 +164,12 @@ public abstract class AbstractRemapJarTask extends Jar {
+ 		});
+ 
+ 		getModPlatform().value(LoomGradleExtension.get(getProject()).getPlatform()).finalizeValue();
++
++		// 重映射的映射树取自平台映射文件（Forge 下是迁移产物）：投影时它由迁移任务产出，
++		// 按路径声明输入不带任务依赖，必须显式接线。
++		// 这里只能接线、不能立刻查询映射配置：remapJar 由 RemapTaskConfiguration 在插件 apply 期
++		// 就 eager 创建，那时 mappings 阶段还没跑（addPlatformMappingsDependency 因此把查询做成惰性 Provider）。
++		LoomGradleExtension.get(getProject()).addPlatformMappingsDependency(this);
+ 	}
+ 
+ 	public final <P extends AbstractRemapParams> void submitWork(Class<? extends AbstractRemapAction<P>> workAction, Action<P> action) {
+diff --git a/src/main/java/net/fabricmc/loom/task/GenerateForgePatchedSourcesTask.java b/src/main/java/net/fabricmc/loom/task/GenerateForgePatchedSourcesTask.java
+index 78e4b8e321ad7774f7a936130a2ff502ddd30c3d..a8d340c7ad74ab873ed99d4f99e7e9b13339d8ae 100644
+--- a/src/main/java/net/fabricmc/loom/task/GenerateForgePatchedSourcesTask.java
++++ b/src/main/java/net/fabricmc/loom/task/GenerateForgePatchedSourcesTask.java
+@@ -190,6 +190,9 @@ public abstract class GenerateForgePatchedSourcesTask extends AbstractLoomTask {
+ 			sro.getJavaCompileRelease().set(SourceRemapperService.getJavaCompileRelease(getProject()));
+ 			sro.getClasspath().from(getProject().getConfigurations().getByName(Constants.Configurations.MINECRAFT_COMPILE_LIBRARIES));
+ 		}));
++
++		// 源码重映射的映射树取自平台映射文件（迁移产物）：投影时它由迁移任务产出，必须显式接线
++		getExtension().addPlatformMappingsDependency(this);
+ 	}
+ 
+ 	@TaskAction
+diff --git a/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java b/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
+index 6373c4eaa1d78fcf8ba9efa358ba16ce814ef89f..337052d9137070a43895404b9f8b93af228bd50f 100644
+--- a/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
++++ b/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
+@@ -253,6 +253,8 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
+ 		getResetCache().convention(getExtension().refreshDeps());
+ 
+ 		getMappings().set(SourceMappingsService.create(getProject()));
++		// 源码映射派生自平台映射文件（Forge 下是迁移产物）：投影时它由迁移任务产出，必须显式接线
++		LoomGradleExtension.get(getProject()).addPlatformMappingsDependency(this);
+ 
+ 		if (!LoomGradleExtension.get(getProject()).disableObfuscation()) {
+ 			getUnpickOptions().set(UnpickService.createOptions(this));
+diff --git a/src/main/java/net/fabricmc/loom/task/MigrateClassTweakerMappingsTask.java b/src/main/java/net/fabricmc/loom/task/MigrateClassTweakerMappingsTask.java
+index 80b61ab112a408508443a3fcbe1191cf770de023..48fb275fe6ee1af449fa092232f7a54c78f33cce 100644
+--- a/src/main/java/net/fabricmc/loom/task/MigrateClassTweakerMappingsTask.java
++++ b/src/main/java/net/fabricmc/loom/task/MigrateClassTweakerMappingsTask.java
+@@ -65,6 +65,8 @@ public abstract class MigrateClassTweakerMappingsTask extends AbstractMigrateMap
+ 		getInputFile().convention(getExtension().getAccessWidenerPath());
+ 		getOutputFile().convention(getProject().getLayout().getProjectDirectory().file("remapped.accesswidener"));
+ 		getMigrationServiceOptions().set(MigrateClassTweakerMappingsService.createOptions(getProject(), getMappings()));
++		// 迁移的源映射取自平台映射文件（Forge 下是迁移产物）：投影时它由迁移任务产出，必须显式接线
++		getExtension().addPlatformMappingsDependency(this);
+ 	}
+ 
+ 	@TaskAction
+diff --git a/src/main/java/net/fabricmc/loom/task/MigrateMappingsTask.java b/src/main/java/net/fabricmc/loom/task/MigrateMappingsTask.java
+index 1f2e0ccdb1bc8e2aa5b3f72caa5c3db2bdfb9fe4..2b1e79319324bba71fd17fdc93e30a3fa709b9bf 100644
+--- a/src/main/java/net/fabricmc/loom/task/MigrateMappingsTask.java
++++ b/src/main/java/net/fabricmc/loom/task/MigrateMappingsTask.java
+@@ -62,6 +62,8 @@ public abstract class MigrateMappingsTask extends AbstractMigrateMappingsTask {
+ 		getInputDir().convention(getProject().getLayout().getProjectDirectory().dir("src/main/java"));
+ 		getOutputDir().convention(getProject().getLayout().getProjectDirectory().dir("remappedSrc"));
+ 		getMigrationServiceOptions().set(MigrateSourceCodeMappingsService.createOptions(getProject(), getMappings(), getInputDir(), getOutputDir()));
++		// 迁移的源映射取自平台映射文件（Forge 下是迁移产物）：投影时它由迁移任务产出，必须显式接线
++		getExtension().addPlatformMappingsDependency(this);
+ 	}
+ 
+ 	@TaskAction
+diff --git a/src/main/java/net/fabricmc/loom/task/launch/GenerateDLIConfigTask.java b/src/main/java/net/fabricmc/loom/task/launch/GenerateDLIConfigTask.java
+index c1bc1f1558f1ba1c260fa83458515818d8245b04..4df7e4a7af7222e1f13c6146dad14a7232ac61f1 100644
+--- a/src/main/java/net/fabricmc/loom/task/launch/GenerateDLIConfigTask.java
++++ b/src/main/java/net/fabricmc/loom/task/launch/GenerateDLIConfigTask.java
+@@ -170,6 +170,8 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
+ 			getPlatformMappingFile().set(getProject().getLayout().file(getProject().provider(() -> getExtension().getPlatformMappingFile().toFile())));
+ 			getPlatformMappingFile().finalizeValue();
+ 			getMappingJars().from(getProject().getConfigurations().getByName(Constants.Configurations.MAPPINGS_FINAL));
++			// 该文件是 @InputFile（Forge 下即迁移产物）：投影时它由迁移任务产出，必须显式接线
++			getExtension().addPlatformMappingsDependency(this);
+ 		}
+ 
+ 		if (getExtension().isForgeLike()) {
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeMigratedMappingsTaskEquivalenceTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeMigratedMappingsTaskEquivalenceTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..44b346f3a90a3c3fbed11adc691564f065a7489d
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/ForgeMigratedMappingsTaskEquivalenceTest.groovy
+@@ -0,0 +1,393 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration.pipeline
++
++import java.security.MessageDigest
++
++import spock.lang.Specification
++
++import net.fabricmc.loom.test.util.GradleProjectTestTrait
++
++import static net.fabricmc.loom.test.LoomTestConstants.DEFAULT_GRADLE
++import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
++
++/**
++ * Forge 的「迁移后 mappings」（{@code mappings-migrated.tiny} / {@code mappings-srg-migrated.tiny}）
++ * 由执行期任务产出的**产物内容**等价性与接线检查.
++ *
++ * <p>被切到任务的是 {@code ForgeMigratedMappingConfiguration.manipulateMappings}：改造前它把迁移产物写在配置期，
++ * 现在由 {@code :manipulateForgeMappings} 在执行期写同一批路径。两个迁移器在缓存未命中时要按路径读
++ * patched 中间 jar——那件产物由补丁链的任务产出，配置期读不到，这正是本步要消灭的依赖。
++ *
++ * <h2>对照怎么构造</h2>
++ * 配置期路径已从调用点上切走，产出不再自动可得，因此本测试在探针里**手工调用被切走的那几步实现**：
++ * 构造 {@code MappingsMigrator.Inputs}（{@code refreshDeps = true}，强制读 patched jar 而不是读缓存）
++ * → 逐个迁移器 {@code setup} → 把原始 mappings 复制到参照路径 → 逐个迁移器 {@code migrate}。
++ * 参照产物写在 {@code build/probe/configtime-*.tiny}，因此**被测产物的路径上只有被测任务一个写入者**。
++ *
++ * <p>参照侧先删掉迁移器缓存、强制走「读 patched jar」的冷分支，被测任务随后走缓存分支：
++ * 两条分支的输入同源，结果必须一致。这同时钉住「任务声明的 patched jar 确实是迁移器读到的那一件」——
++ * 若任务把输入接错（例如指向未打补丁的 jar），迁移结果就会与参照不同。
++ *
++ * <h2>金标重建</h2>
++ * 第二条用例把迁移产物**移出共享缓存**再整链重建：重建后的产物必须与第一次逐行一致。
++ * 它同时钉住「任务确实从零写出了这些产物」——产物在任务跑之前是不存在的。
++ *
++ * <h2>比对口径</h2>
++ * 逐**行**比 SHA-256（mappings 是纯文本 tiny，不是 jar，故没有 entry 概念），行数也必须一致：
++ * 不是整文件哈希——整文件哈希只能回答「一样不一样」，逐行摘要才能指出差在哪一行。
++ *
++ * <h2>覆盖边界（如实记录）</h2>
++ * <ul>
++ *   <li>覆盖 **MERGED 形态 + Forge 1.20.1 + officialMojangMappings**（srg 命名空间，hasSrg = true）。</li>
++ *   <li>**NeoForge 的 mojang 分支没有覆盖**：夹具是 Forge；该分支的接线只由「hasMojang 是纯值输入」这一条覆盖。</li>
++ *   <li>**legacy Forge 与 legacy mixin AP 没有覆盖**：两者按
++ *       {@code mappingsMigrationProjectionBlocker()} 整批留在配置期（前者不做迁移，后者有配置期读者）。</li>
++ *   <li>**迁移器缓存的冷/暖分支不等价**：本仓库实测两者产出的迁移产物有约 36/85705 行不同，
++ *       且差异位置随运行变化。这是迁移器自身既有的性质（与本次任务化无关），本用例因此让两侧
++ *       处在同一缓存状态下比较；它是下一手值得单独排查的缺口。</li>
++ * </ul>
++ */
++class ForgeMigratedMappingsTaskEquivalenceTest extends Specification implements GradleProjectTestTrait {
++	/** 迁移产出任务名（见 {@code ManipulateForgeMappingsTask.NAME}）. */
++	private static final String MIGRATE_TASK = "manipulateForgeMappings"
++
++	def "迁移产物由执行期任务产出，且与配置期实现逐行一致"() {
++		setup:
++		def gradle = forgeProject()
++		gradle.buildGradle << probeScript()
++
++		when: "跑消费方：迁移任务必须先在任务图里跑过"
++		def result = gradle.run(task: "remapJar", configurationCache: false, args: [
++			"--console=plain",
++			"--no-build-cache"
++		])
++		def report = parseReport(new File(gradle.projectDir, "probe-report.properties"))
++		def subjectMigrated = lines(new File(report.SUBJECT_MIGRATED))
++		def subjectWithNs = lines(new File(report.SUBJECT_MIGRATED_WITH_NS))
++		def referenceMigrated = lines(new File(report.REFERENCE_MIGRATED))
++		def referenceWithNs = lines(new File(report.REFERENCE_MIGRATED_WITH_NS))
++		def rawMappings = lines(new File(report.PROVIDER_RAW_MAPPINGS))
++		printEvidence(report, subjectMigrated, subjectWithNs)
++
++		then: "任务被注册，且写的就是配置期路径下那两个产物"
++		report.MIGRATE_TASK_FOUND == "true"
++		report.TASK_MIGRATED == report.PROVIDER_MIGRATED
++		report.TASK_MIGRATED_WITH_NS == report.PROVIDER_MIGRATED_WITH_NS
++
++		and: "任务真的跑过（不是「注册了但没人依赖」）"
++		result.task(":" + MIGRATE_TASK)?.outcome == SUCCESS
++
++		and: "任务的每一个输入就是配置期实现读入的那一件"
++		report.TASK_RAW_MAPPINGS == report.PROVIDER_RAW_MAPPINGS
++		report.TASK_RAW_MAPPINGS_WITH_NS == report.PROVIDER_RAW_MAPPINGS_WITH_NS
++		report.TASK_PATCHED_INTERMEDIATE == report.PROVIDER_PATCHED_INTERMEDIATE
++		report.TASK_FORGE_JAR == report.PROVIDER_FORGE_JAR
++		report.TASK_USERDEV_JAR == report.PROVIDER_USERDEV_JAR
++		report.TASK_CACHE_DIR == report.PROVIDER_FORGE_CACHE
++		report.TASK_HAS_SRG == "true"
++		report.TASK_HAS_MOJANG == "false"
++
++		and: "消费任务都接上了产出方（漏一处 = 任务读到不存在的映射）"
++		report.PROVIDER_TASK_PATH == ":" + MIGRATE_TASK
++		report.CONSUMER_PATCHED_JAR_DEPS == "true"
++		report.CONSUMER_REMAP_MINECRAFT_DEPS == "true"
++		report.CONSUMER_SRG_NAMED_DEPS == "true"
++		report.CONSUMER_DLI_DEPS == "true"
++		report.CONSUMER_REMAP_JAR_DEPS == "true"
++
++		and: "产物非空，且与原始 mappings 逐行不同（迁移确实改写了内容，比对口径能识别差异）"
++		subjectMigrated.size() > 0
++		subjectWithNs.size() > 0
++		diff(subjectMigrated, rawMappings).size() > 0
++		diff(subjectWithNs, rawMappings).size() > 0
++
++		and: "两个产物与配置期实现逐行一致"
++		diff(subjectMigrated, referenceMigrated).isEmpty()
++		diff(subjectWithNs, referenceWithNs).isEmpty()
++
++		and: "扰动对照：比对口径能识别「同一输入、不同产物」——拿原始 mappings 当期望值必须报差异"
++		diff(referenceMigrated, rawMappings).size() > 0
++		diff(subjectMigrated, subjectWithNs).size() > 0
++	}
++
++	def "迁移产物移出共享缓存后由任务重建，且与金标逐行一致"() {
++		setup:
++		def goldProject = forgeProject()
++		goldProject.buildGradle << probeScript()
++
++		when: "第一次产出金标 → 把迁移产物移出共享缓存 → 用一个没有任何执行历史的工程重建"
++		goldProject.run(task: "remapJar", configurationCache: false, args: [
++			"--console=plain",
++			"--no-build-cache"
++		])
++		def report = parseReport(new File(goldProject.projectDir, "probe-report.properties"))
++		def goldMigrated = lines(new File(report.SUBJECT_MIGRATED))
++		def goldWithNs = lines(new File(report.SUBJECT_MIGRATED_WITH_NS))
++
++		// 移到本工程的备份目录：产物路径上不再有任何写入者，重建只能由被测任务完成。
++		// 共享缓存与工程目录未必在同一文件系统（本机实测跨设备），故先复制再删源，而不是 rename。
++		def backup = new File(goldProject.projectDir, "build/gold-backup")
++		backup.mkdirs()
++		[
++			report.SUBJECT_MIGRATED,
++			report.SUBJECT_MIGRATED_WITH_NS
++		].each { path ->
++			def source = new File(path)
++			assert source.exists(): "金标产物不存在: ${path}"
++			def target = new File(backup, source.name)
++			java.nio.file.Files.copy(source.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
++			java.nio.file.Files.delete(source.toPath())
++		}
++
++		// 必须先确认产物确实不在了：否则下面的重建断言可以读到旧文件而假通过
++		[
++			report.SUBJECT_MIGRATED,
++			report.SUBJECT_MIGRATED_WITH_NS
++		].each { path ->
++			assert !new File(path).exists(): "金标产物仍在原位: ${path}"
++		}
++
++		// 重建用**另一个工程目录**（没有任何任务执行历史）：迁移任务因此必然执行，
++		// 不会被「同工程上一轮的 up-to-date 记录」影响
++		def rebuildProject = forgeProject()
++		def second = rebuildProject.run(task: "remapJar", configurationCache: false, args: [
++			"--console=plain",
++			"--no-build-cache"
++		])
++		def rebuiltMigrated = lines(new File(report.SUBJECT_MIGRATED))
++		def rebuiltWithNs = lines(new File(report.SUBJECT_MIGRATED_WITH_NS))
++
++		then: "迁移任务这次必须真的执行（产物缺失且无执行历史 ⇒ 不能是 UP-TO-DATE）"
++		second.task(":" + MIGRATE_TASK).outcome == SUCCESS
++
++		and: "重建产物与金标逐行一致"
++		def rebuiltDiff = diff(rebuiltMigrated, goldMigrated)
++		def rebuiltNsDiff = diff(rebuiltWithNs, goldWithNs)
++		explain(rebuiltDiff, new File(report.SUBJECT_MIGRATED), new File(backup, new File(report.SUBJECT_MIGRATED).name))
++		explain(rebuiltNsDiff, new File(report.SUBJECT_MIGRATED_WITH_NS), new File(backup, new File(report.SUBJECT_MIGRATED_WITH_NS).name))
++		rebuiltDiff.isEmpty()
++		rebuiltNsDiff.isEmpty()
++
++		and: "金标本身有效：两个产物互不相同（比对口径能识别差异）"
++		diff(goldMigrated, goldWithNs).size() > 0
++
++		cleanup:
++		println("金标备份留在 ${new File(goldProject.projectDir, 'build/gold-backup')}（供人工复核）")
++	}
++
++	/** 构造 Forge 1.20.1 夹具（与 ForgePatchedChainTaskEquivalenceTest 同一套替换）. */
++	private GradleProject forgeProject() {
++		def gradle = gradleProject(project: "forge/simple", version: DEFAULT_GRADLE)
++		gradle.buildGradle.text = gradle.buildGradle.text.replace('@MCVERSION@', '1.20.1')
++				.replace('@FORGEVERSION@', '47.2.1')
++				.replace('@MAPPINGS@', 'loom.officialMojangMappings()')
++				.replace('@REPOSITORIES@', '')
++				.replace('@PACKAGE@', 'net.minecraftforge:forge')
++				.replace('@JAVA_VERSION@', '17')
++		return gradle
++	}
++
++	/**
++	 * 追加到夹具 build.gradle 的探针.
++	 *
++	 * <p>它在配置期（{@code afterEvaluate}，晚于 Loom 自己的 setup job）记录迁移任务声明的输入输出、
++	 * 消费任务的依赖边，并用被切走的配置期实现产出两份对照。报告只写一次。
++	 */
++	private static String probeScript() {
++		return '''
++		afterEvaluate {
++			def reportFile = file('probe-report.properties')
++
++			if (reportFile.exists()) {
++				return
++			}
++
++			def extension = net.fabricmc.loom.LoomGradleExtension.get(project)
++			def mappingConfiguration = extension.mappingConfiguration
++			def provider = dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider.get(project)
++			def probeDir = new File(project.buildDir, 'probe')
++			probeDir.mkdirs()
++
++			def lines = []
++			def migrateTask = project.tasks.findByName('manipulateForgeMappings')
++
++			lines << 'MIGRATE_TASK_FOUND=' + (migrateTask != null)
++			lines << 'TASK_MIGRATED=' + migrateTask.migratedMappings.get().asFile.absolutePath
++			lines << 'TASK_MIGRATED_WITH_NS=' + migrateTask.migratedMappingsWithNs.get().asFile.absolutePath
++			lines << 'TASK_READY_MARKER=' + migrateTask.readyMarker.get().asFile.absolutePath
++			lines << 'TASK_RAW_MAPPINGS=' + migrateTask.rawMappings.get().asFile.absolutePath
++			lines << 'TASK_RAW_MAPPINGS_WITH_NS=' + migrateTask.rawMappingsWithNs.get().asFile.absolutePath
++			lines << 'TASK_PATCHED_INTERMEDIATE=' + migrateTask.patchedIntermediateJar.get().asFile.absolutePath
++			lines << 'TASK_FORGE_JAR=' + migrateTask.forgeJar.get().asFile.absolutePath
++			lines << 'TASK_USERDEV_JAR=' + migrateTask.forgeUserdevJar.get().asFile.absolutePath
++			lines << 'TASK_CACHE_DIR=' + migrateTask.migratorCacheDir.get()
++			lines << 'TASK_HAS_SRG=' + migrateTask.hasSrg.get()
++			lines << 'TASK_HAS_MOJANG=' + migrateTask.hasMojang.get()
++
++			// 配置期实现读的那几条路径（provider / 映射配置自己算出来的），与任务声明的输入输出逐项对照
++			def workingDir = mappingConfiguration.mappingsWorkingDir()
++			lines << 'PROVIDER_MIGRATED=' + mappingConfiguration.tinyMappings.toAbsolutePath().toString()
++			lines << 'PROVIDER_MIGRATED_WITH_NS=' + mappingConfiguration.tinyMappingsWithSrg.toAbsolutePath().toString()
++			lines << 'PROVIDER_RAW_MAPPINGS=' + workingDir.resolve('mappings.tiny').toAbsolutePath().toString()
++			lines << 'PROVIDER_RAW_MAPPINGS_WITH_NS=' + workingDir.resolve('mappings-srg.tiny').toAbsolutePath().toString()
++			lines << 'PROVIDER_PATCHED_INTERMEDIATE=' + provider.minecraftPatchedIntermediateJar.toAbsolutePath().toString()
++			lines << 'PROVIDER_FORGE_JAR=' + extension.forgeUniversalProvider.forge.toPath().toAbsolutePath().toString()
++			lines << 'PROVIDER_USERDEV_JAR=' + extension.forgeUserdevProvider.userdevJar.toPath().toAbsolutePath().toString()
++			lines << 'PROVIDER_FORGE_CACHE=' + dev.architectury.loom.forge.dependency.ForgeProvider.getForgeCache(project).toAbsolutePath().toString()
++			lines << 'PROVIDER_TASK_PATH=' + mappingConfiguration.manipulateMappingsTaskPath
++
++			// 消费任务的依赖边：按任务名取，逐条回答「我的输入由谁产出」
++			def dependsOnMigrate = { String taskName ->
++				def task = project.tasks.findByName(taskName)
++
++				if (task == null) {
++					return 'missing'
++				}
++
++				def dependencies = task.taskDependencies.getDependencies(task)
++				return dependencies.any { it.name == 'manipulateForgeMappings' }.toString()
++			}
++			lines << 'CONSUMER_PATCHED_JAR_DEPS=' + dependsOnMigrate('generateForgePatchedJar')
++			lines << 'CONSUMER_REMAP_MINECRAFT_DEPS=' + dependsOnMigrate('remapMinecraftNamedMerged')
++			lines << 'CONSUMER_SRG_NAMED_DEPS=' + dependsOnMigrate('generateSrgNamedMappings')
++			lines << 'CONSUMER_DLI_DEPS=' + dependsOnMigrate('generateDLIConfig')
++			lines << 'CONSUMER_REMAP_JAR_DEPS=' + dependsOnMigrate('remapJar')
++
++			// 对照：配置期实现（读 patched jar 的分支，而不是读迁移器缓存）
++			def rawMappings = workingDir.resolve('mappings.tiny')
++			def rawMappingsWithNs = workingDir.resolve('mappings-srg.tiny')
++			def referenceMigrated = new File(probeDir, 'configtime-mappings-migrated.tiny')
++			def referenceWithNs = new File(probeDir, 'configtime-mappings-srg-migrated.tiny')
++
++			def info = { String message -> project.logger.info(message) }
++			def forgeCache = dev.architectury.loom.forge.dependency.ForgeProvider.getForgeCache(project)
++			// 迁移器的中间缓存是「按输入算出的中间数据」的记忆化：命中时 setup 根本不读 patched jar。
++			// 先删掉迁移器缓存，让参照侧走「读 patched jar」的冷分支（缓存命中时 setup 根本不读 jar，
++			// 那样就钉不住「任务声明的三个 jar 输入就是迁移器真正读到的那三件」）。
++			//
++			// 刻意**不**在参照侧写完缓存后再删一次：本仓库实测「冷分支」与「缓存分支」产出的迁移产物
++			// 并非逐行等价（36/85705 行不同，且差异位置随机），这是迁移器自身既有的性质、与本次任务化无关。
++			// 因此两侧保持在同一个缓存状态下比较——否则测的是那条既有差异，而不是被测任务。
++			def migratorCaches = [
++					forgeCache.resolve('migrated-fields.json'),
++					forgeCache.resolve('method-inheritance-migrator.json')
++			]
++			def dropCaches = { migratorCaches.each { java.nio.file.Files.deleteIfExists(it) } }
++
++			def inputs = new dev.architectury.loom.forge.MappingsMigrator.Inputs(
++					forgeCache,
++					rawMappingsWithNs,
++					provider.minecraftPatchedIntermediateJar,
++					extension.forgeUniversalProvider.forge.toPath(),
++					extension.forgeUserdevProvider.userdevJar.toPath(),
++					true,
++					false,
++					true,
++					info)
++			def migrators = [
++					new dev.architectury.loom.forge.FieldMappingsMigrator(),
++					new dev.architectury.loom.forge.MethodInheritanceMappingsMigrator()
++			]
++
++			dropCaches()
++			migrators.each { it.setup(inputs) }
++			java.nio.file.Files.copy(rawMappings, referenceMigrated.toPath())
++			java.nio.file.Files.copy(rawMappingsWithNs, referenceWithNs.toPath())
++
++			def entries = [
++					new dev.architectury.loom.forge.MappingsMigrator.MappingsEntry(referenceMigrated.toPath()),
++					new dev.architectury.loom.forge.MappingsMigrator.MappingsEntry(referenceWithNs.toPath())
++			]
++			migrators.each { it.migrate(entries, info) }
++
++			lines << 'REFERENCE_MIGRATED=' + referenceMigrated.absolutePath
++			lines << 'REFERENCE_MIGRATED_WITH_NS=' + referenceWithNs.absolutePath
++			lines << 'SUBJECT_MIGRATED=' + migrateTask.migratedMappings.get().asFile.absolutePath
++			lines << 'SUBJECT_MIGRATED_WITH_NS=' + migrateTask.migratedMappingsWithNs.get().asFile.absolutePath
++
++			reportFile.text = lines.join(System.lineSeparator()) + System.lineSeparator()
++		}
++		'''
++	}
++
++	/** 读报告文件；键值各占一行. */
++	private static Map<String, String> parseReport(File file) {
++		if (!file.exists()) {
++			throw new FileNotFoundException("未生成报告文件: " + file)
++		}
++
++		return file.readLines().findAll { it.contains('=') }.collectEntries {
++			def split = it.split('=', 2)
++			[(split[0]): split[1]]
++		}
++	}
++
++	/** 逐行 SHA-256：mappings 是纯文本 tiny，没有 zip entry，逐行摘要才能指出差在哪一行. */
++	private static Map<Integer, String> lines(File mappings) {
++		final Map<Integer, String> result = [:]
++		int index = 0
++
++		mappings.eachLine { line ->
++			def digest = MessageDigest.getInstance("SHA-256")
++			digest.update(line.getBytes("UTF-8"))
++			result[index++] = digest.digest().encodeHex().toString()
++		}
++
++		return result
++	}
++
++	private static List<Integer> diff(Map<Integer, String> actual, Map<Integer, String> expected) {
++		return actual.findResults { index, hash -> hash == expected[index] ? null : index }
++	}
++
++	/**
++	 * 差异诊断：报出行数、前几个差异行号与两侧的原文.
++	 *
++	 * <p>只报「有多少行不同」不足以定位；mappings 的差异往往是一整片（迁移器改写了几百行），
++	 * 因此把差异**区间**也打出来——区间边界能直接指向是哪一步（字段描述符迁移 / 方法继承删除）出了偏差。
++	 */
++	private static void explain(List<Integer> diffIndices, File actualFile, File expectedFile) {
++		if (diffIndices.isEmpty()) {
++			return
++		}
++
++		def actualLines = actualFile.readLines()
++		def expectedLines = expectedFile.readLines()
++		println("差异：${diffIndices.size()} 行；实际 ${actualLines.size()} 行 / 期望 ${expectedLines.size()} 行")
++		println("差异行号（前 20）：${diffIndices.take(20)}")
++
++		diffIndices.take(3).each { index ->
++			println("  行 ${index}: 实际=${index < actualLines.size() ? actualLines[index] : '<越界>'}")
++			println("  行 ${index}: 期望=${index < expectedLines.size() ? expectedLines[index] : '<越界>'}")
++		}
++	}
++
++	private static void printEvidence(Map<String, String> report, Map<Integer, String> migrated, Map<Integer, String> withNs) {
++		println("迁移产物: " + report.SUBJECT_MIGRATED + "（" + migrated.size() + " 行）")
++		println("命名空间迁移产物: " + report.SUBJECT_MIGRATED_WITH_NS + "（" + withNs.size() + " 行）")
++		println("产出任务: " + report.PROVIDER_TASK_PATH)
++	}
++}

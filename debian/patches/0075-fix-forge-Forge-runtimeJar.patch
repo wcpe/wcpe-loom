@@ -1,0 +1,56 @@
+From 143f93fd55381a8a4b0c438a425776c816c4bab3 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Sat, 3 Oct 2026 05:41:40 +0800
+Subject: [PATCH 075/147] =?UTF-8?q?fix(forge):=20Forge=20=E5=8F=8D?=
+ =?UTF-8?q?=E7=BC=96=E8=AF=91=E7=9A=84=20runtimeJar=20=E6=8E=A5=E4=B8=8A?=
+ =?UTF-8?q?=E4=BA=A7=E5=87=BA=E6=96=B9=EF=BC=8C=E4=B8=8D=E5=86=8D=E6=8C=89?=
+ =?UTF-8?q?=E8=A3=B8=E8=B7=AF=E5=BE=84=E5=A3=B0=E6=98=8E=E8=BE=93=E5=85=A5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+PatchedDecompileTest 的 1.19.2 行一直失败：GenerateForgePatchedSourcesTask.runtimeJar
+（named 映射后的 MC jar）在此共享缓存里从未存在，报
+"property 'runtimeJar' specifies file … which doesn't exist"。
+
+根因：该处按**裸路径**声明输入、没有产出方。MC jar 生产链任务化之后，named jar 只在
+执行期落位，配置期按路径声明输入必然校验失败（此前是「恰好」由配置期生产掩盖了）。
+
+修法：接上 getMinecraftJarsCollection(NAMED)，让输入携带产出任务依赖。
+
+验证：
+- 负对照：修复前 forge-1.19.2-43.1.1-minecraft-merged 目录从未存在（只有 -merged-srg
+  中间产物），修复后该目录由无到有
+- PatchedDecompileTest 由 1/3 转为 3/3 PASSED（1.19.2 行 128s）
+- compileJava + checkstyleMain 通过
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/decompile/SingleJarDecompileConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/decompile/SingleJarDecompileConfiguration.java
+index 79d5cd6c4a57ba65632e946e74bfe880cc547c5c..fdfb904a7b3db5570ff13daf4de04e75e084dfc9 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/decompile/SingleJarDecompileConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/decompile/SingleJarDecompileConfiguration.java
+@@ -30,6 +30,7 @@ import dev.architectury.loom.forge.minecraft.MinecraftPatchedProvider;
+ import org.gradle.api.Project;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
++import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJar;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftJarConfiguration;
+ import net.fabricmc.loom.configuration.providers.minecraft.mapped.MappedMinecraftProvider;
+@@ -83,6 +84,14 @@ public class SingleJarDecompileConfiguration extends DecompileConfiguration<Mapp
+ 
+ 				task.getInputJar().set(MinecraftPatchedProvider.get(project).getMinecraftIntermediateJar().toFile());
+ 				task.getRuntimeJar().set(minecraftJar.toFile());
++				// runtimeJar 是 named 命名空间的 MC jar，即 mapped provider 的产物；生产链迁移后它只在执行期
++				// 由重映射任务（RemapMinecraftTask / ProcessMinecraftJarTask）落位，而上面那行只是按**裸路径**
++				// 声明输入，不携带产出方——冷缓存下 Gradle 会在输入校验处以
++				// 「property 'runtimeJar' specifies file ... which doesn't exist」直接失败（实测 Forge 1.19.2），
++				// 因为没有任何任务被要求先产出它。故显式接上该命名空间的产出任务依赖：登记过任务产出时
++				// 这份集合由产出任务派生（见 LoomGradleExtension#setMinecraftJarsTaskOutputs），
++				// 未登记（配置期回退）时是纯文件集合，dependsOn 无副作用，与改造前语义一致。
++				task.dependsOn(extension.getMinecraftJarsCollection(MappingsNamespace.NAMED));
+ 			});
+ 		}
+ 	}

@@ -1,0 +1,137 @@
+From 49e9c53295ea0aee95b1b9a55e1a7be968d601d6 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Wed, 28 Oct 2026 12:18:37 +0800
+Subject: [PATCH 102/147] =?UTF-8?q?fix(cache):=20=E6=97=A5=E5=BF=97?=
+ =?UTF-8?q?=E9=80=8F=E4=BC=A0=E5=BC=80=E5=85=B3=E4=B8=8D=E5=86=8D=E5=8F=82?=
+ =?UTF-8?q?=E4=B8=8E=20forge=20=E4=BA=A7=E7=BA=BF=E7=9A=84=E7=BC=93?=
+ =?UTF-8?q?=E5=AD=98=E9=94=AE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`showVerboseStdout/Stderr` 只决定工具的 stdout/stderr 接到哪个流，不参与任何产物
+字节；但它的取值随构建日志级别与 stacktrace 开关变化，标成 `@Input` 就等于让
+「换一个日志级别」变成「换一整套缓存键」，使这些标了 `@CacheableTask` 的节点永远
+无法命中缓存。
+
+实测后果（AllinGame）：`generateForgePrePatchJar` 每轮重跑整条 10 步 MCP 链，
+直接造成 forge 全量 26 分钟的头部开销；下游 `generateForgePatchedIntermediateJar`
+/`manipulateForgeMappings`/`accessTransformForgeJar`/`generateForgePatchedJar`
+全部跟着重跑。复合构建下每个构建根各一份，重复行数成倍上涨。
+
+改为 `@Internal` 的三处：
+
+- `ForgeToolExecutor.Settings#getShowVerboseStdout/Stderr`
+- `ForgeSourcesService.Options#getShouldShowVerboseStderr`
+- `AccessTransformForgeJarTask#getAtVerboseStdout/Stderr`
+
+取值来源与透传行为本身不变，因此改后行为与产物等价，只是缓存键不再受日志级别影响。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/dev/architectury/loom/forge/ForgeSourcesService.java b/src/main/java/dev/architectury/loom/forge/ForgeSourcesService.java
+index c924f70fb6776d41d05d97ffeb10d88783ed5cc1..27947443b1e4dd24eaed7d0e8d663806cd8fd5c4 100644
+--- a/src/main/java/dev/architectury/loom/forge/ForgeSourcesService.java
++++ b/src/main/java/dev/architectury/loom/forge/ForgeSourcesService.java
+@@ -32,6 +32,7 @@ import org.gradle.api.provider.Property;
+ import org.gradle.api.provider.Provider;
+ import org.gradle.api.tasks.Input;
+ import org.gradle.api.tasks.InputFiles;
++import org.gradle.api.tasks.Internal;
+ import org.gradle.api.tasks.Nested;
+ import org.gradle.api.tasks.Optional;
+ import org.gradle.api.tasks.PathSensitive;
+@@ -100,7 +101,16 @@ public final class ForgeSourcesService extends Service<ForgeSourcesService.Optio
+ 		@Nested
+ 		Property<SourceRemapperService.Options> getSourceRemapperService();
+ 
+-		@Input
++		/**
++		 * 是否把工具的标准错误透传到构建日志。
++		 *
++		 * <p>标记为 {@code @Internal} 而**不是** {@code @Input}：它只决定错误流接哪里，
++		 * 不参与任何产物字节；而取值随构建日志级别与 stacktrace 开关变化
++		 * （{@code ForgeToolExecutor#shouldShowVerboseStderr}），当 {@code @Input} 会让
++		 * 「换日志级别」等于换缓存键，使引用本服务选项的任务永远无法命中缓存。
++		 * 同上理由的还有 {@code ForgeToolExecutor.Settings} 与 {@code AccessTransformForgeJarTask} 里的对应字段。
++		 */
++		@Internal
+ 		Property<Boolean> getShouldShowVerboseStderr();
+ 	}
+ 
+diff --git a/src/main/java/dev/architectury/loom/forge/tool/ForgeToolExecutor.java b/src/main/java/dev/architectury/loom/forge/tool/ForgeToolExecutor.java
+index 825733ef2f586d3afa0446fb7e0b65c97d6cfc07..0615bdaa609e58bebb6967589578a47711489ec2 100644
+--- a/src/main/java/dev/architectury/loom/forge/tool/ForgeToolExecutor.java
++++ b/src/main/java/dev/architectury/loom/forge/tool/ForgeToolExecutor.java
+@@ -12,6 +12,7 @@ import org.gradle.api.provider.ListProperty;
+ import org.gradle.api.provider.Property;
+ import org.gradle.api.tasks.Classpath;
+ import org.gradle.api.tasks.Input;
++import org.gradle.api.tasks.Internal;
+ import org.gradle.api.tasks.Optional;
+ import org.gradle.process.ExecOperations;
+ import org.gradle.process.ExecResult;
+@@ -111,10 +112,24 @@ public final class ForgeToolExecutor {
+ 		@Classpath
+ 		ConfigurableFileCollection getExecClasspath();
+ 
+-		@Input
++		/**
++		 * 是否把工具的标准输出透传到构建日志。
++		 *
++		 * <p>标记为 {@code @Internal} 而**不是** {@code @Input}：本值只决定「输出流接哪里」，
++		 * 不参与任何产物字节。而它的取值随构建日志级别变化（{@link #shouldShowVerboseStdout}），
++		 * 若当 {@code @Input}，则「换一个日志级别」就等于换了一整套缓存键。
++		 *
++		 * <p>实测后果（2026-10-27，AllinGame）：节点 {@code generateForgePrePatchJar} 标了
++		 * {@code @CacheableTask} 却永远撞不到同一键，每轮重跑整条 10 步 MCP 链，
++		 * 直接造成 forge 全量 26 分钟的头部开销；下游 {@code generateForgePatchedIntermediateJar}
++		 * /{@code manipulateForgeMappings}/{@code accessTransformForgeJar}/{@code generateForgePatchedJar}
++		 * 全部跟着重跑。复合构建下更糟：每个构建根各自一份，重复行数成倍上涨。
++		 */
++		@Internal
+ 		Property<Boolean> getShowVerboseStdout();
+ 
+-		@Input
++		/** 同 {@link #getShowVerboseStdout()}：只影响日志透传，不影响产物。 */
++		@Internal
+ 		Property<Boolean> getShowVerboseStderr();
+ 
+ 		default void classpath(Object... paths) {
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/AccessTransformForgeJarTask.java b/src/main/java/net/fabricmc/loom/pipeline/AccessTransformForgeJarTask.java
+index f4d8307c7289211a87553e6b0dcf87dc7664038f..790a03fbacb8647bbdd1b12853259f1bddd38e4c 100644
+--- a/src/main/java/net/fabricmc/loom/pipeline/AccessTransformForgeJarTask.java
++++ b/src/main/java/net/fabricmc/loom/pipeline/AccessTransformForgeJarTask.java
+@@ -49,6 +49,7 @@ import org.gradle.api.tasks.CacheableTask;
+ import org.gradle.api.tasks.Classpath;
+ import org.gradle.api.tasks.Input;
+ import org.gradle.api.tasks.InputFile;
++import org.gradle.api.tasks.Internal;
+ import org.gradle.api.tasks.Optional;
+ import org.gradle.api.tasks.OutputFile;
+ import org.gradle.api.tasks.PathSensitive;
+@@ -120,12 +121,19 @@ public abstract class AccessTransformForgeJarTask extends DefaultTask {
+ 	@Optional
+ 	public abstract Property<String> getAtJavaExecutable();
+ 
+-	/** 是否把 AT 工具的标准输出透传到构建日志. */
+-	@Input
++	/**
++	 * 是否把 AT 工具的标准输出透传到构建日志。
++	 *
++	 * <p>标记为 {@code @Internal} 而**不是** {@code @Input}：它只决定输出流接哪里，
++	 * 不参与产物字节。当它是 {@code @Input} 时，本任务虽标了 {@code @CacheableTask}
++	 * 却会因「日志级别变化」而缓存键变化，永远撞不到同一键（实测：AllinGame 的
++	 * forge 生产线每轮重跑 10 步 MCP 链，并连带下游三个任务一起重跑）。
++	 */
++	@Internal
+ 	public abstract Property<Boolean> getAtVerboseStdout();
+ 
+-	/** 是否把 AT 工具的标准错误透传到构建日志. */
+-	@Input
++	/** 同 {@link #getAtVerboseStdout()}：只影响日志透传，不影响产物。 */
++	@Internal
+ 	public abstract Property<Boolean> getAtVerboseStderr();
+ 
+ 	/** 产物：AT 之后的 jar（与配置期同一条路径）. */

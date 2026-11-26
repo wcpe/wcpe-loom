@@ -1,0 +1,418 @@
+From 76dd0297083ad0988245bab39ad2035faad81dcd Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Sun, 1 Nov 2026 07:08:50 +0800
+Subject: [PATCH 113/147] =?UTF-8?q?perf(cache):=20=E6=8C=89=E4=BA=A7?=
+ =?UTF-8?q?=E7=89=A9=E6=89=B9=E6=AC=A1=E5=88=86=E7=89=87=20Minecraft=20?=
+ =?UTF-8?q?=E5=85=B1=E4=BA=AB=E7=BC=93=E5=AD=98=E9=94=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+同一个 Minecraft 版本的所有产物生产（下载/抽取、合并、拆分）共用一把跨进程锁
+（key = minecraft:<mc>），于是并行开多个项目、每个项目多个 worktree 时，冷启动
+全部排成一条队：一个项目在合并，另一个项目的下载也得等它。
+
+根因在 key 只按版本、不按产物批次：
+
+  MinecraftProvider.downloadLockKey()  -> minecraft:<mc>
+  MergedMinecraftProvider              -> 继承同一个 key
+  SplitMinecraftProvider               -> 继承同一个 key
+
+而它们的写目标互不相交，本可以各自独立。旁证是 SingleJarMinecraftProvider 早就按
+type() 分片了（server/client env-only jar 各一把锁），单它一个不够。
+
+改为按产物批次分片（产物路径一处未动，缓存键不变，不影响既有缓存与任务重跑）：
+
+  MinecraftProvider.downloadLockKey()  minecraft:<mc>            -> minecraft-download:<mc>
+  MergedMinecraftProvider.cacheKey()   minecraft:<mc>（继承）    -> minecraft-merge:<mc>
+  SplitMinecraftProvider.cacheKey()    minecraft:<mc>（继承）    -> minecraft-split:<mc>
+  基类 cacheKey() 兜底                  minecraft:<mc>            -> minecraft-jars:<mc>
+
+分片的单位是「一次生产写出的那批产物」而不是单个文件：同一版本的下载/抽取仍由一把
+锁保护（所有 jar 配置共享它、只下载一次），拆分的两件产物也仍共用一把锁（一次拆分一起
+落位）。跨 key 没有共享写目标，因此分片不引入写冲突：
+
+  · 产物路径互不相异：下载/抽取写 minecraft-client.jar / minecraft-server.jar /
+    minecraft-extracted_server.jar，合并写 minecraft-merged.jar，拆分写
+    minecraft-client-only.jar / minecraft-common.jar。合并与拆分只把基类产物当只读输入。
+  · 落盘都是原子发布：下载走 .part + AtomicFiles.move，抽取走
+    BundleMetadata.unpackEntry 的 AtomicFiles.publish，合并走
+    MergedMinecraftProvider.mergeJars 的 AtomicFiles.publish，拆分走
+    splitJars 的 tempSibling + 逐件 AtomicFiles.move。因此读方只会看到完整的旧文件或
+    完整的新文件，无锁快路径（JarReusability 的内容级就绪判定）不必担心半成品。
+
+同时把纯只读的签名校验移出下载锁。verifyJars() 不写共享产物，却要逐条读完整份 jar
+做内容与证书链校验（秒级），把它留在锁内等于让同版本的其它进程为「本进程的 CPU 时间」
+排队——它们需要的只是「jar 已在盘上」，而那在锁释放时已经成立。
+
+校验的唯一副作用是「删掉校验失败的 jar」（它是共享缓存里的一份产物，不能留在锁外删）。
+为此把删除动作从 MinecraftJarVerification 里摘出来，改为登记到 rejectedJars()，由
+MinecraftProvider.discardRejectedJars 回到同一把下载锁内执行。失败路径才取锁，正常
+路径全程无锁；jarsRequireProduction 的无锁快路径与锁内二次确认都保持不变。
+
+测试：LoomCacheServiceTest 新增两条——
+  · 两线程分别持 minecraft-download:* 与 minecraft-merge:*，用 latch 互相确认对方
+    已进入临界区（不靠墙钟阈值；若两 key 又被合并回一把锁，等对方的 latch 不归零，
+    用例失败）；
+  · 三个分片 key 依次取锁后，锁目录下应有三份 .lock（防哈希碰撞退化成共用一把锁）。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: lock-shard
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MergedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MergedMinecraftProvider.java
+index d0f3a6b37902f299fe5a7a3193d3d95afd1fcb11..c69a07ad48fcc0786e66233f04c9e5c9c48de6f0 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MergedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MergedMinecraftProvider.java
+@@ -115,6 +115,16 @@ public class MergedMinecraftProvider extends MinecraftProvider {
+ 		}
+ 	}
+ 
++	// 合并产物（minecraft-merged.jar）的跨进程互斥 key，与下载/抽取分片。
++	//
++	// 合并只写自己的产物、并把基类产物当只读输入：它和「下载」之间没有共享的写目标，
++	// 共用一把锁只会让「一个项目在合并」堵住「另一个项目在下载」，冷启动时二者排在一条队上。
++	// 基类默认值（minecraft-jars:<mc>）对合并并不合用，故在此显式按产物批次命名。
++	@Override
++	protected String cacheKey() {
++		return "minecraft-merge:" + minecraftVersion();
++	}
++
+ 	/**
+ 	 * 注册合并任务：产物生产交给执行期任务，产物路径与配置期一致.
+ 	 *
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
+index 411af1f80b583343f5d3eda0026fe3b694ec5909..689d1181dd4b86dc64f7479aa7e51592f10cffa9 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/MinecraftProvider.java
+@@ -26,6 +26,7 @@ package net.fabricmc.loom.configuration.providers.minecraft;
+ 
+ import java.io.File;
+ import java.io.IOException;
++import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+@@ -630,9 +631,14 @@ public abstract class MinecraftProvider {
+ 	private void produceJarsInConfiguration(String blocker) throws Exception {
+ 		getProject().getLogger().lifecycle("Minecraft {} 的 jar 保持配置期生产：{}", minecraftVersion(), blocker);
+ 
++		// 本次是否真的下载了 jar：只有下载过才需要签名校验（暖缓存下不重复校验）。
++		// 用字段而不是锁内局部变量，是因为校验已移到锁外执行，见下面的说明。
++		final AtomicBoolean didDownload = new AtomicBoolean(false);
++
+ 		// 无锁快路径：未要求刷新且所有产物已就绪时，不获取任何文件锁
+ 		if (jarsRequireProduction()) {
+-			// 产文件部分（下载/抽取/校验）用 per-key 锁保护，按 mcVersion 串行、不同版本可并行
++			// 产文件部分（下载/抽取）用 per-key 锁保护，按 mcVersion 串行、不同版本可并行；
++			// 合并/拆分/env-only 各写自己的产物，用各自的 key，不排在这一把锁后面（见 cacheKey）
+ 			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
+ 			final Path lockRoot = getExtension().getFiles().getCacheLocks().toPath();
+ 
+@@ -642,7 +648,7 @@ public abstract class MinecraftProvider {
+ 					return null;
+ 				}
+ 
+-				boolean didDownload = downloadJars();
++				didDownload.set(downloadJars());
+ 
+ 				if (provideServer()) {
+ 					// 锁内读取 bundle 元数据用于决定是否抽取（extractBundledServerJar 依赖该字段）
+@@ -653,10 +659,6 @@ public abstract class MinecraftProvider {
+ 					}
+ 				}
+ 
+-				if (didDownload) {
+-					verifyJars();
+-				}
+-
+ 				return null;
+ 			});
+ 		}
+@@ -667,6 +669,14 @@ public abstract class MinecraftProvider {
+ 		if (provideServer() && serverBundleMetadata == null) {
+ 			serverBundleMetadata = readServerBundleMetadata();
+ 		}
++
++		// 签名校验在锁外做：它只读已落位的 jar（见 verifyJars），不参与产物生产，却要逐条读完整份 jar
++		// 做内容与证书链校验，耗时可达秒级。把它留在下载锁内，等于让其它项目为「本进程的 CPU 计算」排队——
++		// 而同版本的其它进程此时需要的只是「jar 已在盘上」，那件事在锁释放时就已经成立。
++		// 顺序上放在 bundle 元数据落定之后：verifyJars 按它决定校验哪个 server jar。
++		if (didDownload.get()) {
++			verifyJars();
++		}
+ 	}
+ 
+ 	/**
+@@ -683,15 +693,28 @@ public abstract class MinecraftProvider {
+ 		return BundleMetadata.fromJarCached(store, minecraftServerJar.toPath(), sha1);
+ 	}
+ 
+-	// 下载/抽取产物的跨进程锁 key：始终按版本，确保同一 mcVersion 的所有 jar 配置共享同一把下载锁、只下载一次。
+-	// 不可用会被子类覆写的 cacheKey()，否则不同 jar 配置（如 server-only/client-only single jar）会用不同 key 并发下载同一批共享 jar。
++	// 下载/抽取产物的跨进程锁 key：按「产物批次 + 版本」分片。
++	//
++	// 分片的唯一依据是产物批次，不是「谁在跑」：同一个 mcVersion 的下载/抽取产物（client jar、server jar、
++	// 抽取出的 server jar）始终只由这一个 key 保护，因此同一版本的所有 jar 配置仍共享同一把锁、只下载一次。
++	// 合并、拆分、env-only 透传各自写自己的产物，用各自的 key（见 cacheKey 与各子类覆写）——
++	// 于是「一个项目在合并」不会再堵住「另一个项目在下载」。
++	//
++	// 不可用会被子类覆写的 cacheKey()，否则不同 jar 配置（如 server-only/client-only single jar）会分片到不同锁上。
+ 	private String downloadLockKey() {
+-		return "minecraft:" + minecraftVersion();
++		return "minecraft-download:" + minecraftVersion();
+ 	}
+ 
+-	// 跨进程互斥 key：用于子类自身产物（merge/split/env-only jar）的生产锁，子类可覆写以区分不同产物
++	// 跨进程互斥 key：用于子类自身产物（merge/split/env-only jar）的生产锁。
++	//
++	// 各产出自己产物的 provider 都必须覆写它并按产物批次分片（见 MergedMinecraftProvider /
++	// SplitMinecraftProvider / SingleJarMinecraftProvider）。分片只要求「同一产物始终由同一个 key 保护」；
++	// 不同产物共用一把锁只会白白排队——下载、合并、拆分互不依赖对方的输出，本可以各自独立进行。
++	//
++	// 这里的默认值只作兜底：落到它上面的形态维持「同版本共用一把锁」的保守语义
++	// （宁可多排一点队，也不要两种产物共用一把锁却不自知）。
+ 	protected String cacheKey() {
+-		return "minecraft:" + minecraftVersion();
++		return "minecraft-jars:" + minecraftVersion();
+ 	}
+ 
+ 	// 无锁快路径：判断下载/抽取产物是否需要生产。返回 false 即所有产物已就绪，可走无锁快路径。
+@@ -761,6 +784,12 @@ public abstract class MinecraftProvider {
+ 		}
+ 	}
+ 
++	/**
++	 * 校验已落位的 jar 的签名与完整性.
++	 *
++	 * <p>校验本身只读，因此跑在下载锁之外（见 {@link #produceJarsInConfiguration}）；唯一的副作用是
++	 * 「把判定为无效的 jar 从共享缓存里删掉」，那一步交给 {@link #discardRejectedJars(List)} 在锁内做。
++	 */
+ 	private void verifyJars() throws IOException, SignatureVerificationFailure {
+ 		if (!GradleUtils.getBooleanProperty(getProject(), Constants.Properties.ENABLE_MINECRAFT_VERIFICATION)) {
+ 			LOGGER.info("Skipping Minecraft jar verification!");
+@@ -771,21 +800,63 @@ public abstract class MinecraftProvider {
+ 
+ 		MinecraftJarVerification verification = getProject().getObjects().newInstance(MinecraftJarVerification.class, minecraftVersion());
+ 
+-		if (provideClient()) {
+-			verification.verifyClientJar(minecraftClientJar.toPath());
+-		}
++		try {
++			if (provideClient()) {
++				verification.verifyClientJar(minecraftClientJar.toPath());
++			}
+ 
+-		if (provideServer()) {
+-			if (serverBundleMetadata == null) {
+-				verification.verifyServerJar(minecraftServerJar.toPath());
+-			} else {
+-				verification.verifyServerJar(getMinecraftExtractedServerJar().toPath());
++			if (provideServer()) {
++				if (serverBundleMetadata == null) {
++					verification.verifyServerJar(minecraftServerJar.toPath());
++				} else {
++					verification.verifyServerJar(getMinecraftExtractedServerJar().toPath());
++				}
+ 			}
++		} finally {
++			// 被判定为无效的 jar 要从共享缓存里摘掉（否则下一次会把它当就绪产物直接用，而校验只在
++			// 「本次下载过」时跑，不会再被拦一次）；全部通过时这里是空操作。
++			discardRejectedJars(verification.rejectedJars());
+ 		}
+ 
+ 		LOGGER.info("Jar verification complete");
+ 	}
+ 
++	/**
++	 * 把签名校验判定为无效的 jar 从共享缓存里删掉.
++	 *
++	 * <p>这是一次对共享缓存产物的<b>写</b>，因此必须回到下载锁内做，与下载/抽取同一把锁
++	 * （{@link #downloadLockKey()}）：锁外删文件会让正好在读该产物的其它进程失败，在 Windows 上还会让
++	 * 它们的原子替换持续撞上共享冲突。
++	 *
++	 * <p>这并不推翻「校验在锁外」——校验本身只读且耗时，不该占着锁；只有真正需要改盘上内容的那一步
++	 * 才去取锁，而且只在失败路径上发生。
++	 */
++	private void discardRejectedJars(List<Path> rejected) {
++		if (rejected.isEmpty()) {
++			return;
++		}
++
++		try {
++			final LoomCacheService cacheService = LoomCacheService.get(getProject()).get();
++			final Path lockRoot = getExtension().getFiles().getCacheLocks().toPath();
++
++			cacheService.runExclusive(lockRoot, downloadLockKey(), LoomCacheService.defaultTimeout(), () -> {
++				for (Path path : rejected) {
++					try {
++						Files.deleteIfExists(path);
++					} catch (IOException e) {
++						LOGGER.error("Failed to delete invalid Minecraft jar: {}", path, e);
++					}
++				}
++
++				return null;
++			});
++		} catch (Exception e) {
++			// 删不掉不影响抛出原始校验异常（与改造前一致：删除失败只记日志）
++			LOGGER.error("Failed to discard invalid Minecraft jars", e);
++		}
++	}
++
+ 	// Returns true when a file was downloaded
+ 	private boolean downloadJars() throws IOException {
+ 		AtomicBoolean didDownload = new AtomicBoolean(false);
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SplitMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SplitMinecraftProvider.java
+index 81a46fc117a107489eec092eff1cb0ad6ce41faf..f4043f3347943e2a0dd0424f84951d3cdcc85a0d 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SplitMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/SplitMinecraftProvider.java
+@@ -109,6 +109,15 @@ public final class SplitMinecraftProvider extends MinecraftProvider {
+ 		});
+ 	}
+ 
++	// 拆分产物（minecraft-client-only.jar / minecraft-common.jar）的跨进程互斥 key，与下载/抽取分片。
++	//
++	// 两个产物由同一次拆分一起落位，所以它们共用这一个 key（与 SingleJarMinecraftProvider 按 type() 分片同理：
++	// 分片的单位是产物批次，不是单个文件）。拆分只读基类产物、只写自己的两件产物，不需要和下载排队。
++	@Override
++	protected String cacheKey() {
++		return "minecraft-split:" + minecraftVersion();
++	}
++
+ 	/**
+ 	 * 注册拆分任务：产物生产交给执行期任务，产物路径与配置期一致.
+ 	 *
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/verify/MinecraftJarVerification.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/verify/MinecraftJarVerification.java
+index b0fac6d33b8c629cb7295912b96c8c08b11293b2..5a55ce82b1f222d231da089913a466842fb88ecb 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/verify/MinecraftJarVerification.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/verify/MinecraftJarVerification.java
+@@ -25,8 +25,10 @@
+ package net.fabricmc.loom.configuration.providers.minecraft.verify;
+ 
+ import java.io.IOException;
+-import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
+ import java.util.Map;
+ import java.util.function.Function;
+ 
+@@ -43,6 +45,14 @@ public abstract class MinecraftJarVerification {
+ 
+ 	private final String minecraftVersion;
+ 
++	/**
++	 * 被判定为无效、待从缓存里摘掉的 jar.
++	 *
++	 * <p>本类<b>不自己删文件</b>：删除是对共享缓存产物的写，必须由调用方在它自己的跨进程锁内完成
++	 * （见 {@code MinecraftProvider#verifyJars}）。校验本身只读，才能搬到锁外跑。
++	 */
++	private final List<Path> rejectedJars = new ArrayList<>();
++
+ 	@Inject
+ 	protected abstract Project getProject();
+ 
+@@ -51,6 +61,11 @@ public abstract class MinecraftJarVerification {
+ 		this.minecraftVersion = minecraftVersion;
+ 	}
+ 
++	/** {@return 已被判定为无效、待调用方在锁内删除的 jar 列表} */
++	public List<Path> rejectedJars() {
++		return Collections.unmodifiableList(rejectedJars);
++	}
++
+ 	public void verifyClientJar(Path path) throws IOException, SignatureVerificationFailure {
+ 		verifyJarSignature(path, KnownJarType.CLIENT);
+ 	}
+@@ -73,13 +88,8 @@ public abstract class MinecraftJarVerification {
+ 			}
+ 
+ 			LOGGER.error("Verification of Minecraft {} signature failed: {}", path.getFileName(), e.getMessage());
+-
+-			try {
+-				Files.delete(path);
+-			} catch (IOException ioe) {
+-				LOGGER.error("Failed to delete invalid Minecraft jar: {}", path, ioe);
+-			}
+-
++			// 只登记，不在这里删：删除是对共享缓存的写，必须回到调用方的跨进程锁内（见类注释）
++			rejectedJars.add(path);
+ 			throw e;
+ 		}
+ 	}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/cache/LoomCacheServiceTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/cache/LoomCacheServiceTest.groovy
+index e3e525efad543e9ca0997e6bca3b6dde2c3372a3..97ac4c56608d122e05b15173c940b45b2b04f04e 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/cache/LoomCacheServiceTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/cache/LoomCacheServiceTest.groovy
+@@ -119,4 +119,69 @@ class LoomCacheServiceTest extends Specification {
+ 		!overlapDetected.get()
+ 		totalRuns.get() == threads
+ 	}
++
++	def "不同分片 key 的并发 runExclusive 可同时进入临界区（下载与合并不再互阻）"() {
++		// 背景：同一 MC 版本的「下载/抽取」「合并」「拆分」曾经共用一把锁（key = minecraft:<mc>），
++		// 于是冷启动时全部排成一条队。分片后三者各用各的 key，本用例直接验证这一点。
++		//
++		// 断言不靠墙钟阈值，而是靠两个 latch 互相确认：两边都必须先进入临界区、再等对方进入；
++		// 只要有一边被挡在锁外，等对方的那个 latch 就永远不会归零。如果锁被合并回去，本用例会卡住
++		// 到上限后判 sawOther == false 而失败，而不是靠「跑得快不快」猜。
++		given:
++		CountDownLatch downloadInside = new CountDownLatch(1)
++		CountDownLatch mergeInside = new CountDownLatch(1)
++		AtomicBoolean downloadSawMerge = new AtomicBoolean(false)
++		AtomicBoolean mergeSawDownload = new AtomicBoolean(false)
++		def pool = Executors.newFixedThreadPool(2)
++
++		// 失败上限，不是断言依据：成功路径上两个 latch 毫秒级归零
++		long boundSeconds = 30
++
++		when:
++		def downloadFuture = pool.submit {
++			service.runExclusive(lockRoot, "minecraft-download:1.20.1", Duration.ofSeconds(60)) {
++				downloadInside.countDown()
++				downloadSawMerge.set(mergeInside.await(boundSeconds, TimeUnit.SECONDS))
++				return null
++			}
++		}
++		def mergeFuture = pool.submit {
++			service.runExclusive(lockRoot, "minecraft-merge:1.20.1", Duration.ofSeconds(60)) {
++				mergeInside.countDown()
++				mergeSawDownload.set(downloadInside.await(boundSeconds, TimeUnit.SECONDS))
++				return null
++			}
++		}
++		downloadFuture.get(boundSeconds * 2, TimeUnit.SECONDS)
++		mergeFuture.get(boundSeconds * 2, TimeUnit.SECONDS)
++
++		then: "两个临界区确实重叠过（各自看到了对方在内）"
++		downloadSawMerge.get()
++		mergeSawDownload.get()
++
++		cleanup:
++		pool.shutdownNow()
++	}
++
++	def "不同分片 key 的锁文件互不相同（分片不会退化成共用一把锁）"() {
++		// 与上一个用例互补：那里验「能并行」，这里验「锁文件确实分开了」。
++		// 只看行为的话，两个 key 里只要有一个被哈希碰撞撞到同一文件就会误判；这里直接看目录里落了几把锁。
++		given:
++		def keys = [
++			"minecraft-download:1.20.1",
++			"minecraft-merge:1.20.1",
++			"minecraft-split:1.20.1"
++		]
++
++		when:
++		keys.forEach { key ->
++			service.runExclusive(lockRoot, key, Duration.ofSeconds(30)) {
++				-> null
++			}
++		}
++		def lockFiles = lockRoot.toFile().listFiles().findAll { it.name.endsWith(".lock") }*.name.sort()
++
++		then:
++		lockFiles.size() == keys.size()
++	}
+ }

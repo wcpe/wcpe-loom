@@ -1,0 +1,1028 @@
+From 9cdada2041890f6ca832ee6996e65f64b8de4050 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:20 +0800
+Subject: [PATCH 001/147] =?UTF-8?q?feat(cache):=20=E8=B7=A8=20daemon=20per?=
+ =?UTF-8?q?-key=20=E7=BC=93=E5=AD=98=E9=94=81=E4=B8=8E=E5=8E=9F=E5=AD=90?=
+ =?UTF-8?q?=E5=8F=91=E5=B8=83?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+多 daemon 并发构建同一版本时会同时生产共享缓存产物并互相踩踏；引入按缓存键隔离的
+跨进程文件锁与原子发布（唯一临时文件 + 原子 move），读方不会看到半成品。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/src/main/java/net/fabricmc/loom/extension/LoomFiles.java b/src/main/java/net/fabricmc/loom/extension/LoomFiles.java
+index d75a647456c63803f69de035bf4789f718d24c62..14fc606083997acce6ff68866f58ea196362b168 100644
+--- a/src/main/java/net/fabricmc/loom/extension/LoomFiles.java
++++ b/src/main/java/net/fabricmc/loom/extension/LoomFiles.java
+@@ -51,4 +51,6 @@ public interface LoomFiles {
+ 	File getLocalMinecraftRepo();
+ 	File getDecompileCache(String version);
+ 	File getForgeDependencyRepo();
++	// 共享缓存按 key 锁文件目录（仅写路径在缺失时使用，读路径不涉及）
++	File getCacheLocks();
+ }
+diff --git a/src/main/java/net/fabricmc/loom/extension/LoomFilesBaseImpl.java b/src/main/java/net/fabricmc/loom/extension/LoomFilesBaseImpl.java
+index 1675cdbc5eb4646b7c7a486c5a679934c2e1dbfe..311c919a45a0db06bd778e1fb0b5bdd424aea3ee 100644
+--- a/src/main/java/net/fabricmc/loom/extension/LoomFilesBaseImpl.java
++++ b/src/main/java/net/fabricmc/loom/extension/LoomFilesBaseImpl.java
+@@ -29,6 +29,7 @@ import java.io.File;
+ import org.gradle.api.Project;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
++import net.fabricmc.loom.util.Constants;
+ 
+ public abstract class LoomFilesBaseImpl implements LoomFiles {
+ 	protected abstract File getGradleUserHomeDir();
+@@ -47,6 +48,19 @@ public abstract class LoomFilesBaseImpl implements LoomFiles {
+ 
+ 	@Override
+ 	public File getUserCache() {
++		// 支持通过系统属性 fabric.loom.cache.dir 覆盖默认缓存目录，
++		// 实现多项目隔离：不同项目可指定各自独立的 Loom 缓存路径，
++		// 避免多项目同时构建时共享全局缓存产生锁竞争。
++		// 用法：在 gradle.properties 中设置 systemProp.fabric.loom.cache.dir=/path/to/loom-cache
++		// 默认目录保持 fabric-loom，与基底共享缓存协议兼容（同目录同锁语义）。
++		String customCacheDir = System.getProperty("fabric.loom.cache.dir");
++
++		if (customCacheDir != null && !customCacheDir.isEmpty()) {
++			File cacheDir = new File(customCacheDir);
++			cacheDir.mkdirs();
++			return cacheDir;
++		}
++
+ 		return createFile(getGradleUserHomeDir(), "caches" + File.separator + "fabric-loom");
+ 	}
+ 
+@@ -115,4 +129,8 @@ public abstract class LoomFilesBaseImpl implements LoomFiles {
+ 	public File getForgeDependencyRepo() {
+ 		return new File(getUserCache(), "forge/transformed-dependencies-v1");
+ 	}
++
++	public File getCacheLocks() {
++		return createFile(getUserCache(), Constants.Cache.LOCKS_DIR);
++	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java b/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
+index 1436a1b168e873f5d8e92f907bc2124fa416f51a..9abfb163b600da09f17751ef1fb29d11e2be4593 100644
+--- a/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
++++ b/src/main/java/net/fabricmc/loom/task/GenerateSourcesTask.java
+@@ -95,7 +95,9 @@ import net.fabricmc.loom.util.ExceptionUtil;
+ import net.fabricmc.loom.util.FileSystemUtil;
+ import net.fabricmc.loom.util.IOStringConsumer;
+ import net.fabricmc.loom.util.Platform;
++import net.fabricmc.loom.util.cache.CacheEntryLock;
+ import net.fabricmc.loom.util.gradle.GradleUtils;
++import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.loom.util.gradle.SyncTaskBuildService;
+ import net.fabricmc.loom.util.gradle.ThreadedProgressLoggerConsumer;
+ import net.fabricmc.loom.util.gradle.ThreadedSimpleProgressLogger;
+@@ -109,7 +111,8 @@ import net.fabricmc.mappingio.tree.MemoryMappingTree;
+ 
+ @DisableCachingByDefault
+ public abstract class GenerateSourcesTask extends AbstractLoomTask {
+-	private static final String CACHE_VERSION = "v1";
++	// v2：引入跨进程缓存锁与原子发布机制后 bump，使旧版本反编译缓存自然失效重建
++	private static final String CACHE_VERSION = "v2";
+ 	private final DecompilerOptions decompilerOptions;
+ 
+ 	/**
+@@ -281,27 +284,34 @@ public abstract class GenerateSourcesTask extends AbstractLoomTask {
+ 
+ 			try (var timer = new Timer("Decompiled sources with cache")) {
+ 				final Path cacheFile = getDecompileCacheFile().getAsFile().get().toPath();
++				// 反编译缓存锁：缓存文件位于 <userCache>/decompile/<version>.zip，锁目录取 <userCache>/.locks。
++				// 跨进程按缓存文件名加锁，避免多个 genSources 任务（不同子项目/不同 daemon）并发读写同一缓存 zip 导致损坏。
++				final Path lockRoot = cacheFile.getParent().getParent().resolve(Constants.Cache.LOCKS_DIR);
++				final String lockKey = "decompile:" + cacheFile.getFileName();
++
++				CacheEntryLock.withLock(lockRoot, lockKey, LoomCacheService.defaultTimeout(), () -> {
++					if (getResetCache().get()) {
++						getLogger().warn("Resetting decompile cache");
++						Files.deleteIfExists(cacheFile);
++					}
+ 
+-				if (getResetCache().get()) {
+-					getLogger().warn("Resetting decompile cache");
+-					Files.deleteIfExists(cacheFile);
+-				}
++					Files.createDirectories(cacheFile.getParent());
+ 
+-				// TODO ensure we have a lock on this file to prevent multiple tasks from running at the same time
+-				Files.createDirectories(cacheFile.getParent());
++					if (Files.exists(cacheFile)) {
++						try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(cacheFile, true)) {
++							// Success, cache exists and can be read
++						} catch (IOException e) {
++							getLogger().warn("Discarding invalid decompile cache file: {}", cacheFile, e);
++							Files.delete(cacheFile);
++						}
++					}
+ 
+-				if (Files.exists(cacheFile)) {
+ 					try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(cacheFile, true)) {
+-						// Success, cache exists and can be read
+-					} catch (IOException e) {
+-						getLogger().warn("Discarding invalid decompile cache file: {}", cacheFile, e);
+-						Files.delete(cacheFile);
++						runWithCache(serviceFactory, fs.getRoot());
+ 					}
+-				}
+ 
+-				try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(cacheFile, true)) {
+-					runWithCache(serviceFactory, fs.getRoot());
+-				}
++					return null;
++				});
+ 			} catch (Exception e) {
+ 				ExceptionUtil.processException(e, getDaemonUtilsContext().get());
+ 				throw ExceptionUtil.createDescriptiveWrapper(RuntimeException::new, "Failed to decompile", e);
+diff --git a/src/main/java/net/fabricmc/loom/util/cache/AtomicFiles.java b/src/main/java/net/fabricmc/loom/util/cache/AtomicFiles.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a238c86a8be21ff43994646cad7087fb3671b8f7
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/util/cache/AtomicFiles.java
+@@ -0,0 +1,114 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2025 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.util.cache;
++
++import java.io.IOException;
++import java.nio.file.AtomicMoveNotSupportedException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardCopyOption;
++import java.util.UUID;
++
++/**
++ * 原子发布工具：保证「文件存在 ⟺ 内容完整」这一不变量成立.
++ *
++ * <p>各最终产物先写入「与 target 同目录的唯一临时文件」，写完整后再用原子 move 落位。
++ * 这样跨 daemon 的无锁存在性检查不会在写入期间看到半成品：读方要么看到旧文件、要么看到完整的新文件。
++ */
++public final class AtomicFiles {
++	private AtomicFiles() {
++	}
++
++	/**
++	 * 接收一个 Path 并向其写入内容的回调，允许抛出 {@link IOException}.
++	 */
++	@FunctionalInterface
++	public interface IOConsumer<T> {
++		void accept(T t) throws IOException;
++	}
++
++	/**
++	 * 原子发布：让 producer 把内容写入「同目录唯一临时文件」，写完后原子 move 到 target.
++	 *
++	 * <p>临时文件用 {@link Files#createTempFile(Path, String, String, java.nio.file.attribute.FileAttribute[])}
++	 * 生成唯一名，避免并发写同一 target 时多个临时文件互相踩踏。无论成功失败，finally 都会清理临时文件。
++	 *
++	 * @param target   最终落位路径
++	 * @param producer 内容生产者，接收临时文件路径并把内容写进去
++	 */
++	public static void publish(Path target, IOConsumer<Path> producer) throws IOException {
++		Files.createDirectories(target.getParent());
++		// 生成唯一且「尚不存在」的临时路径，且不预先创建文件——这点很关键：
++		//   - 唯一名（UUID）避免并发写同一 target 时多个临时文件互相踩踏；
++		//   - 不预先创建空文件，是因为很多生产者（zip/jar 文件系统、tinyremapper 输出）要求目标不存在、由其自行创建，
++		//     若预先创建一个空文件，会被当成「损坏的 zip」而失败（暖缓存会跳过这些步骤，故该问题只在冷缓存暴露）。
++		final Path tmp = tempSibling(target);
++
++		try {
++			producer.accept(tmp);
++			move(tmp, target);
++		} finally {
++			// 原子 move 成功后 tmp 已不存在；失败时清理残留，避免遗留垃圾临时文件
++			Files.deleteIfExists(tmp);
++		}
++	}
++
++	/**
++	 * 为 target 生成一个同目录、唯一且尚不存在的临时路径（不创建文件）.
++	 *
++	 * <p>供「一次产生多个输出、不便用 {@link #publish} 逐个包裹」的场景使用（例如 jar 拆分写两个文件）：
++	 * 调用方把内容写入这些临时路径后，用 {@link #move} 各自原子落位。
++	 */
++	public static Path tempSibling(Path target) {
++		final String name = target.getFileName().toString();
++		final int dot = name.lastIndexOf('.');
++		// 保留 target 的原始扩展名（.jar/.zip 等）：tinyremapper 的 OutputConsumerPath 等工具按扩展名
++		// 决定输出是 zip 还是目录，若临时文件以 .tmp 结尾会被当成目录输出，在 Windows 上报错。
++		final String stem = dot >= 0 ? name.substring(0, dot) : name;
++		final String ext = dot >= 0 ? name.substring(dot) : "";
++		return target.resolveSibling(stem + "." + UUID.randomUUID() + ".tmp" + ext);
++	}
++
++	/**
++	 * 便捷方法：原子复制一个已存在的源文件到 target.
++	 */
++	public static void copy(Path source, Path target) throws IOException {
++		publish(target, tmp -> Files.copy(source, tmp, StandardCopyOption.REPLACE_EXISTING));
++	}
++
++	/**
++	 * 原子 move：优先 ATOMIC_MOVE，个别平台不支持时退化为普通 move.
++	 *
++	 * <p>用于调用方已将内容写入同目录临时文件、需把其原子落位到 target 的场景
++	 * （例如一次产生多个输出、不便用 {@link #publish} 逐个包裹时）。
++	 */
++	public static void move(Path source, Path target) throws IOException {
++		try {
++			Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
++		} catch (AtomicMoveNotSupportedException e) {
++			Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
++		}
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/util/cache/CacheEntryLock.java b/src/main/java/net/fabricmc/loom/util/cache/CacheEntryLock.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c78b6559d04171a5be7932cd8acee8e9d03558e5
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/util/cache/CacheEntryLock.java
+@@ -0,0 +1,171 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2025 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.util.cache;
++
++import java.io.IOException;
++import java.nio.channels.FileChannel;
++import java.nio.channels.FileLock;
++import java.nio.channels.OverlappingFileLockException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardOpenOption;
++import java.time.Duration;
++import java.time.LocalTime;
++import java.util.concurrent.Callable;
++
++import org.gradle.api.GradleException;
++import org.gradle.api.logging.Logger;
++import org.gradle.api.logging.Logging;
++
++import net.fabricmc.loom.util.Checksum;
++
++/**
++ * 跨进程的按 key 细粒度文件锁工具.
++ *
++ * <p>每个缓存条目对应一把独立的锁文件，多个 Gradle daemon 进程在生产同一缓存条目时
++ * 通过该锁串行化，避免重复或损坏的写入。读已发布缓存的路径不应使用此工具（读路径无锁）。
++ */
++public final class CacheEntryLock {
++	private CacheEntryLock() {
++	}
++
++	/**
++	 * 在按 key 取得的跨进程文件锁保护下执行 {@code action}.
++	 *
++	 * <p>取得锁后会把持有者信息（PID、工作目录、时间）写入旁文件 {@code <hash>.lock.owner}，
++	 * 供其它等待进程读取并播报「锁被谁持有」；释放锁时删除旁文件。持有者信息不写入锁文件本体，
++	 * 因为 Windows 的文件锁是强制锁，其它进程读被锁文件会被拒绝。
++	 *
++	 * @param lockRoot 锁文件所在目录，会按需创建
++	 * @param key      缓存条目的逻辑 key，内部以其 sha256 命名锁文件
++	 * @param timeout  等待锁的最长时间，超时抛出 {@link GradleException}
++	 * @param action   取得锁后执行的动作
++	 * @param <T>      动作返回值类型
++	 * @return action 的返回值
++	 * @throws Exception action 自身抛出的异常会原样向上传播
++	 */
++	public static <T> T withLock(Path lockRoot, String key, Duration timeout, Callable<T> action) throws Exception {
++		Files.createDirectories(lockRoot);
++		// 锁文件长期复用，不在结束时删除，避免「删文件」与「持锁」之间的竞态
++		final Path lockFile = lockRoot.resolve(Checksum.of(key).sha256().hex() + ".lock");
++		final Path ownerFile = lockFile.resolveSibling(lockFile.getFileName() + ".owner");
++
++		try (FileChannel channel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.READ)) {
++			FileLock lock = acquireFileLockWithTimeout(channel, key, ownerFile, timeout);
++			writeOwnerInfo(ownerFile, key);
++
++			try {
++				return action.call();
++			} finally {
++				// 先删持有者旁文件再释放锁：等待者只在拿不到锁时才读旁文件，
++				// 此顺序保证旁文件存在时其内容必出自当前（或刚释放的）持有者，不会长期误导
++				try {
++					Files.deleteIfExists(ownerFile);
++				} catch (IOException e) {
++					// 删除失败不影响正确性（下一个持有者会覆盖），忽略
++				}
++
++				if (lock.isValid()) {
++					lock.release();
++				}
++			}
++		}
++	}
++
++	// 带超时的 NIO 文件锁获取：通过轮询 tryLock() 实现超时等待
++	@SuppressWarnings("BusyWait")
++	private static FileLock acquireFileLockWithTimeout(FileChannel channel, String key, Path ownerFile, Duration timeout) throws IOException {
++		final long timeoutMs = timeout.toMillis();
++		final Logger logger = Logging.getLogger("loom_cacheEntryLock");
++		long waitedMs = 0;
++
++		while (true) {
++			FileLock lock = null;
++
++			try {
++				lock = channel.tryLock();
++			} catch (OverlappingFileLockException e) {
++				// 同一 JVM 内已有线程持有/正在获取该文件的重叠锁；视为竞争，继续轮询等待
++			}
++
++			if (lock != null) {
++				return lock;
++			}
++
++			if (waitedMs == 0) {
++				logger.lifecycle("正在等待共享缓存锁（key={}）{}", key, describeOwner(ownerFile));
++			}
++
++			try {
++				Thread.sleep(100);
++			} catch (InterruptedException e) {
++				Thread.currentThread().interrupt();
++				throw new IOException("等待共享缓存锁时被中断（key=%s）".formatted(key), e);
++			}
++
++			waitedMs += 100;
++
++			if (waitedMs >= 1000 * 60 && waitedMs % (1000 * 60) == 0L) {
++				logger.lifecycle("已等待共享缓存锁 {} 分钟（key={}）{}", waitedMs / 1000 / 60, key, describeOwner(ownerFile));
++
++				if (waitedMs == 1000 * 60 * 2) {
++					logger.lifecycle("提示：若持有锁的构建正在缓慢下载 Minecraft，可在 gradle.properties 配置镜像（如 loom_libraries_base / loom_version_manifests / loom_resources_base）以加速；持有进程若已无响应可按上述 PID 手动结束。");
++				}
++			}
++
++			if (waitedMs >= timeoutMs) {
++				throw new GradleException("等待共享缓存锁超时（key=%s, 超时=%dms）%s".formatted(key, timeoutMs, describeOwner(ownerFile)));
++			}
++		}
++	}
++
++	// 把持有者信息写入旁文件：PID、工作目录、获取时间。写失败不影响锁语义，仅损失诊断信息
++	private static void writeOwnerInfo(Path ownerFile, String key) {
++		try {
++			final String info = "pid=%d, dir=%s, key=%s, since=%s".formatted(
++					ProcessHandle.current().pid(),
++					System.getProperty("user.dir", "?"),
++					key,
++					LocalTime.now().withNano(0));
++			Files.write(ownerFile, info.getBytes(StandardCharsets.UTF_8));
++		} catch (IOException e) {
++			Logging.getLogger("loom_cacheEntryLock").debug("写入锁持有者信息失败（仅影响诊断）", e);
++		}
++	}
++
++	// 读取持有者旁文件生成描述；读不到（持有者刚释放/写失败）时返回空串
++	private static String describeOwner(Path ownerFile) {
++		try {
++			if (Files.exists(ownerFile)) {
++				return "，当前持有者：[" + Files.readString(ownerFile, StandardCharsets.UTF_8).trim() + "]";
++			}
++		} catch (IOException e) {
++			// 旁文件读取竞态（持有者正在删除）等情况，忽略即可
++		}
++
++		return "...";
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/util/cache/package-info.java b/src/main/java/net/fabricmc/loom/util/cache/package-info.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..79818cd1f9993e1c39ee70789e93d9d708959330
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/util/cache/package-info.java
+@@ -0,0 +1,28 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2025 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++@NullMarked
++package net.fabricmc.loom.util.cache;
++
++import org.jspecify.annotations.NullMarked;
+diff --git a/src/main/java/net/fabricmc/loom/util/gradle/LoomCacheService.java b/src/main/java/net/fabricmc/loom/util/gradle/LoomCacheService.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f25603eba2f314e66e45def1ece39f94ce18bf9
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/util/gradle/LoomCacheService.java
+@@ -0,0 +1,113 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2025 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.util.gradle;
++
++import java.io.File;
++import java.nio.file.Path;
++import java.time.Duration;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ConcurrentHashMap;
++
++import org.gradle.api.Project;
++import org.gradle.api.logging.Logging;
++import org.gradle.api.provider.Provider;
++import org.gradle.api.services.BuildService;
++import org.gradle.api.services.BuildServiceParameters;
++
++import net.fabricmc.loom.util.cache.CacheEntryLock;
++
++/**
++ * build 作用域的共享缓存编排服务.
++ *
++ * <p>在 JVM 内按 key 去重，并叠加跨进程文件锁，使同一缓存条目的生产在「单 daemon --parallel」与
++ * 「多 daemon」下都串行化。读已发布缓存的路径由调用方自身的存在性检查无锁完成，无需经过此服务。
++ */
++public abstract class LoomCacheService implements BuildService<BuildServiceParameters.None> {
++	public static final String NAME = "loomSharedCache";
++
++	// JVM 内 per-key 监视器，保证同一构建（含 --parallel）内同 key 的生产串行
++	private final ConcurrentHashMap<String, Object> monitors = new ConcurrentHashMap<>();
++
++	/**
++	 * 在按 key 取得的「JVM 监视器 + 跨进程文件锁」保护下执行一个互斥动作.
++	 *
++	 * <p>读路径应由调用方自身的存在性检查无锁完成；仅在判定需要生产时才调用本方法取锁。
++	 * 各 provider 以 {@code shouldRefreshOutputs} / {@code Files.exists} 作为无锁快路径，
++	 * 配合产物的原子发布（写入即完整），保证读方不会看到半成品。
++	 *
++	 * @param lockRoot 锁文件目录
++	 * @param key      互斥 key
++	 * @param timeout  等待跨进程锁的超时时间
++	 * @param action   取得锁后执行的动作
++	 */
++	public void runExclusive(Path lockRoot, String key, Duration timeout, Callable<Void> action) throws Exception {
++		final Object monitor = monitors.computeIfAbsent(key, k -> new Object());
++
++		synchronized (monitor) {
++			CacheEntryLock.withLock(lockRoot, key, timeout, action);
++		}
++	}
++
++	/**
++	 * 共享缓存锁的默认等待超时.
++	 *
++	 * <p>可通过系统属性 {@code fabric.loom.lock.timeout.minutes} 覆盖
++	 * （在 gradle.properties 中写 {@code systemProp.fabric.loom.lock.timeout.minutes=10}）。
++	 * 未配置时：CI 上 1 分钟（不太可能解锁），本地 30 分钟（容忍首次冷构建的慢速下载，
++	 * 但避免在异常持有者上无限等待——配合等待日志中的持有者 PID 可手动处置）。
++	 */
++	public static Duration defaultTimeout() {
++		final String override = System.getProperty("fabric.loom.lock.timeout.minutes");
++
++		if (override != null) {
++			try {
++				return Duration.ofMinutes(Long.parseLong(override.trim()));
++			} catch (NumberFormatException e) {
++				Logging.getLogger(LoomCacheService.class).warn("无效的 fabric.loom.lock.timeout.minutes 值：{}，使用默认超时", override);
++			}
++		}
++
++		if (System.getenv("CI") != null) {
++			return Duration.ofMinutes(1);
++		}
++
++		return Duration.ofMinutes(30);
++	}
++
++	/**
++	 * mod 依赖重映射写 LOCAL 共享 {@code remapped_mods} 缓存时的互斥 key（按根项目目录 + mappings 标识分）.
++	 *
++	 * <p>同一 checkout 的多个并发构建（如同时跑 client 与 server）共享该 key、串行化写入；
++	 * 不同 checkout 根目录不同 → key 不同 → 互不阻塞。两处写入点（ModProcessor / SourceRemapper）
++	 * 用同一助手生成 key，避免写法漂移。
++	 */
++	public static String modDepsKey(File rootDir, String mappingsIdentifier) {
++		return "mod-deps:" + rootDir.getAbsolutePath() + ":" + mappingsIdentifier;
++	}
++
++	public static Provider<LoomCacheService> get(Project project) {
++		return project.getGradle().getSharedServices().registerIfAbsent(NAME, LoomCacheService.class, spec -> { });
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/cache/AtomicFilesTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/cache/AtomicFilesTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..a40746f488a54e22900b2316676b777dd99dbbfb
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/cache/AtomicFilesTest.groovy
+@@ -0,0 +1,215 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2025 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.cache
++
++import java.nio.charset.StandardCharsets
++import java.nio.file.Files
++import java.nio.file.Path
++import java.util.stream.Collectors
++
++import spock.lang.Specification
++import spock.lang.TempDir
++
++import net.fabricmc.loom.util.FileSystemUtil
++import net.fabricmc.loom.util.cache.AtomicFiles
++
++class AtomicFilesTest extends Specification {
++	@TempDir
++	Path tempDir
++
++	def "tempSibling 保留原扩展名且唯一"() {
++		given:
++		def jarTarget = tempDir.resolve("minecraft-merged.jar")
++		def pomTarget = tempDir.resolve("foo.pom")
++		def noExtTarget = tempDir.resolve("plainfile")
++
++		when:
++		def jarTmp = AtomicFiles.tempSibling(jarTarget)
++		def pomTmp = AtomicFiles.tempSibling(pomTarget)
++		def noExtTmp = AtomicFiles.tempSibling(noExtTarget)
++
++		then:
++		// 扩展名必须保留：否则 tinyremapper 等按扩展名判断输出类型的工具会出错
++		jarTmp.fileName.toString().endsWith(".jar")
++		pomTmp.fileName.toString().endsWith(".pom")
++		// 同目录、唯一、不预先存在
++		jarTmp.parent == jarTarget.parent
++		AtomicFiles.tempSibling(jarTarget) != AtomicFiles.tempSibling(jarTarget)
++		Files.notExists(jarTmp)
++		// 无扩展名时不追加多余的点
++		!noExtTmp.fileName.toString().endsWith(".")
++	}
++
++	def "publish 适用于 zip/jar 生产者（producer 需把临时文件当作新 jar 创建）"() {
++		given:
++		// 复现 merge/split/remap 等真实场景：producer 用 getJarFileSystem(tmp, true) 把 tmp 当作新 zip 创建并写入。
++		// 若 publish 预先创建了空文件，zip 文件系统会因空文件不是合法 zip 而失败。
++		def target = tempDir.resolve("out.jar")
++
++		when:
++		AtomicFiles.publish(target, this.&writeHelloJar)
++
++		then:
++		Files.exists(target)
++		readHelloJar(target) == "hi"
++	}
++
++	def "publish 后 target 内容完整"() {
++		given:
++		def target = tempDir.resolve("out.txt")
++
++		when:
++		AtomicFiles.publish(target) { tmp ->
++			Files.writeString(tmp, "完整内容", StandardCharsets.UTF_8)
++		}
++
++		then:
++		Files.exists(target)
++		Files.readString(target, StandardCharsets.UTF_8) == "完整内容"
++	}
++
++	def "publish 会自动创建父目录"() {
++		given:
++		def target = tempDir.resolve("nested/dir/out.txt")
++
++		when:
++		AtomicFiles.publish(target) { tmp ->
++			Files.writeString(tmp, "数据", StandardCharsets.UTF_8)
++		}
++
++		then:
++		Files.readString(target, StandardCharsets.UTF_8) == "数据"
++	}
++
++	def "producer 抛异常时 target 不出现且临时文件被清理"() {
++		given:
++		def target = tempDir.resolve("out.txt")
++
++		when:
++		AtomicFiles.publish(target) { tmp ->
++			Files.writeString(tmp, "半成品", StandardCharsets.UTF_8)
++			throw new IOException("模拟写入中途失败")
++		}
++
++		then:
++		thrown(IOException)
++		// target 不应出现
++		Files.notExists(target)
++		// 临时文件应被清理，目录里不残留任何文件
++		listDir(tempDir).isEmpty()
++	}
++
++	def "producer 抛异常时保留 target 旧内容"() {
++		given:
++		def target = tempDir.resolve("out.txt")
++		Files.writeString(target, "旧内容", StandardCharsets.UTF_8)
++
++		when:
++		AtomicFiles.publish(target) { tmp ->
++			Files.writeString(tmp, "新的半成品", StandardCharsets.UTF_8)
++			throw new IOException("模拟写入中途失败")
++		}
++
++		then:
++		thrown(IOException)
++		// 旧内容应被保留
++		Files.readString(target, StandardCharsets.UTF_8) == "旧内容"
++		// 仅剩 target 一个文件，临时文件已清理
++		listDir(tempDir).size() == 1
++	}
++
++	def "copy 原子复制源文件到 target"() {
++		given:
++		def source = tempDir.resolve("source.bin")
++		Files.write(source, [1, 2, 3, 4] as byte[])
++		def target = tempDir.resolve("target.bin")
++
++		when:
++		AtomicFiles.copy(source, target)
++
++		then:
++		Files.readAllBytes(target) == [1, 2, 3, 4] as byte[]
++		// 源文件保持不变
++		Files.exists(source)
++	}
++
++	def "move 原子移动源文件到 target"() {
++		given:
++		def source = tempDir.resolve("source.bin")
++		Files.write(source, [9, 8, 7] as byte[])
++		def target = tempDir.resolve("target.bin")
++
++		when:
++		AtomicFiles.move(source, target)
++
++		then:
++		Files.readAllBytes(target) == [9, 8, 7] as byte[]
++		// 源文件已被移走
++		Files.notExists(source)
++	}
++
++	def "publish 覆盖已存在的 target"() {
++		given:
++		def target = tempDir.resolve("out.txt")
++		Files.writeString(target, "旧内容", StandardCharsets.UTF_8)
++
++		when:
++		AtomicFiles.publish(target) { tmp ->
++			Files.writeString(tmp, "新内容", StandardCharsets.UTF_8)
++		}
++
++		then:
++		Files.readString(target, StandardCharsets.UTF_8) == "新内容"
++		// 不残留临时文件
++		listDir(tempDir).size() == 1
++	}
++
++	private static List<Path> listDir(Path dir) {
++		Files.list(dir).withCloseable { stream ->
++			return stream.collect(Collectors.toList())
++		}
++	}
++
++	/** 读取 zip 内 hello.txt 内容（简化实现规避 groovy formatter 缺陷） */
++	private static String readHelloJar(Path jar) {
++		def zin = new java.util.zip.ZipInputStream(Files.newInputStream(jar))
++		try {
++			def entry = zin.nextEntry
++			while (entry != null && entry.name != "hello.txt") {
++				entry = zin.nextEntry
++			}
++			return entry == null ? null : new String(zin.readAllBytes(), StandardCharsets.UTF_8)
++		} finally {
++			zin.close()
++		}
++	}
++
++	/** publish 消费者：把临时文件当作新 zip 创建并写入内容（方法引用形式规避 groovy formatter 缺陷） */
++	private static void writeHelloJar(Path tmp) {
++		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(tmp, true)) {
++			Files.writeString(fs.getRoot().resolve("hello.txt"), "hi", StandardCharsets.UTF_8)
++		}
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/cache/CacheEntryLockTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/cache/CacheEntryLockTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b824d6135cf1c46d1a8ab380e5d9fb95639bb00
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/cache/CacheEntryLockTest.groovy
+@@ -0,0 +1,91 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2025 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.cache
++
++import java.nio.file.Path
++import java.time.Duration
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicBoolean
++import java.util.concurrent.atomic.AtomicInteger
++
++import spock.lang.Specification
++import spock.lang.TempDir
++
++import net.fabricmc.loom.util.cache.CacheEntryLock
++
++class CacheEntryLockTest extends Specification {
++	@TempDir
++	Path lockRoot
++
++	def "单线程 withLock 能正常返回 action 结果"() {
++		when:
++		def result = CacheEntryLock.withLock(lockRoot, "key", Duration.ofSeconds(5)) { -> "ok" }
++
++		then:
++		result == "ok"
++	}
++
++	def "同一 key 并发互斥：计数最终等于线程数且无临界区重叠"() {
++		given:
++		int threads = 8
++		AtomicInteger counter = new AtomicInteger(0)
++		AtomicBoolean inside = new AtomicBoolean(false)
++		AtomicInteger conflicts = new AtomicInteger(0)
++		CountDownLatch ready = new CountDownLatch(threads)
++		CountDownLatch start = new CountDownLatch(1)
++		def pool = Executors.newFixedThreadPool(threads)
++
++		when:
++		def futures = (1..threads).collect {
++			pool.submit {
++				ready.countDown()
++				start.await()
++				CacheEntryLock.withLock(lockRoot, "shared-key", Duration.ofSeconds(30)) {
++					// 进入临界区：若发现已有线程在内则记录冲突
++					if (!inside.compareAndSet(false, true)) {
++						conflicts.incrementAndGet()
++					}
++
++					// 读-改-写，并 sleep 制造重叠窗口
++					int v = counter.get()
++					Thread.sleep(5)
++					counter.set(v + 1)
++					inside.set(false)
++					return null
++				}
++			}
++		}
++		ready.await()
++		start.countDown()
++		futures.each { it.get(60, TimeUnit.SECONDS) }
++		pool.shutdown()
++
++		then:
++		counter.get() == threads
++		conflicts.get() == 0
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/cache/LoomCacheServiceTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/cache/LoomCacheServiceTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..691ed842d2aae700a7d08744c24019c169d70348
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/cache/LoomCacheServiceTest.groovy
+@@ -0,0 +1,112 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2025 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.unit.cache
++
++import java.nio.file.Path
++import java.time.Duration
++import java.util.concurrent.Callable
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicBoolean
++import java.util.concurrent.atomic.AtomicInteger
++
++import org.gradle.api.services.BuildServiceParameters
++import spock.lang.Specification
++import spock.lang.TempDir
++
++import net.fabricmc.loom.util.gradle.LoomCacheService
++
++class LoomCacheServiceTest extends Specification {
++	@TempDir
++	Path tempDir
++
++	Path lockRoot
++	// BuildService 是 abstract 类，无法直接 new，使用匿名子类绕过 Gradle 实例化；
++	// runExclusive 不会用到 getParameters，故返回 None 占位即可
++	LoomCacheService service = new LoomCacheService() {
++		@Override
++		BuildServiceParameters.None getParameters() {
++			return null
++		}
++	}
++
++	def setup() {
++		lockRoot = tempDir.resolve("locks")
++	}
++
++	def "runExclusive 执行 action 并正常返回"() {
++		given:
++		AtomicInteger callCount = new AtomicInteger(0)
++		Callable<Void> action = { -> callCount.incrementAndGet(); null }
++
++		when:
++		service.runExclusive(lockRoot, "key", Duration.ofSeconds(30), action)
++
++		then:
++		callCount.get() == 1
++	}
++
++	def "同 key 并发 runExclusive 严格互斥且每个 action 都执行"() {
++		given:
++		int threads = 8
++		AtomicInteger totalRuns = new AtomicInteger(0)
++		AtomicInteger inside = new AtomicInteger(0)
++		AtomicBoolean overlapDetected = new AtomicBoolean(false)
++		CountDownLatch ready = new CountDownLatch(threads)
++		CountDownLatch start = new CountDownLatch(1)
++		def pool = Executors.newFixedThreadPool(threads)
++
++		Callable<Void> action = {
++			->
++			// 进入临界区：若已有其它线程在内，说明互斥被破坏
++			if (inside.incrementAndGet() != 1) {
++				overlapDetected.set(true)
++			}
++
++			Thread.sleep(20)
++			totalRuns.incrementAndGet()
++			inside.decrementAndGet()
++			return null
++		}
++
++		when:
++		def futures = (1..threads).collect {
++			pool.submit {
++				ready.countDown()
++				start.await()
++				service.runExclusive(lockRoot, "key", Duration.ofSeconds(60), action)
++			}
++		}
++		ready.await()
++		start.countDown()
++		futures.each { it.get(120, TimeUnit.SECONDS) }
++		pool.shutdown()
++
++		then:
++		!overlapDetected.get()
++		totalRuns.get() == threads
++	}
++}

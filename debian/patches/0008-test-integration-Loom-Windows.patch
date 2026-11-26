@@ -1,0 +1,191 @@
+From 3ff26b1cbe3ec41af38d10b31161e632b804e7d3 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:24 +0800
+Subject: [PATCH 008/147] =?UTF-8?q?test(integration):=20=E5=A2=9E=E5=8A=A0?=
+ =?UTF-8?q?=E5=A4=9A=20Loom=20=E5=AD=90=E9=A1=B9=E7=9B=AE=E4=B8=8E=20Windo?=
+ =?UTF-8?q?ws=20=E8=B7=AF=E5=BE=84=E5=9B=9E=E5=BD=92=E6=B5=8B=E8=AF=95?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+覆盖多子项目直连 Loom、配置缓存复用，以及 Windows 下的路径处理。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/MultiProjectDirectPluginTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/MultiProjectDirectPluginTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..82f6702bb48165cdc0b5ce828b438d659550e358
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/MultiProjectDirectPluginTest.groovy
+@@ -0,0 +1,46 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 WCPE
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration
++
++import spock.lang.Specification
++
++import net.fabricmc.loom.test.util.GradleProjectTestTrait
++
++import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
++
++class MultiProjectDirectPluginTest extends Specification implements GradleProjectTestTrait {
++	def "multiple subprojects can apply Loom directly in one Gradle root"() {
++	setup:
++		def gradle = gradleProject(project: "multiProjectDirectLoom", version: "9.5.0")
++		gradle.buildSrc("loomClasspath")
++
++		when:
++		def result = gradle.run(tasks: [":one:configureClientLaunch", ":two:configureClientLaunch"])
++
++		then:
++		result.task(":one:configureClientLaunch").outcome == SUCCESS
++		result.task(":two:configureClientLaunch").outcome == SUCCESS
++	}
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/SimpleDevOnlyRemapTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/SimpleDevOnlyRemapTest.groovy
+index 48f1dbb3d48d0a8932c53dffbd8a980872fe35aa..55d169860f4ba2b58e5d5667cea6587777ff5f56 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/integration/SimpleDevOnlyRemapTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/SimpleDevOnlyRemapTest.groovy
+@@ -138,12 +138,13 @@ class SimpleDevOnlyRemapTest extends Specification implements GradleProjectTestT
+ 	def "build with official to named"() {
+ 		setup:
+ 		def mappings = Path.of("src/test/resources/mappings/25w46a_unobfuscated-named-minimal.tiny").toAbsolutePath()
++		def mappingsLiteral = mappings.toString().replace('\\', '/')
+ 		def gradle = gradleProject(project: "minimalBase", version: PRE_RELEASE_GRADLE)
+ 		gradle.buildGradle << """
+ 				dependencies {
+ 					minecraft 'com.mojang:minecraft:25w46a_unobfuscated'
+ 					mappings loom.layered {
+-					    it.mappings file("${mappings}")
++					    it.mappings file("${mappingsLiteral}")
+ 					}
+ 					modImplementation "${LoomTestVersions.FABRIC_LOADER.mavenNotation()}"
+                 }
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/buildSrc/loomClasspath/ForeignCacheService.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/buildSrc/loomClasspath/ForeignCacheService.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..065acfc4e19def10da4b1ed98f4acca2d1b66176
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/buildSrc/loomClasspath/ForeignCacheService.groovy
+@@ -0,0 +1,7 @@
++package net.fabricmc.loom.test.integration.buildSrc.loomClasspath
++
++import org.gradle.api.services.BuildService
++import org.gradle.api.services.BuildServiceParameters
++
++abstract class ForeignCacheService implements BuildService<BuildServiceParameters.None> {
++}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/buildSrc/loomClasspath/TestPlugin.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/buildSrc/loomClasspath/TestPlugin.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..a26cb06e8206090e8f4199ef47857e3854273a99
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/buildSrc/loomClasspath/TestPlugin.groovy
+@@ -0,0 +1,13 @@
++package net.fabricmc.loom.test.integration.buildSrc.loomClasspath
++
++import org.gradle.api.Plugin
++import org.gradle.api.Project
++
++class TestPlugin implements Plugin<Project> {
++	@Override
++	void apply(Project project) {
++		// Register a same-name service from the convention plugin classloader.
++		// Loom must not cast this foreign registration to its own LoomCacheService.
++		project.gradle.sharedServices.registerIfAbsent("loomSharedCache", ForeignCacheService) { }
++	}
++}
+diff --git a/src/test/resources/projects/multiProjectDirectLoom/build.gradle b/src/test/resources/projects/multiProjectDirectLoom/build.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..d244cde1d5c314ddfa30e1618d4964f6b7cb33c9
+--- /dev/null
++++ b/src/test/resources/projects/multiProjectDirectLoom/build.gradle
+@@ -0,0 +1,13 @@
++plugins {
++	id "java"
++}
++
++apply plugin: "gg.essential.loom"
++
++version = "1.0.0"
++
++dependencies {
++	minecraft "com.mojang:minecraft:1.20.4"
++	mappings loom.officialMojangMappings()
++	modImplementation "net.fabricmc:fabric-loader:0.15.6"
++}
+diff --git a/src/test/resources/projects/multiProjectDirectLoom/one/build.gradle b/src/test/resources/projects/multiProjectDirectLoom/one/build.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..d0d1c59aa5144ce73b6b09debd1a5d1eb0ce5bc2
+--- /dev/null
++++ b/src/test/resources/projects/multiProjectDirectLoom/one/build.gradle
+@@ -0,0 +1,16 @@
++plugins {
++	id "java"
++	id "gg.essential.loom"
++}
++
++version = "1.0.0"
++
++base {
++	archivesName = "one"
++}
++
++dependencies {
++	minecraft "com.mojang:minecraft:1.20.4"
++	mappings loom.officialMojangMappings()
++	modImplementation "net.fabricmc:fabric-loader:0.15.6"
++}
+diff --git a/src/test/resources/projects/multiProjectDirectLoom/settings.gradle b/src/test/resources/projects/multiProjectDirectLoom/settings.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..e119e06cff5c03622568681b7a41b94c862b4732
+--- /dev/null
++++ b/src/test/resources/projects/multiProjectDirectLoom/settings.gradle
+@@ -0,0 +1,4 @@
++rootProject.name = "multi-project-direct-loom"
++
++include "one"
++include "two"
+diff --git a/src/test/resources/projects/multiProjectDirectLoom/two/build.gradle b/src/test/resources/projects/multiProjectDirectLoom/two/build.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc69ea11decd36eabab77f174b40e8803429214d
+--- /dev/null
++++ b/src/test/resources/projects/multiProjectDirectLoom/two/build.gradle
+@@ -0,0 +1,16 @@
++plugins {
++	id "java"
++	id "gg.essential.loom"
++}
++
++version = "1.0.0"
++
++base {
++	archivesName = "two"
++}
++
++dependencies {
++	minecraft "com.mojang:minecraft:1.20.4"
++	mappings loom.officialMojangMappings()
++	modImplementation "net.fabricmc:fabric-loader:0.15.6"
++}

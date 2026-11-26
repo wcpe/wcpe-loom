@@ -1,0 +1,2448 @@
+From dcfd2172bba9cc7a51a9c18e496f20534e4e1f95 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:31:01 +0800
+Subject: [PATCH 062/147] =?UTF-8?q?feat(mod):=20mod=20jar=20=E9=87=8D?=
+ =?UTF-8?q?=E6=98=A0=E5=B0=84=E7=94=B1=E9=85=8D=E7=BD=AE=E6=9C=9F=E8=BF=81?=
+ =?UTF-8?q?=E8=87=B3=E4=BB=BB=E5=8A=A1=EF=BC=8C=E5=B9=B6=E5=88=A0=E9=99=A4?=
+ =?UTF-8?q?=20ModProcessor=20(#21)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* chore(cleanup): 删除已无调用方的 StaticPathWatcher
+
+该类的唯一消费点是 MappingsCache 的 hasFileChanged 调用，而 MappingsCache
+已由上游提交 9d9be1b8 整体删除，此后它一直是没有调用方的孤儿。
+
+- INSTANCE / hasFileChanged / pathsObserved / changeCache 四个标识符在全仓库
+  （含 src/test 与 src/decompilers 各源集）只出现在其自身文件内，零外部引用
+- 非 api 包（net.fabricmc.loom.util），不在 META-INF/services，无反射注册
+- 它属于「配置期观察文件以决定手写缓存条目是否可复用」那一族协议，删除方向
+  与把产物有效性交给 Gradle 判定的整体工作一致
+
+已在本分支单独验证：从 dev/1.17-wcpe 拉出仅含本改动的分支可正常 compileJava。
+
+* fix(aw,at): 让条目只持有纯值，避免 Gson 结构进入序列化路径
+
+ModAccessWidenerEntry 与 AccessTransformerEntry.Mod 原先各自持有整个
+FabricModJson，其内部 jsonObject 是 Gson 的 JsonObject（底层
+com.google.gson.internal.LinkedTreeMap）。@Internal 只免掉输入指纹、不免掉
+序列化，因此一旦该 spec 需要被写入配置缓存，就会以
+'value {...} is not assignable to com.google.gson.internal.LinkedTreeMap' 失败。
+
+改为条目只保存纯值：
+- ModAccessWidenerEntry：modId、元数据 schema 版本、路径、环境、transitive
+  标志，以及规则文件字节
+- AccessTransformerEntry.Mod：modId、version、规则字节、hash
+
+规则字节在配置期读取是安全的：依赖 mod 的元数据本就由同一来源读出（项目依赖
+走 LoomProjectData 已复制的资源，jar 依赖走 jar 条目），buildSpec 原本就为
+计算 hash 读取过同一份字节。
+
+spec 身份保持不变：AccessTransformerJarProcessorTest 的
+'consistent spec hash' 用例在未做任何修改的原始版本下通过，说明该 spec 的
+hashCode（产物路径与缓存值的来源）未发生漂移。
+
+本分支已验证可独立 compileJava 并通过上述用例。
+
+* fix(forge): 输入 jar 缺失时不再产出空 sources jar，并让反编译缓存键覆盖注入输入
+
+两处都会静默产出错误的 Forge 源码：
+
+1. 输入 jar 不存在时，ForgeSourcesService 仍会创建空的 sources jar 并落位。
+   此后 "文件已存在" 的有效性守卫会把它认成已完成，于是该错误产物被永久锁定，
+   后续构建一直沿用空 jar 而不再尝试重做。改为直接失败，不产出任何 jar。
+
+2. 反编译缓存键未覆盖「源码重映射映射」这一注入输入，导致映射变了而缓存键不变，
+   静默沿用旧的 Forge 源码。改为把该输入的内容纳入键：只认内容、不认路径，
+   路径变化不会造成无谓失效，内容变化必然失效。
+
+新增 ForgeSourcesServiceTest 三条用例分别钉住：输入缺失时不产出任何 jar、
+named MC jar 缺失时配置期入口整体跳过、缓存键对内容敏感而对路径不敏感。
+
+本分支已验证可独立 compileJava，且上述 3 条用例 PASSED。
+
+* fix(sources): SourceRemapper 不再静默丢弃 MC classpath，重映射器构造脱离 Project
+
+两处问题：
+
+1. SourceRemapper 组装 classpath 时会把不存在的路径一并过滤掉，而过滤粒度过粗，
+   连 MC 的 classpath 一起丢掉，导致源码重映射在缺少 MC 类型的上下文里进行。
+   实测同一输入下 17 个条目里有 6 个产出内容不同——且不报错，属静默损坏。
+   修正过滤语义：只跳过确实不存在的路径，目录照常加入。
+
+2. TinyRemapperHelper 的构造入口依赖 Project 去读 extension（knownIndyBsms 等），
+   使执行期无法在没有 Project 的情况下构造重映射器。改为由调用方传入，
+   去掉该依赖，Fabric 与 Forge（含内部类映射）两个分支都加了用例覆盖。
+
+新增 SourceRemapperTest 与 TinyRemapperHelperTest 共 6 条用例：
+classpath 过滤语义、空 classpath 仍可构造、两条不依赖 Project 的构造路径、
+未开启 record 修复时不改变构造结果、knownIndyBsms 由参数传入而非读 extension。
+
+本分支已验证可独立 compileJava，上述 6 条用例全部 PASSED。
+
+* feat(core,spec): 引入执行期 jar 操作的抽象与派生数据缓存
+
+core/：把「重映射 MC jar」「重映射 mod jar」「mod jar 后处理」三件事的输入契约
+与执行逻辑从配置期 provider 中抽出来，使其不依赖 Project 与 SourceSet，可在执行期
+由任务重建。这是后续把这两条线的产物生产搬进 Gradle 任务的前提。
+
+spec/：EnvironmentSpec 声明各环境需要哪些映射/迁移步骤，SpecStore 提供按
+「命名空间 + 身份 + 维度」寻址的纯派生数据缓存。缓存只存解析结果，丢失仅意味着
+多解析一次，不参与任何产物就绪标记。
+
+SpecStore 的身份沿用输入文件的大小与修改时间：清单被刷新后身份自然变化，
+不会读到过期条目——该自失效语义是有意的。
+
+新增 SpecStoreTest 9 条用例覆盖命中/未命中、命名空间与维度隔离、空内容哨兵、
+同名覆盖、维度值含路径分隔符、以及 inputIdentity 对文件大小/修改时间的敏感与
+对不存在文件返回空。
+
+本分支基于 #16（TinyRemapperHelper 的不依赖 Project 构造重载）之上，已验证可编译
+且上述 9 条用例 PASSED。
+
+* feat(pipeline): 为执行期重建补上处理器契约，并引入 jar 生产任务
+
+为让 jar 生产脱离配置期，先把「执行期重建处理器实例」所需的契约补上：
+
+- ProcessorContext 收窄并新增 getJarConfiguration()，使处理器不再从 Project 取配置
+- MinecraftJarProcessor 新增 ProcessorDescriptor 契约（descriptor()），处理器据此
+  声明重建所需的纯值
+- 各内置处理器（access widener、interface injection、AT、jsr 注解、javadoc 等）
+  补齐 descriptor()，不再依赖 Project / SourceSet / Project 模型对象
+- LoomGradleExtension 与 extension 实现相应调整，LoomProjectData 同步
+
+在此之上引入 pipeline 的任务实现：RemapMinecraftTask（重映射 MC jar）、
+ProcessMinecraftJarTask（执行处理器链）、WriteMinecraftJarSidecarsTask（写 pom
+等伴随文件）、ExecutionProcessorContext（执行期处理器上下文）。
+
+LocalMavenHelper 新增 getRelativeArtifactPath，供任务侧判定 pom 与 jar 是否落在
+同一构件目录——两侧必须成对，否则 maven 仓库里会出现孤儿。
+
+mod 线任务 RemapModsTask 不属本层，留待 mod 线接入时一并提交。
+
+本分支基于 #17（core/ 与 spec/）之上，已验证可 compileJava。
+
+* feat(mc): MC jar 生产由配置期迁至任务
+
+provider 不再在配置期立即产出 jar，而是登记任务、由任务在执行期产出；
+仅在三种形态下回退配置期生产（legacy merged、disableObfuscation、processor
+链含无法执行期重建的 processor，见 verifyProjectable）。
+
+- AbstractMappedMinecraftProvider：registerRemapTasks 登记任务、jarOutputs 与
+  dependencyNotation 按任务路径建依赖边、produceInConfiguration 保留回退路径、
+  verifyProjectable 声明式三态、remapperHookKind 显式声明各 provider 的重映射钩子
+- ProcessedNamedMinecraftProvider：处理器链改为可执行期重建，descriptor 契约
+- Intermediary / Named / Srg / MojangMapped：接入任务登记与回退判定
+
+同时移除 deleteSimilarJars：它按文件名前缀删除「相似」jar 以清理上次运行的产物，
+在并发构建下会删掉别的进程正在写的临时文件。产物落位改由 Gradle 的任务输出与
+构建缓存接管后，该启发式不再需要。
+
+MinecraftMetadataProvider / BundleMetadata 接入 spec 缓存；GenerateSourcesTask、
+ValidateAccessWidenerTask、GenerateRemapClasspathTask、task/service 与
+LoomCacheService、ServiceType 相应调整。
+
+本分支基于 integrate/slices-13-to-18（含 #13~#18），已验证可 compileJava。
+
+* feat(mod): mod jar 重映射由配置期迁至任务，并删除 ModProcessor
+
+RemapModsTask 接替 ModProcessor 承担 mod jar 的重映射与后处理，ModProcessor
+（334 行）随之删除。相比原实现，任务化后产物落位交给 Gradle 的任务输出与构建
+缓存，不再依赖配置期的存在性检查与自定义可复用判据。
+
+- RemapModsTask：按依赖种类重映射 mod jar，处理 Forge 系的后置步骤
+  （NeoForge AT 重映射、Forge 类名映射、coremod 重映射），并按需把整体产物拆成
+  common/client 两半各自落位
+- RemappedModArtifacts：按任务路径建立消费方与产物的依赖边，使 Gradle 能看见
+  跨项目的产物归属
+- ModDependency / SimpleModDependency / SplitModDependency：产物路径由一处给出
+  （simple 一条；split 按 target 给 -common / -client），供登记表统一认领
+- ModConfigurationRemapper：接入任务路径
+- AccessWidenerJarProcessor 与 InterfaceInjectionProcessor 补齐执行期重建所需的
+  descriptor（属性对象无法进任务状态，只保留重建所需的文件路径）
+- AT / Forge 侧重映射器（AccessTransformerService、AtClassRemapper、
+  CoreModClassRemapper、ForgeLibrariesProvider）随 mod 线调用方调整签名
+
+本分支基于 #19，已验证可 compileJava。
+
+* test(aw): 为 AccessWidenerJarProcessorTest 的依赖 mod 补齐 getSource 桩
+
+条目改为在建条目时就取出规则文件内容（理由见 ModAccessWidenerEntry），
+因此测试里模拟的 FabricModJson 必须提供可读的来源，否则 read 时 NPE。
+ModAccessWidenerEntryTest 当时已补该桩，此处是同源遗漏。
+
+该缺口此前未被发现：所有验证都按 pattern 跑指定测试类，从未跑过完整的
+unit 包；补齐后 AccessWidenerJarProcessorTest 三条用例全部通过。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerJarProcessor.java b/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerJarProcessor.java
+index 8671d0d497eab62571a98200b2a446bcb92a4f5f..a1467c9ef133917d4af919366ba0cd82c72ed957 100644
+--- a/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerJarProcessor.java
++++ b/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerJarProcessor.java
+@@ -44,33 +44,53 @@ import dev.architectury.loom.util.TempFiles;
+ import org.gradle.api.Project;
+ import org.gradle.api.logging.Logger;
+ import org.gradle.api.logging.Logging;
++import org.gradle.api.model.ObjectFactory;
+ import org.jspecify.annotations.Nullable;
+ 
+-import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.api.processor.MinecraftJarProcessor;
+ import net.fabricmc.loom.api.processor.ProcessorContext;
+ import net.fabricmc.loom.api.processor.SpecContext;
+-import net.fabricmc.loom.build.IntermediaryNamespaces;
+-import net.fabricmc.loom.configuration.providers.minecraft.MinecraftVersionMeta;
+ import net.fabricmc.loom.util.Checksum;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.ExceptionUtil;
+-import net.fabricmc.loom.util.LoomVersions;
+ import net.fabricmc.loom.util.fmj.FabricModJson;
+ import net.fabricmc.loom.util.service.ScopedServiceFactory;
+ 
+ public class AccessTransformerJarProcessor implements MinecraftJarProcessor<AccessTransformerJarProcessor.Spec> {
+ 	private static final Logger LOGGER = Logging.getLogger(AccessTransformerJarProcessor.class);
+ 	private final String name;
+-	private final Project project;
+ 	private final Iterable<File> localAccessTransformers;
+-
++	private final ObjectFactory objectFactory;
++	/** 仅配置期实例持有：执行期没有 {@link Project}，AT 工具信息由 {@link Descriptor} 带过来. */
++	private final @Nullable Project project;
++	/** 启动 AT 工具所需的信息，配置期惰性解析并缓存. */
++	private AccessTransformerService.@Nullable Tool tool;
++
++	/**
++	 * 配置期构造器：AT 工具推迟到真正需要时（{@link #descriptor()} 或 {@link #processJar}）再解析.
++	 */
+ 	@Inject
+-	public AccessTransformerJarProcessor(String name, Project project, Iterable<File> localAccessTransformers) {
++	public AccessTransformerJarProcessor(String name, Project project, Iterable<File> localAccessTransformers, ObjectFactory objectFactory) {
+ 		this.name = name;
+ 		this.project = project;
+ 		this.localAccessTransformers = localAccessTransformers;
++		this.objectFactory = objectFactory;
++	}
++
++	/**
++	 * 执行期重建用构造器：不依赖 {@link Project}，AT 工具信息与对象工厂都由描述符提供.
++	 *
++	 * <p>本构造器由 {@link Descriptor#createProcessor} 直接调用而不经 {@code ObjectFactory.newInstance}：
++	 * 本类唯一的 {@code @Inject} 构造器需要一个 {@link Project}，执行期无法提供，而 Gradle 在存在
++	 * {@code @Inject} 构造器时只会用它，传参形态再吻合也不会选到另一个构造器。
++	 */
++	public AccessTransformerJarProcessor(String name, Iterable<File> localAccessTransformers, AccessTransformerService.Tool tool, ObjectFactory objectFactory) {
++		this.name = name;
++		this.project = null;
++		this.localAccessTransformers = localAccessTransformers;
++		this.objectFactory = objectFactory;
++		this.tool = tool;
+ 	}
+ 
+ 	@Override
+@@ -111,13 +131,28 @@ public class AccessTransformerJarProcessor implements MinecraftJarProcessor<Acce
+ 			Files.copy(jar, tempInput, StandardCopyOption.REPLACE_EXISTING);
+ 			final Path atPath = mergeAndRemapAccessTransformers(context, spec.accessTransformers(), tempFiles);
+ 
+-			final AccessTransformerService service = serviceFactory.get(AccessTransformerService.createOptions(project, atPath.toAbsolutePath()));
++			final AccessTransformerService service = serviceFactory.get(AccessTransformerService.createOptions(objectFactory, getTool(), atPath.toAbsolutePath()));
+ 			service.execute(tempInput, jar);
+ 		} catch (IOException e) {
+ 			throw ExceptionUtil.createDescriptiveWrapper(UncheckedIOException::new, "Could not access transform " + jar.toAbsolutePath(), e);
+ 		}
+ 	}
+ 
++	/**
++	 * 取得启动 AT 工具所需的信息：配置期实例惰性解析一次并缓存，执行期实例由描述符给出.
++	 */
++	private AccessTransformerService.Tool getTool() {
++		if (tool == null) {
++			if (project == null) {
++				throw new IllegalStateException("AccessTransformerJarProcessor 既没有 Project，描述符里也没有 AT 工具信息");
++			}
++
++			tool = AccessTransformerService.resolveTool(project);
++		}
++
++		return tool;
++	}
++
+ 	private Path mergeAndRemapAccessTransformers(ProcessorContext context, List<AccessTransformerEntry> accessTransformers, TempFiles tempFiles) throws IOException {
+ 		AccessTransformSet accessTransformSet = AccessTransformSet.create();
+ 
+@@ -130,7 +165,7 @@ public class AccessTransformerJarProcessor implements MinecraftJarProcessor<Acce
+ 		}
+ 
+ 		if (!context.disableObfuscation()) {
+-			accessTransformSet = accessTransformSet.remap(context.getMappings(), IntermediaryNamespaces.intermediary(project), MappingsNamespace.NAMED.toString());
++			accessTransformSet = accessTransformSet.remap(context.getMappings(), context.getIntermediaryNamespace().toString(), MappingsNamespace.NAMED.toString());
+ 		}
+ 
+ 		final Path accessTransformerPath = tempFiles.file("accesstransformer-merged", ".cfg");
+@@ -149,21 +184,50 @@ public class AccessTransformerJarProcessor implements MinecraftJarProcessor<Acce
+ 		return name;
+ 	}
+ 
+-	private static LoomVersions chooseAccessTransformer(Project project) {
+-		LoomGradleExtension extension = LoomGradleExtension.get(project);
+-		boolean serverBundleMetadataPresent = extension.getMinecraftProvider().getServerBundleMetadata() != null;
++	@Override
++	public Descriptor descriptor() {
++		return new Descriptor(name, localAccessTransformerPaths(), getTool());
++	}
+ 
+-		if (!serverBundleMetadataPresent) {
+-			return LoomVersions.ACCESS_TRANSFORMERS;
+-		} else if (extension.isNeoForge()) {
+-			MinecraftVersionMeta.JavaVersion javaVersion = extension.getMinecraftProvider().getVersionInfo().javaVersion();
++	/**
++	 * 本地 AT 文件的绝对路径，排序以保证描述符的取值稳定.
++	 */
++	private List<String> localAccessTransformerPaths() {
++		final List<String> paths = new ArrayList<>();
+ 
+-			if (javaVersion != null && javaVersion.majorVersion() >= 21) {
+-				return LoomVersions.ACCESS_TRANSFORMERS_NEO;
+-			}
++		for (File file : localAccessTransformers) {
++			paths.add(file.getAbsolutePath());
+ 		}
+ 
+-		return LoomVersions.ACCESS_TRANSFORMERS_NEW;
++		return paths.stream().sorted().toList();
++	}
++
++	/**
++	 * 用于在执行期重建 {@link AccessTransformerJarProcessor} 的描述符.
++	 *
++	 * <p>AT 工具的信息必须随描述符一起走：它的 classpath 来自项目依赖解析、JVM 可执行文件来自
++	 * Java 工具链，二者都只能在配置期取得。因此调用 {@link AccessTransformerJarProcessor#descriptor()}
++	 * 时项目模型必须已经就绪（Minecraft provider 与 Java 工具链都已配置），否则会解析出错误的工具。
++	 *
++	 * @param name processor 名称
++	 * @param localAccessTransformers 本地 AT 文件的绝对路径
++	 * @param tool 启动 AT 工具所需的纯值
++	 */
++	public record Descriptor(String name, List<String> localAccessTransformers, AccessTransformerService.Tool tool)
++			implements MinecraftJarProcessor.ProcessorDescriptor<AccessTransformerJarProcessor> {
++		public Descriptor {
++			localAccessTransformers = List.copyOf(localAccessTransformers);
++		}
++
++		@Override
++		public AccessTransformerJarProcessor createProcessor(ObjectFactory objectFactory) {
++			return new AccessTransformerJarProcessor(
++					name,
++					localAccessTransformers.stream().map(File::new).toList(),
++					tool,
++					objectFactory
++			);
++		}
+ 	}
+ 
+ 	@FunctionalInterface
+diff --git a/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerService.java b/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerService.java
+index e3eb2aabddbe16986345dd9a0f407310a98a9c08..33bdf8d1c3d126dbcae9edd2d4b20360b5a20f00 100644
+--- a/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerService.java
++++ b/src/main/java/dev/architectury/loom/accesstransformer/AccessTransformerService.java
+@@ -2,6 +2,7 @@ package dev.architectury.loom.accesstransformer;
+ 
+ import java.io.File;
+ import java.io.IOException;
++import java.io.Serializable;
+ import java.nio.file.Files;
+ import java.nio.file.NoSuchFileException;
+ import java.nio.file.Path;
+@@ -11,12 +12,15 @@ import java.util.List;
+ import java.util.stream.Stream;
+ 
+ import dev.architectury.loom.forge.config.UserdevConfig;
++import dev.architectury.loom.forge.tool.ForgeToolExecutor;
+ import dev.architectury.loom.forge.tool.ForgeToolService;
++import dev.architectury.loom.forge.tool.JavaExecutableFetcher;
+ import dev.architectury.loom.util.DependencyDownloader;
+ import dev.architectury.loom.util.TempFiles;
+ import org.gradle.api.Project;
+ import org.gradle.api.file.ConfigurableFileCollection;
+ import org.gradle.api.file.FileCollection;
++import org.gradle.api.model.ObjectFactory;
+ import org.gradle.api.provider.Property;
+ import org.gradle.api.provider.Provider;
+ import org.gradle.api.tasks.Classpath;
+@@ -25,6 +29,7 @@ import org.gradle.api.tasks.InputFiles;
+ import org.gradle.api.tasks.Nested;
+ import org.gradle.api.tasks.PathSensitive;
+ import org.gradle.api.tasks.PathSensitivity;
++import org.jspecify.annotations.Nullable;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftVersionMeta;
+@@ -56,25 +61,115 @@ public final class AccessTransformerService extends Service<AccessTransformerSer
+ 		Property<ForgeToolService.Options> getToolServiceOptions();
+ 	}
+ 
++	/**
++	 * 执行期启动 AT 工具所需的纯值.
++	 *
++	 * <p>这些值都只能在配置期解析：工具 classpath 来自项目依赖解析，JVM 可执行文件来自 Java 工具链。
++	 * 解析一次后以纯值保存，执行期就能在没有 {@code Project} 的情况下重建服务选项。
++	 *
++	 * @param mainClass AT 工具的主类
++	 * @param classpath AT 工具及其依赖的 jar 绝对路径
++	 * @param javaExecutable 执行 AT 工具的 JVM 可执行文件；未配置 Java 工具链时为 {@code null}，表示沿用 Gradle 自身的 JVM
++	 * @param verboseStdout 是否把工具的标准输出透传到构建日志
++	 * @param verboseStderr 是否把工具的标准错误透传到构建日志
++	 */
++	public record Tool(String mainClass, List<String> classpath, @Nullable String javaExecutable,
++			boolean verboseStdout, boolean verboseStderr) implements Serializable {
++		public Tool {
++			classpath = List.copyOf(classpath);
++		}
++	}
++
+ 	public static Provider<Options> createOptions(Project project, Object atFiles) {
+ 		return TYPE.create(project, options -> {
+ 			LoomVersions accessTransformer = chooseAccessTransformer(project);
+-			String mainClass = accessTransformer.equals(LoomVersions.ACCESS_TRANSFORMERS_NEO)
+-					? "net.neoforged.accesstransformer.cli.TransformerProcessor"
+-					: "net.minecraftforge.accesstransformer.TransformerProcessor";
+ 			FileCollection classpath = new DependencyDownloader(project)
+ 					.add(accessTransformer.mavenNotation())
+ 					.add(LoomVersions.ASM.mavenNotation())
+ 					.platform(LoomVersions.ACCESS_TRANSFORMERS_LOG4J_BOM.mavenNotation())
+ 					.download();
+ 
+-			options.getMainClass().set(mainClass);
++			options.getMainClass().set(mainClass(accessTransformer));
+ 			options.getAccessTransformers().from(atFiles);
+ 			options.getClasspath().from(classpath);
+ 			options.getToolServiceOptions().set(ForgeToolService.createOptions(project));
+ 		});
+ 	}
+ 
++	/**
++	 * 执行期创建服务选项.
++	 *
++	 * <p>与 {@link #createOptions(Project, Object)} 等价，区别只在于 AT 工具的信息与工具服务的设置
++	 * 都已经在配置期解析成纯值，因此本方法不需要 {@code Project}。
++	 *
++	 * @param objects 执行期可用的对象工厂
++	 * @param tool 配置期解析出的 AT 工具信息
++	 * @param atFiles 待应用的 access transformer 文件
++	 * @return 服务选项
++	 */
++	public static Options createOptions(ObjectFactory objects, Tool tool, Object atFiles) {
++		return ServiceType.createOptions(objects, TYPE, options -> {
++			options.getMainClass().set(tool.mainClass());
++			options.getAccessTransformers().from(atFiles);
++			options.getClasspath().from(tool.classpath());
++			options.getToolServiceOptions().set(createToolServiceOptions(objects, tool));
++		});
++	}
++
++	/**
++	 * 配置期解析 AT 工具，得到执行期可用的信息.
++	 *
++	 * <p>工具 classpath 来自项目依赖解析、JVM 可执行文件来自 Java 工具链，两者都只能在配置期取得，
++	 * 因此在这里一次性解析出来再传给执行期。
++	 *
++	 * @param project 当前项目
++	 * @return AT 工具信息
++	 */
++	public static Tool resolveTool(Project project) {
++		final LoomVersions accessTransformer = chooseAccessTransformer(project);
++		final FileCollection classpath = new DependencyDownloader(project)
++				.add(accessTransformer.mavenNotation())
++				.add(LoomVersions.ASM.mavenNotation())
++				.platform(LoomVersions.ACCESS_TRANSFORMERS_LOG4J_BOM.mavenNotation())
++				.download();
++
++		return new Tool(
++				mainClass(accessTransformer),
++				classpath.getFiles().stream().map(File::getAbsolutePath).toList(),
++				JavaExecutableFetcher.getJavaToolchainExecutable(project).getOrNull(),
++				ForgeToolExecutor.shouldShowVerboseStdout(project),
++				ForgeToolExecutor.shouldShowVerboseStderr(project)
++		);
++	}
++
++	private static ForgeToolService.Options createToolServiceOptions(ObjectFactory objects, Tool tool) {
++		return ServiceType.createOptions(objects, ForgeToolService.TYPE, options -> {
++			final ForgeToolExecutor.Settings settings = objects.newInstance(ForgeToolExecutor.Settings.class);
++
++			if (tool.javaExecutable() != null) {
++				settings.getExecutable().set(tool.javaExecutable());
++			}
++
++			settings.getShowVerboseStdout().set(tool.verboseStdout());
++			settings.getShowVerboseStderr().set(tool.verboseStderr());
++
++			// 与 ForgeToolExecutor.getDefaultSettings 同理，先把属性都取一遍，
++			// 否则 JSON 序列化这些选项时字段为 null
++			settings.getProgramArgs();
++			settings.getJvmArgs();
++			settings.getMainClass();
++			settings.getExecClasspath();
++
++			options.getBaseSettings().set(settings);
++		});
++	}
++
++	private static String mainClass(LoomVersions accessTransformer) {
++		return accessTransformer.equals(LoomVersions.ACCESS_TRANSFORMERS_NEO)
++				? "net.neoforged.accesstransformer.cli.TransformerProcessor"
++				: "net.minecraftforge.accesstransformer.TransformerProcessor";
++	}
++
+ 	public static Provider<Options> createOptionsForLoaderAts(Project project, TempFiles tempFiles) {
+ 		final Provider<List<String>> atFiles = project.provider(() -> {
+ 			LoomGradleExtension extension = LoomGradleExtension.get(project);
+diff --git a/src/main/java/dev/architectury/loom/accesstransformer/AtClassRemapper.java b/src/main/java/dev/architectury/loom/accesstransformer/AtClassRemapper.java
+index 9e2107e264ac82e78dc6fd1c34cc2cab146dbfa8..f80a3dfeda79fbb59f97f66a076f23d9f6b5ed3a 100644
+--- a/src/main/java/dev/architectury/loom/accesstransformer/AtClassRemapper.java
++++ b/src/main/java/dev/architectury/loom/accesstransformer/AtClassRemapper.java
+@@ -37,6 +37,7 @@ import java.util.function.UnaryOperator;
+ import dev.architectury.loom.util.collection.CollectionUtil;
+ import org.gradle.api.Project;
+ import org.gradle.api.logging.Logger;
++import org.gradle.api.logging.Logging;
+ 
+ import net.fabricmc.loom.build.IntermediaryNamespaces;
+ import net.fabricmc.loom.util.Constants;
+@@ -47,9 +48,18 @@ import net.fabricmc.mappingio.tree.MappingTree;
+  * Remaps AT classes from SRG to Yarn.
+  */
+ public final class AtClassRemapper {
+-	public static void remap(Project project, Path jar, MappingTree mappings) throws IOException {
+-		final Logger logger = project.getLogger();
+-		final String sourceNamespace = IntermediaryNamespaces.intermediary(project);
++	private static final Logger LOGGER = Logging.getLogger(AtClassRemapper.class);
++
++	/**
++	 * 重映射 jar 内 AT 条目的类名（SRG → named）.
++	 *
++	 * <p>不依赖 {@link Project}：源命名空间由调用方给出，日志走静态 logger。
++	 * 项目模型版本委托到此，二者共用同一份实现，避免任务化时出现第二份拷贝。
++	 *
++	 * @param sourceNamespace AT 条目当前所处的命名空间
++	 */
++	public static void remap(Path jar, MappingTree mappings, String sourceNamespace) throws IOException {
++		final Logger logger = LOGGER;
+ 
+ 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar, false)) {
+ 			Path atPath = fs.getPath(Constants.Forge.ACCESS_TRANSFORMER_PATH);
+@@ -137,4 +147,8 @@ public final class AtClassRemapper {
+ 			throw new AssertionError(e);
+ 		}
+ 	}
++
++	public static void remap(Project project, Path jar, MappingTree mappings) throws IOException {
++		remap(jar, mappings, IntermediaryNamespaces.intermediary(project));
++	}
+ }
+diff --git a/src/main/java/dev/architectury/loom/forge/CoreModClassRemapper.java b/src/main/java/dev/architectury/loom/forge/CoreModClassRemapper.java
+index 57b136078ce4ade055cd9519fb20d34a6d367705..33ddfb6132ca5ac2beb3c49703aa7e7443194f6b 100644
+--- a/src/main/java/dev/architectury/loom/forge/CoreModClassRemapper.java
++++ b/src/main/java/dev/architectury/loom/forge/CoreModClassRemapper.java
+@@ -44,6 +44,7 @@ import com.google.gson.JsonObject;
+ import dev.architectury.loom.util.collection.CollectionUtil;
+ import org.gradle.api.Project;
+ import org.gradle.api.logging.Logger;
++import org.gradle.api.logging.Logging;
+ 
+ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.util.FileSystemUtil;
+@@ -56,9 +57,18 @@ public final class CoreModClassRemapper {
+ 	private static final Pattern CLASS_NAME_PATTERN = Pattern.compile("^(.*')((?:com\\.mojang\\.|net\\.minecraft\\.)[A-Za-z0-9.-_$]+)('.*)$");
+ 	private static final Pattern REDIRECT_FIELD_TO_METHOD_PATTERN = Pattern.compile("^(.*\\w+\\s*\\.\\s*redirectFieldToMethod\\s*\\(\\s*\\w+\\s*,\\s*')(\\w*)('\\s*,(?:\\s*'(\\w+)'\\s*|.*)\\).*)$");
+ 
+-	public static void remapJar(Project project, boolean isRuntimeMojang, Path jar, MappingTree mappings) throws IOException {
+-		final Logger logger = project.getLogger();
+-		final String sourceNamespace = LoomGradleExtension.get(project).getProductionNamespace().get();
++	private static final Logger LOGGER = Logging.getLogger(CoreModClassRemapper.class);
++
++	/**
++	 * 重映射 jar 内 CoreMod 清单条目的类名.
++	 *
++	 * <p>不依赖 {@link Project}：源命名空间由调用方给出，日志走静态 logger。
++	 * 项目模型版本委托到此，二者共用同一份实现。
++	 *
++	 * @param sourceNamespace CoreMod 条目当前所处的命名空间
++	 */
++	public static void remapJar(boolean isRuntimeMojang, Path jar, MappingTree mappings, String sourceNamespace) throws IOException {
++		final Logger logger = LOGGER;
+ 
+ 		try (FileSystemUtil.Delegate fs = FileSystemUtil.getJarFileSystem(jar, false)) {
+ 			Path coremodsJsonPath = fs.getPath("META-INF", "coremods.json");
+@@ -141,4 +151,8 @@ public final class CoreModClassRemapper {
+ 			}
+ 		}
+ 	}
++
++	public static void remapJar(Project project, boolean isRuntimeMojang, Path jar, MappingTree mappings) throws IOException {
++		remapJar(isRuntimeMojang, jar, mappings, LoomGradleExtension.get(project).getProductionNamespace().get());
++	}
+ }
+diff --git a/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java b/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java
+index c10fbcc33214899e79377976231657ddbede6b38..efbdfb9f47f78e41537f3e5511a6b715f550d3d3 100644
+--- a/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java
++++ b/src/main/java/dev/architectury/loom/forge/dependency/ForgeLibrariesProvider.java
+@@ -271,7 +271,10 @@ public class ForgeLibrariesProvider {
+ 			});
+ 
+ 			// Copy sources when not running under CI.
+-			if (!ModConfigurationRemapper.isCIBuild()) {
++			// 与 ModConfigurationRemapper.scheduleSourcesRemapping 同理：sources 只服务于 IDE
++			// 附加源码，配置阶段写出它会让配置缓存记下「文件被创建」并在下次构建失效，
++			// 故仅在 IDE 同步或显式开启时才加工。
++			if (!ModConfigurationRemapper.isCIBuild() && ModConfigurationRemapper.shouldRemapSourcesInConfigurationPhase(project)) {
+ 				final Map<ResolvedArtifact, Path> sourcesByArtifact = ModConfigurationRemapper.downloadAllSources(project, Set.of(artifact));
+ 				final Path sourcesJar = sourcesByArtifact.get(artifact);
+ 
+diff --git a/src/main/java/net/fabricmc/loom/configuration/accesswidener/AccessWidenerJarProcessor.java b/src/main/java/net/fabricmc/loom/configuration/accesswidener/AccessWidenerJarProcessor.java
+index 01abf15aec77b90a404d4e4608149de1e80dc9d9..703b50c5c89e1cc2f41af4fe39e51b9328b0b004 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/accesswidener/AccessWidenerJarProcessor.java
++++ b/src/main/java/net/fabricmc/loom/configuration/accesswidener/AccessWidenerJarProcessor.java
+@@ -24,6 +24,7 @@
+ 
+ package net.fabricmc.loom.configuration.accesswidener;
+ 
++import java.io.File;
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
+ import java.io.UncheckedIOException;
+@@ -36,6 +37,7 @@ import java.util.List;
+ import javax.inject.Inject;
+ 
+ import org.gradle.api.file.RegularFileProperty;
++import org.gradle.api.model.ObjectFactory;
+ import org.jspecify.annotations.Nullable;
+ 
+ import net.fabricmc.classtweaker.api.ClassTweaker;
+@@ -101,6 +103,14 @@ public class AccessWidenerJarProcessor implements MinecraftJarProcessor<AccessWi
+ 		return name;
+ 	}
+ 
++	@Override
++	public Descriptor descriptor() {
++		// access widener 的属性对象无法放进任务状态，这里只保留重建所需的文件路径
++		return new Descriptor(name, includeTransitive, localAccessWidenerProperty.isPresent()
++				? localAccessWidenerProperty.get().getAsFile().getAbsolutePath()
++				: null);
++	}
++
+ 	public record Spec(List<AccessWidenerEntry> accessWideners) implements MinecraftJarProcessor.Spec {
+ 		List<AccessWidenerEntry> accessWidenersForContext(ProcessorContext context) {
+ 			return accessWideners.stream()
+@@ -160,4 +170,25 @@ public class AccessWidenerJarProcessor implements MinecraftJarProcessor<AccessWi
+ 	public @Nullable MappingsProcessor<Spec> processMappings() {
+ 		return TransitiveAccessWidenerMappingsProcessor.INSTANCE;
+ 	}
++
++	/**
++	 * 用于在执行期重建 {@link AccessWidenerJarProcessor} 的描述符.
++	 *
++	 * @param name processor 名称
++	 * @param includeTransitive 是否包含传递性 access widener
++	 * @param localAccessWidenerPath 本地 access widener 的绝对路径，未配置时为 {@code null}
++	 */
++	public record Descriptor(String name, boolean includeTransitive, @Nullable String localAccessWidenerPath)
++			implements MinecraftJarProcessor.ProcessorDescriptor<AccessWidenerJarProcessor> {
++		@Override
++		public AccessWidenerJarProcessor createProcessor(ObjectFactory objectFactory) {
++			final RegularFileProperty localAccessWidener = objectFactory.fileProperty();
++
++			if (localAccessWidenerPath != null) {
++				localAccessWidener.fileValue(new File(localAccessWidenerPath));
++			}
++
++			return objectFactory.newInstance(AccessWidenerJarProcessor.class, name, includeTransitive, localAccessWidener);
++		}
++	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/configuration/ifaceinject/InterfaceInjectionProcessor.java b/src/main/java/net/fabricmc/loom/configuration/ifaceinject/InterfaceInjectionProcessor.java
+index 38fffbc13ef1fdcf8893a02a9c7a30cd32ecb268..322ca63ddca0da17127fcf489a3f4fa499f71606 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/ifaceinject/InterfaceInjectionProcessor.java
++++ b/src/main/java/net/fabricmc/loom/configuration/ifaceinject/InterfaceInjectionProcessor.java
+@@ -41,6 +41,7 @@ import javax.inject.Inject;
+ import com.google.gson.JsonArray;
+ import com.google.gson.JsonElement;
+ import com.google.gson.JsonObject;
++import org.gradle.api.model.ObjectFactory;
+ import org.jetbrains.annotations.Contract;
+ import org.jspecify.annotations.Nullable;
+ import org.objectweb.asm.ClassReader;
+@@ -87,6 +88,11 @@ public abstract class InterfaceInjectionProcessor implements MinecraftJarProcess
+ 		return name;
+ 	}
+ 
++	@Override
++	public Descriptor descriptor() {
++		return new Descriptor(name, fromDependencies);
++	}
++
+ 	@Override
+ 	public InterfaceInjectionProcessor.@Nullable Spec buildSpec(SpecContext context) {
+ 		List<InjectedInterface> injectedInterfaces = new ArrayList<>();
+@@ -113,6 +119,21 @@ public abstract class InterfaceInjectionProcessor implements MinecraftJarProcess
+ 	public record Spec(List<InjectedInterface> injectedInterfaces, Set<String> clientOnlyModIds) implements MinecraftJarProcessor.Spec {
+ 	}
+ 
++	/**
++	 * 用于在执行期重建 {@link InterfaceInjectionProcessor} 的描述符.
++	 *
++	 * @param name processor 名称
++	 * @param fromDependencies 是否读取编译期与运行期都存在的依赖 mod 注入的接口
++	 */
++	public record Descriptor(String name, boolean fromDependencies)
++			implements MinecraftJarProcessor.ProcessorDescriptor<InterfaceInjectionProcessor> {
++		@Override
++		public InterfaceInjectionProcessor createProcessor(ObjectFactory objectFactory) {
++			// 本类是抽象类，交由 Gradle 生成子类实例，因此必须经由 ObjectFactory 而不是 new
++			return objectFactory.newInstance(InterfaceInjectionProcessor.class, name, fromDependencies);
++		}
++	}
++
+ 	@Override
+ 	public void processJar(Path jar, Spec spec, ProcessorContext context) throws IOException {
+ 		List<InjectedInterface> injectedInterfaces = getInjectedInterfaces(spec, context);
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/AccessWidenerAnalyzeVisitorProvider.java b/src/main/java/net/fabricmc/loom/configuration/mods/AccessWidenerAnalyzeVisitorProvider.java
+index 37144f06479f37428c837270cc6b2c37fea292b2..f8778c7a58854aab012a07a5f48f0df48c72a611 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/AccessWidenerAnalyzeVisitorProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/AccessWidenerAnalyzeVisitorProvider.java
+@@ -25,6 +25,7 @@
+ package net.fabricmc.loom.configuration.mods;
+ 
+ import java.io.IOException;
++import java.nio.file.Path;
+ import java.util.List;
+ 
+ import org.objectweb.asm.ClassVisitor;
+@@ -39,12 +40,18 @@ import net.fabricmc.loom.util.ModPlatform;
+ import net.fabricmc.tinyremapper.TinyRemapper;
+ 
+ public record AccessWidenerAnalyzeVisitorProvider(ClassTweaker accessWidener) implements TinyRemapper.AnalyzeVisitorProvider {
+-	static AccessWidenerAnalyzeVisitorProvider createFromMods(String namespace, List<ModDependency> mods, ModPlatform platform) throws IOException {
++	/**
++	 * 从若干 mod jar 合并出 access widener 分析器.
++	 *
++	 * <p>只读取各 jar 内的 AW 内容，不触碰 {@link ModDependency} 的任何缓存或项目状态，
++	 * 因此可在执行期调用（L3 任务路径）。
++	 */
++	public static AccessWidenerAnalyzeVisitorProvider createFromPaths(String namespace, List<Path> modJars, ModPlatform platform) throws IOException {
+ 		ClassTweaker accessWidener = ClassTweaker.newInstance();
+ 		accessWidener.visitHeader(namespace);
+ 
+-		for (ModDependency mod : mods) {
+-			final var accessWidenerData = AccessWidenerUtils.readAccessWidenerData(mod.getInputFile(), platform);
++		for (Path modJar : modJars) {
++			final var accessWidenerData = AccessWidenerUtils.readAccessWidenerData(modJar, platform);
+ 
+ 			if (accessWidenerData == null) {
+ 				continue;
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java b/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java
+index f30ab6babbd34bc0614dde03defb495242d7a481..25496814b7f817a5d7ed4e3a242561f16519ce3d 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/ModConfigurationRemapper.java
+@@ -32,14 +32,18 @@ import java.nio.file.Path;
+ import java.util.ArrayList;
+ import java.util.Comparator;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.function.Supplier;
++import java.util.stream.Collectors;
+ 
++import dev.architectury.loom.mappings.MappingOption;
+ import org.gradle.api.NamedDomainObjectProvider;
+ import org.gradle.api.Project;
+ import org.gradle.api.artifacts.Configuration;
+@@ -67,11 +71,17 @@ import org.slf4j.LoggerFactory;
+ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.LoomGradlePlugin;
+ import net.fabricmc.loom.api.RemapConfigurationSettings;
++import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.configuration.RemapConfigurations;
+ import net.fabricmc.loom.configuration.mods.dependency.ModDependency;
+ import net.fabricmc.loom.configuration.mods.dependency.ModDependencyFactory;
+ import net.fabricmc.loom.configuration.mods.dependency.ModDependencyOptions;
++import net.fabricmc.loom.configuration.mods.dependency.RemappedModArtifacts;
++import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftSourceSets;
++import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
++import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry.Producer;
++import net.fabricmc.loom.pipeline.RemapModsTask;
+ import net.fabricmc.loom.util.AsyncCache;
+ import net.fabricmc.loom.util.Checksum;
+ import net.fabricmc.loom.util.Constants;
+@@ -80,6 +90,7 @@ import net.fabricmc.loom.util.ModPlatform;
+ import net.fabricmc.loom.util.SourceRemapper;
+ import net.fabricmc.loom.util.gradle.LoomCacheService;
+ import net.fabricmc.loom.util.gradle.SourceSetHelper;
++import net.fabricmc.loom.util.kotlin.KotlinClasspathService;
+ import net.fabricmc.loom.util.service.ServiceFactory;
+ 
+ @SuppressWarnings("UnstableApiUsage")
+@@ -211,24 +222,20 @@ public class ModConfigurationRemapper {
+ 			}
+ 
+ 			final NamedDomainObjectProvider<? extends Configuration> clientRemappedConfig = clientConfigsToRemap.get(sourceConfig);
+-			final boolean refreshDeps = LoomGradleExtension.get(project).refreshDeps();
+-			// TODO: With the same artifacts being considered multiple times for their different
+-			//   usage attributes, this should probably not process them multiple times even with refreshDeps.
+-			final List<ModDependency> toRemap = modDependencies.stream()
+-					.filter(dependency -> refreshDeps || dependency.isCacheInvalid(project, null))
+-					.toList();
+-
+-			if (!toRemap.isEmpty()) {
+-				try {
+-					new ModProcessor(project, sourceConfig, serviceFactory).processMods(toRemap);
+-				} catch (IOException e) {
+-					throw new UncheckedIOException("Failed to remap mods", e);
+-				}
+-			}
++
++			// 任务接管**整批**依赖，而非仅「缓存失效的那些」：任务拥有产出目录，未纳入本批的产出
++			// 不会被写出，消费方的文件依赖就会悬空。产物有效性改由 Gradle 的 up-to-date 与构建
++			// 缓存判定，isCacheInvalid / refreshDeps 这套手写判据随之退休（见架构 §5.1）。
++			//
++			// 性能影响**未测**：曾有一次 AllinCore 对照（2m01s→14m14s）看似回退，但随后发现
++			// 该机同时有 8 个 Gradle daemon 并发、同一指标在 41s~28m51s 间飘，故那次对照无效。
++			// 需在安静机器或 CI 上做 A/B 才能定论。
++			final RemappedModArtifacts remappedArtifacts = registerRemapTask(
++					project, sourceConfig.get().getName(), modDependencies, extension.getMappingConfiguration());
+ 
+ 			// Add all of the remapped mods onto the config
+ 			for (ModDependency info : modDependencies) {
+-				info.applyToProject(project);
++				info.applyToProject(project, remappedArtifacts);
+ 				createConstraints(info.getInputArtifact(), remappedConfig, sourceConfig, dependencies);
+ 
+ 				if (clientRemappedConfig != null) {
+@@ -238,6 +245,177 @@ public class ModConfigurationRemapper {
+ 		});
+ 	}
+ 
++	/**
++	 * 为一批 mod 依赖注册 L3 重映射任务，返回「产物路径 → 生产位置」的解析器.
++	 *
++	 * <p>取代原先在配置期同步执行的 {@code ModProcessor.processMods}。三处刻意的不同：
++	 *
++	 * <ul>
++	 *   <li>接管**整批**依赖，而非「缓存失效的那些」。任务拥有产出目录，未纳入本批的产出不会
++	 *       被写出，消费方的文件依赖就会悬空；产物有效性的判据因此从 {@code isCacheInvalid}
++	 *       交给 Gradle 的 up-to-date 与构建缓存（见架构 §5.1）。</li>
++	 *   <li>依赖在此被投影成纯数据 {@link RemapModsTask.ModSpec}。任务输入里不含任何项目对象，
++	 *       才可能被配置缓存序列化——这正是本改造的目的。</li>
++	 *   <li>产物路径经 {@link RemapMinecraftTaskRegistry#claimAll} 逐条认领，任务只写出并声明自己
++	 *       认领到的那些：产物落在构建内所有项目共用的 {@code remapped_mods} 仓库，同一条路径上
++	 *       不能有两个生产者（见 {@link RemapModsTask}）。</li>
++	 * </ul>
++	 *
++	 * @return 本批每条产物的生产位置；消费方据此建依赖边，产出方未必是本项目的任务
++	 */
++	private static RemappedModArtifacts registerRemapTask(
++			Project project,
++			String configName,
++			List<ModDependency> modDependencies,
++			MappingConfiguration mappingConfiguration) {
++		final LoomGradleExtension extension = LoomGradleExtension.get(project);
++		final String sourceNamespace = extension.getProductionNamespaceEnum().get().toString();
++		final String targetNamespace = MappingsNamespace.NAMED.toString();
++
++		// classpath：其余 mod 的原始 jar 提供跨 mod 的类型上下文。
++		//
++		// 关键：这里的配置解析必须**惰性**。旧路径由 toRemap 过滤保护——processMods 只在存在
++		// 缓存失效依赖时才被调用，暖构建时整段不执行。改成任务后若无条件在配置期解析
++		// getSourceConfiguration().get().getFiles()，每次配置都要把所有 remap 配置连同其
++		// *Copy 变体解析一遍（实测 MPMT 41s→4m37s、AllinCore 2m01s→14m14s）。
++		// 用 provider 推迟到任务输入快照时刻：任务不执行（如 :help）就完全不解析。
++		final Set<File> inputsBeingRemapped = modDependencies.stream()
++				.map(dep -> dep.getInputFile().toFile())
++				.collect(Collectors.toSet());
++
++		// 已知 indy BSM：项目级声明 + 各 mod 元数据声明
++		final Set<String> knownIndyBsms = new HashSet<>(extension.getKnownIndyBsms().get());
++
++		for (ModDependency dep : modDependencies) {
++			knownIndyBsms.addAll(dep.getMetadata().knownIdyBsms());
++		}
++
++		final Provider<KotlinClasspathService.Options> kotlinOptions = KotlinClasspathService.createOptions(project);
++		final Map<String, String> identity = remapIdentity(extension, sourceNamespace, targetNamespace, knownIndyBsms, kotlinVersionOf(kotlinOptions));
++
++		// 产出路径与消费方同源：两处都按 LocalMavenHelper 算，任务写出的就是消费方要读的那条路径。
++		// 一条依赖的产物可能不止一条（拆分依赖是 common/client 两条），认领因此按**全部**落位进行：
++		// 只认领其中一条，另一条就没有生产者（消费方读到一条永不写出的路径，而构建不会报错）。
++		final List<Path> artifactPaths = new ArrayList<>();
++		final List<RemapModsTask.ModSpec> specs = new ArrayList<>();
++
++		for (ModDependency dependency : modDependencies) {
++			final List<Path> artifacts = dependency.getCacheArtifactPaths(project);
++			artifactPaths.addAll(artifacts);
++			specs.add(toModSpec(project, dependency, artifacts));
++		}
++
++		final Map<Path, Producer> producers = RemapMinecraftTaskRegistry.claimAll(project, artifactPaths, identity,
++				ownedArtifacts -> project.getTasks().register(taskName(configName), RemapModsTask.class, task -> {
++					task.setGroup("loom");
++					task.setDescription("Remaps the mods of '%s' to %s".formatted(configName, targetNamespace));
++
++					// 只声明认领到的产物；声明集合同时就是写出集合（见 RemapModsTask.getOutputJars）
++					task.getOutputJars().from(ownedArtifacts.stream().map(Path::toFile).toList());
++					task.getRemapClasspath().from(project.provider(() -> {
++						final List<File> remapConfigSourceFiles = new ArrayList<>();
++
++						for (RemapConfigurationSettings entry : extension.getRemapConfigurations()) {
++							remapConfigSourceFiles.addAll(entry.getSourceConfiguration().get().getFiles());
++						}
++
++						return RemapModsTask.collectRemapClasspath(remapConfigSourceFiles, inputsBeingRemapped);
++					}));
++					task.getMappingsServiceOptions().set(
++							mappingConfiguration.getMappingsServiceOptions(project, MappingOption.forPlatform(extension)));
++					task.getSourceNamespace().set(sourceNamespace);
++					task.getTargetNamespace().set(targetNamespace);
++					task.getPlatform().set(extension.getPlatform().get());
++					task.getForgeLike().set(extension.isForgeLike());
++					task.getNeoForge().set(extension.isNeoForge());
++					task.getRuntimeMojang().set(extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime());
++					task.getKnownIndyBsms().set(knownIndyBsms);
++					task.getKotlinOptions().set(kotlinOptions);
++
++					// 输入仍是**完整批次**：认领结果只决定写不写，不决定读什么（见 RemapModsTask 类注释）
++					task.getMods().set(List.copyOf(specs));
++				}));
++
++		return new RemappedModArtifacts(project, extension.getFiles().getRemappedModCache().toPath(), producers);
++	}
++
++	/**
++	 * {@return 本批 mod 重映射的输入指纹}（见 {@link RemapMinecraftTaskRegistry}）.
++	 *
++	 * <p>用来判定「两个项目请求同一条产物路径时，它们要的是不是同一个 jar」。产物路径里已经确定的量
++	 * **不重复**：坐标、映射标识与平台后缀都在 cache key 里（{@code ModDependencyOptions.getCacheKey()}），
++	 * 因此两条 MC 车道、两套映射必然算不出同一条路径，不会互相复用。这里列的只是路径**看不到**、
++	 * 却会改变产物字节的配置项：源/目标命名空间、平台、Forge 系的三个开关、扩展声明的 indy BSM 集合、
++	 * Kotlin 版本（影响 kotlin 元数据的重映射）。
++	 *
++	 * <p>值一律是字符串，且全部取自枚举、布尔与字符串本身：**不含任何对象身份**——把配置对象
++	 * （{@code RemapConfigurationSettings}、{@code Configuration} 之类）当指纹是本仓库已经踩过的坑，
++	 * 它们的 {@code toString} 里带工厂 lambda 的身份哈希，两个配置完全相同的项目也会算出不同的字符串，
++	 * 指纹于是变成假冲突（同类问题的处置见 {@code ProcessedNamedMinecraftProvider} 的
++	 * {@code JarConfigurationKind}）。
++	 *
++	 * <p>刻意**不**列入的是重映射 classpath（其它 mod 的原始 jar）：解析它必须惰性（否则每次配置都要
++	 * 把所有 remap 配置解析一遍，见 {@code registerRemapTask} 的性能记录），而且多模块工程里各模块的
++	 * mod 集合本就不同——把它纳入判定会让正常工程被判成冲突。按路径复用是既有语义
++	 * （配置期由 {@code LocalMavenHelper.isReusable} 决定），这里不改变它。
++	 *
++	 * @param extension 所在项目的 loom 扩展
++	 * @param sourceNamespace 源命名空间（项目的生产命名空间）
++	 * @param targetNamespace 目标命名空间
++	 * @param knownIndyBsms 本批已知的 indy BSM 集合
++	 * @param kotlinVersion 项目的 Kotlin 插件版本；不用 Kotlin 时为空串
++	 */
++	private static Map<String, String> remapIdentity(LoomGradleExtension extension, String sourceNamespace,
++			String targetNamespace, Set<String> knownIndyBsms, String kotlinVersion) {
++		final Map<String, String> identity = new LinkedHashMap<>();
++		identity.put("sourceNamespace", sourceNamespace);
++		identity.put("targetNamespace", targetNamespace);
++		identity.put("platform", extension.getPlatform().get().id());
++		identity.put("forgeLike", Boolean.toString(extension.isForgeLike()));
++		identity.put("neoForge", Boolean.toString(extension.isNeoForge()));
++		identity.put("runtimeMojang", Boolean.toString(extension.isForgeLike() && extension.getForgeProvider().usesMojangAtRuntime()));
++		identity.put("knownIndyBsms", knownIndyBsms.stream().sorted().collect(Collectors.joining("\n")));
++		identity.put("kotlinVersion", kotlinVersion);
++		return Map.copyOf(identity);
++	}
++
++	/** {@return 项目所用的 Kotlin 插件版本} 不用 Kotlin 时为空串；只读一个已设好的属性，不解析任何配置. */
++	private static String kotlinVersionOf(Provider<KotlinClasspathService.Options> kotlinOptions) {
++		final KotlinClasspathService.Options options = kotlinOptions.getOrNull();
++		return options == null ? "" : options.getKotlinVersion().getOrElse("");
++	}
++
++	/**
++	 * 把依赖投影成任务输入.
++	 *
++	 * <p>坐标必须与产出路径一致——消费方按坐标换算出文件依赖的相对路径，不一致就会指向
++	 * 一个任务永不写出的文件。
++	 *
++	 * @param artifacts 该依赖的产出路径，由 {@link ModDependency#getCacheArtifactPaths} 给出；
++	 *         两条时（拆分依赖的 common + client）第一条是 common 半，第二条是 client 半
++	 */
++	private static RemapModsTask.ModSpec toModSpec(Project project, ModDependency dependency, List<Path> artifacts) {
++		final RemapModsTask.ModSpec spec = project.getObjects().newInstance(RemapModsTask.ModSpec.class);
++		spec.getInputJar().set(dependency.getInputFile().toFile());
++		spec.getOutputJar().set(artifacts.get(0).toFile());
++
++		if (artifacts.size() > 1) {
++			spec.getSplitClientJar().set(artifacts.get(1).toFile());
++		}
++
++		spec.getGroup().set(dependency.getGroup());
++		spec.getName().set(dependency.getName());
++		spec.getVersion().set(dependency.getVersion());
++		spec.getClassifier().set(dependency.getClassifier());
++		spec.getMixinRemapType().set(dependency.getMetadata().mixinRemapType());
++		spec.getInlineRefmap().set(dependency.getOptions().getInlineRefmap());
++		return spec;
++	}
++
++	private static String taskName(String configName) {
++		return "remapMods" + configName.substring(0, 1).toUpperCase(Locale.ENGLISH) + configName.substring(1);
++	}
++
+ 	/**
+ 	 * 返回当前 Loom classloader 服务内的跨子项目共享 {@link AsyncCache}.
+ 	 *
+@@ -291,7 +469,14 @@ public class ModConfigurationRemapper {
+ 		final List<ArtifactRef> artifacts = new ArrayList<>();
+ 
+ 		final Set<ResolvedArtifact> resolvedArtifacts = configuration.get().getResolvedConfiguration().getResolvedArtifacts();
+-		Map<ResolvedArtifact, Path> sourcesMap = downloadAllSources(project, resolvedArtifacts);
++
++		// sources 解析只服务于 IDE 附加源码，且是一次真实的 ArtifactResolutionQuery
++		// （可能触发网络下载）。非 IDE 场景下其结果不会被消费，因此这里提前跳过，
++		// 避免在配置阶段为「用不到的东西」做一次完整制品解析。
++		// 守卫口径与 scheduleSourcesRemapping 保持一致。
++		final Map<ResolvedArtifact, Path> sourcesMap = shouldRemapSourcesInConfigurationPhase(project)
++				? downloadAllSources(project, resolvedArtifacts)
++				: Map.of();
+ 
+ 		for (ResolvedArtifact artifact : resolvedArtifacts) {
+ 			Path sources = sourcesMap.get(artifact);
+@@ -371,6 +556,15 @@ public class ModConfigurationRemapper {
+ 			return;
+ 		}
+ 
++		// remapped sources 只被 IDE 附加源码消费，不参与编译与打包。
++		// 在配置阶段写出它是有害的：配置缓存会把「本次创建了该文件」记入指纹，
++		// 下一次构建读到「文件已存在」即判定失效，于是每个含 mod 依赖的项目
++		// 在产物落盘后都要多一轮完整重配置。故仅在真正需要时（IDE 同步，
++		// 或用户显式开启）才在配置期加工。
++		if (!shouldRemapSourcesInConfigurationPhase(project)) {
++			return;
++		}
++
+ 		final Path sourcesInput = dependency.getInputArtifact().sources();
+ 
+ 		if (sourcesInput == null || Files.notExists(sourcesInput)) {
+@@ -406,4 +600,28 @@ public class ModConfigurationRemapper {
+ 		// CI seems to be set by most popular CI services
+ 		return System.getenv("CI") != null;
+ 	}
++
++	/**
++	 * {@return 是否在配置阶段加工依赖的 remapped sources}.
++	 *
++	 * <p>remapped sources 的唯一消费者是 IDE 附加源码；编译、测试、打包都不需要它。
++	 * 而配置阶段写出新文件会让配置缓存把「文件被创建」记入指纹，导致下一次构建
++	 * 因「文件系统条目已改变」而失效——表现为产物落盘后仍要完整重配置一轮。
++	 *
++	 * <p>因此默认只在 IDE 同步时加工（此时 IDE 确实要拿源码去索引），
++	 * 其余场景一律跳过。需要 sources 的非 IDE 场景可用
++	 * {@code -Dfabric.loom.remapSources=true} 显式开启。
++	 *
++	 * <p>注意：本判断只决定「是否加工」，不改变 IDE 同步时的行为，
++	 * 因此不影响既有 IDE 用例（见 IdeaDownloadSourcesHookTest）。
++	 */
++	public static boolean shouldRemapSourcesInConfigurationPhase(Project project) {
++		if (Boolean.parseBoolean(System.getProperty("fabric.loom.remapSources", "false"))) {
++			return true;
++		}
++
++		// 用与 SourceSetHelper 一致的 IDE 判定口径：IntelliJ 同步或 IDE 内运行。
++		// 只判 idea.sync.active 会漏掉「IDE 内直接触发 Gradle 构建」的场景。
++		return SourceSetHelper.isIdeDrivenBuild();
++	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/ModProcessor.java b/src/main/java/net/fabricmc/loom/configuration/mods/ModProcessor.java
+deleted file mode 100644
+index 6c28d9c10444947bd7fb5f5a81b04c23c440be0e..0000000000000000000000000000000000000000
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/ModProcessor.java
++++ /dev/null
+@@ -1,334 +0,0 @@
+-/*
+- * This file is part of fabric-loom, licensed under the MIT License (MIT).
+- *
+- * Copyright (c) 2018-2023 FabricMC
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a copy
+- * of this software and associated documentation files (the "Software"), to deal
+- * in the Software without restriction, including without limitation the rights
+- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+- * copies of the Software, and to permit persons to whom the Software is
+- * furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice shall be included in all
+- * copies or substantial portions of the Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+- * SOFTWARE.
+- */
+-
+-package net.fabricmc.loom.configuration.mods;
+-
+-import java.io.ByteArrayInputStream;
+-import java.io.ByteArrayOutputStream;
+-import java.io.File;
+-import java.io.IOException;
+-import java.io.UncheckedIOException;
+-import java.nio.file.Files;
+-import java.nio.file.Path;
+-import java.util.HashMap;
+-import java.util.HashSet;
+-import java.util.List;
+-import java.util.Locale;
+-import java.util.Map;
+-import java.util.Set;
+-import java.util.function.Predicate;
+-import java.util.jar.Manifest;
+-import java.util.regex.Matcher;
+-import java.util.regex.Pattern;
+-
+-import com.google.gson.JsonObject;
+-import dev.architectury.loom.accesstransformer.AtClassRemapper;
+-import dev.architectury.loom.forge.CoreModClassRemapper;
+-import dev.architectury.loom.mappings.MappingOption;
+-import dev.architectury.loom.neoforge.NeoForgeModDependencies;
+-import dev.architectury.loom.util.LoggerFilter;
+-import dev.architectury.loom.util.Stopwatch;
+-import org.gradle.api.Project;
+-import org.gradle.api.artifacts.Configuration;
+-import org.gradle.api.attributes.Usage;
+-import org.gradle.api.provider.Provider;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-
+-import net.fabricmc.loom.LoomGradleExtension;
+-import net.fabricmc.loom.api.RemapConfigurationSettings;
+-import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+-import net.fabricmc.loom.configuration.mods.dependency.ModDependency;
+-import net.fabricmc.loom.configuration.mods.extension.ModProcessorExtension;
+-import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration;
+-import net.fabricmc.loom.extension.RemapperExtensionHolder;
+-import net.fabricmc.loom.util.Constants;
+-import net.fabricmc.loom.util.IdentityBiMap;
+-import net.fabricmc.loom.util.ModPlatform;
+-import net.fabricmc.loom.util.Pair;
+-import net.fabricmc.loom.util.TinyRemapperHelper;
+-import net.fabricmc.loom.util.TinyRemapperLoggerAdapter;
+-import net.fabricmc.loom.util.ZipUtils;
+-import net.fabricmc.loom.util.kotlin.KotlinClasspathService;
+-import net.fabricmc.loom.util.kotlin.KotlinRemapperClassloader;
+-import net.fabricmc.loom.util.service.ServiceFactory;
+-import net.fabricmc.mappingio.tree.MemoryMappingTree;
+-import net.fabricmc.tinyremapper.InputTag;
+-import net.fabricmc.tinyremapper.NonClassCopyMode;
+-import net.fabricmc.tinyremapper.OutputConsumerPath;
+-import net.fabricmc.tinyremapper.TinyRemapper;
+-
+-public class ModProcessor {
+-	private static final String toM = MappingsNamespace.NAMED.toString();
+-
+-	private static final Logger LOGGER = LoggerFactory.getLogger(ModProcessor.class);
+-
+-	private static final Pattern COPY_CONFIGURATION_PATTERN = Pattern.compile("^(.+)Copy[0-9]*$");
+-
+-	private final Project project;
+-	private final Provider<? extends Configuration> sourceConfiguration;
+-	private final ServiceFactory serviceFactory;
+-
+-	public ModProcessor(Project project, Provider<? extends Configuration> sourceConfiguration, ServiceFactory serviceFactory) {
+-		this.project = project;
+-		this.sourceConfiguration = sourceConfiguration;
+-		this.serviceFactory = serviceFactory;
+-	}
+-
+-	public void processMods(List<ModDependency> remapList) throws IOException {
+-		try {
+-			LOGGER.info(":remapping {} mods from {}", remapList.size(), describeConfiguration(sourceConfiguration));
+-			remapJars(remapList);
+-		} catch (Exception e) {
+-			throw new RuntimeException(String.format(Locale.ENGLISH, "Failed to remap %d mods", remapList.size()), e);
+-		}
+-	}
+-
+-	// Creates a human-readable descriptive string for the configuration.
+-	// This consists primarily of the name with any copy suffixes stripped
+-	// (they're not informative), and the usage attribute if present.
+-	private String describeConfiguration(Provider<? extends Configuration> configuration) {
+-		String description = configuration.get().getName();
+-		final Matcher copyMatcher = COPY_CONFIGURATION_PATTERN.matcher(description);
+-
+-		// If we find a copy suffix, remove it.
+-		if (copyMatcher.matches()) {
+-			final String realName = copyMatcher.group(1);
+-
+-			// It's only a copy if we find a non-copy version.
+-			if (project.getConfigurations().findByName(realName) != null) {
+-				description = realName;
+-			}
+-		}
+-
+-		// Add the usage if present, e.g. "modImplementation (java-api)"
+-		final Usage usage = configuration.get().getAttributes().getAttribute(Usage.USAGE_ATTRIBUTE);
+-
+-		if (usage != null) {
+-			description += " (" + usage.getName() + ")";
+-		}
+-
+-		return description;
+-	}
+-
+-	private void stripNestedJars(Path path) {
+-		try {
+-			ZipUtils.deleteIfExists(path, "META-INF/jarjar/metadata.json");
+-		} catch (IOException e) {
+-			throw new UncheckedIOException("Failed to strip nested jars from %s".formatted(path), e);
+-		}
+-
+-		if (!ZipUtils.contains(path, "fabric.mod.json")) {
+-			if (ZipUtils.contains(path, "quilt.mod.json")) {
+-				// Strip out all contained jar info as we dont want loader to try and load the jars contained in dev.
+-				try {
+-					ZipUtils.transformJson(JsonObject.class, path, Map.of("quilt.mod.json", json -> {
+-						if (json.has("quilt_loader")) {
+-							json.getAsJsonObject("quilt_loader").remove("jars");
+-						}
+-
+-						return json;
+-					}));
+-				} catch (IOException e) {
+-					throw new UncheckedIOException("Failed to strip nested jars from %s".formatted(path), e);
+-				}
+-			}
+-
+-			return;
+-		}
+-
+-		// Strip out all contained jar info as we dont want loader to try and load the jars contained in dev.
+-		try {
+-			ZipUtils.transformJson(JsonObject.class, path, Map.of("fabric.mod.json", json -> {
+-				json.remove("jars");
+-				return json;
+-			}));
+-		} catch (IOException e) {
+-			throw new UncheckedIOException("Failed to strip nested jars from %s".formatted(path), e);
+-		}
+-	}
+-
+-	private void remapJars(List<ModDependency> remapList) throws IOException {
+-		final LoomGradleExtension extension = LoomGradleExtension.get(project);
+-		final MappingConfiguration mappingConfiguration = extension.getMappingConfiguration();
+-
+-		MappingsNamespace productionNamespace = extension.getProductionNamespaceEnum().get();
+-		Stopwatch stopwatch = Stopwatch.createStarted();
+-
+-		Set<String> knownIndyBsms = new HashSet<>(extension.getKnownIndyBsms().get());
+-
+-		for (ModDependency modDependency : remapList) {
+-			knownIndyBsms.addAll(modDependency.getMetadata().knownIdyBsms());
+-		}
+-
+-		MappingOption mappingOption = MappingOption.forPlatform(extension);
+-		MemoryMappingTree mappings = mappingConfiguration.getMappingsService(project, serviceFactory, mappingOption).getMappingTree();
+-		LoggerFilter.replaceSystemOut();
+-
+-		TinyRemapper.Builder builder = TinyRemapper.newRemapper(TinyRemapperLoggerAdapter.INSTANCE)
+-				.withKnownIndyBsm(knownIndyBsms)
+-				.withMappings(TinyRemapperHelper.create(mappings, productionNamespace.toString(), toM, true, true))
+-				.renameInvalidLocals(false)
+-				.extraAnalyzeVisitor(AccessWidenerAnalyzeVisitorProvider.createFromMods(productionNamespace.toString(), remapList, extension.getPlatform().get()));
+-
+-		final KotlinClasspathService kotlinClasspathService = serviceFactory.getOrNull(KotlinClasspathService.createOptions(project));
+-		KotlinRemapperClassloader kotlinRemapperClassloader = null;
+-
+-		if (kotlinClasspathService != null) {
+-			kotlinRemapperClassloader = KotlinRemapperClassloader.create(kotlinClasspathService);
+-			builder.extension(kotlinRemapperClassloader.getTinyRemapperExtension());
+-		}
+-
+-		final IdentityBiMap<InputTag, ModDependency> inputTags = new IdentityBiMap<>();
+-		final List<ModProcessorExtension> activeExtensions = ModProcessorExtension.EXTENSIONS.stream()
+-				.filter(e -> remapList.stream().anyMatch(e::appliesTo))
+-				.toList();
+-		final ModProcessorExtension.Context context = new ModProcessorExtension.Context(productionNamespace.toString(), toM, remapList);
+-
+-		for (ModProcessorExtension modProcessorExtension : activeExtensions) {
+-			LOGGER.info("Applying mod processor extension: {}", modProcessorExtension.getClass().getSimpleName());
+-
+-			final Predicate<InputTag> applyPredicate = inputTag -> {
+-				ModDependency mod = inputTags.getByKey(inputTag);
+-				return mod != null && modProcessorExtension.appliesTo(mod);
+-			};
+-
+-			builder.extension(modProcessorExtension.createExtension(context, applyPredicate));
+-		}
+-
+-		for (RemapperExtensionHolder holder : extension.getRemapperExtensions().get()) {
+-			holder.apply(builder, productionNamespace.toString(), toM);
+-		}
+-
+-		final TinyRemapper remapper = builder.build();
+-
+-		remapper.readClassPath(extension.getMinecraftJars(productionNamespace).toArray(Path[]::new));
+-
+-		final Map<ModDependency, OutputConsumerPath> outputConsumerMap = new HashMap<>();
+-		final Map<ModDependency, Pair<byte[], String>> accessWidenerMap = new HashMap<>();
+-
+-		for (RemapConfigurationSettings entry : extension.getRemapConfigurations()) {
+-			for (File inputFile : entry.getSourceConfiguration().get().getFiles()) {
+-				if (remapList.stream().noneMatch(info -> info.getInputFile().toFile().equals(inputFile))) {
+-					LOGGER.debug("Adding " + inputFile + " onto the remap classpath");
+-					remapper.readClassPathAsync(inputFile.toPath());
+-				}
+-			}
+-		}
+-
+-		for (ModDependency info : remapList) {
+-			InputTag tag = remapper.createInputTag();
+-
+-			LOGGER.debug("Adding " + info.getInputFile() + " as a remap input");
+-			inputTags.put(tag, info);
+-
+-			remapper.readInputsAsync(tag, info.getInputFile());
+-			Files.deleteIfExists(getRemappedOutput(info));
+-		}
+-
+-		try {
+-			// Apply this in a second loop as we need to ensure all the inputs are on the classpath before remapping.
+-			for (ModDependency dependency : remapList) {
+-				try {
+-					OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(getRemappedOutput(dependency)).build();
+-
+-					outputConsumer.addNonClassFiles(dependency.getInputFile(), NonClassCopyMode.FIX_META_INF, remapper);
+-					outputConsumerMap.put(dependency, outputConsumer);
+-
+-					final ModPlatform platform = LoomGradleExtension.get(project).getPlatform().get();
+-					final AccessWidenerUtils.AccessWidenerData accessWidenerData = AccessWidenerUtils.readAccessWidenerData(dependency.getInputFile(), platform);
+-
+-					if (accessWidenerData != null) {
+-						LOGGER.debug("Remapping access widener in {}", dependency.getInputFile());
+-						byte[] remappedAw = AccessWidenerUtils.remapAccessWidener(accessWidenerData.content(), remapper.getEnvironment().getRemapper(), productionNamespace.toString(), toM);
+-						accessWidenerMap.put(dependency, new Pair<>(remappedAw, accessWidenerData.path()));
+-					}
+-
+-					remapper.apply(outputConsumer, inputTags.getByValue(dependency));
+-				} catch (Exception e) {
+-					throw new RuntimeException("Failed to remap: " + dependency, e);
+-				}
+-			}
+-		} finally {
+-			remapper.finish();
+-
+-			if (kotlinRemapperClassloader != null) {
+-				kotlinRemapperClassloader.close();
+-			}
+-		}
+-
+-		project.getLogger().lifecycle(":remapped {} mods ({} -> {}) in {}", remapList.size(), productionNamespace.toString(), toM, stopwatch.stop());
+-
+-		for (ModDependency dependency : remapList) {
+-			outputConsumerMap.get(dependency).close();
+-
+-			final Path output = getRemappedOutput(dependency);
+-			final Pair<byte[], String> accessWidener = accessWidenerMap.get(dependency);
+-
+-			if (accessWidener != null) {
+-				ZipUtils.replace(output, accessWidener.right(), accessWidener.left());
+-			}
+-
+-			for (ModProcessorExtension modProcessorExtension : activeExtensions) {
+-				if (modProcessorExtension.appliesTo(dependency)) {
+-					modProcessorExtension.finalise(dependency, output);
+-				}
+-			}
+-
+-			stripNestedJars(output);
+-			remapJarManifestEntries(output);
+-
+-			if (extension.isForgeLike()) {
+-				if (extension.isNeoForge()) {
+-					// NeoForge: Fully map ATs
+-					NeoForgeModDependencies.remapAts(output, mappings, productionNamespace.toString(), toM);
+-				} else {
+-					// Forge: only map class names, the rest are mapped srg -> named at runtime
+-					AtClassRemapper.remap(project, output, mappings);
+-				}
+-
+-				final boolean runtimeMojang = extension.getForgeProvider().usesMojangAtRuntime();
+-				CoreModClassRemapper.remapJar(project, runtimeMojang, output, mappings);
+-			}
+-
+-			dependency.copyToCache(project, output, null);
+-		}
+-	}
+-
+-	private Path getRemappedOutput(ModDependency dependency) {
+-		return dependency.getWorkingFile(project, null);
+-	}
+-
+-	private void remapJarManifestEntries(Path jar) throws IOException {
+-		ZipUtils.transform(jar, Map.of(Constants.Manifest.PATH, bytes -> {
+-			var manifest = new Manifest(new ByteArrayInputStream(bytes));
+-
+-			manifest.getMainAttributes().putValue(Constants.Manifest.MAPPING_NAMESPACE, toM);
+-
+-			ByteArrayOutputStream out = new ByteArrayOutputStream();
+-			manifest.write(out);
+-			return out.toByteArray();
+-		}));
+-	}
+-}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/ModDependency.java b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/ModDependency.java
+index fd9147fe6d6f8536079f5fa16cd9cfbb5282bafc..80291233c4da1b085fa7fbf0f2fb8c238f152b6d 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/ModDependency.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/ModDependency.java
+@@ -26,6 +26,7 @@ package net.fabricmc.loom.configuration.mods.dependency;
+ 
+ import java.io.IOException;
+ import java.nio.file.Path;
++import java.util.List;
+ 
+ import org.gradle.api.Project;
+ import org.gradle.api.artifacts.component.ComponentIdentifier;
+@@ -67,9 +68,29 @@ public abstract sealed class ModDependency permits SplitModDependency, SimpleMod
+ 	public abstract void copyToCache(Project project, Path path, @Nullable String variant) throws IOException;
+ 
+ 	/**
+-	 * Apply the dependency to the project.
++	 * 把本依赖注入目标配置.
++	 *
++	 * @param artifacts 本批 remapped mod 产物各自的生产位置（见 {@link RemappedModArtifacts}）；
++	 *         产出方未必是本项目的任务，故不传任务实例而传「按路径查生产者」的解析器
+ 	 */
+-	public abstract void applyToProject(Project project);
++	public abstract void applyToProject(Project project, RemappedModArtifacts artifacts);
++
++	/**
++	 * {@return 本依赖的重映射产物落在共享仓库里的**全部**路径}.
++	 *
++	 * <p>与消费方找产物走的是同一处计算（{@link #createMavenHelper}），因为 L3 任务按这些路径写出、
++	 * 消费方按这些路径读取：两处各自算一遍布局，会在快照版本这类「目录名与文件名不同源」的用例上分叉成
++	 * 「任务写一条、消费方读另一条」的静默缺失。
++	 *
++	 * <p>返回列表而不是单条路径，是因为依赖的产物数不止一条：拆分依赖（{@link SplitModDependency}）
++	 * 会产出 common/client 两条各自落位的变体（见 override）。生产与消费都按**这一处**结果走，
++	 * 「谁产出某条路径」才不会漏掉其中一条。
++	 *
++	 * @param project 所在项目（决定共享仓库根）
++	 */
++	public List<Path> getCacheArtifactPaths(Project project) {
++		return List.of(createMavenHelper(project, null).getOutputFile(null));
++	}
+ 
+ 	/**
+ 	 * Create a maven helper for the local cache.
+@@ -102,18 +123,28 @@ public abstract sealed class ModDependency permits SplitModDependency, SimpleMod
+ 		return metadata;
+ 	}
+ 
+-	protected String getName() {
++	/**
++	 * 产出坐标名（含 cache key）；L3 任务据此定位产出路径，故为 public（见架构 §5.1.1）.
++	 */
++	public String getName() {
+ 		return "%s-%s".formatted(name, options.getCacheKey());
+ 	}
+ 
+-	protected String getGroup() {
++	/** 产出坐标组；同上. */
++	public String getGroup() {
+ 		return "remapped.%s".formatted(group);
+ 	}
+ 
+-	protected String getVersion() {
++	/** 产出坐标版本；同上. */
++	public String getVersion() {
+ 		return version;
+ 	}
+ 
++	/** 产出坐标分类器；同上. */
++	public @Nullable String getClassifier() {
++		return classifier;
++	}
++
+ 	public Path getInputFile() {
+ 		return artifact.path();
+ 	}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/RemappedModArtifacts.java b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/RemappedModArtifacts.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..005eee7a2880336bdb7739027a37ee467670a26e
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/RemappedModArtifacts.java
+@@ -0,0 +1,97 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.configuration.mods.dependency;
++
++import java.nio.file.Path;
++import java.util.Map;
++
++import org.gradle.api.Project;
++import org.gradle.api.file.ConfigurableFileCollection;
++import org.jspecify.annotations.Nullable;
++
++import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
++import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry.Producer;
++
++/**
++ * 一批 remapped mod 产物**各自的生产位置**，消费方据此把产物路径换成可注入配置的依赖表示.
++ *
++ * <h2>为什么消费方不能只依赖「本项目的那一个任务」</h2>
++ * 产物落在构建内所有项目共用的 {@code remapped_mods} 仓库里，同一条路径只能有一个生产者，由
++ * {@link RemapMinecraftTaskRegistry#claimAll} 在同一构建内判定（见 {@link net.fabricmc.loom.pipeline.RemapModsTask}）。
++ * 本项目这一批里可能有若干条产物早已被**别的项目**认领——那些产物由对方的任务产出，本项目不会再写第二遍，
++ * 因此消费方必须按**每一条产物**去挂依赖，而不是一律挂到本项目的任务上：后者会让构建因为
++ * 「用了别的任务的产物却没声明依赖」而失败，或者更糟——声明了一条并不产出该文件的任务依赖。
++ *
++ * <h2>依赖按任务路径登记</h2>
++ * 产出方可能来自另一份 Loom classloader（同一构建内多个项目各带一份 Loom 时会发生），任务实例过不来，
++ * 任务路径是字符串、跨 classloader 可用，交给 {@code builtBy} 后由 Gradle 解析成真正的（可能是跨项目的）
++ * 任务依赖。
++ */
++public final class RemappedModArtifacts {
++	private final Project project;
++	private final Path root;
++	private final Map<Path, Producer> producers;
++
++	/**
++	 * @param project 消费方项目
++	 * @param root 共享仓库根（{@code getRemappedModCache}）
++	 * @param producers 本次登记判定的「产物路径 → 生产位置」；键为绝对规范化路径
++	 */
++	public RemappedModArtifacts(Project project, Path root, Map<Path, Producer> producers) {
++		this.project = project;
++		this.root = root;
++		this.producers = Map.copyOf(producers);
++	}
++
++	/**
++	 * {@return 该产物的依赖表示} 即「文件本身 + 产出它的任务」，可直接交给
++	 * {@code DependencyHandler#add} 或 {@code ModSettings#getModFiles}.
++	 *
++	 * @param relativeArtifactPath 相对共享仓库根的产物路径（见 {@link LocalMavenHelper#getRelativeArtifactPath}）
++	 */
++	public Object dependency(String relativeArtifactPath) {
++		final Path artifact = root.resolve(relativeArtifactPath).toAbsolutePath().normalize();
++		final ConfigurableFileCollection files = project.files(artifact.toFile());
++		final String taskPath = taskPathOf(artifact);
++
++		if (taskPath != null) {
++			files.builtBy(taskPath);
++		}
++
++		return files;
++	}
++
++	/**
++	 * {@return 产出该产物的任务路径} 本批次的登记表里没有这条路径时为 {@code null}.
++	 *
++	 * <p>缺失表示该产物不由 L3 任务产出（例如与产物无关的普通文件依赖）：这里不替它编一条任务依赖
++	 * ——那只会让构建声明一条并不产出该文件的依赖边。拆分依赖（{@link SplitModDependency}）的
++	 * common/client 两条变体**不**属于这一类：它们与其它产物一样参与认领，因此同样能在表里查到生产者。
++	 */
++	private @Nullable String taskPathOf(Path artifact) {
++		final Producer producer = producers.get(artifact);
++		return producer == null ? null : producer.taskPath();
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/SimpleModDependency.java b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/SimpleModDependency.java
+index 89342ac03110e510b8089e1277e8cd27e0e5a730..ca12ef8b583b972627f29f425aa0f1bdaf4d0dd9 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/SimpleModDependency.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/SimpleModDependency.java
+@@ -62,7 +62,7 @@ public final class SimpleModDependency extends ModDependency {
+ 	}
+ 
+ 	@Override
+-	public void applyToProject(Project project) {
+-		project.getDependencies().add(targetConfig.getName(), maven.getNotation());
++	public void applyToProject(Project project, RemappedModArtifacts artifacts) {
++		project.getDependencies().add(targetConfig.getName(), artifacts.dependency(maven.getRelativeArtifactPath(null)));
+ 	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/SplitModDependency.java b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/SplitModDependency.java
+index a42e61b499f31fc1af9f0c9627d8585f1c46d4ff..0a623b6fc8633383d339f3042561d3b2f5567306 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/SplitModDependency.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/SplitModDependency.java
+@@ -26,6 +26,7 @@ package net.fabricmc.loom.configuration.mods.dependency;
+ 
+ import java.io.IOException;
+ import java.nio.file.Path;
++import java.util.List;
+ import java.util.Objects;
+ 
+ import org.gradle.api.NamedDomainObjectProvider;
+@@ -105,31 +106,46 @@ public final class SplitModDependency extends ModDependency {
+ 		}
+ 	}
+ 
++	/**
++	 * {@return 本依赖在共享仓库里的全部落位}.
++	 *
++	 * <p>拆分依赖的产物名带 {@code -common} / {@code -client} 后缀（见 {@link #createMavenHelper}），
++	 * 消费方读的也是带后缀的那条——所以生产者要认领、要写出的同样是**带后缀**的路径，
++	 * 而不是无后缀的那条：后者既不在这里消费，写了也无人读。
++	 */
+ 	@Override
+-	public void applyToProject(Project project) {
++	public List<Path> getCacheArtifactPaths(Project project) {
++		return switch (target) {
++		case COMMON_ONLY -> List.of(getCommonMaven().getOutputFile(null));
++		case CLIENT_ONLY -> List.of(getClientMaven().getOutputFile(null));
++		case SPLIT -> List.of(getCommonMaven().getOutputFile(null), getClientMaven().getOutputFile(null));
++		};
++	}
++
++	@Override
++	public void applyToProject(Project project, RemappedModArtifacts artifacts) {
+ 		if (target.common()) {
+-			project.getDependencies().add(targetCommonConfig.getName(), getCommonMaven().getNotation());
++			project.getDependencies().add(targetCommonConfig.getName(),
++					artifacts.dependency(getCommonMaven().getRelativeArtifactPath(null)));
+ 		}
+ 
+ 		if (target.client()) {
+-			project.getDependencies().add(targetClientConfig.getName(), getClientMaven().getNotation());
++			project.getDependencies().add(targetClientConfig.getName(),
++					artifacts.dependency(getClientMaven().getRelativeArtifactPath(null)));
+ 		}
+ 
+ 		if (target == JarSplitter.Target.SPLIT) {
+-			createModGroup(
+-					project,
+-					getCommonMaven().getOutputFile(null),
+-					getClientMaven().getOutputFile(null)
+-			);
++			createModGroup(project, artifacts);
+ 		}
+ 	}
+ 
+-	private void createModGroup(Project project, Path commonJar, Path clientJar) {
++	private void createModGroup(Project project, RemappedModArtifacts artifacts) {
+ 		LoomGradleExtension extension = LoomGradleExtension.get(project);
+ 		final ModSettings modSettings = extension.getMods().maybeCreate(String.format("%s-%s-%s", getGroup(), getName(), getVersion()));
++
+ 		modSettings.getModFiles().from(
+-				commonJar.toFile(),
+-				clientJar.toFile()
++				artifacts.dependency(getCommonMaven().getRelativeArtifactPath(null)),
++				artifacts.dependency(getClientMaven().getRelativeArtifactPath(null))
+ 		);
+ 	}
+ 
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/refmap/MixinRefmapInliner.java b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/refmap/MixinRefmapInliner.java
+index d9d35fd76b54d6706bbfac48a47db0e4c0a5562c..2f3342f2a2c06b2c010d2ebdbd6ca621eccc8078 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/dependency/refmap/MixinRefmapInliner.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/dependency/refmap/MixinRefmapInliner.java
+@@ -32,7 +32,6 @@ import java.util.List;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import net.fabricmc.loom.configuration.mods.ArtifactMetadata;
+ import net.fabricmc.loom.configuration.mods.dependency.ModDependency;
+ import net.fabricmc.loom.util.ExceptionUtil;
+ import net.fabricmc.loom.util.fmj.FabricModJson;
+@@ -42,31 +41,34 @@ import net.fabricmc.loom.util.fmj.mixin.MixinConfiguration;
+ public class MixinRefmapInliner {
+ 	private static final Logger LOGGER = LoggerFactory.getLogger(MixinRefmapInliner.class);
+ 
+-	public static MixinReferenceRemapper createRemapper(String from, String to, List<ModDependency> mods) throws IOException {
++	/**
++	 * 从若干 mod jar 构建 refmap 内联器.
++	 *
++	 * <p>只读取各 jar 的 {@code fabric.mod.json}，不依赖 {@link ModDependency} 的项目状态，
++	 * 因此可在执行期调用（L3 任务路径）。调用方负责按 mixin 重映射类型预先筛选 jar。
++	 */
++	public static MixinReferenceRemapper createFromModJars(String from, String to, List<Path> mixinModJars) throws IOException {
+ 		List<MixinConfiguration> mixinConfigurations = new ArrayList<>();
+ 
+-		for (ModDependency mod : mods) {
+-			if (mod.getMetadata().mixinRemapType() != ArtifactMetadata.MixinRemapType.MIXIN) {
+-				continue;
+-			}
+-
+-			FabricModJson fabricModJson = FabricModJsonFactory.createFromZipNullable(mod.getInputFile());
++		for (Path modJar : mixinModJars) {
++			FabricModJson fabricModJson = FabricModJsonFactory.createFromZipNullable(modJar);
+ 
+ 			if (fabricModJson == null) {
+-				LOGGER.warn("Failed to read fabric.mod.json from {}", mod.getInputFile());
++				LOGGER.warn("Failed to read fabric.mod.json from {}", modJar);
+ 				continue;
+ 			}
+ 
+ 			try {
+ 				mixinConfigurations.addAll(MixinConfiguration.fromMod(fabricModJson));
+ 			} catch (IOException e) {
+-				throw ExceptionUtil.createDescriptiveWrapper(IOException::new, "Failed to read mixin configuration from " + mod.getInputFile(), e);
++				throw ExceptionUtil.createDescriptiveWrapper(IOException::new, "Failed to read mixin configuration from " + modJar, e);
+ 			}
+ 		}
+ 
+ 		return MixinReferenceRemapperImpl.createFromRefmaps(from, to, mixinConfigurations.stream().map(MixinConfiguration::refmap));
+ 	}
+ 
+-	public static void removeRefmap(ModDependency modDependency, Path ouputPath) {
++	/** 当前为空实现：refmap 已在 {@link #createFromModJars} 阶段内联，无需再移除. */
++	public static void removeRefmap(Path outputPath) {
+ 	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/extension/InlineRefmap.java b/src/main/java/net/fabricmc/loom/configuration/mods/extension/InlineRefmap.java
+index 5e19a877af33f1dfae519dd9fe7b724e45d00fb5..3babcc618448a7803eddf4ee73bf7a365b9921e1 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/extension/InlineRefmap.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/extension/InlineRefmap.java
+@@ -29,7 +29,6 @@ import java.nio.file.Path;
+ import java.util.function.Predicate;
+ 
+ import net.fabricmc.loom.configuration.mods.ArtifactMetadata;
+-import net.fabricmc.loom.configuration.mods.dependency.ModDependency;
+ import net.fabricmc.loom.configuration.mods.dependency.refmap.MixinReferenceRemapper;
+ import net.fabricmc.loom.configuration.mods.dependency.refmap.MixinRefmapInliner;
+ import net.fabricmc.loom.configuration.mods.dependency.refmap.MixinRefmapInlinerApplyVisitorProvider;
+@@ -43,18 +42,18 @@ final class InlineRefmap implements ModProcessorExtension {
+ 	}
+ 
+ 	@Override
+-	public boolean appliesTo(ModDependency modDependency) {
+-		return modDependency.getOptions().getInlineRefmap().get()
+-				&& modDependency.getMetadata().mixinRemapType() == ArtifactMetadata.MixinRemapType.MIXIN;
++	public boolean appliesTo(ModInfo mod) {
++		return mod.inlineRefmap()
++				&& mod.mixinRemapType() == ArtifactMetadata.MixinRemapType.MIXIN;
+ 	}
+ 
+ 	@Override
+ 	public TinyRemapper.Extension createExtension(Context ctx, Predicate<InputTag> applyPredicate) throws IOException {
+-		MixinReferenceRemapper refmapRemapper = MixinRefmapInliner.createRemapper(ctx.from(), ctx.to(), ctx.mods());
++		MixinReferenceRemapper refmapRemapper = MixinRefmapInliner.createFromModJars(ctx.from(), ctx.to(), ctx.mixinModJars());
+ 		return new MixinRefmapInlinerApplyVisitorProvider(refmapRemapper, applyPredicate);
+ 	}
+ 
+ 	@Override
+-	public void finalise(ModDependency modDependency, Path path) throws IOException {
++	public void finalise(ModInfo mod, Path path) throws IOException {
+ 	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/extension/MixinRemap.java b/src/main/java/net/fabricmc/loom/configuration/mods/extension/MixinRemap.java
+index 6284bca9b13098397747e5df642e7a31537bb08c..623dc8ff8321713a7f31ebcde9b2eb99f63ceaf1 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/extension/MixinRemap.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/extension/MixinRemap.java
+@@ -29,7 +29,6 @@ import java.nio.file.Path;
+ import java.util.function.Predicate;
+ 
+ import net.fabricmc.loom.configuration.mods.ArtifactMetadata;
+-import net.fabricmc.loom.configuration.mods.dependency.ModDependency;
+ import net.fabricmc.loom.configuration.mods.dependency.refmap.MixinRefmapInliner;
+ import net.fabricmc.tinyremapper.InputTag;
+ import net.fabricmc.tinyremapper.TinyRemapper;
+@@ -42,8 +41,8 @@ final class MixinRemap implements ModProcessorExtension {
+ 	}
+ 
+ 	@Override
+-	public boolean appliesTo(ModDependency modDependency) {
+-		return modDependency.getMetadata().mixinRemapType() == ArtifactMetadata.MixinRemapType.STATIC;
++	public boolean appliesTo(ModInfo mod) {
++		return mod.mixinRemapType() == ArtifactMetadata.MixinRemapType.STATIC;
+ 	}
+ 
+ 	@Override
+@@ -52,7 +51,7 @@ final class MixinRemap implements ModProcessorExtension {
+ 	}
+ 
+ 	@Override
+-	public void finalise(ModDependency modDependency, Path path) throws IOException {
+-		MixinRefmapInliner.removeRefmap(modDependency, path);
++	public void finalise(ModInfo mod, Path path) throws IOException {
++		MixinRefmapInliner.removeRefmap(path);
+ 	}
+ }
+diff --git a/src/main/java/net/fabricmc/loom/configuration/mods/extension/ModProcessorExtension.java b/src/main/java/net/fabricmc/loom/configuration/mods/extension/ModProcessorExtension.java
+index 24da41cca749359886b35692c53a2680c667fc84..d4d0676d2314a4af505a3e57a87d2dda5c987ce8 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/mods/extension/ModProcessorExtension.java
++++ b/src/main/java/net/fabricmc/loom/configuration/mods/extension/ModProcessorExtension.java
+@@ -29,6 +29,7 @@ import java.nio.file.Path;
+ import java.util.List;
+ import java.util.function.Predicate;
+ 
++import net.fabricmc.loom.configuration.mods.ArtifactMetadata;
+ import net.fabricmc.loom.configuration.mods.dependency.ModDependency;
+ import net.fabricmc.tinyremapper.InputTag;
+ import net.fabricmc.tinyremapper.TinyRemapper;
+@@ -45,17 +46,38 @@ public interface ModProcessorExtension {
+ 	/**
+ 	 * Return true if the extension applies to the given mod dependency.
+ 	 */
+-	boolean appliesTo(ModDependency modDependency);
++	boolean appliesTo(ModInfo mod);
+ 
+ 	/**
+ 	 * Create a TinyRemapper extension that uses the predicate to only apply to mods that match appliesTo.
+ 	 */
+ 	TinyRemapper.Extension createExtension(Context ctx, Predicate<InputTag> applyPredicate) throws IOException;
+ 
+-	void finalise(ModDependency modDependency, Path path) throws IOException;
++	void finalise(ModInfo mod, Path path) throws IOException;
+ 
++	/**
++	 * 一个 mod 在「是否 / 如何套用扩展」这件事上被用到的全部事实.
++	 *
++	 * <p>取代原先直接传 {@link ModDependency}：扩展本来就只用到输入 jar 路径与
++	 * mixin 重映射类型、是否内联 refmap 这三项，其中前两项由 jar 内容派生、第三项是
++	 * 声明的选项。收窄成纯数据后，配置期与执行期（L3 任务）都能满足同一份契约，
++	 * 而不需要把依赖对象带进任务。
++	 *
++	 * @param inputJar 原始 mod jar
++	 * @param mixinRemapType 由 jar 内容派生的 mixin 重映射类型
++	 * @param inlineRefmap 声明的 refmap 内联选项
++	 */
++	record ModInfo(Path inputJar, ArtifactMetadata.MixinRemapType mixinRemapType, boolean inlineRefmap) { }
++
++	/**
++	 * 扩展装配上下文.
++	 *
++	 * @param from 源命名空间
++	 * @param to 目标命名空间
++	 * @param mixinModJars 本批次中 mixin 重映射类型为 MIXIN 的输入 jar（refmap 内联器需要）
++	 */
+ 	record Context(
+ 			String from,
+ 			String to,
+-			List<ModDependency> mods) { }
++			List<Path> mixinModJars) { }
+ }
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/RemapModsTask.java b/src/main/java/net/fabricmc/loom/pipeline/RemapModsTask.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..57baaec629fe4ecceb775272f7ff7822d1a426d3
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/pipeline/RemapModsTask.java
+@@ -0,0 +1,590 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.pipeline;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.file.AtomicMoveNotSupportedException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardCopyOption;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.IdentityHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.UUID;
++import java.util.function.Predicate;
++
++import dev.architectury.loom.accesstransformer.AtClassRemapper;
++import dev.architectury.loom.forge.CoreModClassRemapper;
++import org.gradle.api.DefaultTask;
++import org.gradle.api.file.ConfigurableFileCollection;
++import org.gradle.api.file.RegularFile;
++import org.gradle.api.file.RegularFileProperty;
++import org.gradle.api.provider.ListProperty;
++import org.gradle.api.provider.Property;
++import org.gradle.api.provider.SetProperty;
++import org.gradle.api.tasks.CacheableTask;
++import org.gradle.api.tasks.Classpath;
++import org.gradle.api.tasks.Input;
++import org.gradle.api.tasks.InputFile;
++import org.gradle.api.tasks.Internal;
++import org.gradle.api.tasks.Nested;
++import org.gradle.api.tasks.Optional;
++import org.gradle.api.tasks.OutputFiles;
++import org.gradle.api.tasks.PathSensitive;
++import org.gradle.api.tasks.PathSensitivity;
++import org.gradle.api.tasks.TaskAction;
++import org.jspecify.annotations.Nullable;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import net.fabricmc.loom.configuration.mods.AccessWidenerAnalyzeVisitorProvider;
++import net.fabricmc.loom.configuration.mods.AccessWidenerUtils;
++import net.fabricmc.loom.configuration.mods.ArtifactMetadata;
++import net.fabricmc.loom.configuration.mods.JarSplitter;
++import net.fabricmc.loom.configuration.mods.extension.ModProcessorExtension;
++import net.fabricmc.loom.configuration.providers.mappings.TinyMappingsService;
++import net.fabricmc.loom.core.ModJarPostProcess;
++import net.fabricmc.loom.core.ModJarRemap;
++import net.fabricmc.loom.util.ModPlatform;
++import net.fabricmc.loom.util.Pair;
++import net.fabricmc.loom.util.kotlin.KotlinClasspathService;
++import net.fabricmc.loom.util.kotlin.KotlinRemapperClassloader;
++import net.fabricmc.loom.util.service.ScopedServiceFactory;
++import net.fabricmc.loom.util.service.ServiceFactory;
++import net.fabricmc.mappingio.tree.MemoryMappingTree;
++import net.fabricmc.tinyremapper.InputTag;
++import net.fabricmc.tinyremapper.NonClassCopyMode;
++import net.fabricmc.tinyremapper.OutputConsumerPath;
++import net.fabricmc.tinyremapper.TinyRemapper;
++
++/**
++ * L3 流水线：把一个配置里的 mod jar 批量重映射到目标命名空间.
++ *
++ * <p>它取代 {@code ModConfigurationRemapper} 在配置期同步执行的 mod 重映射。与
++ * {@link RemapMinecraftTask} 一起构成 L3 的切换对——二者必须同批接线，因为配置期的
++ * mod 重映射要按路径读 mapped Minecraft jar，只切一个会立刻打断对方。
++ *
++ * <h2>为什么是「批量」而不是「一 jar 一任务」</h2>
++ * mod 重映射需要**整组类型上下文**：字节码里的继承关系可能跨越多个 mod，逐个重映射会
++ * 得到与既有实现不同的结果。因此这里沿用原实现的语义——先把所有输入加入 classpath，
++ * 再逐个 apply。这也意味着不能把它拆成 Artifact Transform。
++ *
++ * <h2>产出落位与共享路径的所有权</h2>
++ * 产物按 Maven 仓库布局写入**构建根下的共享仓库**（{@code .gradle/loom-cache/remapped_mods}：同一构建的
++ * 所有项目、同一台机器的所有工作树共用同一个目录），路径由坐标与 cache key 决定。因此「每个项目各注册一份
++ * 生产者」在这里是不成立的：同一条路径上只能有一个生产者，否则两个任务会写同一个文件（Gradle 9.5 对这种
++ * 重叠既不报错也不排序，后完成的覆盖先完成的），而只要有消费方按该路径取产物，
++ * 隐式依赖校验就会以「uses this output of task ... without declaring an explicit or implicit dependency」
++ * 让整个构建失败——两个项目只是各自依赖自己那份产物时也会失败，因为冲突判定看的是**谁声明了该位置**。
++ *
++ * <p>唯一生产者由 {@link RemapMinecraftTaskRegistry#claimAll} 在同一构建内判定，且产物**逐条**声明：
++ * 本任务声明的是「自己认领到的那些文件」（{@link #getOutputJars()}），绝不声明整个共享目录——声明目录会把
++ * 别的项目、别的配置的产物一起纳入本任务的快照与清理范围。被别的项目认领的产物仍按完整批次读入
++ * （{@link #getMods()} 不因认领结果被截断），因此类型上下文与「谁先登记」无关，每条产物的字节是确定的。
++ *
++ * <p>消费方按 {@code builtBy} 挂到**产出任务的任务路径**上（见 {@code RemappedModArtifacts}）：
++ * 产出方可能是另一份 classloader 里的任务，任务路径是字符串，跨 classloader 可用。
++ *
++ * <h2>一条依赖可能有多条产物</h2>
++ * 拆分依赖（{@code SplitModDependency}）的消费方读的是 {@code -common} / {@code -client} 两条带后缀的
++ * 产物，而重映射产出的是整体 jar：这类 mod 的**两条**路径都要参与认领与声明，写出时先重映射出整体 jar，
++ * 再拆成两半各自落位（见 {@link #publishSplit}）。只认领、只写出无后缀的那一条，消费方的两条路径就都成了
++ * 没有生产者的悬空路径——构建全程不报错，症状是编译期少 jar。
++ */
++@CacheableTask
++public abstract class RemapModsTask extends DefaultTask {
++	private static final Logger LOGGER = LoggerFactory.getLogger(RemapModsTask.class);
++
++	/** 待重映射的 mod，各自携带自己的 Maven 坐标（决定产出路径）. */
++	@Nested
++	public abstract ListProperty<ModSpec> getMods();
++
++	/**
++	 * 重映射 classpath：其它 mod 的原始 jar，以及 mapped Minecraft jar.
++	 *
++	 * <p>必须包含整组输入的类型上下文，且不得包含本轮正在重映射的那些 jar 本身
++	 * （它们由 {@link #getMods()} 提供）。
++	 */
++	@Classpath
++	public abstract ConfigurableFileCollection getRemapClasspath();
++
++	/** 映射服务配置；执行期据此取出映射树. */
++	@Nested
++	public abstract Property<TinyMappingsService.Options> getMappingsServiceOptions();
++
++	/** 源命名空间（项目的生产命名空间）. */
++	@Input
++	public abstract Property<String> getSourceNamespace();
++
++	/** 目标命名空间；mod 重映射固定为 {@code named}. */
++	@Input
++	public abstract Property<String> getTargetNamespace();
++
++	/** 平台；用于读取各 jar 的 access widener. */
++	@Input
++	public abstract Property<ModPlatform> getPlatform();
++
++	/**
++	 * Kotlin 重映射支持；仅当项目应用了 Kotlin 插件时存在.
++	 *
++	 * <p>{@code Options} 本身就是一份任务输入（{@code @Classpath} 文件集 + {@code @Input} 版本号），
++	 * 因此可直接作为嵌套输入携带，无需在配置期装配 kotlin 相关重映射。缺省表示项目不用 Kotlin。
++	 */
++	@Nested
++	@Optional
++	public abstract Property<KotlinClasspathService.Options> getKotlinOptions();
++
++	/** 是否 Forge/NeoForge 系；决定是否执行 AT / CoreMod 加工. */
++	@Input
++	public abstract Property<Boolean> getForgeLike();
++
++	/** 是否 NeoForge；决定 AT 是全量映射还是只映射类名. */
++	@Input
++	public abstract Property<Boolean> getNeoForge();
++
++	/** Forge 运行时是否使用 Mojang 命名空间；决定 CoreMod 的映射基准. */
++	@Input
++	public abstract Property<Boolean> getRuntimeMojang();
++
++	/** 已知的 indy BSM 集合（含各 mod 元数据里声明的）. */
++	@Input
++	public abstract SetProperty<String> getKnownIndyBsms();
++
++	/**
++	 * 本任务写出（也因此**声明**）的产物：批次里认领到的那部分，逐条文件.
++	 *
++	 * <p>刻意不是 {@code @OutputDirectory}：产出根是构建内所有项目共用的共享仓库，声明整个目录会把别人的
++	 * 产物也算成自己的输出，于是「某个文件该由谁产出」这件事立刻变成冲突（见类注释）。同时它也是执行期
++	 * 「哪些 mod 要写出」的唯一判据——写出集合与声明集合必须是同一个，才不会出现写了没声明的文件。
++	 */
++	@OutputFiles
++	public abstract ConfigurableFileCollection getOutputJars();
++
++	@TaskAction
++	public void remap() throws IOException {
++		final List<ModSpec> mods = getMods().get();
++
++		if (mods.isEmpty()) {
++			return;
++		}
++
++		try (ScopedServiceFactory serviceFactory = new ScopedServiceFactory()) {
++			final TinyMappingsService.Options mappingsOptions = getMappingsServiceOptions().get();
++			final TinyMappingsService mappingsService = serviceFactory.get(mappingsOptions);
++
++			remapAll(mods, ownedOutputs(), mappingsService.getMappingTree(), serviceFactory);
++		}
++	}
++
++	/** {@return 本任务写出（也因此声明）的产物} 声明集合与写出集合是同一处：见 {@link #getOutputJars()}. */
++	private Set<Path> ownedOutputs() {
++		final Set<Path> owned = new HashSet<>();
++
++		for (File file : getOutputJars().getFiles()) {
++			owned.add(file.toPath().toAbsolutePath().normalize());
++		}
++
++		return owned;
++	}
++
++	/** {@return 该 mod 的产出文件（已归一化）} 与消费方按 maven 助手算出的路径是同一条，见 {@link ModSpec#getOutputJar()}. */
++	private static Path outputPath(ModSpec mod) {
++		return mod.getOutputJar().get().getAsFile().toPath().toAbsolutePath().normalize();
++	}
++
++	/** {@return 该 mod 的 client 半落位（已归一化）} 非拆分依赖没有这一半，返回 {@code null}，见 {@link ModSpec#getSplitClientJar()}. */
++	private static @Nullable Path splitClientPath(ModSpec mod) {
++		final RegularFile clientJar = mod.getSplitClientJar().getOrNull();
++		return clientJar == null ? null : clientJar.getAsFile().toPath().toAbsolutePath().normalize();
++	}
++
++	/**
++	 * {@return 本任务是否认领了该 mod 的产物}.
++	 *
++	 * <p>未认领的 mod 由别的项目的任务产出（见类注释），本任务既不写也不声明它。
++	 *
++	 * <p>拆分依赖有两条产物，它们由 {@code claimAll} 的**同一次**调用认领，因此只会同时归某个任务
++	 * 或同时不归。若这里只看到 client 半归本任务，说明认领表被按单条路径改过：那时既不能把整体 jar
++	 * 写上 common 落位（那是别人的产物），也无法凭空得到 client 半，只能失败而不是静默写错。
++	 */
++	private static boolean owns(Path output, @Nullable Path splitClient, Set<Path> owned) {
++		if (owned.contains(output)) {
++			return true;
++		}
++
++		if (splitClient != null && owned.contains(splitClient)) {
++			throw new IllegalStateException(
++					"拆分依赖的产物被拆开认领：本任务认领了 %s 但未认领同一条依赖的 %s，无法产出".formatted(splitClient, output));
++		}
++
++		return false;
++	}
++
++	/**
++	 * 把整体 jar 拆成 common/client 两半，各自原子落位到消费方要读的路径.
++	 *
++	 * <p>为什么必须拆：拆分依赖（{@code SplitModDependency}）的消费方读的是带 {@code -common} /
++	 * {@code -client} 后缀的两条产物，而重映射产出的是整体 jar——只写出整体 jar 等于把消费方的两条
++	 * 路径都留成没有生产者的悬空路径（构建不会报错，编译期少 jar 才是症状）。
++	 *
++	 * <p>{@code commonJar} 里的文件此刻是整体 jar，拆分后被 common 半原子覆盖：整个过程只有本任务
++	 * 在写这条路径（唯一生产者），消费方又都依赖本任务，因此没有谁能看到中间态；即便中途失败，
++	 * 这次执行也不会被记为成功，下一次会重新写出。
++	 *
++	 * <p>两半先写**同目录**的临时文件再原子 move：跨文件系统时 move 不是原子操作。
++	 */
++	private static void publishSplit(Path commonJar, Path clientJar, Set<Path> owned) throws IOException {
++		final Path commonTemp = temporaryJar(commonJar);
++		final Path clientTemp = temporaryJar(clientJar);
++
++		try {
++			new JarSplitter(commonJar).split(commonTemp, clientTemp);
++
++			// 只落位本任务声明（也因此拥有）的那些：声明集合与写出集合必须是同一个
++			if (owned.contains(commonJar)) {
++				publishAtomically(commonTemp, commonJar);
++			}
++
++			if (owned.contains(clientJar)) {
++				publishAtomically(clientTemp, clientJar);
++			}
++		} finally {
++			Files.deleteIfExists(commonTemp);
++			Files.deleteIfExists(clientTemp);
++		}
++	}
++
++	/** {@return 与最终产物同目录的临时 jar 路径} 同目录是为了让落位能用原子 move（见 {@link #publishAtomically}）. */
++	private static Path temporaryJar(Path target) throws IOException {
++		final Path directory = target.getParent();
++		Files.createDirectories(directory);
++		// 与最终产物同目录：落位用 move，跨文件系统时不是原子操作
++		return directory.resolve("%s.part-%s.jar".formatted(target.getFileName(), UUID.randomUUID()));
++	}
++
++	/** 原子落位：读方要么看到落位前的文件，要么看到完整的新文件，不会读到半截. */
++	private static void publishAtomically(Path temporaryJar, Path target) throws IOException {
++		try {
++			Files.move(temporaryJar, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
++		} catch (AtomicMoveNotSupportedException e) {
++			// 个别平台/文件系统不支持原子 move，退化为普通 move
++			Files.move(temporaryJar, target, StandardCopyOption.REPLACE_EXISTING);
++		}
++	}
++
++	private void remapAll(List<ModSpec> mods, Set<Path> owned, MemoryMappingTree mappings, ServiceFactory serviceFactory) throws IOException {
++		final String sourceNamespace = getSourceNamespace().get();
++		final String targetNamespace = getTargetNamespace().get();
++
++		// 反查表：builder lambda 会捕获它，而谓词要到 apply() 才求值，
++		// 因此先声明、待阶段一填充是安全的。
++		final Map<InputTag, ModSpec> byTag = new IdentityHashMap<>();
++
++		// kotlin classloader 需在本方法末尾关闭，故用单元素持有者把创建结果带出 lambda
++		final KotlinRemapperClassloader[] kotlinClassloaderHolder = new KotlinRemapperClassloader[1];
++
++		// 扩展链：原先在配置期由 ModProcessor 装配。两项决策事实（mixin 重映射类型、是否内联
++		// refmap）现已收成任务输入，故同一份契约可在执行期满足，无需把依赖对象带进来。
++		final Map<ModSpec, ModProcessorExtension.ModInfo> modInfos = new HashMap<>();
++
++		for (ModSpec mod : mods) {
++			modInfos.put(mod, new ModProcessorExtension.ModInfo(
++					mod.getInputJar().get().getAsFile().toPath(),
++					mod.getMixinRemapType().get(),
++					mod.getInlineRefmap().get()));
++		}
++
++		final List<ModProcessorExtension> activeExtensions = ModProcessorExtension.EXTENSIONS.stream()
++				.filter(e -> modInfos.values().stream().anyMatch(e::appliesTo))
++				.toList();
++		final List<Path> mixinModJars = modInfos.values().stream()
++				.filter(info -> info.mixinRemapType() == ArtifactMetadata.MixinRemapType.MIXIN)
++				.map(ModProcessorExtension.ModInfo::inputJar)
++				.toList();
++		final ModProcessorExtension.Context extensionContext = new ModProcessorExtension.Context(sourceNamespace, targetNamespace, mixinModJars);
++
++		// AW 分析器只需各 jar 内的 AW 内容，执行期可算
++		final AccessWidenerAnalyzeVisitorProvider accessWidenerProvider = AccessWidenerAnalyzeVisitorProvider.createFromPaths(
++				sourceNamespace,
++				mods.stream().map(mod -> mod.getInputJar().get().getAsFile().toPath()).toList(),
++				getPlatform().get()
++		);
++
++		// 构造路径固定在 L4，与 ModProcessor 共用同一条（见 ModJarRemap 的类注释）
++		final TinyRemapper remapper = ModJarRemap.createRemapper(
++				mappings,
++				Set.copyOf(getKnownIndyBsms().get()),
++				sourceNamespace,
++				targetNamespace,
++				accessWidenerProvider,
++				builder -> {
++					// 顺序必须保持「kotlin → mod processor 扩展」，extension 是链式的
++					final KotlinClasspathService.Options kotlinOptions = getKotlinOptions().getOrNull();
++
++					if (kotlinOptions != null) {
++						kotlinClassloaderHolder[0] = KotlinRemapperClassloader.create(serviceFactory.get(kotlinOptions));
++						builder.extension(kotlinClassloaderHolder[0].getTinyRemapperExtension());
++					}
++
++					for (ModProcessorExtension extension : activeExtensions) {
++						LOGGER.info("Applying mod processor extension: {}", extension.getClass().getSimpleName());
++
++						final Predicate<InputTag> applyPredicate = inputTag -> {
++							final ModSpec mod = byTag.get(inputTag);
++							return mod != null && extension.appliesTo(modInfos.get(mod));
++						};
++
++						builder.extension(extension.createExtension(extensionContext, applyPredicate));
++					}
++				}
++		).build();
++
++		// 产出路径：由坐标与 cache key 决定，与消费方按 maven 助手算出的路径同源（见 ModSpec.getOutputJar）
++		final Map<ModSpec, Path> outputs = new HashMap<>();
++		// 拆分依赖的另一半落位；只有 SPLIT 目标的 mod 在这张表里
++		final Map<ModSpec, Path> splitClients = new HashMap<>();
++		final Map<ModSpec, Pair<byte[], String>> accessWideners = new HashMap<>();
++
++		for (ModSpec mod : mods) {
++			outputs.put(mod, outputPath(mod));
++			final Path splitClient = splitClientPath(mod);
++
++			if (splitClient != null) {
++				splitClients.put(mod, splitClient);
++			}
++		}
++
++		try {
++			// 阶段一：把所有输入与 classpath 加入类型上下文——**包括不属于本任务的产物**。
++			// 输入集合不随认领结果变化是有意的：否则「谁先登记」会改变类型上下文，进而改变产物的字节。
++			// 必须全部就位后才能 apply，否则跨 mod 的继承关系会解析不到。
++			for (Path path : getRemapClasspath().getFiles().stream().map(File::toPath).toList()) {
++				remapper.readClassPathAsync(path);
++			}
++
++			final Map<ModSpec, InputTag> tags = new HashMap<>();
++
++			for (ModSpec mod : mods) {
++				final Path input = mod.getInputJar().get().getAsFile().toPath();
++
++				final InputTag tag = remapper.createInputTag();
++				tags.put(mod, tag);
++				byTag.put(tag, mod);
++				remapper.readInputsAsync(tag, input);
++			}
++
++			// 阶段二：逐个 apply；只写出本任务认领到的那些（被别的项目认领的产物由对方产出，这里重复写会互相覆盖）
++			for (ModSpec mod : mods) {
++				final Path output = outputs.get(mod);
++
++				if (!owns(output, splitClients.get(mod), owned)) {
++					continue;
++				}
++
++				final Path input = mod.getInputJar().get().getAsFile().toPath();
++
++				// 拆分依赖先写到 common 落位上，拆分阶段再以它为输入把两半落位（见 publishSplit）：
++				// 重映射只能产出整体 jar，而消费方要的是两半
++				Files.createDirectories(output.getParent());
++
++				try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(output).build()) {
++					outputConsumer.addNonClassFiles(input, NonClassCopyMode.FIX_META_INF, remapper);
++
++					final AccessWidenerUtils.AccessWidenerData awData = AccessWidenerUtils.readAccessWidenerData(input, getPlatform().get());
++
++					if (awData != null) {
++						accessWideners.put(mod, new Pair<>(
++								AccessWidenerUtils.remapAccessWidener(awData.content(), remapper.getEnvironment().getRemapper(), sourceNamespace, targetNamespace),
++								awData.path()));
++					}
++
++					remapper.apply(outputConsumer, tags.get(mod));
++				}
++			}
++		} finally {
++			remapper.finish();
++
++			if (kotlinClassloaderHolder[0] != null) {
++				kotlinClassloaderHolder[0].close();
++			}
++		}
++
++		// 阶段三：后处理。纯步骤走 L4；依赖项目模型的步骤用显式参数的 L4 重载。同样只处理后本任务写出的那些。
++		int remappedMods = 0;
++
++		for (ModSpec mod : mods) {
++			final Path output = outputs.get(mod);
++			final Path splitClient = splitClients.get(mod);
++
++			if (!owns(output, splitClient, owned)) {
++				continue;
++			}
++
++			remappedMods++;
++			ModJarPostProcess.replaceAccessWidener(output, accessWideners.get(mod));
++
++			final ModProcessorExtension.ModInfo modInfo = modInfos.get(mod);
++
++			for (ModProcessorExtension extension : activeExtensions) {
++				if (extension.appliesTo(modInfo)) {
++					extension.finalise(modInfo, output);
++				}
++			}
++
++			ModJarPostProcess.stripNestedJars(output);
++			ModJarPostProcess.writeMappingNamespace(output, targetNamespace);
++
++			if (getForgeLike().get()) {
++				if (getNeoForge().get()) {
++					ModJarPostProcess.remapNeoForgeAts(output, mappings, sourceNamespace, targetNamespace);
++				} else {
++					// Forge：只映射类名，其余在运行时按 srg -> named 处理
++					AtClassRemapper.remap(output, mappings, sourceNamespace);
++				}
++
++				CoreModClassRemapper.remapJar(getRuntimeMojang().get(), output, mappings, sourceNamespace);
++			}
++
++			// 后处理完成的整体 jar 拆成两半后各自落位（非拆分依赖没有这一步：它就是整体产物本身）
++			if (splitClient != null) {
++				publishSplit(output, splitClient, owned);
++			}
++		}
++
++		// 计数按**条 mod**而不是按产物路径：拆分依赖一条 mod 有两条产物，按路径数会报出「2 of 1 mods」
++		LOGGER.info(":remapped {} of {} mods ({} -> {})", remappedMods, mods.size(), sourceNamespace, targetNamespace);
++	}
++
++	/**
++	 * 从 remap 配置的源文件里筛出应加入重映射 classpath 的路径.
++	 *
++	 * <p>两条必须保持的规则：**排除本轮正在重映射的输入**（它们由本任务自己写入产出，
++	 * 不应再作为 classpath 上下文），且只接受**存在且为普通文件**的条目。
++	 *
++	 * <p>保留为 public static 而非内联进注册逻辑，是为了让这两条语义可被单元测试直接覆盖
++	 * ——它们是静默错误的高发点（多收一个输入会让产物与配置期不等价）。
++	 *
++	 * @param remapConfigSourceFiles 各 remap 配置源配置下的文件
++	 * @param inputsBeingRemapped 本轮正在重映射的输入
++	 * @return 应加入重映射 classpath 的路径
++	 */
++	public static List<Path> collectRemapClasspath(Collection<File> remapConfigSourceFiles, Set<File> inputsBeingRemapped) {
++		final List<Path> classpath = new ArrayList<>();
++
++		for (File inputFile : remapConfigSourceFiles) {
++			if (inputsBeingRemapped.contains(inputFile)) {
++				continue;
++			}
++
++			final Path path = inputFile.toPath();
++
++			if (Files.isRegularFile(path)) {
++				classpath.add(path);
++			}
++		}
++
++		return classpath;
++	}
++
++	/**
++	 * 一个待重映射 mod 的描述.
++	 *
++	 * <p>坐标不是元数据冗余：产出路径由坐标与 cache key 决定，而 {@link #getOutputJar()} 携带的正是这条路径
++	 * ——两者必须一致，否则写出的文件与消费方按 maven 助手换算出的是两条不同的路径。
++	 */
++	public interface ModSpec {
++		/**
++		 * 原始 mod jar.
++		 *
++		 * <p>每个属性都必须带输入/输出注解：{@code @Nested} 的嵌套类型上，Gradle 的工作校验会
++		 * 要求**所有**属性可追踪，只写 {@code @Optional} 是不够的（它修饰的是可选性，不是输入性）
++		 * ——漏注解不会在编译期暴露，而是等到某个工程真的依赖了文件型 mod 才在任务校验阶段失败。
++		 */
++		@InputFile
++		@PathSensitive(PathSensitivity.RELATIVE)
++		RegularFileProperty getInputJar();
++
++		/** 产出坐标的组，决定产出路径. */
++		@Input
++		Property<String> getGroup();
++
++		/** 产出坐标的名（含 cache key）. */
++		@Input
++		Property<String> getName();
++
++		/** 产出坐标的版本. */
++		@Input
++		Property<String> getVersion();
++
++		/** 产出坐标的分类器；缺省时产出路径不含分类器段. */
++		@Optional
++		@Input
++		Property<String> getClassifier();
++
++		/** jar 内容派生的 mixin 重映射类型；决定套用哪个扩展. */
++		@Input
++		Property<ArtifactMetadata.MixinRemapType> getMixinRemapType();
++
++		/** 声明的 refmap 内联选项；决定是否套用 InlineRefmap. */
++		@Input
++		Property<Boolean> getInlineRefmap();
++
++		/**
++		 * 本 mod 重映射后的 jar 落在共享仓库里的哪一条路径.
++		 *
++		 * <p>路径只有一处来源——{@code LocalMavenHelper}（消费者的文件依赖也由它算出），注册时按同一条路径
++		 * 同时喂给任务与登记表。刻意不在这里重算布局：快照版本的目录名与文件名不同源，重算就会分叉成
++		 * 「任务写一条路径、消费方读另一条」的静默缺失。
++		 *
++		 * <p>{@code @Internal} 而不是 {@code @OutputFile}：本任务按批次共享产出，写出的集合是
++		 * {@link #getOutputJars()}（只有认领到的那些），而这里的路径是**每条** mod 的落位——两者混用会把
++		 * 不属于本任务的产物也声明成输出。
++		 */
++		@Internal
++		RegularFileProperty getOutputJar();
++
++		/**
++		 * 拆分依赖的 client 半落位；非拆分依赖为空，此时 {@link #getOutputJar()} 就是全部产物.
++		 *
++		 * <p>有值表示这条依赖的产物流向消费方的两条路径（{@code -common} 与 {@code -client}，
++		 * 见 {@code SplitModDependency}）：重映射产出的是整体 jar，因此执行期还要按 {@code JarSplitter}
++		 * 把它拆成两半，再分别落位到这两条路径上——只写其中一条，另一条就是没有生产者的悬空路径。
++		 *
++		 * <p>来源与 {@link #getOutputJar()} 相同（同样由 {@code LocalMavenHelper} 算出，并参与登记表认领），
++		 * 因此两条路径与消费方读的两条永远一致。
++		 *
++		 * <p>只标 {@code @Internal}：它与其它输入注解不能共存（属性既然被忽略，就不该再声明可选性）。
++		 * 为空表示非拆分依赖，这一点与 {@code @Optional} 无关。
++		 */
++		@Internal
++		RegularFileProperty getSplitClientJar();
++	}
++}

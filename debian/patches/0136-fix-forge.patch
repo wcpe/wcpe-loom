@@ -1,0 +1,151 @@
+From f384bda08cf5e9f162d1492d13b4bcca780d3393 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Wed, 25 Nov 2026 01:38:07 +0800
+Subject: [PATCH 136/147] =?UTF-8?q?fix(forge):=20=E9=9A=94=E7=A6=BB?=
+ =?UTF-8?q?=E8=87=AA=E5=AE=9A=E4=B9=89=E8=BF=90=E8=A1=8C=E7=8E=AF=E5=A2=83?=
+ =?UTF-8?q?=E7=9A=84=E6=B3=A8=E5=85=A5=E9=94=AE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+生成侧和启动侧使用一致的环境键，避免不同配置名因大小写或保留前缀冲突而互相覆盖。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+Patch-Name: forge-dli-run-environment-keys
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/ide/DefaultRunConfigurationSettings.java b/src/main/java/net/fabricmc/loom/configuration/ide/DefaultRunConfigurationSettings.java
+index 3fbc721262210b031275a790e06df26e2ee89d19..c71b4fc2e105a55cce50b4009e60094079732dc6 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/ide/DefaultRunConfigurationSettings.java
++++ b/src/main/java/net/fabricmc/loom/configuration/ide/DefaultRunConfigurationSettings.java
+@@ -103,7 +103,7 @@ public class DefaultRunConfigurationSettings {
+ 		String environment = run.getRuntimeEnvironment().get().toLowerCase(Locale.ROOT);
+ 
+ 		run.getJvmArguments().add("-Dfabric.dli.config=" + encodeEscaped(extension.getFiles().getDevLauncherConfig().getAbsolutePath()));
+-		run.getJvmArguments().add("-Dfabric.dli.env=" + environment);
++		run.getJvmArguments().add("-Dfabric.dli.env=" + (extension.isForgeLike() ? RunConfigUtils.getForgeDliEnvironment(environment) : environment));
+ 		run.getJvmArguments().add("-Dfabric.dli.main=" + run.getMainClass().get());
+ 
+ 		if (environment.equals("client")) {
+diff --git a/src/main/java/net/fabricmc/loom/configuration/ide/RunConfigUtils.java b/src/main/java/net/fabricmc/loom/configuration/ide/RunConfigUtils.java
+index fd3747a435bc78a135f1a3272da493dea64c67f7..82ccfc0643ab1dc6789497714bbf63264cd63c2c 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/ide/RunConfigUtils.java
++++ b/src/main/java/net/fabricmc/loom/configuration/ide/RunConfigUtils.java
+@@ -26,8 +26,11 @@ package net.fabricmc.loom.configuration.ide;
+ 
+ import java.io.File;
+ import java.io.IOException;
++import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.util.HexFormat;
++import java.util.Locale;
+ import java.util.function.Function;
+ import java.util.stream.Collectors;
+ 
+@@ -48,6 +51,19 @@ import net.fabricmc.loom.util.gradle.GradleUtils;
+ public class RunConfigUtils {
+ 	private static final Logger LOGGER = LoggerFactory.getLogger(RunConfigUtils.class);
+ 
++	/**
++	 * {@return Forge 运行环境在 DLI 配置中使用的分段键}.
++	 *
++	 * <p>DLI 先按前缀匹配，再校验 Args 或 Properties 后缀；末尾分隔符使自定义环境的键互不为前缀。
++	 */
++	public static String getForgeDliEnvironment(String environment) {
++		final String normalized = environment.toLowerCase(Locale.ROOT);
++		return switch (normalized) {
++		case "common", "client", "server" -> normalized;
++		default -> "loom-" + HexFormat.of().formatHex(normalized.getBytes(StandardCharsets.UTF_8)) + "-";
++		};
++	}
++
+ 	public static void createRunDirectory(RunConfiguration runConfiguration) throws IOException {
+ 		Path runDirectory = runConfiguration.getRunDirectory().getAsFile().get().toPath();
+ 
+diff --git a/src/main/java/net/fabricmc/loom/task/launch/GenerateDLIConfigTask.java b/src/main/java/net/fabricmc/loom/task/launch/GenerateDLIConfigTask.java
+index fe34d85e0839b2559e58e4d82270769ae41dac0f..0882e6d91fb3733dde954a3205f8c16bad5a9d37 100644
+--- a/src/main/java/net/fabricmc/loom/task/launch/GenerateDLIConfigTask.java
++++ b/src/main/java/net/fabricmc/loom/task/launch/GenerateDLIConfigTask.java
+@@ -65,6 +65,7 @@ import net.fabricmc.loom.LoomGradleExtension;
+ import net.fabricmc.loom.LoomGradlePlugin;
+ import net.fabricmc.loom.api.mappings.layered.MappingsNamespace;
+ import net.fabricmc.loom.build.IntermediaryNamespaces;
++import net.fabricmc.loom.configuration.ide.RunConfigUtils;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftVersionMeta;
+ import net.fabricmc.loom.configuration.providers.minecraft.mapped.MappedMinecraftProvider;
+ import net.fabricmc.loom.task.AbstractLoomTask;
+@@ -314,9 +315,7 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
+ 			}
+ 
+ 			for (ForgeRunTemplate.Resolved template : getRunTemplates().get()) {
+-				// Note: lowercase to match DefaultRunConfigurationSettings which lowercases all user input for
+-				// RunConfigSettings.environment
+-				var env = template.name().toLowerCase(Locale.ROOT);
++				var env = template.name();
+ 
+ 				for (String argument : template.args()) {
+ 					launchConfig.argument(env, argument);
+@@ -368,7 +367,7 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
+ 		}
+ 
+ 		public LaunchConfig property(String side, String key, String value) {
+-			values.computeIfAbsent(side + "Properties", (s -> new ArrayList<>()))
++			values.computeIfAbsent(RunConfigUtils.getForgeDliEnvironment(side) + "Properties", (s -> new ArrayList<>()))
+ 					.add(String.format("%s=%s", key, value));
+ 			return this;
+ 		}
+@@ -378,7 +377,7 @@ public abstract class GenerateDLIConfigTask extends AbstractLoomTask {
+ 		}
+ 
+ 		public LaunchConfig argument(String side, String value) {
+-			values.computeIfAbsent(side + "Args", (s -> new ArrayList<>()))
++			values.computeIfAbsent(RunConfigUtils.getForgeDliEnvironment(side) + "Args", (s -> new ArrayList<>()))
+ 					.add(value);
+ 			return this;
+ 		}
+diff --git a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeRunTemplateTest.groovy b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeRunTemplateTest.groovy
+index 7a85794a36dd13c9635c9a5855d6c64e29baeb7e..33dea75b4f9804bbddc2d542c33c864da43a407b 100644
+--- a/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeRunTemplateTest.groovy
++++ b/src/test/groovy/net/fabricmc/loom/test/unit/forge/ForgeRunTemplateTest.groovy
+@@ -35,6 +35,7 @@ import spock.lang.Specification
+ import spock.lang.TempDir
+ import spock.lang.Unroll
+ 
++import net.fabricmc.loom.task.launch.GenerateDLIConfigTask.LaunchConfig
+ import net.fabricmc.loom.util.ZipUtils
+ import net.fabricmc.loom.util.download.Download
+ 
+@@ -74,4 +75,32 @@ class ForgeRunTemplateTest extends Specification {
+ 		'1.18.2'    | '40.1.80'    | 'cpw.mods.bootstraplauncher.BootstrapLauncher'
+ 		'1.19.2'    | '43.1.25'    | 'cpw.mods.bootstraplauncher.BootstrapLauncher'
+ 	}
++
++	def "DLI data 环境不会误匹配客户端或服务端数据段"() {
++		given:
++		def config = new LaunchConfig()
++				.argument('--common')
++				.argument('client', '--client')
++				.argument('server', '--server')
++				.argument('data', '--data')
++				.argument('dataClient', '--data-client')
++				.argument('dataServer', '--data-server')
++				.property('data', 'run.kind', 'data')
++				.property('dataClient', 'run.kind', 'client-data')
++		def lines = config.asString().readLines()
++		def headers = lines.findAll { !it.startsWith('\t') }
++		def dataHeader = lines[lines.indexOf('\t--data') - 1]
++		def environment = dataHeader.substring(0, dataHeader.length() - 'Args'.length())
++
++		expect:
++		headers.containsAll([
++			'commonArgs',
++			'clientArgs',
++			'serverArgs'
++		])
++		headers.findAll { it.startsWith(environment) }.toSet() == [
++			dataHeader,
++			environment + 'Properties'
++		].toSet()
++	}
+ }

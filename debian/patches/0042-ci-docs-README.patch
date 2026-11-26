@@ -1,0 +1,54 @@
+From 1b70d6bb518491cf6578491e142634eb66af8d64 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:45 +0800
+Subject: [PATCH 042/147] =?UTF-8?q?ci:=20=E7=BA=AF=E6=96=87=E6=A1=A3?=
+ =?UTF-8?q?=E6=8E=A8=E9=80=81=E4=B8=8D=E5=86=8D=E8=A7=A6=E5=8F=91=E6=B5=8B?=
+ =?UTF-8?q?=E8=AF=95=E5=B7=A5=E4=BD=9C=E6=B5=81=EF=BC=9Bdocs:=20=E4=BF=AE?=
+ =?UTF-8?q?=E6=AD=A3=20README=20=E4=BA=A7=E7=89=A9=E5=9D=90=E6=A0=87?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+一次发版过程中发现两处浪费与错误：
+
+- test-push.yml 只过滤了 tag，未过滤纯文档推送，导致一行 README 改动也要跑
+  一轮约 30 分钟的完整测试。补上 paths-ignore，仅作用于 push 触发，
+  PR 仍照常运行，避免分支保护所需的状态检查缺失。
+- README 记录的产物坐标 net.fabricmc:architectury-loom 与实际发布坐标
+  dev.architectury:architectury-loom 不符，据此拉取会 404。
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/.github/workflows/test-push.yml b/.github/workflows/test-push.yml
+index 9bec306557ec5566ca56b8e3b251f5aab9781937..e6dcc426aea3960bf9b5a9ce5428ac0b41f94bca 100644
+--- a/.github/workflows/test-push.yml
++++ b/.github/workflows/test-push.yml
+@@ -10,6 +10,14 @@ on:
+     # GitHub 读取的正是本提交上的版本，故修正必须落在队列内。
+     tags-ignore:
+       - '**'
++    # 纯文档推送不跑测试：与 publish.yml 的 paths-ignore 对齐，
++    # 避免一行 README 改动就白跑一轮约 30 分钟的完整测试。
++    # 仅作用于 push 触发，PR 仍照常运行，以免分支保护要求的状态检查缺失。
++    paths-ignore:
++      - 'README.md'
++      - 'CHANGELOG.md'
++      - 'docs/**'
++      - '**.md'
+   pull_request:
+   workflow_dispatch:
+     inputs:
+diff --git a/README.md b/README.md
+index fd3982d6fae090a8d01d29a95da11c67d5dcc956..e812c91252761b06b208c0d4b91b3039218002a8 100644
+--- a/README.md
++++ b/README.md
+@@ -50,7 +50,7 @@ plugins {
+ | 正式版 | 打 tag 并推送（`git tag wcpe-v1.17.2 && git push origin wcpe-v1.17.2`） | `1.17.2`（取自 tag），并自动创建 GitHub Release |
+ | 日常推送 | 推送到 `dev/1.17-wcpe` | `1.17.<运行号>`（自动递增、不可覆盖） |
+ 
+-产物坐标：`net.fabricmc:architectury-loom:<版本>`，仓库 `maven.wcpe.top/repository/maven-releases/`。
++产物坐标：`dev.architectury:architectury-loom:<版本>`（Gradle 插件标记为 `top.wcpe.loom:top.wcpe.loom.gradle.plugin`），仓库 `maven.wcpe.top/repository/maven-releases/`。
+ 
+ 支持的 Minecraft 版本：Fabric 全线；Forge/NeoForge 含 1.8–1.16 的 legacy 链路（1.12.2 端到端测试覆盖）。
+ 

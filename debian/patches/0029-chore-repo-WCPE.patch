@@ -1,0 +1,708 @@
+From cf9cb8a8f681b96caf27fd45e6adb9ecb7fb813c Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:30:36 +0800
+Subject: [PATCH 029/147] =?UTF-8?q?chore(repo):=20WCPE=20=E5=8F=91?=
+ =?UTF-8?q?=E5=B8=83=E4=BD=93=E7=B3=BB=E3=80=81=E9=98=9F=E5=88=97=E8=A7=84?=
+ =?UTF-8?q?=E8=8C=83=E4=B8=8E=E6=96=87=E6=A1=A3=E5=85=83=E6=95=B0=E6=8D=AE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+仓库元数据，不属于补丁队列，位于 patch-queue/1.17 之后，一次汇总（对齐 1.15 线的元数据提交做法）。
+
+- 发布体系：build.gradle 增加 WCPE 发布仓库（maven.wcpe.top，凭据取 wcpeUsername/
+  wcpePassword 属性，CI 经 ORG_GRADLE_PROJECT_* 注入）；publish.yml 换为 WCPE 管线
+  （推送到默认分支发 1.17.<运行号>；wcpe-v* tag 发 tag 指定正式版并创建 GitHub Release；
+  因 v1.17.* 已被上游 release tag 占用，正式版前缀改用 wcpe-v*）；增加 RELEASE_VERSION
+  版本覆盖入口；工作流统一 actions v5（清除 Node 20 弃用告警）
+- 队列规范：.upstream/PATCH-QUEUE.md（队列结构与三段划分、补丁判定标准与压缩判据、
+  DEP-3 溯源标注要求与逐补丁归类、校验与维护纪律）、scripts/sync-upstream.sh
+  （status/verify/rebase，默认只读、改写只在临时分支、不自动改默认分支或打 tag）、
+  .upstream/README.md
+- 谱系清单：.upstream/migration-1.17.md（基底与两线关系、补丁与来源对照、P2 等例外说明、
+  同步上游的方法、审计方法与已知遗留）
+- README 重写：说明本 fork 定位与插件 id / 版本发布规则，并完整保留上游 README 原文
+- .gitignore：放行 .upstream/ 与 scripts/
+
+Origin: vendor, wcpe-loom
+Forwarded: not-needed
+
+diff --git a/.github/workflows/publish.yml b/.github/workflows/publish.yml
+index 391418f1412f0ad7129aab2dc0a88541a38fbefe..ce60b4153c09f01925f92ea943ea5b12b86fdb8a 100644
+--- a/.github/workflows/publish.yml
++++ b/.github/workflows/publish.yml
+@@ -1,41 +1,129 @@
+-name: Publish
++name: CI
++
++# 触发规则：
++# 1. 推送到 dev/1.17-wcpe（仅代码变更）→ 构建 + 发布补丁版本（版本号 1.17.<运行号>）
++# 2. 打 wcpe-v 开头的 tag → 发布该 tag 指定的正式版（如 wcpe-v1.17.1 → 1.17.1）
++#    并创建 GitHub Release。
++#    说明：这里不用 v* 前缀，因为上游 fabric-loom 已占用大量 v1.17.* 的 release tag，
++#    同名 tag 在本仓库内不可复用。
++# 3. 纯文档修改（README/CHANGELOG/docs/**）不触发任何构建
+ on:
+   push:
+     branches:
+-      - 'dev/0.6-forge'
+-      - 'dev/0.7-forge'
+-      - 'dev/0.8'
+-      - 'dev/0.9'
+-      - 'dev/0.10.0'
+-      - 'dev/0.11.0'
+-      - 'dev/0.12.0'
+-      - 'dev/1.0'
+-      - 'dev/1.1'
+-      - 'dev/1.2'
+-      - 'dev/1.3'
+-      - 'dev/1.4'
+-      - 'dev/1.5'
+-      - 'dev/1.6'
+-      - 'dev/1.7'
+-      - 'dev/1.9'
+-      - 'dev/1.10'
+-      - 'dev/1.11'
+-      - 'dev/1.13'
+-      - 'dev/1.14'
+-      - 'dev/1.17'
++      - dev/1.17-wcpe
++    tags:
++      - 'wcpe-v*'
++    paths-ignore:
++      - 'README.md'
++      - 'CHANGELOG.md'
++      - 'docs/**'
++      - '**.md'
++
++permissions:
++  contents: read
+ 
+ jobs:
+   build:
+     runs-on: ubuntu-24.04
++    outputs:
++      is-release: ${{ steps.meta.outputs.is-release }}
++      release-version: ${{ steps.meta.outputs.release-version }}
+     steps:
+-      - name: setup jdk
++      - name: 检出代码
++        uses: actions/checkout@v5
++        with:
++          fetch-depth: 0
++
++      - name: 配置 JDK
+         uses: actions/setup-java@v5
+         with:
+-          java-version: 25
+-          distribution: 'temurin'
+-      - uses: actions/checkout@v6
+-      - uses: gradle/actions/wrapper-validation@v6
+-      - name: Upload to Maven
+-        run: ./gradlew publish --stacktrace
++          java-version: 21
++          distribution: temurin
++
++      - name: 验证 Gradle Wrapper
++        uses: gradle/actions/wrapper-validation@v5
++
++      - name: 判断构建类型
++        id: meta
++        shell: bash
++        run: |
++          if [[ "${GITHUB_REF}" == refs/tags/wcpe-v* ]]; then
++            # 正式版：打 tag 发布，版本号取 tag 名去掉 wcpe-v 前缀（如 wcpe-v1.17.1 → 1.17.1）
++            VERSION="${GITHUB_REF#refs/tags/wcpe-v}"
++            echo "is-release=true" >> "$GITHUB_OUTPUT"
++            echo "release-version=$VERSION" >> "$GITHUB_OUTPUT"
++            echo "latest-version=1.17-latest" >> "$GITHUB_OUTPUT"
++            echo "is-prerelease=false" >> "$GITHUB_OUTPUT"
++          else
++            # 代码推送：发布补丁版本 1.17.<运行号>；运行号单调递增，天然满足产物不可覆盖的要求
++            VERSION="1.17.${GITHUB_RUN_NUMBER}"
++            echo "is-release=false" >> "$GITHUB_OUTPUT"
++            echo "release-version=$VERSION" >> "$GITHUB_OUTPUT"
++            echo "latest-version=1.17-dev-latest" >> "$GITHUB_OUTPUT"
++            echo "is-prerelease=true" >> "$GITHUB_OUTPUT"
++          fi
++
++      - name: 验证重映射缓存回归
++        run: ./gradlew test --tests net.fabricmc.loom.test.integration.RemapTaskCacheTest --no-daemon --stacktrace --warning-mode fail
+         env:
+-          MAVEN_PASS: ${{ secrets.MAVEN_PASS }}
++          CI: true
++          RELEASE_VERSION: ${{ steps.meta.outputs.release-version }}
++
++      - name: 上传缓存回归失败报告
++        if: failure()
++        uses: actions/upload-artifact@v5
++        with:
++          name: remap-cache-test-results
++          path: |
++            build/reports/tests/test/
++            build/test-results/test/
++
++      - name: 构建并发布
++        run: ./gradlew build publish exportVersion -x test --no-daemon --stacktrace
++        env:
++          CI: true
++          RELEASE_VERSION: ${{ steps.meta.outputs.release-version }}
++          IS_PRERELEASE: ${{ steps.meta.outputs.is-prerelease }}
++          PUBLISH_LATEST: ${{ steps.meta.outputs.is-prerelease == 'true' && 'dev' || 'stable' }}
++          ORG_GRADLE_PROJECT_wcpeUsername: ${{ secrets.WCPE_USERNAME }}
++          ORG_GRADLE_PROJECT_wcpePassword: ${{ secrets.WCPE_PASSWORD }}
++
++  # 正式版发布后创建 GitHub Release（仅 tag 触发）
++  release:
++    needs: build
++    if: needs.build.outputs.is-release == 'true'
++    runs-on: ubuntu-24.04
++    permissions:
++      contents: write
++    steps:
++      - name: 检出代码
++        uses: actions/checkout@v5
++
++      - name: 提取 CHANGELOG
++        id: changelog
++        shell: bash
++        run: |
++          VERSION="${{ needs.build.outputs.release-version }}"
++          BODY=""
++          # 本线暂无 CHANGELOG.md，缺失时回退为占位说明，不让发布失败
++          if [ -f CHANGELOG.md ]; then
++            BODY=$(awk -v ver="$VERSION" '
++              /^## / { if (found) exit; if ($2 == ver) found=1; next }
++              found { print }
++            ' CHANGELOG.md)
++          fi
++          if [ -z "$BODY" ]; then
++            BODY="发布版本 $VERSION"
++          fi
++          echo "body<<EOF" >> "$GITHUB_OUTPUT"
++          echo "$BODY" >> "$GITHUB_OUTPUT"
++          echo "EOF" >> "$GITHUB_OUTPUT"
++
++      - name: 创建 GitHub Release
++        uses: softprops/action-gh-release@v2
++        with:
++          tag_name: ${{ github.ref_name }}
++          name: wcpe-loom ${{ github.ref_name }}
++          body: ${{ steps.changelog.outputs.body }}
++          draft: false
++          prerelease: false
+diff --git a/.gitignore b/.gitignore
+index 6cf4432fbfb14754dab0509ce4585003e6b0d852..1b6c3f0f7f4bd14533d2de0831e317318e3c48a4 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -25,3 +25,11 @@
+ !/bootstrap
+ 
+ /src/**/generated
++
++# 谱系/队列元数据属正式项目文档，需入库（! 行必须在忽略规则之后）
++!.upstream/
++!.upstream/**
++
++# 维护脚本属正式项目内容，需入库
++!scripts/
++!scripts/**
+diff --git a/.upstream/PATCH-QUEUE.md b/.upstream/PATCH-QUEUE.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..e8a1977262c62acd0ed0c8defdc9fdbdbc93a838
+--- /dev/null
++++ b/.upstream/PATCH-QUEUE.md
+@@ -0,0 +1,97 @@
++# WCPE Loom 1.17 补丁队列规范
++
++本规范定义 `dev/1.17-wcpe` 相对上游基底的补丁如何组织、标注与校验。流程借鉴 1.15 线的
++`.upstream/PATCH-QUEUE.md`（Debian quilt / DEP-3 实践），但**队列模型不同**：
++
++| | 1.15 线 | 1.17 线（本线） |
++|---|---|---|
++| 维护方式 | 逐个补丁 cherry-pick 采集、可增删 | 把 1.15 线的改动**整体重放**后合并为固定序列 |
++| 同步上游 | 换基底 rebase 逐个补丁 | **整条序列** `rebase --onto` 到新基底 |
++| 队列标识 | `patch-queue/1.15` · `patch-queue/v1.15-wcpe.N` | `patch-queue/1.17` |
++
++## 1. 队列结构
++
++历史自基底起分为三段，边界由 tag 标记：
++
++```
++base/architectury-1.17-026ce830   ← 基底快照（不可变）
++  ↓  补丁队列：每个提交 = 一个补丁 = 一个逻辑变更单元
++patch-queue/1.17                  ← 队列末端标记
++  ↓  仓库元数据：非补丁内容，按普通提交维护
++HEAD
++```
++
++- **基底**：上游的一个不可变提交快照，用 `base/<来源>-<代系>-<sha 前 8 位>` 注释 tag 固定。
++  基线一旦固定不再移动；换基底等于换 tag。
++- **补丁队列**：基底之上的**线性提交，禁止 merge 提交**。整条序列可被线性重放到新基底。
++- **仓库元数据**：CI、文档、发布脚本、队列自身的清单（本目录与 `scripts/`）。这些属于本仓库
++  而非补丁，不参与队列。
++
++## 2. 补丁的判定标准
++
++一个补丁是一个**逻辑变更单元**，须同时满足：
++
++1. 能用一句话说明其目的；
++2. 能独立审查，不必先读队列中其他补丁；
++3. 撤销它不牵连其他补丁的功能。
++
++| 情形 | 处置 |
++|---|---|
++| 一个变更恰好是一个逻辑单元 | 1:1 保留 |
++| N 个提交共同构成一个逻辑变更（开发中的多次迭代） | **压缩为一个补丁** |
++| 一个提交混合多个不相关的变更 | **拆分为多个补丁** |
++
++**压缩判据**：若补丁 B 修改的内容全部是补丁 A 新增或修改过的行，B 必须压缩进 A。队列描述的是
++**最终状态**，不是开发过程的年表；"先实现、再修正实现"的中间态不属于队列。
++
++> 本线的 25 个补丁提交即按此判据由 42 个开发提交合并而来（见 `migration-1.17.md` 第四节）。
++
++## 3. 溯源标注
++
++每个补丁的提交信息末尾附溯源块，字段取自 Debian DEP-3：
++
++```
++<type>(<scope>): <中文描述>
++
++<正文：说明为什么改、改动要点>
++
++Origin: <取值>
++Forwarded: <取值>
++```
++
++| 字段 | 取值 | 含义 |
++|---|---|---|
++| `Origin` | `upstream, <提交URL>` | 取自上游，可原样保留 |
++| | `backport, <上游版本>` | 从其他代系向后移植 |
++| | `vendor, wcpe-loom` | 本项目自研，永不上游 |
++| `Forwarded` | `no` | 应当反馈上游，尚未反馈 |
++| | `not-needed` | 本项目专属，无需反馈 |
++| | `<URL>` | 已反馈，附链接 |
++| `Applied-Upstream` | `<版本或提交>` | 可选。上游已收录 → 换基底时**直接删除该补丁** |
++
++### 本线补丁的溯源归类
++
++| 补丁 | Origin | Forwarded |
++|---|---|---|
++| 1–11（P1、P3–P12 重放） | `vendor, wcpe-loom` | `not-needed` |
++| 12（移除 RunConfig） | `vendor, wcpe-loom` | `not-needed` |
++| 13（补回重放丢失内容） | `vendor, wcpe-loom` | `no`（其中缓存锁相关值得反馈上游） |
++| 14–15（legacy Forge 支持） | `backport, essential dev/1.15` | `no`（上游 1.17 已移除该链路，宜反馈） |
++| 16（P2 内容） | `vendor, wcpe-loom` | `no` |
++| 17（DownloadSourcesHook） | `backport, essential dev/1.15` | `no` |
++| 18（分隔符归一化） | `vendor, wcpe-loom` | `no`（基底自身在 Windows 上的缺陷） |
++| 19·20（测试与 checkstyle） | `backport, essential dev/1.15` | `not-needed` |
++| 21（server-only 守卫） | `vendor, wcpe-loom` | `no`（**上游缺陷，应反馈**） |
++| 22–25（插件 id / 发布 / 文档） | `vendor, wcpe-loom` | `not-needed` |
++
++## 4. 校验
++
++`scripts/sync-upstream.sh verify` 检查：基底与队列末端 tag 是否存在、队列是否线性无 merge、
++提交数、溯源块是否齐备、工作树是否与队列一致。默认只读，不修改任何分支或 tag。
++
++## 5. 维护纪律
++
++1. 队列内部**禁止 merge 提交**；需要合并上游时用 `rebase --onto`，不是 merge。
++2. **不自动打发布 tag**、不自动推送改写后的队列；改写后必须人工确认内容等价再切换分支。
++3. 内容等价判据：`git diff <改写后> <改写前>` 为空（或差异仅限明确预期的那几个文件）。
++4. 每次换基底或改写队列后，同步更新 `migration-1.17.md` 与本节第 3 节的溯源归类。
+diff --git a/.upstream/README.md b/.upstream/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..81e17d4893acfd42e1fcd0f08a4988e0e5a4b209
+--- /dev/null
++++ b/.upstream/README.md
+@@ -0,0 +1,34 @@
++# `.upstream/` 目录说明
++
++本目录保存**队列与谱系元数据**，属于仓库元数据而非补丁（不参与补丁队列）。
++
++| 文件 | 作用 |
++|---|---|
++| `PATCH-QUEUE.md` | **队列规范**：结构、补丁判定标准、DEP-3 溯源标注、校验与维护纪律 |
++| `migration-1.17.md` | **1.17 主线谱系清单**：基底、25 个补丁与来源的对照、例外说明、同步上游的方法、审计方法与已知遗留 |
++| `essential-base` | （继承自 1.15 线）essential 基底快照的说明 |
++
++对应的维护脚本：`scripts/sync-upstream.sh`（`status` / `verify` / `rebase`，默认只读）。
++
++## 与 1.15 线的关系
++
++1.15 线的队列元数据在其分支 `1.15-wcpe` 上：`.upstream/wcpe-patches.txt`（12 个补丁的清单）、
++`.upstream/PATCH-QUEUE.md`（同一套规范）、`scripts/sync-upstream.sh`（quilt 式逐补丁采集）。
++本线沿用同一套规范与纪律，但**队列模型不同**：
++
++- 1.15 线：基底 + 12 个可逐个增删的补丁，同步上游时逐补丁 rebase
++- **1.17 线（本线）**：基底 + 一条由 1.15 线改动整体重放后合并而成的**固定序列**（25 个补丁），
++  同步上游时对**整条序列** `rebase --onto`
++
++具体差异与理由见 `PATCH-QUEUE.md` 开头的对照表。
++
++## 快速上手
++
++```bash
++scripts/sync-upstream.sh status                 # 看当前基底/队列状态
++scripts/sync-upstream.sh verify                 # 校验队列是否符合规范
++git fetch architectury
++scripts/sync-upstream.sh rebase <新基底sha> base/architectury-1.17-<新sha>
++```
++
++第三条会在**临时分支**上重放整条队列，不会改动默认分支，也不会推送；冲突解决与切换分支都需人工完成。
+diff --git a/.upstream/migration-1.17.md b/.upstream/migration-1.17.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..ede60b27a118b3ef155d06e47a165b63936dba7b
+--- /dev/null
++++ b/.upstream/migration-1.17.md
+@@ -0,0 +1,116 @@
++# 1.17 主线谱系清单
++
++本文件记录 `dev/1.17-wcpe`（仓库默认分支）相对上游的**全部偏离及其来源**，供日后对照上游、
++排查补丁回放缺口、或在同步上游时归因冲突时使用。
++
++本线**不使用** quilt 式补丁队列（那是 1.15 线的维护方式，见 `1.15-wcpe` 分支的
++`.upstream/wcpe-patches.txt`），而是**把 1.15 线的改动重放到 architectury 1.17 基底之上**，
++并把重放结果整理为一条**可整体 rebase 的补丁序列**。
++
++## 一、基线
++
++| 项 | 值 |
++|---|---|
++| 直接上游 | [architectury/architectury-loom](https://github.com/architectury/architectury-loom)，`architectury` 分支 |
++| 基底提交 | `026ce830`（Fix dev launch issues in unobfuscated Forge (#352)，2026-09-12） |
++| 基底锚点 | tag `base/architectury-1.17-026ce830` |
++| 队列末端 | tag `patch-queue/1.17` |
++| 旁系来源 | SparkUniverse/architectury-loom（Essential Loom `dev/1.15`，提交 `713489a9`）——功能按需移植，**不并入历史** |
++| 更上游 | FabricMC/fabric-loom |
++| 代码补丁数 | 22（另有 4 个元数据提交，位于队列末端之后） |
++
++两条线是**同一项目相隔约 5 个月的两个历史点**（1.15 线基底 2026-04-15，1.17 线基底 2026-09-12），
++因此大量文件存在实现差异属正常演进，**不是**缺口。
++
++## 二、同步上游的方法
++
++1. 锚定新的上游提交（如 tag `base/architectury-1.17-<新sha>`）
++2. `git rebase --onto <新基底> 026ce830 patch-queue/1.17`
++3. 逐补丁解决冲突：每个补丁只承载**单一逻辑**，冲突归因容易
++4. 内容校验：`git diff <新队列> <旧队列>` 应仅体现上游自身变更
++5. 前移 tag `patch-queue/1.17`，并更新本文件第一、三节
++
++## 三、补丁序列（22 个代码补丁 + 队列之外的元数据，按基底之后从上到下）
++
++| # | 提交标题 | 来源 |
++|---|---|---|
++| 1 | feat(cache): 跨 daemon per-key 缓存锁与原子发布 | 补丁 P1 |
++| 2 | fix(forge): 完善无混淆 Forge 运行链 | 补丁 P3 |
++| 3 | fix(cache): 扩展跨 daemon 加锁与原子发布到全部缓存产物 | 补丁 P4 |
++| 4 | fix(build): 复合构建保留全局依赖替换规则并共享元数据缓存 | 补丁 P5 |
++| 5 | fix(cache): AsyncCache 改用平台线程池避免虚拟线程 pinning | 补丁 P6 |
++| 6 | fix(mods): 版本校验兼容 WCPE 版本后缀 | 补丁 P7 |
++| 7 | fix(download): 内容寻址下载跳过无谓的强制重下 | 补丁 P8 |
++| 8 | test(integration): 增加多 Loom 子项目与 Windows 路径回归测试 | 补丁 P9 |
++| 9 | fix(cache): 缓存服务按 classloader 隔离 | 补丁 P10 |
++| 10 | fix(loom): 重映射任务支持构建缓存 | 补丁 P11 |
++| 11 | fix(service): 展开服务实例化异常的根因 | 补丁 P12 |
++| 12 | fix(migration): 移除 1.17 已重构掉的 RunConfig | 本线有意偏离 |
++| 13 | fix(cache): 补回重放时丢失的补丁内容 | 见第四节 |
++| 14 | feat(forge): 恢复 legacy Forge（1.8-1.16）支持链 | legacy 移植（9 个过程提交合并） |
++| 15 | fix(forge): 修复迁移中丢失的 legacy 支持与 setup 时序 | 迁移缺口修复 |
++| 16 | fix(config-cache): 补回 IDE 驱动守卫与执行期 stdin 转发 | 补丁 P2 的内容 |
++| 17 | feat(ide): 移植 DownloadSourcesHook 与 IDE 源码下载挂接 | 从 essential 侧移植 |
++| 18 | fix(ide): 运行目录相对路径统一使用正斜杠 | 恢复 1.15 行为 |
++| 19 | test(forge): 移植 McmodInfoTest | 测试移植 |
++| 20 | fix(build): 补回 checkstyle 抑制过滤器并修正 javadoc 格式 | 配置层缺口 |
++| 21 | fix(forge): server-only 下不再生成与注册 client-extra | 上游缺陷先行修复 |
++| 22 | feat(plugin): 新增 top.wcpe.loom 插件 id 并保留 architectury 别名 | 本线工程化（含 2 个夹具/补丁 id 修正） |
++| — | ci(publish): 建立 1.17 线发布体系并升级 actions v5 | **元数据**（队列之外：CI 配置） |
++| — | docs: 重写 README 并补充 1.17 主线谱系清单 | **元数据**（队列之外：文档） |
++| — | docs: 按重建后的结构更新谱系清单 | **元数据**（队列之外：文档） |
++| — | docs: 补齐 1.17 线的队列规范、同步脚本与元数据说明 | **元数据**（队列之外：本次修正计数） |
++
++## 四、例外说明
++
++### P2 无同名提交
++
++P2（`fix(config-cache): 运行与 IDE 任务兼容 Gradle 9 配置缓存`）在本线**没有独立提交**，
++其内容分两处承载：第 16 项（`SourceSetHelper.isIdeDrivenBuild()` 守卫与 `RunGameTask`
++执行期设置 stdin）与第 2 项（无混淆模式下的库排除短路）。这两处在重放时**整块丢失**，
++经审计发现后补回，并同步补回了测试侧改动（`idea.active` 适配与非 IDE 驱动构建的负向用例）。
++
++### 第 13 项：补回重放时丢失的补丁内容
++
++该项合并了 5 个修补提交，分别补回：跨子项目共享元数据缓存、`setupMinecraft` 的跨进程缓存锁、
++重映射任务的 Manifest 版本输入登记、源码重映射的跨进程锁、无混淆模式下的库排除短路。
++它们**不是新功能**，而是 P1/P4/P11 等在重放时被丢掉的部分。
++
++### 提交合并的说明
++
++重建前该线有 42 个提交（含大量"补回/格式修正/过程调整"等中间提交）。为使队列可整体 rebase、
++并让冲突归因落在单一逻辑上，按主题合并为 24 个补丁提交。重建采用**同序重放**，因此不产生冲突；
++重建后与重建前的**内容差异为空**（逐字节一致）—— 这是客观验证，不是主观判断。
++
++## 五、本线独有的适配与有意偏离
++
++| 项 | 说明 |
++|---|---|
++| **插件 id** | 自有域名 `top.wcpe.loom`、`-no-remap`、`-remap`、`-companion`、`-repositories`；**保留 `dev.architectury.loom*` 作为兼容别名**，另保留上游的 `net.fabricmc.fabric-loom-companion`。检测逻辑统一走各插件类的 `isApplied()` |
++| **RunConfig API** | 不回归 —— 1.17 上游已移除该 API，本线改用 `RunConfiguration` |
++| **运行目录分隔符** | `RunConfigUtils` 相对路径统一用正斜杠，避免 Windows 下产出 `$PROJECT_DIR$/sub\run` 这类混用分隔符 |
++| **server-only 的 client-extra** | `MinecraftPatchedProvider.remapJar` 对 `fillClientExtraJar` 与 client-extra 注册加守卫。该调用链在基底上同样无守卫，属**上游缺陷**，本线先行修复 |
++| **checkstyle 抑制过滤器** | 补回 1.15 有的 `SuppressionCommentFilter`，否则源码里的 `//CHECKSTYLE:OFF` 全部失效 |
++| **发布体系** | 正式版 tag 前缀 `wcpe-v*`（如 `wcpe-v1.17.1` → 版本 `1.17.1`）；日常推送发 `1.17.<运行号>`。**`v1.17.*` 前缀已被上游 release tag 占用，不可复用** |
++| **actions 版本** | 工作流统一 actions v5 |
++
++## 六、审计方法（排查"漏移植"用）
++
++重放类迁移的典型缺陷是**回退分支/条件被整块或部分丢掉**，且不会编译报错。本线使用的判据：
++
++1. **补丁面**：对每个补丁，逐条检查"它当初新增的代码行是否仍存在于本线"，缺席者逐一判定
++   （真缺口 / 正当适配）。此法发现并修掉了 P2 与 2 处配置缓存缺口。
++2. **legacy 面**：以 legacy/FG2 特征词筛选 1.15 独有的差异块，逐项判定。
++3. **测试面**：对比 1.15 线的测试文件与用例名，1.15 有而本线没有的逐条判定——此法发现
++   `McmodInfoTest`（真缺口）与 `SourceSetHelperTest` 丢失的负向用例。
++4. **判据自身的偏差**（务必注意）：两线基底不同，多数差异是正常演进而非缺口；比对时须以正确的
++   编码读取（否则中文注释会被误判为差异）；"文件缺失"未必是缺口（可能是重命名或重复副本）。
++
++## 七、已知遗留
++
++| 项 | 状态 |
++|---|---|
++| `1.15-wcpe` 归档线的发布管线 | 触发分支已由 `main` 改为 `1.15-wcpe`，其代码线已冻结 |
++| `dev/1.16-w1` 的"按分支名发布自定义版本"CI 提交 | 仅存于 tag `preserve/1.16-w1-ci`，**尚未并入本线**（本线已有等价的 `RELEASE_VERSION` 入口） |
++| 代码层过期 API 告警 | `ForgeExtensionImpl` 等使用 `ForgeExtensionAPI` 中标记待删除的 API，仅告警 |
++| 重建前的完整历史 | 保留于 tag `backup/pre-queue-1.17` 与分支 `backup/1.17-pre-queue` |
+diff --git a/README.md b/README.md
+index 0c32bc99f2f7f5ac01141ab18fe9b06f228fc4d8..fd3982d6fae090a8d01d29a95da11c67d5dcc956 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,65 @@
++# WCPE Loom
++
++[![CI 发布状态](https://github.com/wcpe/wcpe-loom/actions/workflows/publish.yml/badge.svg?branch=dev/1.17-wcpe)](https://github.com/wcpe/wcpe-loom/actions/workflows/publish.yml)
++[![最新正式版](https://img.shields.io/github/v/release/wcpe/wcpe-loom?filter=wcpe-v*&label=正式版)](https://github.com/wcpe/wcpe-loom/releases/latest)
++[![Maven 仓库](https://img.shields.io/badge/Maven-maven.wcpe.top-orange)](https://maven.wcpe.top/repository/maven-releases/net/fabricmc/architectury-loom/)
++[![License](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
++
++**WCPE Loom** 是 [Architectury Loom](https://github.com/architectury/architectury-loom)（`architectury` 分支，Loom 1.17 代系）的定制版本：在保留其 **Fabric + Forge/NeoForge** 能力的基础上，重新接回 **老版本 Forge（1.8–1.16）支持**，并叠加 WCPE 的并发缓存、配置缓存兼容等补丁，发布到自建 Maven 仓库供下游使用。
++
++## 当前使用哪个上游
++
++| 角色 | 来源 | 说明 |
++|---|---|---|
++| **直接上游** | [architectury/architectury-loom](https://github.com/architectury/architectury-loom) | `architectury` 分支，基底提交 `026ce830` |
++| 旁系来源 | [SparkUniverse/architectury-loom](https://github.com/SparkUniverse/architectury-loom) | Essential Loom `dev/1.15`；本项目 1.15 线的基底，其功能按需移植，**不并入历史** |
++| 更上游 | [FabricMC/fabric-loom](https://github.com/FabricMC/fabric-loom) | 最原始上游 |
++
++## 仓库分支与版本线
++
++| 分支 | 定位 | 状态 |
++|---|---|---|
++| **`dev/1.17-wcpe`**（默认分支） | **开发主线**，基于 architectury 1.17 上游 | 活跃开发 |
++| `1.15-wcpe` | 1.15 代系（Essential Loom `dev/1.15` + WCPE 补丁），已归档 | 冻结保留 |
++
++- 1.17 线不走 quilt 式补丁队列，而是把原 1.15 线上的 WCPE 补丁**重放到** architectury 1.17 基底之上（上游相隔约 5 个月，两线同一项目的不同历史点）。
++- 正式版以 tag 标记：`wcpe-v1.17.1`、`wcpe-v1.17.2`…（不用 `v1.17.*`，该前缀已被上游 release tag 占用）。
++
++## 插件 id
++
++本 fork 使用自有域名的插件 id，并保留上一层分叉的 id 作为**兼容别名**，既有项目无需改动即可继续使用：
++
++| 用途 | 插件 id | 兼容别名 |
++|---|---|---|
++| 主插件 | `top.wcpe.loom` | `dev.architectury.loom` |
++| 无重映射变体 | `top.wcpe.loom-no-remap` | `dev.architectury.loom-no-remap` |
++| 重映射变体 | `top.wcpe.loom-remap` | `dev.architectury.loom-remap` |
++| companion | `top.wcpe.loom-companion` | `dev.architectury.loom-companion`、`net.fabricmc.fabric-loom-companion` |
++| 仓库插件 | `top.wcpe.loom-repositories` | `dev.architectury.loom-repositories` |
++
++```groovy
++plugins {
++	id 'top.wcpe.loom'
++}
++```
++
++## 版本与发布
++
++| 目的 | 操作 | 版本号 |
++|---|---|---|
++| 正式版 | 打 tag 并推送（`git tag wcpe-v1.17.2 && git push origin wcpe-v1.17.2`） | `1.17.2`（取自 tag），并自动创建 GitHub Release |
++| 日常推送 | 推送到 `dev/1.17-wcpe` | `1.17.<运行号>`（自动递增、不可覆盖） |
++
++产物坐标：`net.fabricmc:architectury-loom:<版本>`，仓库 `maven.wcpe.top/repository/maven-releases/`。
++
++支持的 Minecraft 版本：Fabric 全线；Forge/NeoForge 含 1.8–1.16 的 legacy 链路（1.12.2 端到端测试覆盖）。
++
++---
++
++## 上游 README（Architectury Loom 原文）
++
++> 以下为上游 [architectury/architectury-loom](https://github.com/architectury/architectury-loom) 的 README 原文，保留以便对照上游能力与用法。
++
+ # Architectury Loom
+ 
+ Talk to us on [Discord](https://discord.gg/C2RdJDpRBP)!
+diff --git a/build.gradle b/build.gradle
+index 0e89c0de4b8879e7a95222726dd3c9c59ded1f9d..db68680debb1db53fc26cb686883d6f35ad83cee 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -30,7 +30,10 @@ def runNumber = ENV.GITHUB_RUN_NUMBER ?: "9999"
+ 
+ def isSnapshot = ENV.PR_NUM != null
+ 
+-if (!isSnapshot) {
++if (ENV.RELEASE_VERSION) {
++	// 发布流程可显式指定版本号（如从 tag 推导的 1.17.3），优先于按运行号推导
++	version = ENV.RELEASE_VERSION
++} else if (!isSnapshot) {
+ 	version = baseVersion + "." + runNumber
+ } else {
+ 	version = baseVersion + "-PR." + ENV.PR_NUM + "." + runNumber
+@@ -357,6 +360,18 @@ import org.w3c.dom.Element
+ import org.w3c.dom.Node
+ 
+ publishing {
++	repositories {
++		// WCPE Maven 仓库（CI 发布写入 maven-releases）
++		maven {
++			name = 'WCPE'
++			url = project.findProperty('wcpeMavenUrl') ?: 'https://maven.wcpe.top/repository/maven-releases/'
++			credentials {
++				username = project.findProperty('wcpeUsername')?.toString() ?: ''
++				password = project.findProperty('wcpePassword')?.toString() ?: ''
++			}
++		}
++	}
++
+ 	publications {
+ 		if (!isSnapshot && !ENV.EXPERIMENTAL) {
+ 			// Also publish a snapshot so people can use the latest version if they wish
+diff --git a/scripts/sync-upstream.sh b/scripts/sync-upstream.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1e8cdf0591b7f5bdb15ae6f684601913cac208a
+--- /dev/null
++++ b/scripts/sync-upstream.sh
+@@ -0,0 +1,123 @@
++#!/usr/bin/env bash
++# WCPE Loom 1.17 补丁队列维护脚本
++#
++# 用法：
++#   scripts/sync-upstream.sh status          # 查看基底/队列末端/提交数（只读）
++#   scripts/sync-upstream.sh verify          # 校验队列是否符合 .upstream/PATCH-QUEUE.md 规范（只读，默认）
++#   scripts/sync-upstream.sh rebase <新基底sha> [新基底tag名]
++#                                            # 把整条队列重放到新基底（在临时分支上执行，不碰默认分支）
++#
++# 原则（与 1.15 线一致）：
++#   - 默认只读；任何改写都在临时分支上进行，**不自动改默认分支、不自动打发布 tag**
++#   - 改写后必须人工确认内容等价，再自行切换分支
++#
++# 与 1.15 线的差异：本线是「整条序列 rebase」模型，故无 pick/candidates 之类的逐补丁采集命令；
++# 同步上游用 rebase。
++
++set -euo pipefail
++
++cd "$(git rev-parse --show-toplevel)"
++
++BASE_TAG="${WCPE_BASE_TAG:-base/architectury-1.17-026ce830}"
++QUEUE_TAG="${WCPE_QUEUE_TAG:-patch-queue/1.17}"
++UPSTREAM_REMOTE="${WCPE_UPSTREAM_REMOTE:-architectury}"
++
++die() { echo "错误: $*" >&2; exit 1; }
++
++base_commit() {
++	git rev-parse -q --verify "refs/tags/${BASE_TAG}^{commit}" 2>/dev/null \
++		|| die "找不到基底 tag ${BASE_TAG}"
++}
++
++queue_commit() {
++	git rev-parse -q --verify "refs/tags/${QUEUE_TAG}^{commit}" 2>/dev/null || echo ""
++}
++
++cmd_status() {
++	local base queue
++	base="$(base_commit)"
++	queue="$(queue_commit)"
++	echo "基底 tag    : ${BASE_TAG} -> ${base:0:8}"
++	echo "队列末端 tag: ${QUEUE_TAG} -> ${queue:0:8}"
++	echo "当前 HEAD   : $(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD))"
++	if [ -n "${queue}" ]; then
++		echo "队列提交数  : $(git rev-list --count "${base}..${queue}")"
++		echo "队列是否含 merge: $(git rev-list --merges --count "${base}..${queue}") 个"
++	fi
++	echo "上游远端    : ${UPSTREAM_REMOTE} -> $(git rev-parse --short "${UPSTREAM_REMOTE}" 2>/dev/null || echo '(未 fetch)')"
++}
++
++cmd_verify() {
++	local base queue rc=0
++	base="$(base_commit)"
++	queue="$(queue_commit)"
++	[ -n "${queue}" ] || die "找不到队列末端 tag ${QUEUE_TAG}"
++
++	local merges
++	merges="$(git rev-list --merges --count "${base}..${queue}")"
++	if [ "${merges}" != "0" ]; then
++		echo "✗ 队列中存在 ${merges} 个 merge 提交（规范禁止）"; rc=1
++	else
++		echo "✓ 队列线性，无 merge 提交"
++	fi
++
++	echo "· 队列提交数: $(git rev-list --count "${base}..${queue}")"
++
++	# 溯源块：序列中的提交均应含 Origin: 字段
++	local missing
++	missing="$(git log --format='%H %s' "${base}..${queue}" | while read -r sha _; do
++		git log -1 --format=%B "${sha}" | grep -q '^Origin:' || echo "${sha:0:8}"
++	done)"
++	if [ -n "${missing}" ]; then
++		echo "✗ 缺少溯源块（Origin:）的提交:"; echo "${missing}" | sed 's/^/    /'; rc=1
++	else
++		echo "✓ 所有补丁均含溯源块"
++	fi
++
++	# 工作树当前分支是否就是队列末端
++	if [ "$(git rev-parse HEAD)" = "${queue}" ] || git merge-base --is-ancestor "${queue}" HEAD 2>/dev/null; then
++		echo "✓ 当前分支基于队列末端"
++	else
++		echo "· 当前分支与队列末端无祖先关系（改写进行中？）"
++	fi
++
++	[ "${rc}" = "0" ] && echo "校验通过" || echo "校验未通过"
++	return "${rc}"
++}
++
++cmd_rebase() {
++	local new_base="${1:-}" new_tag="${2:-}"
++	[ -n "${new_base}" ] || die "用法: scripts/sync-upstream.sh rebase <新基底sha> [新基底tag名]"
++
++	local base branch
++	base="$(base_commit)"
++	git rev-parse -q --verify "${new_base}^{commit}" >/dev/null || die "新基底 ${new_base} 不存在（先 fetch ${UPSTREAM_REMOTE}）"
++
++	if [ -n "${new_tag}" ]; then
++		git tag -a "${new_tag}" "${new_base}" -m "architectury 1.17 基底（${new_base:0:8}）"
++		echo "已锚定新基底 tag: ${new_tag}"
++	fi
++
++	branch="rebase/$(date +%Y%m%d-%H%M%S)"
++	echo "在临时分支 ${branch} 上重放队列（不触碰默认分支）..."
++	git branch "${branch}" "${QUEUE_TAG}^{commit}"
++	git checkout -q "${branch}"
++	if git rebase --onto "${new_base}" "${base}"; then
++		echo
++		echo "重放完成。请人工完成以下步骤："
++		echo "  1) 复核冲突解决是否符合预期： git log --oneline ${new_base}..HEAD"
++		echo "  2) 对比内容：                      git diff <改写前备份> HEAD"
++		echo "  3) 确认无误后再自行切换默认分支，并前移 tag ${QUEUE_TAG}"
++		echo "  4) 更新 .upstream/migration-1.17.md 的基底与溯源归类"
++	else
++		echo "重放出现冲突，解决后执行 git rebase --continue（当前在 ${branch}）"
++		return 1
++	fi
++}
++
++case "${1:-verify}" in
++	status) cmd_status ;;
++	verify) cmd_verify ;;
++	rebase) shift; cmd_rebase "$@" ;;
++	*) echo "用法: scripts/sync-upstream.sh {status|verify|rebase <新基底sha> [新基底tag名]}"; exit 2 ;;
++esac

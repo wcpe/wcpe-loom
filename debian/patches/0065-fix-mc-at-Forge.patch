@@ -1,0 +1,65 @@
+From a3bcdcd5caaf4dc4c81af44700739ec39f0ac9ca Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Thu, 1 Oct 2026 15:31:03 +0800
+Subject: [PATCH 065/147] =?UTF-8?q?fix(mc,at):=20=E4=BF=AE=E5=A4=8D=20Forg?=
+ =?UTF-8?q?e=20=E4=B8=8A=E5=A4=84=E7=90=86=E5=99=A8=E6=89=A7=E8=A1=8C?=
+ =?UTF-8?q?=E6=9C=9F=E9=87=8D=E5=BB=BA=E7=9A=84=E4=B8=A4=E5=A4=84=E7=BC=BA?=
+ =?UTF-8?q?=E9=99=B7?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+两处都会让 Forge 的构建在 setup / 处理器执行期失败，实测由 AccessTransformerTest 暴露（该用例被发布门禁选中，曾因此阻断 1.17.11 的发布）：
+
+1. ProcessedNamedMinecraftProvider.processedArtifactIdentity 取 remap classpath 时走了 extension.getMinecraftJars(productionNamespace)。该方法在 Forge 上会取 SRG 命名空间，而本方法跑在 provide() 的锁内、srg provider 尚未 setup，直接 NPE（Cannot get SrgMinecraftProvider before it has been setup，挂在 setupMinecraft）。改为取父 provider 的 jar——那正是本 provider 要处理、也是配置期 ContextImplHelper.createRemapper 所用的同一批 jar，且此时必然已就绪。
+
+2. GradleTypeAdapter.PropertyTypeAdapter 不是 null-safe。Gson 不替自定义适配器挡 null，字段本身为 null 时照样把 null 传进来，于是算 options 缓存键时 NPE（Cannot invoke Property.isPresent() because property is null）。而本适配器代表「可能未设置的属性」，null 与 isPresent()==false 语义相同——都表示没有值，序列化结果也应一致，故按未设置处理。
+
+验证：AccessTransformerTest > build (gradle 9.5.0) 由 FAILED 转 PASSED；完整 unit 包 797 tests / 0 failures / 0 errors / 3 skipped（与修复前一致，未引入回归）。
+
+注：GradleTypeAdapter 中 ListProperty / MapProperty 等适配器是同一写法，疑有同类问题，但无实测证据且语义需单独判断，本次未动。
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/ProcessedNamedMinecraftProvider.java b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/ProcessedNamedMinecraftProvider.java
+index 3484922bc0ecba1be5a2ff0c6bc9d69a1e094656..82f6f68b63289c1e3f3b9c6783cb781878cf5bd9 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/ProcessedNamedMinecraftProvider.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/minecraft/mapped/ProcessedNamedMinecraftProvider.java
+@@ -226,10 +226,15 @@ public abstract class ProcessedNamedMinecraftProvider<M extends MinecraftProvide
+ 		identity.put("requiresBackupJars", Boolean.toString(requiresBackupJars()));
+ 		identity.put("processors", processors.stream().map(MinecraftJarProcessor::getName).toList().toString());
+ 		identity.put("specFingerprints", specs.stream().map(spec -> Integer.toString(spec.hashCode())).toList().toString());
+-		// remapper 的 classpath 与配置期 ContextImplHelper.createRemapper 同源（源命名空间的 MC jar）；
+-		// 取配置路径而不是集合内容：后者要求文件已落位，冷缓存下配置期还取不到
+-		identity.put("remapClasspath", extension.getMinecraftJars(extension.getProductionNamespaceEnum().get()).stream()
+-				.map(path -> path.toAbsolutePath().normalize().toString())
++		// remapper 的 classpath 与配置期 ContextImplHelper.createRemapper 同源：都是「被处理的这批
++		// MC jar」，也就是父 provider 的 jar。取配置路径而不是集合内容：后者要求文件已落位，
++		// 冷缓存下配置期还取不到。
++		//
++		// 必须走父 provider 而不是 extension.getMinecraftJars(productionNamespace)：后者在 Forge 上
++		// 会取 SRG 命名空间，而本方法跑在 provide() 的锁内、srg provider 尚未 setup，会直接 NPE
++		// （实测：Forge 的 AccessTransformerTest 因此挂在 setupMinecraft）。
++		identity.put("remapClasspath", parentMinecraftProvider.getMinecraftJars().stream()
++				.map(jar -> jar.getPath().toAbsolutePath().normalize().toString())
+ 				.sorted()
+ 				.collect(Collectors.joining("\n")));
+ 		return identity;
+diff --git a/src/main/java/net/fabricmc/loom/util/gradle/GradleTypeAdapter.java b/src/main/java/net/fabricmc/loom/util/gradle/GradleTypeAdapter.java
+index e165b9a5f724c7c1d0a9e36eb628c66799a89503..03ed9f111fcee4176c1c73806c00ea6d90f26947 100644
+--- a/src/main/java/net/fabricmc/loom/util/gradle/GradleTypeAdapter.java
++++ b/src/main/java/net/fabricmc/loom/util/gradle/GradleTypeAdapter.java
+@@ -78,7 +78,11 @@ public class GradleTypeAdapter implements TypeAdapterFactory {
+ 
+ 		@Override
+ 		public void write(JsonWriter out, T property) throws IOException {
+-			if (!property.isPresent()) {
++			// Gson 不会替自定义适配器挡掉 null：字段本身为 null 时它照样把 null 传进来。
++			// 而本适配器代表的是「可能未设置的属性」，null 与 isPresent()==false 语义相同——
++			// 都表示没有值，序列化结果也应当一致。少这一层会让整条序列化以 NPE 失败：
++			// 实测 AccessTransformerTest 的 AT 处理器在执行期算 options 缓存键时因此挂掉。
++			if (property == null || !property.isPresent()) {
+ 				out.nullValue();
+ 				return;
+ 			}

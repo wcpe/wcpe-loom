@@ -1,0 +1,618 @@
+From f44857b363ac4e4b6f9ecbc3433a6813af04b6f8 Mon Sep 17 00:00:00 2001
+From: wxys233 <1837019522@qq.com>
+Date: Sat, 3 Oct 2026 03:12:05 +0800
+Subject: [PATCH 072/147] =?UTF-8?q?feat(mc):=20Forge=20=E7=9A=84=20srg?=
+ =?UTF-8?q?=E2=86=92named=20=E6=98=A0=E5=B0=84=E7=94=9F=E6=88=90=E8=BF=81?=
+ =?UTF-8?q?=E5=88=B0=E6=89=A7=E8=A1=8C=E6=9C=9F=E4=BB=BB=E5=8A=A1?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+MappingConfiguration.applyToProject 里唯一一步真 IO（把 srg 命名空间的映射树转成
+mappings-srg-named.srg 文本并落盘，15MB 量级）改为执行期任务产出。同一方法里的另外
+两项副作用是纯声明性的（加 mappingsConstants 依赖、加 mappingsFinal 的文件），保持不动。
+
+两条路径共用同一份 writer（writeSrgNamedMappings），产物逐字节一致；不可投影时整批回退
+配置期并留痕。
+
+唯一消费方是 generateDLIConfig：它只把该文件的**路径**写进 DLI 配置
+（net.minecraftforge.gradle.GradleStart.srg.srg-mcp，仅 useCustomMixin=false 分支），
+真正读取在游戏启动时由 ForgeGradle 完成。因此接线方式是让 generateDLIConfig 携带产出
+任务依赖（用 Provider 延迟取值，任务图解析时才求值）。
+
+验证：
+- 产物 sha1 逐字节一致：改造前后均为 2ac00d8472323f74070640e34d5842381eec0901
+  （15,233,830 B），输入 mappings-srg-migrated.tiny 亦未变
+- 冷缓存行为：改造后 `help` 不再产出该文件（删除后重跑仍 ABSENT），日志显示生成由
+  :generateSrgNamedMappings 承担
+- forge.* + pipeline.* 共 64 用例：ForgeTest 13/13、ForgeRunConfigTest 5/5、
+  AccessTransformerTest 1/1 全绿；新增 SrgNamedMappingsTaskTest PASSED
+  （SplitModDependencyProducerTest 与 PatchedDecompileTest 两条为已知环境性偶发，
+  定向重跑 PASSED）
+
+Origin: vendor, wcpe-loom
+Forwarded: no
+
+diff --git a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+index 0674ffb9bf745ed3341dbda52fd791be3858840d..276347a1a31a733fc5241dde18563a04d15656c9 100644
+--- a/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
++++ b/src/main/java/net/fabricmc/loom/configuration/providers/mappings/MappingConfiguration.java
+@@ -71,6 +71,8 @@ import net.fabricmc.loom.configuration.providers.mappings.tiny.MappingsMerger;
+ import net.fabricmc.loom.configuration.providers.mappings.tiny.TinyJarInfo;
+ import net.fabricmc.loom.configuration.providers.mappings.unpick.UnpickMetadata;
+ import net.fabricmc.loom.configuration.providers.minecraft.MinecraftProvider;
++import net.fabricmc.loom.pipeline.GenerateSrgNamedMappingsTask;
++import net.fabricmc.loom.pipeline.RemapMinecraftTaskRegistry;
+ import net.fabricmc.loom.util.Checksum;
+ import net.fabricmc.loom.util.Constants;
+ import net.fabricmc.loom.util.FileSystemUtil;
+@@ -89,6 +91,7 @@ import net.fabricmc.mappingio.adapter.MappingSourceNsSwitch;
+ import net.fabricmc.mappingio.format.MappingFormat;
+ import net.fabricmc.mappingio.format.tiny.Tiny2FileWriter;
+ import net.fabricmc.mappingio.tree.MappingTree;
++import net.fabricmc.mappingio.tree.MemoryMappingTree;
+ import net.fabricmc.stitch.Command;
+ import net.fabricmc.stitch.commands.CommandProposeFieldNames;
+ 
+@@ -156,6 +159,17 @@ public class MappingConfiguration {
+ 	// mappings.tiny 与 mappings.jar 的成对就绪标记：与两件产物同处共享工作目录，跨工作树/daemon 共享
+ 	private final Path mappingsPairMarker;
+ 
++	/**
++	 * srg→named 产物的产出任务路径；未投影（整批回退配置期）时为 {@code null}.
++	 *
++	 * <p>它承载消费侧接线：消费方（{@code GenerateDLIConfigTask}）只把产物**路径**当字符串写进 DLI 配置，
++	 * Gradle 看不见这条输入依赖，故由消费方在任务图上显式声明（见
++	 * {@link #projectSrgNamedToTasks(Project, LoomGradleExtension)}）。按路径而不是任务实例传递：
++	 * 产出方可能由另一份 Loom classloader 配置。
++	 */
++	@Nullable
++	private String srgNamedTaskPath;
++
+ 	private List<AnnotationsData> annotationsData = List.of();
+ 
+ 	@Nullable
+@@ -276,6 +290,17 @@ public class MappingConfiguration {
+ 		return Objects.requireNonNull(mappingsSupplier.get());
+ 	}
+ 
++	/**
++	 * {@return srg→named 产物的产出任务路径；未投影（整批回退配置期）时为 {@code null}}.
++	 *
++	 * <p>供消费方把「我的输入就是你的产出」表达成任务依赖。返回值是任务**路径**而不是任务实例：产出方
++	 * 可能由另一份 Loom classloader 配置（约定插件/included build 各自带一份 Loom），把对方的任务实例
++	 * 交给本 classloader 的任务会在使用处抛 {@link ClassCastException}。
++	 */
++	public @Nullable String getSrgNamedTaskPath() {
++		return srgNamedTaskPath;
++	}
++
+ 	public Provider<TinyMappingsService.Options> getMappingsServiceOptions(Project project) {
+ 		return getMappingsServiceOptions(project, MappingOption.DEFAULT);
+ 	}
+@@ -564,41 +589,180 @@ public class MappingConfiguration {
+ 				throw new IllegalStateException("We have to generate srg tiny in a forge environment!");
+ 			}
+ 
+-			// 就绪判据为内容级（见 isReusableMappingsText）。该产物虽以 .srg 结尾，内容仍是纯文本：
+-			// 它由 MappingWriter.create(tmp, MappingFormat.SRG_FILE) 经 java.io.Writer 逐行写出，
+-			// 与 .tiny 同属文本映射而非 zip，故同样不能套用 JarReusability 的 zip 口径，取「存在且非空」。
+-			// 只判存在的代价偏大：该文件是 dev 启动配置里 SRG→named 的映射来源，复用 0 字节残骸
+-			// 会让开发环境静默地按错误映射启动，而不是报错。
+-			if (!isReusableMappingsText(srgToNamedSrg) || extension.refreshDeps()) {
+-				final boolean refresh = extension.refreshDeps();
+-				// 该产物与 mappings-srg.tiny 同处共享工作目录且由它派生，故与 produceMappings / setupPost
+-				// 共用同一把 mappings 锁，避免不同工作树/daemon 交叉生产这一组互相依赖的产物。
+-				runWithMappingsLock(project, "生成 srg->named mappings 失败", () -> {
+-					// 锁内二次确认：等锁期间可能已被其它进程产出（refresh 时仍需强制重建）
+-					if (!refresh && isReusableMappingsText(srgToNamedSrg)) {
+-						return null;
+-					}
+-
+-					try (var serviceFactory = new ScopedServiceFactory()) {
+-						TinyMappingsService mappingsService = getMappingsService(project, serviceFactory, MappingOption.WITH_SRG);
+-
+-						// 原子发布：先在临时文件上写完整份 srg 文本，再原子 move 落位
+-						AtomicFiles.publish(srgToNamedSrg, tmp -> {
+-							try (MappingWriter writer = MappingWriter.create(tmp, MappingFormat.SRG_FILE)) {
+-								MappingVisitor visitor = new MappingSourceNsSwitch(new MappingDstNsReorder(writer, "named"), "srg");
+-								mappingsService.getMappingTree().accept(visitor);
+-							}
+-						});
+-					}
++			final String blocker = srgNamedProjectionBlocker();
+ 
+-					return null;
+-				});
++			if (blocker == null) {
++				projectSrgNamedToTasks(project, extension);
++			} else {
++				// 整批回退：配置期路径逐字保留（含它自己的就绪判据、跨进程锁与原子发布）
++				generateSrgNamedInConfiguration(project, extension, blocker);
+ 			}
+ 		}
+ 
+ 		project.getDependencies().add(Constants.Configurations.MAPPINGS_FINAL, project.files(tinyMappingsJar.toFile()));
+ 	}
+ 
++	/**
++	 * {@return 不能把 srg→named 的生成投影成执行期任务的原因；可以投影时为 {@code null}}.
++	 *
++	 * <p>本产物的消费面很窄，全仓库只有一处读它：{@code GenerateDLIConfigTask} 把它的**路径**写进
++	 * DLI 配置的 {@code net.minecraftforge.gradle.GradleStart.srg.srg-mcp}
++	 * （见 {@code GenerateDLIConfigTask.ForgeInputs}），真正的读取发生在游戏启动时（ForgeGradle 的
++	 * {@code GradleStart} 按那个属性打开文件）。既然唯一的消费方是一个任务、而它的依赖可以接线
++	 * （见 {@link #projectSrgNamedToTasks}），判据就只剩一类「配置期必须真读/真写该产物」的形态。
++	 *
++	 * <p><b>任何新增的配置期读者都必须在这里补一条判据</b>：回退必须可见，不能是静默的——新增读者
++	 * 读到的是「产出任务还没跑」的文件。
++	 *
++	 * <ul>
++	 *   <li><b>映射树来源不可用</b>：srg 命名空间的映射树（Forge 下即 {@code mappings-srg-migrated.tiny}）
++	 *       缺失或为空时投影对双方都没有好处：任务拿到的是不可读的输入（必然失败），而配置期那条路径
++	 *       会以它自己的判据处理这一轮——产物可用就直接复用、不碰输入。这类残骸形态本仓库实测出现过
++	 *       （见 {@link #isReusableMappingsText(Path)}），故整批回退，让改造前的路径去处理。</li>
++	 * </ul>
++	 */
++	private @Nullable String srgNamedProjectionBlocker() {
++		final Path source = srgNamedMappingsPath();
++
++		if (source == null) {
++			return "srg 命名空间的映射树来源未登记（" + MappingOption.WITH_SRG + "）：产出任务没有可读的输入";
++		}
++
++		if (!isReusableMappingsText(source)) {
++			return "srg 命名空间的映射树不可用（" + describeMappingsTextSize(source) + "）：产出任务没有可读的输入";
++		}
++
++		return null;
++	}
++
++	/**
++	 * {@return srg 命名空间的映射树路径；该选项未登记时为 {@code null}}.
++	 *
++	 * <p>与 {@link #getMappingsPath(MappingOption)} 的区别只有一个：不因「文件不存在」抛异常。投影前的
++	 * 判定本身就要能看见并描述这种形态（见 {@link #srgNamedProjectionBlocker()}），否则判定会退化成一个
++	 * 没人接得住的异常。
++	 */
++	private @Nullable Path srgNamedMappingsPath() {
++		final Supplier<Path> mappingsSupplier = mappingOptions.get(MappingOption.WITH_SRG);
++		return mappingsSupplier == null ? null : mappingsSupplier.get();
++	}
++
++	/**
++	 * 把 srg→named 的生成投影成执行期任务.
++	 *
++	 * <p>配置期只做「配置期已知量 → 任务输入」的映射，不写产物文件：产物有效性交给 Gradle 的 up-to-date
++	 * 判定与构建缓存，并发保护交给任务图。产物路径沿用既有位置（{@code <userCache>/<mappingsIdentifier>/}），
++	 * 否则 {@code GenerateDLIConfigTask} 写进 DLI 配置的那条路径会悬空。
++	 *
++	 * <p>输入取 {@code MappingOption.WITH_SRG} 指向的 tiny 文件——与旧路径经 {@code TinyMappingsService}
++	 * 读的是同一份文件；该文件由 mappings 阶段（{@code setupPost} / {@code manipulateMappings}）产出，
++	 * 因此本任务的输入在配置期结束时必定已落位（这也是本次不把整棵映射树推迟到执行期的原因）。
++	 *
++	 * <p><b>消费侧接线</b>：{@link #srgNamedTaskPath} 登记给消费方（{@code GenerateDLIConfigTask}），
++	 * 由它在任务图上建依赖。按任务**路径**而不是任务实例登记：产出方可能由另一份 Loom classloader
++	 * 配置（约定插件/included build 各自带一份 Loom），把对方的任务实例交过来会在使用处抛
++	 * {@link ClassCastException}。
++	 */
++	private void projectSrgNamedToTasks(Project project, LoomGradleExtension extension) {
++		final Path source = Objects.requireNonNull(srgNamedMappingsPath(), "投影前已由判据保证输入可用");
++		final Path output = srgToNamedSrg;
++		final boolean refresh = extension.refreshDeps();
++
++		// 同一产物路径在本构建内只能有一个生产者：同一构建内的多个同构项目会算出同一条路径。
++		// 指纹只放**决定内容**的量。刻意不放 refreshDeps：它只影响「这轮要不要重建」，
++		// 不改变字节，而它按项目设置（loom.refreshDeps），放进指纹会让「只有其中一个项目刷新」
++		// 变成整批共享失败。
++		srgNamedTaskPath = RemapMinecraftTaskRegistry.claim(project, output, Map.of(
++				"stage", "srg-named",
++				"mappings", source.toAbsolutePath().normalize().toString()
++		), () -> project.getTasks().register("generateSrgNamedMappings", GenerateSrgNamedMappingsTask.class, task -> {
++			task.setGroup(Constants.TaskGroup.FABRIC);
++			task.setDescription("Generates the srg -> named mappings for %s".formatted(mappingsIdentifier));
++			task.getMappings().set(source.toFile());
++			task.getRefreshDeps().set(refresh);
++			task.getSrgFile().set(output.toFile());
++		})).taskPath();
++
++		// 用 Gradle 的 lifecycle 而不是 SLF4J 的 info：默认控制台级别是 LIFECYCLE，
++		// 「本次到底走哪条生产路径」必须默认可见，否则回退是静默的
++		project.getLogger().lifecycle("srg→named 映射的生成由执行期任务承担：{}", srgNamedTaskPath);
++	}
++
++	/**
++	 * 配置期生成 srg→named 的旧路径（整批回退时使用）.
++	 *
++	 * <p>本方法就是改造前 {@code applyToProject} 里的那一段，逐字保留：判据、跨进程锁、锁内二次确认、
++	 * 原子发布都不动。回退路径与投影路径产出的是同一件产物、同一条路径，因此它必须一直可用
++	 * （也是「投影判据必须与回退原因同处」的意义所在）。
++	 *
++	 * @param blocker 回退原因，只用于留痕
++	 */
++	private void generateSrgNamedInConfiguration(Project project, LoomGradleExtension extension, String blocker) throws IOException {
++		project.getLogger().lifecycle("srg→named 映射的生成整批回退到配置期：{}", blocker);
++
++		// 就绪判据为内容级（见 isReusableMappingsText）。该产物虽以 .srg 结尾，内容仍是纯文本：
++		// 它由 MappingWriter.create(tmp, MappingFormat.SRG_FILE) 经 java.io.Writer 逐行写出，
++		// 与 .tiny 同属文本映射而非 zip，故同样不能套用 JarReusability 的 zip 口径，取「存在且非空」。
++		// 只判存在的代价偏大：该文件是 dev 启动配置里 SRG→named 的映射来源，复用 0 字节残骸
++		// 会让开发环境静默地按错误映射启动，而不是报错。
++		if (!isReusableMappingsText(srgToNamedSrg) || extension.refreshDeps()) {
++			final boolean refresh = extension.refreshDeps();
++			// 该产物与 mappings-srg.tiny 同处共享工作目录且由它派生，故与 produceMappings / setupPost
++			// 共用同一把 mappings 锁，避免不同工作树/daemon 交叉生产这一组互相依赖的产物。
++			runWithMappingsLock(project, "生成 srg->named mappings 失败", () -> {
++				// 锁内二次确认：等锁期间可能已被其它进程产出（refresh 时仍需强制重建）
++				if (!refresh && isReusableMappingsText(srgToNamedSrg)) {
++					return null;
++				}
++
++				// 原子发布：先在临时文件上写完整份 srg 文本，再原子 move 落位
++				AtomicFiles.publish(srgToNamedSrg, tmp -> writeSrgNamedMappings(srgNamedTree(project), tmp));
++				return null;
++			});
++		}
++	}
++
++	/** {@return 配置期读到的 srg 命名空间映射树} 走 {@code TinyMappingsService}，与改造前同一来源. */
++	private MemoryMappingTree srgNamedTree(Project project) throws IOException {
++		try (var serviceFactory = new ScopedServiceFactory()) {
++			TinyMappingsService mappingsService = getMappingsService(project, serviceFactory, MappingOption.WITH_SRG);
++			return mappingsService.getMappingTree();
++		}
++	}
++
++	/**
++	 * 把 {@code srg → named} 的映射整份写成 SRG 文本.
++	 *
++	 * <p>两条路径共用这一份实现：读写方式、命名空间切换与目标命名空间必须逐字一致，否则同一件产物在
++	 * 「投影」与「回退」下会不一样。本流水线的其余环节（合并/拆分/重映射）同样按「同一份实现被两条路径
++	 * 共用」处置。
++	 *
++	 * @param source 输入的 tiny 映射（srg 命名空间的映射树）
++	 * @param target 输出路径；必须是**尚不存在**的路径（调用方负责原子发布，见 {@code AtomicFiles}）
++	 */
++	public static void writeSrgNamedMappings(Path source, Path target) throws IOException {
++		final MemoryMappingTree mappingTree = new MemoryMappingTree();
++		MappingReader.read(source, mappingTree);
++		writeSrgNamedMappings(mappingTree, target);
++	}
++
++	/**
++	 * 把 {@code srg → named} 的映射整份写成 SRG 文本.
++	 *
++	 * <p>与 {@link #writeSrgNamedMappings(Path, Path)} 的差别只有「映射树从哪来」：执行期路径直接读
++	 * {@code MappingOption.WITH_SRG} 指向的文件，配置期回退路径读 {@code TinyMappingsService} 的树
++	 * （同一份文件、同一个读法）。写法本身共用，避免两套转换逻辑产出不等价的 srg 文本。
++	 *
++	 * @param mappingTree srg 命名空间的映射树
++	 * @param target      输出路径；必须是**尚不存在**的路径（调用方负责原子发布，见 {@code AtomicFiles}）
++	 */
++	public static void writeSrgNamedMappings(MappingTree mappingTree, Path target) throws IOException {
++		try (MappingWriter writer = MappingWriter.create(target, MappingFormat.SRG_FILE)) {
++			MappingVisitor visitor = new MappingSourceNsSwitch(new MappingDstNsReorder(writer, "named"), "srg");
++			mappingTree.accept(visitor);
++		}
++	}
++
+ 	public static Path getRawSrgFile(Project project) throws IOException {
+ 		LoomGradleExtension extension = LoomGradleExtension.get(project);
+ 
+diff --git a/src/main/java/net/fabricmc/loom/pipeline/GenerateSrgNamedMappingsTask.java b/src/main/java/net/fabricmc/loom/pipeline/GenerateSrgNamedMappingsTask.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..97be7e2c5f4c04e2d2ba412ab6d19542bf8de57b
+--- /dev/null
++++ b/src/main/java/net/fabricmc/loom/pipeline/GenerateSrgNamedMappingsTask.java
+@@ -0,0 +1,98 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.pipeline;
++
++import java.io.IOException;
++import java.nio.file.Path;
++
++import org.gradle.api.DefaultTask;
++import org.gradle.api.file.RegularFileProperty;
++import org.gradle.api.provider.Property;
++import org.gradle.api.tasks.CacheableTask;
++import org.gradle.api.tasks.Input;
++import org.gradle.api.tasks.InputFile;
++import org.gradle.api.tasks.OutputFile;
++import org.gradle.api.tasks.PathSensitive;
++import org.gradle.api.tasks.PathSensitivity;
++import org.gradle.api.tasks.TaskAction;
++
++import net.fabricmc.loom.configuration.providers.mappings.MappingConfiguration;
++import net.fabricmc.loom.util.cache.AtomicFiles;
++
++/**
++ * L3 流水线：把「srg → named」的映射整份写成 SRG 文本（Forge 的 {@code mappings-srg-named.srg}）.
++ *
++ * <p>它取代的是 {@code MappingConfiguration.applyToProject} 里那段配置期同步执行的生成
++ * （配置文件锁 → 锁内二次确认 → 写临时文件 → 原子落位）。转换本身仍走
++ * {@link MappingConfiguration#writeSrgNamedMappings(Path, Path)}：同一份实现被两条路径共用，
++ * 避免两套转换逻辑产出不等价的 srg 文本——这与本流水线其余环节（合并/拆分/重映射）的处置一致。
++ *
++ * <table>
++ *   <caption>旧路径 vs 本任务</caption>
++ *   <tr><th></th><th>旧路径</th><th>本任务</th></tr>
++ *   <tr><td>是否需要生成</td><td>配置期 {@code isReusableMappingsText} 判定（存在且非空）</td>
++ *       <td>Gradle up-to-date 检查（输入内容 + 输出快照）</td></tr>
++ *   <tr><td>并发保护</td><td>跨进程文件锁 + 锁内二次确认</td><td>任务图 + 构建缓存</td></tr>
++ *   <tr><td>残骸恢复</td><td>手工判「0 字节残骸」并重建</td><td>输出快照不符即重建</td></tr>
++ *   <tr><td>执行时机</td><td>配置期（{@code afterEvaluate}）</td><td>执行期</td></tr>
++ * </table>
++ *
++ * <h2>为什么输入是「srg 命名空间的 tiny」而不是映射 jar</h2>
++ * 旧路径用的是 {@code TinyMappingsService}（{@code MappingOption.WITH_SRG}），它读的就是
++ * {@code mappings-srg-migrated.tiny} 这一份纯文本映射树；本任务的 {@link #getMappings()} 取同一条路径，
++ * 读取方式也同源（{@code MappingReader.read(Path, MappingTree)}）。换成映射 jar 需要重跑整条
++ * layered/migrated 链，那是另一个阶段的事，也不属于本次迁移范围。
++ *
++ * <h2>就绪判据的差别</h2>
++ * 旧路径的「存在且非空」判据是为了识别「先删后写被中断」留下的 0 字节残骸；换成任务后这一层由
++ * Gradle 的输出快照承担：快照不符（含被截断）即重建，且任务每次都是原子落位，不会自己制造残骸。
++ * {@link #getRefreshDeps()} 只是把 {@code --refresh-dependencies} 的强制重建语义保留下来（与
++ * {@code ExtractMinecraftServerJarTask} 同款），不参与产物的内容判定。
++ */
++@CacheableTask
++public abstract class GenerateSrgNamedMappingsTask extends DefaultTask {
++	/** 输入的映射树：{@code mappings-srg-migrated.tiny}（srg 命名空间）. */
++	@InputFile
++	@PathSensitive(PathSensitivity.NONE)
++	public abstract RegularFileProperty getMappings();
++
++	/** 是否强制重建（对应 {@code --refresh-dependencies}）:旧路径在该情形下无条件重写产物. */
++	@Input
++	public abstract Property<Boolean> getRefreshDeps();
++
++	/** 产物：{@code mappings-srg-named.srg}（与旧路径同一条路径）. */
++	@OutputFile
++	public abstract RegularFileProperty getSrgFile();
++
++	@TaskAction
++	public void generate() throws IOException {
++		final Path mappings = getMappings().get().getAsFile().toPath();
++		final Path srgFile = getSrgFile().get().getAsFile().toPath();
++
++		// 原子发布：产物位于跨进程、跨 daemon 共享的 mappings 工作目录，旧路径即原子落位。
++		// 读方（游戏启动时的 ForgeGradle GradleStart）按路径直接打开它，因此「存在 ⟺ 内容完整」这一不变量必须保住。
++		AtomicFiles.publish(srgFile, tmp -> MappingConfiguration.writeSrgNamedMappings(mappings, tmp));
++	}
++}
+diff --git a/src/main/java/net/fabricmc/loom/task/LoomTasks.java b/src/main/java/net/fabricmc/loom/task/LoomTasks.java
+index 29e40a446c8c50d2acf48b982bda2421d026b0a9..6922ad71e60d2a5ed438e4b7decc5c4af248d1e9 100644
+--- a/src/main/java/net/fabricmc/loom/task/LoomTasks.java
++++ b/src/main/java/net/fabricmc/loom/task/LoomTasks.java
+@@ -25,6 +25,7 @@
+ package net.fabricmc.loom.task;
+ 
+ import java.io.File;
++import java.util.List;
+ import java.util.Objects;
+ 
+ import javax.inject.Inject;
+@@ -95,6 +96,20 @@ public abstract class LoomTasks implements Runnable {
+ 				GenerateRemapClasspathTask remapClasspath = Objects.requireNonNull(generateRemapClasspathTask.get());
+ 				t.getRemapClasspathFile().set(remapClasspath.getRemapClasspathFile());
+ 			}
++
++			// srg→named 的产出任务：本任务只把它的**路径**当字符串写进 DLI 配置
++			// （见 GenerateDLIConfigTask.ForgeInputs 的 net.minecraftforge.gradle.GradleStart.srg.srg-mcp），
++			// Gradle 看不见这条输入依赖，故显式声明——否则 runClient / IDE 同步可能在产出任务之前跑完，
++			// 而游戏启动时按该路径打开 srg 文件会失败。
++			// 用 Provider 延迟取值：产出任务在 afterEvaluate（映射阶段）才登记，本注册块在插件 apply 时就跑。
++			t.dependsOn(getProject().provider(() -> {
++				if (extension.disableObfuscation() || !extension.isForge()) {
++					return List.of();
++				}
++
++				final String srgTask = extension.getMappingConfiguration().getSrgNamedTaskPath();
++				return srgTask == null ? List.of() : List.of(srgTask);
++			}));
+ 		});
+ 
+ 		getTasks().register("configureLaunch", task -> {
+diff --git a/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/SrgNamedMappingsTaskTest.groovy b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/SrgNamedMappingsTaskTest.groovy
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b0d81027d66087dd000ebd0fcc490563a083637
+--- /dev/null
++++ b/src/test/groovy/net/fabricmc/loom/test/integration/pipeline/SrgNamedMappingsTaskTest.groovy
+@@ -0,0 +1,174 @@
++/*
++ * This file is part of fabric-loom, licensed under the MIT License (MIT).
++ *
++ * Copyright (c) 2026 FabricMC
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package net.fabricmc.loom.test.integration.pipeline
++
++import java.nio.file.Files
++
++import spock.lang.Specification
++
++import net.fabricmc.loom.test.util.GradleProjectTestTrait
++import net.fabricmc.mappingio.MappingReader
++import net.fabricmc.mappingio.MappingWriter
++import net.fabricmc.mappingio.adapter.MappingDstNsReorder
++import net.fabricmc.mappingio.adapter.MappingSourceNsSwitch
++import net.fabricmc.mappingio.format.MappingFormat
++import net.fabricmc.mappingio.tree.MemoryMappingTree
++
++import static net.fabricmc.loom.test.LoomTestConstants.DEFAULT_GRADLE
++import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
++
++/**
++ * Forge 的 {@code mappings-srg-named.srg} 由执行期任务产出的接线与等价性检查.
++ *
++ * <p>本产物是 {@code MappingConfiguration.applyToProject} 里唯一一件真 IO（改造前在配置期做）：
++ * 把 srg 命名空间的映射树整份写成 SRG 文本。用例断言四件事：
++ *
++ * <ul>
++ *   <li><b>生产者存在且路径一致</b>：任务注册在 {@code applyToProject} 生产该文件的那条路径上
++ *       （{@code MappingConfiguration.srgToNamedSrg}）。路径换一处，消费侧（DLI 配置里写死的 srg 路径）
++ *       就会悬空；</li>
++ *   <li><b>输入是 srg 命名空间的映射树</b>：{@code mappings-srg-migrated.tiny}，取自
++ *       {@code MappingOption.WITH_SRG}——与旧路径经 {@code TinyMappingsService} 读的是同一份文件。
++ *       读错映射选项（例如读 {@code mappings.tiny}）会静默产出另一份 srg；</li>
++ *   <li><b>消费方拿到任务依赖</b>：{@code generateDLIConfig} 跑之前 {@code :generateSrgNamedMappings}
++ *       已经跑过，且它写出的 DLI 配置里的 {@code net.minecraftforge.gradle.GradleStart.srg.srg-mcp}
++ *       指向的正是这个任务产出的文件；</li>
++ *   <li><b>产物逐字节一致</b>：用测试 JVM 里独立写的「读同一棵树的同一个命名空间、写成同一格式」
++ *       与任务产出对 sha1。这一层抓的是接线接错（读了另一个映射选项、切错命名空间）；
++ *       「配置期回退路径与任务路径共用同一份实现」由 {@code MappingConfiguration.writeSrgNamedMappings}
++ *       在实现层面保证。</li>
++ * </ul>
++ *
++ * <p>{@code useCustomMixin=false} 是刻意设置的：默认值（true）下 DLI 配置不写 srg 路径那一项，
++ * 本用例就检查不到「消费方读到的是产出任务的文件」这一环。
++ */
++class SrgNamedMappingsTaskTest extends Specification implements GradleProjectTestTrait {
++	def "srg→named 的产物由执行期任务产出，且消费方拿到任务依赖"() {
++		setup:
++		def gradle = gradleProject(project: "forge/simple", version: DEFAULT_GRADLE)
++		gradle.buildGradle.text = gradle.buildGradle.text.replace('@MCVERSION@', '1.20.1')
++				.replace('@FORGEVERSION@', '47.2.1')
++				.replace('@MAPPINGS@', "'net.fabricmc:yarn:1.20.1+build.10:v2'")
++				.replace('@REPOSITORIES@', "maven { url = 'https://maven.minecraftforge.net/' }")
++				.replace('@PACKAGE@', 'net.minecraftforge:forge')
++				.replace('@JAVA_VERSION@', '17')
++		gradle.buildGradle << '''
++		// 走「消费 srg→named 文件」的那条 DLI 分支（默认的 useCustomMixin=true 不写 srg 路径）
++		net.fabricmc.loom.LoomGradleExtension.get(project).getForge().getUseCustomMixin().set(false)
++
++		def srgReport = project.file('srg-report.properties')
++
++		afterEvaluate {
++			def mappingConfiguration = net.fabricmc.loom.LoomGradleExtension.get(project).getMappingConfiguration()
++			def srgTask = project.tasks.findByName('generateSrgNamedMappings')
++			def lines = []
++
++			lines << 'SRG_OUTPUT=' + mappingConfiguration.srgToNamedSrg.toAbsolutePath()
++			lines << 'TASK_FOUND=' + (srgTask != null)
++
++			if (srgTask != null) {
++				lines << 'TASK_OUTPUT=' + srgTask.srgFile.get().asFile.absolutePath
++				lines << 'TASK_INPUT=' + srgTask.mappings.get().asFile.absolutePath
++			}
++
++			// applyToProject 的另一处副作用：mappings.jar 被登记进 mappingsFinal
++			lines << 'MAPPINGS_FINAL=' + project.configurations.getByName('mappingsFinal').files.collect { it.name }.sort().join(',')
++
++			srgReport.text = lines.join(System.lineSeparator()) + System.lineSeparator()
++		}
++		'''.stripIndent()
++
++		when: "跑消费方：产出任务必须先在任务图里跑过"
++		def result = gradle.run(task: "generateDLIConfig")
++		def report = parseReport(new File(gradle.projectDir.toString(), "srg-report.properties"))
++		def produced = new File(report.SRG_OUTPUT)
++		def input = new File(report.TASK_INPUT)
++		def expected = computeExpectedSrg(input)
++
++		then: "产出任务被注册，且落在 applyToProject 原本写的那条路径上"
++		report.TASK_FOUND == "true"
++		report.TASK_OUTPUT == report.SRG_OUTPUT
++
++		and: "任务的输入就是 srg 命名空间的映射树（mappings-srg.tiny 的迁移产物）"
++		input.name == "mappings-srg-migrated.tiny"
++		input.exists()
++
++		and: "消费方的任务图里带着产出任务"
++		result.task(":generateSrgNamedMappings").outcome == SUCCESS
++		result.task(":generateDLIConfig").outcome == SUCCESS
++
++		and: "消费方写出的 DLI 配置指向的正是产出任务写的那个文件"
++		def dliConfig = new File(gradle.projectDir.toString(), ".gradle/loom-cache/launch.cfg").text
++		dliConfig.contains("net.minecraftforge.gradle.GradleStart.srg.srg-mcp=" + produced.absolutePath)
++
++		and: "applyToProject 的另一处副作用仍在：mappingsFinal 里有 mappings.jar"
++		report.MAPPINGS_FINAL.contains("mappings.jar")
++
++		and: "产物与测试 JVM 里独立算出的同一变换逐字节一致"
++		produced.length() > 0
++		sha1(produced) == sha1(expected)
++	}
++
++	/** 读报告文件；键值各占一行. */
++	private static Map<String, String> parseReport(File file) {
++		if (!file.exists()) {
++			throw new FileNotFoundException("未生成报告文件: " + file)
++		}
++
++		return file.readLines().findAll { it.contains('=') }.collectEntries {
++			def split = it.split('=', 2)
++			[(split[0]): split[1]]
++		}
++	}
++
++	/**
++	 * 在测试 JVM 里独立做一遍同样的变换：读 srg 命名空间的映射树、切成 named、写成 SRG 文本.
++	 *
++	 * <p>刻意不调用 loom 的实现：这样「读了别的映射选项」或「切错命名空间」这类接线错误会被抓到，
++	 * 而不是自我印证。
++	 */
++	private static File computeExpectedSrg(File mappings) {
++		def tree = new MemoryMappingTree()
++		MappingReader.read(mappings.toPath(), tree)
++
++		def expected = Files.createTempFile("expected-srg-named", ".srg").toFile()
++		expected.deleteOnExit()
++
++		MappingWriter.create(expected.toPath(), MappingFormat.SRG_FILE).withCloseable { writer ->
++			def visitor = new MappingSourceNsSwitch(new MappingDstNsReorder(writer, "named"), "srg")
++			tree.accept(visitor)
++		}
++
++		assert expected.length() > 0
++		return expected
++	}
++
++	private static String sha1(File file) {
++		return java.security.MessageDigest.getInstance("SHA-1")
++				.digest(file.bytes)
++				.collect { String.format("%02x", it) }
++				.join()
++	}
++}
